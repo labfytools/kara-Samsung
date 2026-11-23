@@ -30,7 +30,7 @@ small{color:#a6adc8;display:block;margin-top:16px}
 </p>
 <p><button id="start">Activer le micro</button> <button id="stop" disabled>Couper</button></p>
 <p><button id="calibrate">Mesurer sortie audio (sans écho)</button></p>
-<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage puis cinq mesures. La V5 utilise une référence à balayage fréquentiel codé et compare la première arrivée acoustique au pic dominant, avec contrôle des ambiguïtés. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
+<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage puis cinq mesures. Diagnostic V5 : compare la référence captée sur le téléphone et son retour acoustique (niveau, enveloppe et écrêtage), même si la mesure de latence est rejetée. Les valeurs sont indicatives, pas une mesure de distorsion harmonique. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
 <div id="status" role="status">Micro inactif.</div>
 <p><small>Le volume de retour agit sur le flux microphone uniquement, pas sur Strawberry. Commence à 160 % et baisse si tu entends de la distorsion.</small></p>
 <p><small>Capture AudioWorklet en temps réel, sans ScriptProcessor ni conversion 16 kHz. Test audio propre : pas de double amplification. Commence à 90 % et baisse si nécessaire. La musique n’est pas modifiée.</small></p>
@@ -373,6 +373,42 @@ function analyzeRecordedReturn(recording,clip,rate,anchorMs){
  }
  return {ok:true,delay,confidence,rivalRatio:Math.round(rivalRatio*100)};
 }
+// Diagnostics are calculated in browser RAM on already captured audio. They
+// never create files or transmit microphone data other than the finite reference.
+// The reference has already passed through the phone microphone and is not an
+// untouched digital original; the figures are relative, NOT a THD measurement.
+function waveformDiagnostics(recording,reference,rate,peakMs){
+ const offset=Math.round(peakMs*rate/1000);
+ const length=Math.min(reference.length,recording.length-offset);
+ if(!Number.isFinite(offset)||offset<0||length<rate*.1)return null;
+ let sumRef=0,sumRx=0,clipCount=0;
+ const refEnv=[],rxEnv=[],hop=Math.max(1,Math.round(rate*.01));
+ for(let start=0;start<length;start+=hop){
+  let a=0,b=0;
+  for(let i=start;i<Math.min(length,start+hop);i++){
+   const x=reference[i],y=recording[offset+i];
+   a+=x*x;b+=y*y;clipCount+=Math.abs(y)>=.995;
+  }
+  sumRef+=a;sumRx+=b;
+  refEnv.push(Math.sqrt(a/Math.min(hop,length-start)));
+  rxEnv.push(Math.sqrt(b/Math.min(hop,length-start)));
+ }
+ const n=refEnv.length;
+ const av=refEnv.reduce((a,b)=>a+b,0)/n;
+ const bv=rxEnv.reduce((a,b)=>a+b,0)/n;
+ let cov=0,va=0,vb=0;
+ for(let i=0;i<n;i++){
+  const a=refEnv[i]-av,b=rxEnv[i]-bv;
+  cov+=a*b;va+=a*a;vb+=b*b;
+ }
+ const envCorr=va>1e-12&&vb>1e-12?cov/Math.sqrt(va*vb):0;
+ const referenceDb=10*Math.log10(Math.max(1e-12,sumRef/length));
+ const returnDb=10*Math.log10(Math.max(1e-12,sumRx/length));
+ return {referenceDb:Math.round(referenceDb),returnDb:Math.round(returnDb),
+  levelDeltaDb:Math.round(returnDb-referenceDb),
+  envelopeCorr:Math.round(Math.max(-1,Math.min(1,envCorr))*100),
+  clippedPercent:Math.round(10000*clipCount/length)/100};
+}
 // V4: select the FIRST sufficiently supported acoustic arrival, rather than
 // assuming the strongest correlation peak is always the direct sound.
 // Strong later reflections may dominate, especially in a room with a speaker.
@@ -381,9 +417,10 @@ function analyzeFirstArrival(recording,clip,rate,anchorMs){
  const response=correlateTone(recording,clip,rate);
  const window=response.filter(p=>p.ms>=anchorMs+35&&p.ms<=anchorMs+1150);
  const dominant=window.reduce((best,p)=>!best||p.score>best.score?p:best,null);
+ const diagnostic=dominant?waveformDiagnostics(recording,clip,rate,dominant.ms):null;
  if(!dominant||dominant.score<0.40){
   return {ok:false,confidence:Math.round(Math.max(0,dominant?.score||0)*100),
-   reason:'signal trop faible ou non identifié'};
+   reason:'signal trop faible ou non identifié',diagnostic};
  }
  // A distinct local maximum must stand above the measured room/background
  // correlation and be at least 70% of the strongest possible arrival.
@@ -405,7 +442,7 @@ function analyzeFirstArrival(recording,clip,rate,anchorMs){
  // The dominant peak itself can lie at a filter boundary.
  if(!peaks.length){
   return {ok:false,confidence:Math.round(dominant.score*100),
-   reason:'aucune première arrivée fiable',noiseP95:Math.round(noiseP95*100)};
+   reason:'aucune première arrivée fiable',noiseP95:Math.round(noiseP95*100),diagnostic};
  }
  const first=peaks[0];
  const delay=Math.round(first.ms-anchorMs);
@@ -416,7 +453,7 @@ function analyzeFirstArrival(recording,clip,rate,anchorMs){
  return {ok:true,delay,confidence,dominantDelay,
   dominantConfidence:Math.round(dominant.score*100),
   echoes:echoes.length, noiseP95:Math.round(noiseP95*100),
-  onsetRelative:Math.round(first.score/Math.max(.0001,dominant.score)*100)};
+  onsetRelative:Math.round(first.score/Math.max(.0001,dominant.score)*100),diagnostic};
 }
 function median(values){
  const a=[...values].sort((x,y)=>x-y);
@@ -488,6 +525,10 @@ async function runAutomaticCalibration(){
    (r.echoes!==undefined?' · échos distincts '+r.echoes:'')+
    (r.dominantDelay!==undefined?' · écart pic '+(r.dominantDelay-r.delay)+' ms':'')+
    (r.noiseP95!==undefined?' · bruit corrélation p95 '+r.noiseP95+' %':'')+
+   (r.diagnostic?' · référence '+r.diagnostic.referenceDb+' dBFS · retour '+
+    r.diagnostic.returnDb+' dBFS · écart niveau '+r.diagnostic.levelDeltaDb+
+    ' dB · enveloppe '+r.diagnostic.envelopeCorr+' % · saturation '+
+    r.diagnostic.clippedPercent+' %':' · diagnostic indisponible')+
    ' · émission max +'+r.maxLateMs+
    ' ms · intervalle max '+r.gapMs+' ms · tampon WS max '+r.maxBuffered+' octets');
   const conclusive=cluster.length>=3&&clusterSpread<=30&&valid.length>=3;
@@ -505,7 +546,8 @@ async function runAutomaticCalibration(){
      'Les valeurs exclues restent visibles ci-dessous. Aucune correction appliquée.';
   }
   verdict+=' Détail : '+details.join(' | ')+
-    '. Mesure de retour acoustique uniquement ; capture Android exclue.';
+    '. Diagnostic de forme d’onde en mémoire : comparaison relative, pas une mesure THD. '+
+    'Mesure de retour acoustique uniquement ; capture Android exclue.';
   await stop();
   label.textContent=verdict;
  }catch(error){
