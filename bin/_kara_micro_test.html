@@ -30,7 +30,7 @@ small{color:#a6adc8;display:block;margin-top:16px}
 </p>
 <p><button id="start">Activer le micro</button> <button id="stop" disabled>Couper</button></p>
 <p><button id="calibrate">Mesurer sortie audio (sans écho)</button></p>
-<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage puis cinq mesures. La V4 compare la première arrivée acoustique aux échos, avec des critères de rejet conservateurs. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
+<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage puis cinq mesures. La V5 utilise une référence à balayage fréquentiel codé et compare la première arrivée acoustique au pic dominant, avec contrôle des ambiguïtés. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
 <div id="status" role="status">Micro inactif.</div>
 <p><small>Le volume de retour agit sur le flux microphone uniquement, pas sur Strawberry. Commence à 160 % et baisse si tu entends de la distorsion.</small></p>
 <p><small>Capture AudioWorklet en temps réel, sans ScriptProcessor ni conversion 16 kHz. Test audio propre : pas de double amplification. Commence à 90 % et baisse si nécessaire. La musique n’est pas modifiée.</small></p>
@@ -227,20 +227,28 @@ $('calibrate').onclick=()=>{
   if(stream){$('calibration').textContent='Coupe d’abord le micro normal, puis relance la calibration.';return;}
   startMic(true);
 };
-// Fixed pseudorandom phase-coded carrier; two recordings compare the same
-// emitted signal with Karaoke monitor disabled vs enabled.
+// V5: nonrepeating, phase-coded frequency sweep. Earlier switching between
+// only two fixed frequencies produced strongly correlated false arrivals.
+// A smooth gated sweep with changing chips has a distinct time signature.
 function makeCalibrationTone(rate){
- const length=Math.round(rate*0.36), out=new Float32Array(length);
- let seed=0x12f35a9b, phase=0;
+ const duration=0.36,length=Math.round(rate*duration);
+ const out=new Float32Array(length);
+ let seed=0x12f35a9b,phase=0,chipSign=1,lastChip=-1;
  for(let i=0;i<length;i++){
-  const chip=Math.floor(i/(rate*0.012));
-  if(i===0||Math.floor((i-1)/(rate*0.012))!==chip){
+  const t=i/rate,chip=Math.floor(t/0.0073);
+  if(chip!==lastChip){
    seed=(Math.imul(seed,1664525)+1013904223)>>>0;
+   chipSign=(seed&1)?1:-1;
+   lastChip=chip;
   }
-  const carrier=seed&1?1550:2350;
-  phase+=2*Math.PI*carrier/rate;
-  const fade=Math.min(1,i/(rate*.025),(length-1-i)/(rate*.025));
-  out[i]=0.22*Math.sin(phase)*Math.max(0,fade);
+  const fraction=t/duration;
+  const hz=950+2600*fraction+380*Math.sin(2*Math.PI*3.1*t);
+  phase+=2*Math.PI*hz/rate;
+  const fade=Math.min(1,t/.008,(duration-t)/.008);
+  // Deterministic phase-code, smooth transitions suppress clicks.
+  const chipPhase=(t/0.0073)-chip;
+  const gate=Math.sin(Math.PI*chipPhase)**2;
+  out[i]=0.20*chipSign*Math.sin(phase)*gate*Math.max(0,fade);
  }
  return out;
 }
@@ -441,7 +449,7 @@ async function runAutomaticCalibration(){
    if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
    const warmup=trial===0;
    label.textContent=warmup?'Amorçage : signal non comptabilisé.':
-     'Calibration V4 : mesure '+trial+'/5, micro en écoute seule.';
+     'Calibration V5 : mesure '+trial+'/5, micro en écoute seule.';
    ws.send('monitor:off');
    await sleep(650);
    resetCalibrationCapture();
@@ -478,19 +486,20 @@ async function runAutomaticCalibration(){
    ' · première arrivée '+r.confidence+' %'+
    (r.dominantDelay!==undefined?' · pic maximal '+r.dominantDelay+' ms ('+r.dominantConfidence+' %)':'')+
    (r.echoes!==undefined?' · échos distincts '+r.echoes:'')+
+   (r.dominantDelay!==undefined?' · écart pic '+(r.dominantDelay-r.delay)+' ms':'')+
    (r.noiseP95!==undefined?' · bruit corrélation p95 '+r.noiseP95+' %':'')+
    ' · émission max +'+r.maxLateMs+
    ' ms · intervalle max '+r.gapMs+' ms · tampon WS max '+r.maxBuffered+' octets');
   const conclusive=cluster.length>=3&&clusterSpread<=30&&valid.length>=3;
   let verdict;
   if(!conclusive){
-   verdict='Calibration V4 non concluante : '+valid.length+'/5 signaux valides'+
+   verdict='Calibration V5 non concluante : '+valid.length+'/5 signaux valides'+
      (spread!==null?', dispersion totale '+spread+' ms':'')+
      ' · groupe cohérent '+cluster.length+'/5'+
      (clusterSpread!==null?' sur '+clusterSpread+' ms':'')+
      '. Aucune correction appliquée.';
   }else{
-   verdict='Calibration V4 : première arrivée acoustique estimée '+Math.round(mid)+
+   verdict='Calibration V5 : première arrivée acoustique estimée '+Math.round(mid)+
      ' ms (médiane du groupe '+cluster.length+'/5) · dispersion groupe '+clusterSpread+
      ' ms · dispersion totale '+spread+' ms. '+
      'Les valeurs exclues restent visibles ci-dessous. Aucune correction appliquée.';
