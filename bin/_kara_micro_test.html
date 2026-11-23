@@ -30,7 +30,7 @@ small{color:#a6adc8;display:block;margin-top:16px}
 </p>
 <p><button id="start">Activer le micro</button> <button id="stop" disabled>Couper</button></p>
 <p><button id="calibrate">Mesurer sortie audio (sans écho)</button></p>
-<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage puis cinq mesures. Diagnostic V5 : compare la référence captée sur le téléphone et son retour acoustique (niveau, enveloppe et écrêtage), même si la mesure de latence est rejetée. Les valeurs sont indicatives, pas une mesure de distorsion harmonique. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
+<div id="calibration" role="status">Calibration V6 sans Larsen : Kara transmet directement un signal numérique synthétique vers Arch (aucun bip sur le téléphone). Après un amorçage, cinq retours acoustiques sont analysés. Le microphone reste en écoute seule et n’est jamais retransmis en direct. Volume modéré ; aucun enregistrement sur disque.</div>
 <div id="status" role="status">Micro inactif.</div>
 <p><small>Le volume de retour agit sur le flux microphone uniquement, pas sur Strawberry. Commence à 160 % et baisse si tu entends de la distorsion.</small></p>
 <p><small>Capture AudioWorklet en temps réel, sans ScriptProcessor ni conversion 16 kHz. Test audio propre : pas de double amplification. Commence à 90 % et baisse si nécessaire. La musique n’est pas modifiée.</small></p>
@@ -302,8 +302,8 @@ function findCorrelationPeak(data,startMs,endMs){
  }
  return best;
 }
-// Only transmit a previously captured, finite reference sample to Arch.
-// Never forward the live mic during calibration: breaks acoustic feedback loop.
+// Legacy V2-V5 helper retained for regression tests only.
+// V6 sends the original digital tone, never a captured microphone clip.
 function findRecordedTone(recording,rate){
  const window=Math.round(rate*0.25), hop=Math.round(rate*0.01);
  const from=Math.round(rate*.22), to=Math.min(recording.length-window,Math.round(rate*.9));
@@ -320,7 +320,7 @@ function resetCalibrationCapture(){
  calibrationCaptureStartSec=null;
  calibrationCaptureFrames=0;
 }
-// Transmit a finite, already recorded reference clip. Never transmit live mic.
+// Transmit only a bounded, deterministic DIGITAL tone. Never transmit live mic.
 // Monotonic deadlines prevent setTimeout drift from accumulating frame by frame.
 async function transmitRecordedClip(clip,rate){
  const frame=Math.round(rate/50), period=1000*frame/rate;
@@ -334,7 +334,7 @@ async function transmitRecordedClip(clip,rate){
    throw Error('Calibration interrompue');
   const bytes=new Int16Array(frame), offset=index*frame;
   for(let i=0;i<frame&&offset+i<clip.length;i++){
-   bytes[i]=Math.round(Math.max(-1,Math.min(1,clip[offset+i]*0.65))*32767);
+   bytes[i]=Math.round(Math.max(-1,Math.min(1,clip[offset+i]))*32767);
   }
   if(index===0)firstSendContextSec=context.currentTime;
   const now=performance.now();
@@ -375,8 +375,8 @@ function analyzeRecordedReturn(recording,clip,rate,anchorMs){
 }
 // Diagnostics are calculated in browser RAM on already captured audio. They
 // never create files or transmit microphone data other than the finite reference.
-// The reference has already passed through the phone microphone and is not an
-// untouched digital original; the figures are relative, NOT a THD measurement.
+// V6 uses the original DIGITAL reference, but the return is acoustically
+// recorded after Android/Arch processing. Values are relative, NOT THD.
 function waveformDiagnostics(recording,reference,rate,peakMs){
  const offset=Math.round(peakMs*rate/1000);
  const length=Math.min(reference.length,recording.length-offset);
@@ -461,24 +461,19 @@ function median(values){
 }
 async function runAutomaticCalibration(){
  const label=$('calibration');
- const rate=context.sampleRate,tone=makeCalibrationTone(rate);
+ const rate=context.sampleRate;
+ // V6: the SAME deterministic digital waveform is sent to Arch and used as
+ // the correlation reference. Do not play it on the phone or capture it first.
+ const digitalTone=makeCalibrationTone(rate);
+ const reference=Float32Array.from(digitalTone,s=>s*0.65);
  try{
-  // The live microphone is NEVER transmitted to the PC in calibration mode.
+  // Strict anti-Larsen: only a finite generated reference reaches WebSocket.
+  // AudioWorklet microphone samples stay entirely on the phone in this mode.
   ws.send('monitor:off');
-  label.textContent='Référence : un bip sur le téléphone. Ne parle pas.';
+  label.textContent='V6 : référence numérique directe, aucun bip sur le téléphone.';
   await sleep(350);
   if(calibrationCancelled)throw Error('Calibration interrompue');
   resetCalibrationCapture();
-  await sleep(350);
-  playCalibrationTone(tone);
-  await sleep(800);
-  const detected=findRecordedTone(flattenCalibration(calibrationSamples),rate);
-  resetCalibrationCapture();
-  if(!detected||detected.energy<0.006){
-   await stop();
-   label.textContent='Signal direct insuffisant. Augmente légèrement le volume média du téléphone ; aucun retour enceinte déclenché.';
-   return;
-  }
   const results=[];
   // Prime audio playback once, then measure five independent acoustic bursts.
   // All runs stay finite and the microphone is NEVER sent live to the server.
@@ -486,19 +481,19 @@ async function runAutomaticCalibration(){
    if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
    const warmup=trial===0;
    label.textContent=warmup?'Amorçage : signal non comptabilisé.':
-     'Calibration V5 : mesure '+trial+'/5, micro en écoute seule.';
+     'Calibration V6 : mesure '+trial+'/5, micro en écoute seule.';
    ws.send('monitor:off');
    await sleep(650);
    resetCalibrationCapture();
    await sleep(400);
    if(calibrationCaptureStartSec===null)throw Error('Capture micro inactive');
    ws.send('monitor:on');
-   const sent=await transmitRecordedClip(detected.clip,rate);
+   const sent=await transmitRecordedClip(reference,rate);
    ws.send('monitor:off');
    await sleep(1100);
    const captured=flattenCalibration(calibrationSamples);
    const anchorMs=(sent.sendContextSec-calibrationCaptureStartSec)*1000;
-   const result=analyzeFirstArrival(captured,detected.clip,rate,anchorMs);
+   const result=analyzeFirstArrival(captured,reference,rate,anchorMs);
    result.maxLateMs=Math.round(sent.maxLateMs);
    result.gapMs=Math.round(sent.maxGapMs);
    result.maxBuffered=sent.maxBuffered;
@@ -534,20 +529,20 @@ async function runAutomaticCalibration(){
   const conclusive=cluster.length>=3&&clusterSpread<=30&&valid.length>=3;
   let verdict;
   if(!conclusive){
-   verdict='Calibration V5 non concluante : '+valid.length+'/5 signaux valides'+
+   verdict='Calibration V6 non concluante : '+valid.length+'/5 signaux valides'+
      (spread!==null?', dispersion totale '+spread+' ms':'')+
      ' · groupe cohérent '+cluster.length+'/5'+
      (clusterSpread!==null?' sur '+clusterSpread+' ms':'')+
      '. Aucune correction appliquée.';
   }else{
-   verdict='Calibration V5 : première arrivée acoustique estimée '+Math.round(mid)+
+   verdict='Calibration V6 : première arrivée acoustique estimée '+Math.round(mid)+
      ' ms (médiane du groupe '+cluster.length+'/5) · dispersion groupe '+clusterSpread+
      ' ms · dispersion totale '+spread+' ms. '+
      'Les valeurs exclues restent visibles ci-dessous. Aucune correction appliquée.';
   }
   verdict+=' Détail : '+details.join(' | ')+
-    '. Diagnostic de forme d’onde en mémoire : comparaison relative, pas une mesure THD. '+
-    'Mesure de retour acoustique uniquement ; capture Android exclue.';
+    '. Référence numérique originale ; retour mesuré acoustiquement. '+
+    'Capture Android du chant exclue ; niveau, enveloppe et corrélation indicatifs.';
   await stop();
   label.textContent=verdict;
  }catch(error){
