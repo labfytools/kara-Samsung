@@ -59,6 +59,7 @@ let packetSequence=0, workletAge=[], beforeSendDelay=[], clientBufferedMax=0;
 let calibrationMode=false, calibrationSamples=[], calibrationTimer=null;
 let calibrationRate=48000, temporaryVolume=null, calibrationCancelled=false;
 let calibrationSending=false, calibrationSession=null;
+let calibrationCaptureStartSec=null, calibrationCaptureFrames=0;
 let wake=null,awake=true;
 async function keepAwake(){
  if(!awake||document.visibilityState!=='visible'||wake)return;
@@ -144,7 +145,16 @@ async function startMic(calibration=false){
       }
       lastMicPacketAt=arrived;
     }
-    if(calibrationMode) calibrationSamples.push(new Int16Array(payload));
+    if(calibrationMode){
+      // Timestamp every captured PCM frame on the SAME AudioContext clock
+      // as the outgoing test burst. Never infer time from a reset array length.
+      const block=new Int16Array(payload);
+      if(calibrationCaptureStartSec===null){
+        calibrationCaptureStartSec=endSec-block.length/context.sampleRate;
+      }
+      calibrationCaptureFrames+=block.length;
+      calibrationSamples.push(block);
+    }
     if(calibrationMode)return; // NEVER forward live microphone in calibration
     if(ws&&ws.readyState===WebSocket.OPEN&&ws.bufferedAmount<4000){
       // KTS1 + u32 sequence + f64 client send timestamp (milliseconds).
@@ -297,31 +307,47 @@ function findRecordedTone(recording,rate){
  }
  return bestOffset<0?null:{clip:recording.slice(bestOffset,bestOffset+window),energy:Math.sqrt(bestEnergy/Math.ceil(window/8))};
 }
+function resetCalibrationCapture(){
+ calibrationSamples=[];
+ calibrationCaptureStartSec=null;
+ calibrationCaptureFrames=0;
+}
+// Transmit a finite, already recorded reference clip. Never transmit live mic.
+// Monotonic deadlines prevent setTimeout drift from accumulating frame by frame.
 async function transmitRecordedClip(clip,rate){
- const frame=Math.round(rate/50);
- for(let offset=0;offset<clip.length;offset+=frame){
-  if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
-  const bytes=new Int16Array(frame);
+ const frame=Math.round(rate/50), period=1000*frame/rate;
+ const count=Math.ceil(clip.length/frame), timeline=[];
+ const startPerformance=performance.now();
+ let firstSendContextSec=null, maxBuffered=0, maxLateMs=0;
+ for(let index=0;index<count;index++){
+  const deadline=startPerformance+index*period;
+  if(index>0)await sleep(Math.max(0,deadline-performance.now()));
+  if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)
+   throw Error('Calibration interrompue');
+  const bytes=new Int16Array(frame), offset=index*frame;
   for(let i=0;i<frame&&offset+i<clip.length;i++){
    bytes[i]=Math.round(Math.max(-1,Math.min(1,clip[offset+i]*0.65))*32767);
   }
+  if(index===0)firstSendContextSec=context.currentTime;
+  const now=performance.now();
+  maxLateMs=Math.max(maxLateMs,Math.max(0,now-deadline));
+  timeline.push(now);
   ws.send(bytes.buffer);
-  await sleep(20);
+  maxBuffered=Math.max(maxBuffered,ws.bufferedAmount);
  }
+ const gaps=timeline.slice(1).map((time,i)=>time-timeline[i]);
+ return {sendContextSec:firstSendContextSec,
+         maxLateMs, maxBuffered,
+         minGapMs:gaps.length?Math.min(...gaps):0,
+         maxGapMs:gaps.length?Math.max(...gaps):0};
 }
-function calibrationFrames(){
- return calibrationSamples.reduce((sum,block)=>sum+block.length,0);
-}
-function analyzeRecordedReturn(recording,clip,rate,sendSample){
+function analyzeRecordedReturn(recording,clip,rate,anchorMs){
  const response=correlateTone(recording,clip,rate);
- // Send time is anchored in captured PCM samples, not a guessed 350 ms timeout.
- // A postMessage frame boundary contributes up to ~20ms of uncertainty.
- const anchor=sendSample*1000/rate;
- const best=findCorrelationPeak(response,anchor+35,anchor+1150);
+ const best=findCorrelationPeak(response,anchorMs+35,anchorMs+1150);
  if(!best||best.score<0.10){
   return {ok:false,confidence:Math.round((best?.score||0)*100),reason:'corrélation insuffisante'};
  }
- const delay=Math.round(best.ms-anchor);
+ const delay=Math.round(best.ms-anchorMs);
  if(delay<35||delay>1150){
   return {ok:false,confidence:Math.round(best.score*100),reason:'retard hors plage'};
  }
@@ -340,12 +366,12 @@ async function runAutomaticCalibration(){
   label.textContent='Référence : un bip sur le téléphone. Ne parle pas.';
   await sleep(350);
   if(calibrationCancelled)throw Error('Calibration interrompue');
-  calibrationSamples=[];
+  resetCalibrationCapture();
   await sleep(350);
   playCalibrationTone(tone);
   await sleep(800);
   const detected=findRecordedTone(flattenCalibration(calibrationSamples),rate);
-  calibrationSamples=[];
+  resetCalibrationCapture();
   if(!detected||detected.energy<0.006){
    await stop();
    label.textContent='Signal direct insuffisant. Augmente légèrement le volume média du téléphone ; aucun retour enceinte déclenché.';
@@ -358,28 +384,42 @@ async function runAutomaticCalibration(){
    label.textContent='Mesure '+trial+'/3 : un seul signal bref sur l’enceinte, micro en écoute seule.';
    ws.send('monitor:off');
    await sleep(650);
-   calibrationSamples=[];
+   resetCalibrationCapture();
    await sleep(400);
-   const sendSample=calibrationFrames();
+   if(calibrationCaptureStartSec===null)throw Error('Capture micro inactive');
    ws.send('monitor:on');
-   await transmitRecordedClip(detected.clip,rate);
+   const sent=await transmitRecordedClip(detected.clip,rate);
    ws.send('monitor:off');
    await sleep(1100);
    const captured=flattenCalibration(calibrationSamples);
-   const result=analyzeRecordedReturn(captured,detected.clip,rate,sendSample);
+   const anchorMs=(sent.sendContextSec-calibrationCaptureStartSec)*1000;
+   const result=analyzeRecordedReturn(captured,detected.clip,rate,anchorMs);
+   result.anchorMs=Math.round(anchorMs);
+   result.maxLateMs=Math.round(sent.maxLateMs);
+   result.gapMs=Math.round(sent.maxGapMs);
+   result.maxBuffered=sent.maxBuffered;
    results.push(result);
-   calibrationSamples=[];
+   resetCalibrationCapture();
   }
   const valid=results.filter(r=>r.ok);
   const delays=valid.map(r=>r.delay);
   const mid=delays.length?median(delays):null;
   const spread=delays.length>=2?Math.max(...delays)-Math.min(...delays):null;
+  const details=results.map((r,i)=>
+   'Essai '+(i+1)+' : '+(r.ok?r.delay+' ms':'rejeté ('+r.reason+')')+
+   ' · corrélation '+r.confidence+' % · émission max +'+r.maxLateMs+
+   ' ms · intervalle max '+r.gapMs+' ms · tampon WS max '+r.maxBuffered+' octets');
   let verdict;
   if(valid.length<2||spread>90){
-   verdict='Mesure non concluante : '+valid.length+'/3 signaux reconnus'+(spread!==null?', dispersion '+spread+' ms':'')+'. Essais : '+results.map(r=>r.ok?r.delay+' ms':'rejeté ('+r.confidence+' %)').join(' · ')+'. Aucune correction appliquée.';
+   verdict='Calibration V2 non concluante : '+valid.length+'/3 signaux reconnus'+
+     (spread!==null?', dispersion '+spread+' ms':'')+'. Aucune correction appliquée.';
   }else{
-   verdict='Retard réseau + sortie estimé : médiane '+Math.round(mid)+' ms · dispersion '+spread+' ms · '+valid.length+'/3 essais valides · corrélation médiane '+Math.round(median(valid.map(r=>r.confidence)))+' %. Mesure de sortie uniquement : ne comprend pas toute la latence de capture Android. Aucune correction appliquée.';
+   verdict='Calibration V2 : retard réseau + sortie estimé '+Math.round(mid)+
+     ' ms (médiane) · dispersion '+spread+' ms · corrélation médiane '+
+     Math.round(median(valid.map(r=>r.confidence)))+' %. Aucune correction appliquée.';
   }
+  verdict+=' Détail : '+details.join(' | ')+
+    '. Mesure de retour acoustique uniquement ; capture Android exclue.';
   await stop();
   label.textContent=verdict;
  }catch(error){
