@@ -30,7 +30,7 @@ small{color:#a6adc8;display:block;margin-top:16px}
 </p>
 <p><button id="start">Activer le micro</button> <button id="stop" disabled>Couper</button></p>
 <p><button id="calibrate">Mesurer sortie audio (sans écho)</button></p>
-<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage non comptabilisé, puis cinq mesures acoustiques. Les pics ambigus sont rejetés avant d’afficher la médiane et la dispersion. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
+<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage puis cinq mesures. La V4 compare la première arrivée acoustique aux échos, avec des critères de rejet conservateurs. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
 <div id="status" role="status">Micro inactif.</div>
 <p><small>Le volume de retour agit sur le flux microphone uniquement, pas sur Strawberry. Commence à 160 % et baisse si tu entends de la distorsion.</small></p>
 <p><small>Capture AudioWorklet en temps réel, sans ScriptProcessor ni conversion 16 kHz. Test audio propre : pas de double amplification. Commence à 90 % et baisse si nécessaire. La musique n’est pas modifiée.</small></p>
@@ -365,6 +365,51 @@ function analyzeRecordedReturn(recording,clip,rate,anchorMs){
  }
  return {ok:true,delay,confidence,rivalRatio:Math.round(rivalRatio*100)};
 }
+// V4: select the FIRST sufficiently supported acoustic arrival, rather than
+// assuming the strongest correlation peak is always the direct sound.
+// Strong later reflections may dominate, especially in a room with a speaker.
+// Report both onset and dominant peaks; no claims of end-to-end Android delay.
+function analyzeFirstArrival(recording,clip,rate,anchorMs){
+ const response=correlateTone(recording,clip,rate);
+ const window=response.filter(p=>p.ms>=anchorMs+35&&p.ms<=anchorMs+1150);
+ const dominant=window.reduce((best,p)=>!best||p.score>best.score?p:best,null);
+ if(!dominant||dominant.score<0.40){
+  return {ok:false,confidence:Math.round(Math.max(0,dominant?.score||0)*100),
+   reason:'signal trop faible ou non identifié'};
+ }
+ // A distinct local maximum must stand above the measured room/background
+ // correlation and be at least 70% of the strongest possible arrival.
+ const background=response.filter(p=>p.ms<anchorMs-30);
+ const noiseScores=background.map(p=>Math.max(0,p.score)).sort((a,b)=>a-b);
+ const noiseP95=noiseScores.length?noiseScores[Math.floor(.95*(noiseScores.length-1))]:0;
+ const threshold=Math.max(.40,dominant.score*.70,noiseP95+.16);
+ const peaks=[];
+ for(let i=1;i<window.length-1;i++){
+  const p=window[i];
+  if(p.score>=threshold&&p.score>=window[i-1].score&&p.score>window[i+1].score){
+   const previous=peaks[peaks.length-1];
+   // Merge peaks only 2ms apart into one acoustic event.
+   if(previous&&p.ms-previous.ms<24){
+    if(p.score>previous.score)peaks[peaks.length-1]=p;
+   }else peaks.push(p);
+  }
+ }
+ // The dominant peak itself can lie at a filter boundary.
+ if(!peaks.length){
+  return {ok:false,confidence:Math.round(dominant.score*100),
+   reason:'aucune première arrivée fiable',noiseP95:Math.round(noiseP95*100)};
+ }
+ const first=peaks[0];
+ const delay=Math.round(first.ms-anchorMs);
+ const dominantDelay=Math.round(dominant.ms-anchorMs);
+ const confidence=Math.round(first.score*100);
+ if(delay<35||delay>1150)return {ok:false,confidence,reason:'retard hors plage'};
+ const echoes=peaks.filter(p=>p.ms-first.ms>=35);
+ return {ok:true,delay,confidence,dominantDelay,
+  dominantConfidence:Math.round(dominant.score*100),
+  echoes:echoes.length, noiseP95:Math.round(noiseP95*100),
+  onsetRelative:Math.round(first.score/Math.max(.0001,dominant.score)*100)};
+}
 function median(values){
  const a=[...values].sort((x,y)=>x-y);
  return a.length%2?a[(a.length-1)/2]:(a[a.length/2-1]+a[a.length/2])/2;
@@ -396,7 +441,7 @@ async function runAutomaticCalibration(){
    if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
    const warmup=trial===0;
    label.textContent=warmup?'Amorçage : signal non comptabilisé.':
-     'Calibration V3 : mesure '+trial+'/5, micro en écoute seule.';
+     'Calibration V4 : mesure '+trial+'/5, micro en écoute seule.';
    ws.send('monitor:off');
    await sleep(650);
    resetCalibrationCapture();
@@ -408,7 +453,7 @@ async function runAutomaticCalibration(){
    await sleep(1100);
    const captured=flattenCalibration(calibrationSamples);
    const anchorMs=(sent.sendContextSec-calibrationCaptureStartSec)*1000;
-   const result=analyzeRecordedReturn(captured,detected.clip,rate,anchorMs);
+   const result=analyzeFirstArrival(captured,detected.clip,rate,anchorMs);
    result.maxLateMs=Math.round(sent.maxLateMs);
    result.gapMs=Math.round(sent.maxGapMs);
    result.maxBuffered=sent.maxBuffered;
@@ -417,7 +462,6 @@ async function runAutomaticCalibration(){
   }
   const valid=results.filter(r=>r.ok);
   const delays=valid.map(r=>r.delay);
-  const firstMedian=delays.length?median(delays):null;
   // A cluster check is descriptive, not a hidden automatic correction:
   // require >=3 confident arrivals in a 30ms window and disclose exclusions.
   let cluster=[];
@@ -431,20 +475,22 @@ async function runAutomaticCalibration(){
   const details=results.map((r,i)=>
    'Essai '+(i+1)+' : '+(r.ok?r.delay+' ms':
       'rejeté ('+r.reason+(r.delay!==undefined?', '+r.delay+' ms':'')+')')+
-   ' · corrélation '+r.confidence+' %'+
-   (r.rivalRatio!==undefined?' · pic concurrent '+r.rivalRatio+' %':'')+
+   ' · première arrivée '+r.confidence+' %'+
+   (r.dominantDelay!==undefined?' · pic maximal '+r.dominantDelay+' ms ('+r.dominantConfidence+' %)':'')+
+   (r.echoes!==undefined?' · échos distincts '+r.echoes:'')+
+   (r.noiseP95!==undefined?' · bruit corrélation p95 '+r.noiseP95+' %':'')+
    ' · émission max +'+r.maxLateMs+
    ' ms · intervalle max '+r.gapMs+' ms · tampon WS max '+r.maxBuffered+' octets');
   const conclusive=cluster.length>=3&&clusterSpread<=30&&valid.length>=3;
   let verdict;
   if(!conclusive){
-   verdict='Calibration V3 non concluante : '+valid.length+'/5 signaux valides'+
+   verdict='Calibration V4 non concluante : '+valid.length+'/5 signaux valides'+
      (spread!==null?', dispersion totale '+spread+' ms':'')+
      ' · groupe cohérent '+cluster.length+'/5'+
      (clusterSpread!==null?' sur '+clusterSpread+' ms':'')+
      '. Aucune correction appliquée.';
   }else{
-   verdict='Calibration V3 : retour acoustique estimé '+Math.round(mid)+
+   verdict='Calibration V4 : première arrivée acoustique estimée '+Math.round(mid)+
      ' ms (médiane du groupe '+cluster.length+'/5) · dispersion groupe '+clusterSpread+
      ' ms · dispersion totale '+spread+' ms. '+
      'Les valeurs exclues restent visibles ci-dessous. Aucune correction appliquée.';
