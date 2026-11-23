@@ -1,45 +1,118 @@
-# Kara Samsung
+<h1 align="center">Kara Samsung</h1>
 
-Projet de karaoké pour **Arch Linux / Sway**, Strawberry, navigateurs mobiles et **TV Samsung Tizen**. Le code a été regroupé le 23 novembre 2026 depuis les lanceurs locaux, l’interface web et les sources Tizen.
+<p align="center">Karaoké multijoueur pour Arch Linux et Samsung Tizen : paroles synchronisées, Strawberry, microphones mobiles et analyse vocale.</p>
 
-## Organisation
+<p align="center">
+  <img alt="Arch Linux" src="https://img.shields.io/badge/Arch_Linux-Sway-1793d1?style=flat-square&logo=archlinux&logoColor=white">
+  <img alt="Python GTK4" src="https://img.shields.io/badge/Python-GTK4-89b4fa?style=flat-square&logo=python&logoColor=white">
+  <img alt="Samsung Tizen" src="https://img.shields.io/badge/TV-Samsung_Tizen-cba6f7?style=flat-square">
+  <img alt="MIT" src="https://img.shields.io/badge/license-MIT-a6e3a1?style=flat-square">
+  <img alt="Prototype" src="https://img.shields.io/badge/status-prototype-f9e2af?style=flat-square">
+</p>
 
-| Chemin | Contenu | Versionné ? |
-| --- | --- | --- |
-| `bin/` | Application Strawberry, serveur de paroles/TV, sessions de jeu, micro HTTPS AudioWorklet et utilitaires Python | Oui |
-| `tizen/app/` | Source de l’application Tizen Samsung (`config.xml`, HTML, CSS, JS, icône) | Oui |
-| `native/src/` | Source C de l’alignement DTW | Oui |
-| `tests/` | Tests de langage / scripts de vérification | Oui |
-| `.runtime/` | SDK et émulateur Tizen, environnements Python, modèles, artefacts signés, sauvegardes, certificats | **Non : ignoré par Git** |
+<p align="center">
+  <a href="#-overview">Overview</a> · <a href="#-stack">Stack</a> · <a href="#-architecture">Architecture</a> ·
+  <a href="#-repository">Repository</a> · <a href="#-quick-start">Quick Start</a> ·
+  <a href="#-mirrors">Mirrors</a> · <a href="#-version">Version</a> · <a href="#-license">License</a>
+</p>
 
-## Points d’entrée
+## ✦ Overview
 
-- `~/.local/bin/paroles-strawberry` : interface GTK4 avec Strawberry, TV WebSocket sur le port **8765**.
-- `~/.local/bin/kara` : import et bibliothèque de musique.
-- `~/.local/bin/kara-tizen-tv` : émulateur Samsung via Podman.
-- `~/.local/bin/kara-tv-test` : test d’interface TV.
-- `python3 -u bin/_kara_micro_test.py` : serveur HTTPS de test micro sur le port **8766**.
+**Kara Samsung** associe Strawberry (MPRIS), un poste Linux sous Sway, une interface TV Samsung Tizen et des téléphones pour une expérience de karaoké multijoueur. Le prototype intègre les paroles synchronisées, la préparation de parties et l'analyse expérimentale de voix chantée.
 
-Les anciens lanceurs dans `~/.local/bin` sont des liens symboliques vers ce dépôt, afin de préserver les raccourcis et la session courante. Le dossier historique `~/.local/share/kara` pointe vers `.runtime/kara-data` ; son contenu n’est pas versé dans Git.
+Le retour micro sans fil par navigateur, AudioWorklet, WebSocket et PipeWire est **expérimental** ; la latence acoustique et la régularité réseau sont encore à valider. Ce dépôt n'est pas une application prête à installer sur toutes les TV Samsung.
 
-## Contrôle rapide
+## ✦ Stack
+
+| Poste Linux | TV et mobile |
+| --- | --- |
+| Arch Linux · Sway · Strawberry · MPRIS | Samsung Tizen · JavaScript · HTML/CSS |
+| Python · GTK4 / PyGObject · aiohttp | Application Web TV · interface joueurs |
+| PipeWire · NumPy · SciPy | HTTPS/WebSocket · AudioWorklet · PCM 20 ms |
+| C · algorithme DTW | Client smartphone utilisé comme micro |
+
+```mermaid
+flowchart LR
+    S[Strawberry / MPRIS] --> K[Kara GTK4]
+    K --> TV[Serveur paroles : 8765]
+    TV --> T[Samsung Tizen]
+    TV --> P[Téléphones joueurs]
+    M[Micro smartphone / AudioWorklet] --> W[WebSocket HTTPS : 8766]
+    W --> A[Python / PipeWire]
+    A --> H[Enceinte]
+```
+
+## ✦ Architecture
+
+Le service TV (port **8765**) et le prototype de micro (port **8766**) sont distincts. Le microphone navigateur transmet des blocs audio de 20 ms. Les compteurs d'arrivée, de pertes et les diagnostics d'horodatage sont destinés à identifier la latence ; ils ne prouvent pas à eux seuls le temps de restitution acoustique.
+
+L'interface de calibration n'envoie jamais le micro en direct à l'enceinte, afin d'éviter les boucles d'écho. Les artefacts Tizen et les environnements présents sur ArchASP ne sont pas des dépendances portables incluses dans Git.
+
+## ✦ Repository
+
+```text
+kara-Samsung/
+├── bin/             Application GTK4, serveurs et utilitaires
+├── tizen/app/       Sources Samsung Tizen
+├── native/src/      Code C DTW
+├── tests/           Vérifications existantes
+├── .runtime/        SDK, environnements, modèles et secrets (ignorés)
+├── .gitignore
+├── LICENSE
+└── README.md
+```
+
+Le dossier historique `~/.local/share/kara` et les anciens lanceurs `~/.local/bin` restent compatibles grâce à des liens symboliques. `.runtime/` n'est pas suivi par Git.
+
+## ✦ Quick Start
+
+Sur une installation **déjà configurée comme ArchASP** :
 
 ```bash
 cd ~/Documents/Development/kara-Samsung
 python3 -m compileall -q bin
 node --check bin/_kara_micro_worklet.js
 node --check tizen/app/app.js
-git status --short
+
+# Serveur micro de développement : nécessite le certificat local HTTPS
+python3 -u bin/_kara_micro_test.py
 ```
 
-Les dépendances système (GTK4/PyGObject, aiohttp, numpy, scipy, PipeWire, Strawberry, Tizen SDK, Podman, etc.) ne sont pas fournies par ce dépôt. Des environnements installés localement existent dans `.runtime/` mais ne sont pas portables tels quels.
+Autres points d'entrée existants : `~/.local/bin/paroles-strawberry` (interface GTK4), `~/.local/bin/kara` (bibliothèque), `~/.local/bin/kara-tizen-tv` (émulateur Podman) et `~/.local/bin/kara-tv-test` (test TV).
 
-## Sécurité et données
+**Prérequis à installer séparément :** Strawberry, GTK4/PyGObject, Python, aiohttp, NumPy/SciPy, PipeWire et les outils Tizen/Podman pour l'émulation. Il n'existe pas encore de script d'installation reproductible depuis zéro.
 
-Les tokens, certificats et clés du micro HTTPS sont conservés dans `~/.local/state/kara/micro-test/` ; ne jamais les commiter. Les certificats de signature Tizen, les paquets signés, les modèles et données d’exécution sont exclus du dépôt. Ne pas versionner de musiques ni d’enregistrements vocaux.
+## ✦ Documentation
 
-## État
+| Ressource | Contenu |
+| --- | --- |
+| [Source Tizen](tizen/app/README.md) | Application TV |
+| [Code micro](bin/_kara_micro_test.py) | Serveur HTTPS WebSocket |
+| [Page micro](bin/_kara_micro_test.html) | Interface mobile et calibration |
+| [AudioWorklet](bin/_kara_micro_worklet.js) | Capture audio et paquets PCM |
+| [Source C](native/src/_kara_dtw.c) | Alignement natif DTW |
 
-Le retour vocal normal utilise des blocs de 20 ms. Une calibration sans retransmission directe du microphone est disponible dans l’interface de test. Le diagnostic horodaté Worklet → WebSocket → Arch est en cours de validation réelle.
+## ✦ Mirrors
 
-**Publication :** dépôt Git local uniquement. Aucun dépôt distant ni push n’a été créé automatiquement.
+| Rôle | Dépôt |
+| --- | --- |
+| Principal | [Forgejo](https://git.labfytools.com/fy59/kara-Samsung) |
+| Miroir public | [GitHub](https://github.com/labfytools/kara-Samsung) |
+
+Forgejo est le dépôt principal (`origin`), avec GitHub comme miroir. Les deux URLs de push peuvent publier le même historique ; il faut vérifier chaque destination lors d'un push.
+
+## ✦ Version
+
+| Branche | Usage |
+| --- | --- |
+| `main` | Développement du prototype |
+
+Aucune version stable n'est annoncée. Les essais de mesure audio ne valent pas certification de latence ni de compatibilité matérielle.
+
+## ✦ Security
+
+Les clés du serveur HTTPS sont dans `~/.local/state/kara/micro-test/` et **ne sont pas versionnées**. Sont aussi exclus : certificats de signature Tizen, SDK, `.runtime/`, musiques, données personnelles et enregistrements de voix. Vérifier toute publication avant le push.
+
+## ✦ License
+
+Distribué sous [licence MIT](LICENSE). Copyright (c) 2026 labfytools. Les dépendances tierces conservent leurs propres licences.
