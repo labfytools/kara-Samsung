@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Karaoké — Strawberry</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<form id="pair">
+  <h1>Karaoké</h1>
+  <p>Active TV dans Paroles Strawberry et saisis les identifiants affichés.</p>
+  <label for="pc">Adresse du PC</label>
+  <input id="pc" type="text" maxlength="15" autocomplete="off" spellcheck="false">
+  <label for="code">Code</label>
+  <input id="code" type="text" maxlength="8" autocomplete="off" spellcheck="false">
+  <button type="submit" id="join">Se connecter</button>
+  <p id="hint" role="status"></p>
+</form>
+<div id="screen" hidden>
+<header><h1 id="title">Karaoké</h1><div id="artist"></div><div id="score"></div></header>
+<div id="stage">
+<section id="performance">
+<main id="lyrics">
+<div id="previous" class="line"></div>
+<div id="current" class="line">En attente de Strawberry…</div>
+<div id="progress"><div id="fill"></div></div>
+<div id="next" class="line"></div>
+<div id="following" class="line"></div>
+</main>
+<p id="status"></p>
+</section>
+<aside id="party" aria-labelledby="party-title">
+  <h2 id="party-title">Joueurs connectés <span id="player-count">0</span></h2>
+  <ol id="players"></ol>
+  <div id="no-players">Scanne le QR code pour rejoindre la soirée.</div>
+  <section id="mobile-room" aria-label="Rejoindre la salle sur un téléphone">
+    <img id="room-qr" alt="QR code pour rejoindre le karaoké" width="180" height="180">
+    <div id="room-info">
+      <strong>Rejoins la soirée !</strong>
+      <small>Android et iPhone</small>
+      <span id="room-url"></span>
+    </div>
+  </section>
+</aside>
+</div>
+</div>
+<div id="tv-closed" hidden>
+  <h2>Affichage TV fermé</h2>
+  <p>Les joueurs et la musique restent connectés au PC.</p>
+  <p>Utilise « Actualiser TV » dans Paroles pour rouvrir l’écran.</p>
+  <button type="button" id="reopen-tv">Rouvrir l’écran</button>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

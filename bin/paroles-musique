@@ -1,0 +1,938 @@
+#!/usr/bin/python3 -B
+"""Récupère les paroles pour Strawberry et les intègre sans réencodage."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.utils import parsedate_to_datetime
+from fcntl import LOCK_EX, LOCK_NB, flock
+from html import unescape
+from html.parser import HTMLParser
+from itertools import groupby
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile, TemporaryDirectory
+from threading import Lock
+import time
+from unicodedata import combining, normalize
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, unquote, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_artist,
+                         probe, share_file, shared_mutation)
+from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
+
+
+LIBRARY = Path.home() / "Music"
+STREAM_TAGS = {".opus", ".ogg", ".oga"}
+FILE_TAGS = {".flac", ".m4a", ".mp3"}
+LYRICS_TAGS = {"lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx"}
+REMASTER_SUFFIX = re.compile(r"\s*[\[(](?:\d{4}\s+)?remaster(?:ed)?(?:\s+(?:\d{4}|deluxe box set))?[\])]\s*$", re.I)
+MAX_RESPONSE = 2 * 1024 * 1024
+TRACK_WORKERS = 50
+
+
+class ServiceUnavailable(Exception):
+    pass
+
+
+class NoRedirect(HTTPRedirectHandler):
+    # Les titres recherchés restent sur le domaine du fournisseur choisi.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def command(args, description):
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=40)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"{description} (délai dépassé)") from error
+    if result.returncode:
+        raise ValueError(description)
+    return result.stdout
+
+
+def retry_delay(header, fallback):
+    if not header:
+        return fallback
+    try:
+        indicated = int(header) if header.isdecimal() else parsedate_to_datetime(header).timestamp() - time.time()
+    except (ValueError, TypeError, OverflowError):
+        return fallback
+    return max(fallback, indicated)
+
+
+class RequestGate:
+    def __init__(self, interval):
+        self.interval = interval
+        self.lock = Lock()
+        self.next_request = 0.0
+        self.paused = False
+
+    def wait(self):
+        while True:
+            with self.lock:
+                if self.paused:
+                    return False
+                now = time.monotonic()
+                delay = self.next_request - now
+                if delay <= 0:
+                    self.next_request = now + self.interval
+                    return True
+            time.sleep(delay)
+
+    def defer(self, delay):
+        with self.lock:
+            if delay > 30:
+                self.paused = True
+            else:
+                self.next_request = max(self.next_request, time.monotonic() + delay)
+
+
+class LrcLib:
+    def __init__(self):
+        self.opener = build_opener(NoRedirect)
+        self.gate = RequestGate(0.75)
+
+    def get(self, endpoint, **params):
+        url = f"https://lrclib.net/api/{endpoint}?{urlencode(params)}"
+        request = Request(url, headers={
+            "Accept": "application/json",
+            "User-Agent": "ParolesMusique/1.0 (client local pour Strawberry)",
+        })
+        for delay in (2, 5, None):
+            last_attempt = delay is None
+            if not self.gate.wait():
+                raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer")
+            try:
+                with self.opener.open(request, timeout=10) as response:
+                    if response.headers.get_content_type() != "application/json":
+                        raise ServiceUnavailable("réponse LRCLIB inattendue")
+                    raw = response.read(MAX_RESPONSE + 1)
+                if len(raw) > MAX_RESPONSE:
+                    raise ServiceUnavailable("réponse LRCLIB trop volumineuse")
+                try:
+                    return json.loads(raw)
+                except ValueError as error:
+                    raise ServiceUnavailable("réponse LRCLIB illisible") from error
+            except HTTPError as error:
+                if error.code == 404:
+                    return None
+                if error.code not in {429, 500, 502, 503, 504}:
+                    raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}") from error
+                delay = retry_delay(error.headers.get("Retry-After"), delay or 5)
+                self.gate.defer(delay)
+                if delay > 30:
+                    raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer") from error
+                if last_attempt:
+                    raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}") from error
+            except (URLError, TimeoutError) as error:
+                if delay is None:
+                    raise ServiceUnavailable(f"LRCLIB inaccessible : {error}") from error
+            time.sleep(delay)
+
+    def find(self, title, artist, album, duration, album_artist, *, synced=False):
+        signature = dict(track_name=title, artist_name=artist, duration=duration)
+        if album:
+            signature["album_name"] = album
+        record = self.get("get", **signature)
+        result = verified_lyrics(record, title, artist, album, duration, album_artist, synced=synced)
+        if result is not None:
+            return result
+
+        base_title, _ = split_feature(clean_title(title))
+        search_artist = album_artist or artist
+        records = self.get("search", track_name=base_title, artist_name=search_artist)
+        result = best_transcript(records, title, artist, album, duration, album_artist, synced=synced)
+        if result is not None:
+            return result
+        alternative = normalized(base_title)
+        if "-" in alternative:
+            records = self.get("search", track_name=alternative.replace("-", " "), artist_name=search_artist)
+            return best_transcript(records, title, artist, album, duration, album_artist, synced=synced)
+        return None
+
+
+class LyricsOvh:
+    def __init__(self):
+        self.opener = build_opener(NoRedirect)
+        self.gate = RequestGate(0.5)
+
+    def get(self, path):
+        request = Request(f"https://api.lyrics.ovh/{path}", headers={
+            "Accept": "application/json", "User-Agent": "ParolesMusique/1.1",
+        })
+        if not self.gate.wait():
+            return None
+        try:
+            with self.opener.open(request, timeout=6) as response:
+                if response.headers.get_content_type() != "application/json":
+                    return None
+                raw = response.read(MAX_RESPONSE + 1)
+            return json.loads(raw) if len(raw) <= MAX_RESPONSE else None
+        except HTTPError as error:
+            if error.code == 429:
+                self.gate.defer(retry_delay(error.headers.get("Retry-After"), 2))
+            return None
+        except (OSError, ValueError):
+            return None
+
+    def find(self, title, artist, album, duration, album_artist):
+        # La recherche Deezer associée fournit l’identité et la durée. L’API
+        # des paroles, elle, ne répond qu’avec du texte.
+        if not album:
+            return None
+        base_title, _ = split_feature(clean_title(title))
+        query = quote(f"{album_artist or artist} {base_title}", safe="")
+        response = self.get(f"suggest/{query}")
+        if not isinstance(response, dict):
+            return None
+        candidates = set()
+        for track in response.get("data") or []:
+            if not isinstance(track, dict):
+                continue
+            name = (track.get("artist") or {}).get("name")
+            track_title = track.get("title")
+            metadata = dict(trackName=track_title, artistName=name,
+                            albumName=(track.get("album") or {}).get("title"),
+                            duration=track.get("duration"))
+            score = recording_score(metadata, title, artist, album, duration, album_artist)
+            if score is not None:
+                candidates.add((score, name, track_title))
+        if not candidates:
+            return None
+        top = max(score for score, _, _ in candidates)
+        keys = {(name, track) for score, name, track in candidates if score == top}
+        if len(keys) != 1:
+            return None
+        name, track = keys.pop()
+        response = self.get(f"v1/{quote(name, safe='')}/{quote(track, safe='')}")
+        return usable_text(response.get("lyrics"), 32_000) if isinstance(response, dict) else None
+
+
+class PublicLyrics:
+    USER_AGENT = "ParolesMusique/1.2 (client local pour Strawberry)"
+
+    def __init__(self):
+        self.opener = build_opener(NoRedirect)
+        self.gate = RequestGate(0.5)
+
+    def get(self, url, *, html=False, referer=None):
+        headers = {
+            "Accept": "text/html" if html else "application/json",
+            "User-Agent": self.USER_AGENT,
+        }
+        if referer:
+            headers["Referer"] = referer
+        request = Request(url, headers=headers)
+        if not self.gate.wait():
+            return None
+        try:
+            with self.opener.open(request, timeout=6) as response:
+                raw = response.read(MAX_RESPONSE + 1)
+            if len(raw) <= MAX_RESPONSE:
+                return raw.decode("utf-8") if html else json.loads(raw)
+        except HTTPError as error:
+            if error.code == 429:
+                self.gate.defer(retry_delay(error.headers.get("Retry-After"), 2))
+            return None
+        except (OSError, ValueError):
+            return None
+
+
+class NetEase(PublicLyrics):
+    def find(self, title, artist, album, duration, album_artist, *, synced):
+        if not album:
+            return None
+        base_title, _ = split_feature(clean_title(title))
+        params = urlencode({"s": f"{album_artist or artist} {base_title}", "type": 1, "limit": 12})
+        response = self.get(f"https://music.163.com/api/search/get?{params}")
+        if not isinstance(response, dict):
+            return None
+        songs = (response.get("result") or {}).get("songs") or []
+        candidates = {}
+        for song in songs:
+            milliseconds = song.get("duration")
+            song_id = song.get("id")
+            if type(milliseconds) not in (int, float) or type(song_id) is not int:
+                continue
+            metadata = dict(trackName=song.get("name"),
+                            artistName=", ".join(a["name"] for a in song.get("artists", []) if a.get("name")),
+                            albumName=(song.get("album") or {}).get("name"),
+                            duration=milliseconds / 1000)
+            score = recording_score(metadata, title, artist, album, duration, album_artist)
+            if score is not None:
+                candidates[song_id] = score
+        def fetch(song_id):
+            response = self.get(f"https://music.163.com/api/song/lyric?id={song_id}&lv=1")
+            lrc = (response.get("lrc") or {}) if isinstance(response, dict) else {}
+            raw = lrc.get("lyric") if isinstance(lrc, dict) else None
+            return catalog_transcript(raw, duration, synced=synced)
+
+        return available_transcript(candidates, fetch)
+
+
+class QQMusic(PublicLyrics):
+    REFERER = "https://y.qq.com/"
+    USER_AGENT = "ParolesMusique/1.3"
+    EXPLICIT = re.compile(r"\s*(?:\[explicit\]|\(explicit\))\s*$", re.I)
+
+    def remove_explicit(self, value):
+        return self.EXPLICIT.sub("", value) if isinstance(value, str) else ""
+
+    def find(self, title, artist, album, duration, album_artist, *, synced):
+        if not album:
+            return None
+        base_title, _ = split_feature(clean_title(title))
+        service = "music.search.SearchCgiService"
+        search = {
+            service: {
+                "module": service,
+                "method": "DoSearchForQQMusicDesktop",
+                "param": {"search_type": 0, "query": f"{album_artist or artist} {base_title}",
+                          "page_num": 1, "num_per_page": 8},
+            },
+        }
+        params = urlencode({"data": json.dumps(search, ensure_ascii=False, separators=(",", ":")),
+                            "format": "json"})
+        result = self.get(f"https://u.y.qq.com/cgi-bin/musicu.fcg?{params}", referer=self.REFERER)
+        if not isinstance(result, dict):
+            return None
+        body = ((result.get(service) or {}).get("data") or {}).get("body") or {}
+        songs = (body.get("song") or {}).get("list") or []
+        candidates = {}
+        for song in songs:
+            if not isinstance(song, dict):
+                continue
+            song_id = song.get("mid")
+            if not isinstance(song_id, str) or not re.fullmatch(r"[A-Za-z0-9]{8,32}", song_id):
+                continue
+            metadata = dict(
+                trackName=self.remove_explicit(song.get("title") or song.get("name")),
+                artistName=", ".join(singer["name"] for singer in song.get("singer") or []
+                                     if isinstance(singer, dict) and isinstance(singer.get("name"), str)),
+                albumName=self.remove_explicit((song.get("album") or {}).get("name")),
+                duration=song.get("interval"),
+            )
+            score = recording_score(metadata, self.remove_explicit(title), artist,
+                                    self.remove_explicit(album), duration, album_artist)
+            if score is not None:
+                candidates[song_id] = score
+
+        def fetch(song_id):
+            params = urlencode({"songmid": song_id, "format": "json", "nobase64": 1})
+            response = self.get(f"https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?{params}",
+                                referer=self.REFERER)
+            if not isinstance(response, dict) or response.get("code") != 0:
+                return None
+            raw = response.get("lyric")
+            return catalog_transcript(unescape(raw) if isinstance(raw, str) else None, duration, synced=synced)
+
+        return available_transcript(candidates, fetch)
+
+
+class GeniusLyrics(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.fragments = []
+        self.divs = 0
+        self.excluded = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if not self.divs:
+            if tag == "div" and attributes.get("data-lyrics-container") == "true":
+                self.divs = 1
+            return
+        if tag == "div":
+            self.divs += 1
+        if tag in {"br", "hr", "img", "input", "wbr", "area", "embed", "source"}:
+            if tag == "br" and not self.excluded:
+                self.fragments.append("\n")
+        elif self.excluded or "data-exclude-from-selection" in attributes or tag in {"script", "style", "button", "svg"}:
+            self.excluded.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.divs:
+            return
+        if self.excluded and self.excluded[-1] == tag:
+            self.excluded.pop()
+        if tag == "div":
+            self.divs -= 1
+            if not self.divs:
+                self.excluded.clear()
+                self.fragments.append("\n")
+
+    def handle_data(self, data):
+        if self.divs and not self.excluded:
+            self.fragments.append(data)
+
+
+class Genius(PublicLyrics):
+    def find(self, title, artist, album, duration, album_artist):
+        if not album:
+            return None
+        base_title, _ = split_feature(clean_title(title))
+        params = urlencode({"q": f"{album_artist or artist} {base_title}"})
+        response = self.get(f"https://genius.com/api/search/song?{params}")
+        if not isinstance(response, dict):
+            return None
+        sections = (response.get("response") or {}).get("sections") or []
+        hits = next((section.get("hits") or [] for section in sections if section.get("type") == "song"), [])
+        candidates = {}
+        for hit in hits[:6]:
+            song = hit.get("result") or {}
+            found_title, _ = split_feature(clean_title(normalized(song.get("title"))))
+            singer = (song.get("primary_artist") or {}).get("name")
+            song_id = song.get("id")
+            if (type(song_id) is not int or title_key(found_title) != title_key(base_title)
+                    or credits(singer) not in (credits(album_artist), credits(artist))):
+                continue
+            details = self.get(f"https://genius.com/api/songs/{song_id}")
+            if not isinstance(details, dict):
+                continue
+            song = (details.get("response") or {}).get("song") or {}
+            album_name = (song.get("album") or {}).get("name")
+            apple_id = str(song.get("apple_music_id") or "")
+            url = urlsplit(song.get("url") or "")
+            if (title_key(album_name) != title_key(album) or not apple_id.isdecimal()
+                    or url.scheme != "https" or url.netloc != "genius.com"):
+                continue
+            params = urlencode({"id": apple_id, "country": "fr"})
+            catalog = self.get(f"https://itunes.apple.com/lookup?{params}")
+            if not isinstance(catalog, dict):
+                continue
+            for track in catalog.get("results") or []:
+                milliseconds = track.get("trackTimeMillis")
+                if str(track.get("trackId")) != apple_id or type(milliseconds) not in (int, float):
+                    continue
+                metadata = dict(trackName=track.get("trackName"), artistName=track.get("artistName"),
+                                albumName=track.get("collectionName"), duration=milliseconds / 1000)
+                score = recording_score(metadata, title, artist, album, duration, album_artist)
+                if score is not None:
+                    candidates[url.geturl()] = score
+        if not candidates:
+            return None
+        top = max(candidates.values())
+        urls = [url for url, score in candidates.items() if score == top]
+        if len(urls) != 1:
+            return None
+        markup = self.get(urls[0], html=True)
+        if not markup:
+            return None
+        parser = GeniusLyrics()
+        parser.feed(markup)
+        parser.close()
+        return usable_text("".join(parser.fragments), 32_000)
+
+
+
+class LyricDownPage(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.lrc = []
+        self.records = []
+        self.lyric_block = False
+        self.script = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "a":
+            path = urlsplit(attrs.get("href") or "").path
+            if re.fullmatch(r"/(?:lyrics|lrc)/[a-z0-9-]+-\d+", path):
+                self.links.append(path.replace("/lyrics/", "/lrc/", 1))
+        elif tag == "pre" and "lrc-box" in (attrs.get("class") or "").split():
+            self.lyric_block = True
+        elif tag == "script" and attrs.get("type") == "application/ld+json":
+            self.script = []
+
+    def handle_data(self, data):
+        if self.lyric_block:
+            self.lrc.append(data)
+        if self.script is not None:
+            self.script.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "pre":
+            self.lyric_block = False
+        elif tag == "script" and self.script is not None:
+            try:
+                data = json.loads("".join(self.script))
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                records = data.get("@graph", [data])
+                self.records.extend(record for record in records
+                                    if isinstance(record, dict) and record.get("@type") == "MusicRecording")
+            self.script = None
+
+
+def timed_local_lyrics(local, reference, duration):
+    def tokens(line):
+        return re.findall(r"[^\W_]+", folded(line), flags=re.UNICODE)
+
+    local_lines = [(line.strip(), tokens(line)) for line in local.splitlines()
+                   if not re.fullmatch(r"\s*\[[^\]]+\]\s*", line)]
+    local_lines = [(line, words) for line, words in local_lines if words]
+    remote_lines = [(stamp, tokens(line)) for stamp, line in parse_lrc(reference)]
+    remote_lines = [(stamp, words) for stamp, words in remote_lines if words]
+    if len(remote_lines) < 3 or not duration * 0.6 <= remote_lines[-1][0] <= duration + 3:
+        return None
+    if [word for _, words in local_lines for word in words] != [word for _, words in remote_lines for word in words]:
+        return None
+
+    remote_index = 0
+    offset = 0
+    result = []
+    for line, words in local_lines:
+        start, remote_words = remote_lines[remote_index]
+        if offset and remote_index + 1 < len(remote_lines):
+            end = remote_lines[remote_index + 1][0]
+            start += (end - start) * offset / len(remote_words)
+        seconds = round(start * 100)
+        minute, seconds = divmod(seconds, 6000)
+        second, fraction = divmod(seconds, 100)
+        result.append(f"[{minute:02}:{second:02}.{fraction:02}]{line}")
+
+        offset += len(words)
+        while remote_index < len(remote_lines) and offset >= len(remote_lines[remote_index][1]):
+            offset -= len(remote_lines[remote_index][1])
+            remote_index += 1
+    return catalog_transcript("\n".join(result), duration, synced=True)
+
+
+class LyricDown(PublicLyrics):
+    BASE = "https://www.lyricdown.com"
+
+    def page(self, path):
+        contents = self.get(self.BASE + path, html=True)
+        if contents:
+            parsed = LyricDownPage()
+            parsed.feed(contents)
+            parsed.close()
+            return parsed
+        return None
+
+    def find(self, title, artist, album, duration, album_artist, local_text):
+        if not album or not usable_text(local_text, 32_000):
+            return None
+        base, _ = split_feature(clean_title(title))
+        prefixes = []
+        for credit in (artist, album_artist):
+            slug = re.sub(r"[^a-z0-9]+", "-", folded(credit)).strip("-")
+            if slug:
+                prefixes.append("/lrc/" + slug + "-")
+        if not prefixes:
+            return None
+        index = self.page("/search/" + quote(base, safe="") + "/")
+        if index is None:
+            return None
+        candidates = dict.fromkeys(path for path in index.links if path.startswith(tuple(prefixes)))
+        exact, regional = set(), set()
+        for path in list(candidates)[:5]:
+            page = self.page(path)
+            if page is None or len(page.records) != 1:
+                continue
+            record = page.records[0]
+            if title_key(record.get("name")) != title_key(title):
+                continue
+            if credits((record.get("byArtist") or {}).get("name")) not in (credits(artist), credits(album_artist)):
+                continue
+            found_album = normalized((record.get("inAlbum") or {}).get("name"))
+            region_free = re.sub(r"\s*\((?:u\.?k\.?|u\.?s\.?)(?: only)?\)$", "", found_album)
+            if title_key(region_free) != title_key(album):
+                continue
+            result = timed_local_lyrics(local_text, "".join(page.lrc), duration)
+            if result:
+                (exact if title_key(found_album) == title_key(album) else regional).add(result)
+        selected = exact or regional
+        return selected.pop() if len(selected) == 1 else None
+
+
+class LyricsSources:
+    def __init__(self):
+        self.lrc = LrcLib()
+        self.ovh = LyricsOvh()
+        self.netease = NetEase()
+        self.qqmusic = QQMusic()
+        self.genius = Genius()
+        self.lyricdown = LyricDown()
+        self.lrclib_unavailable = None
+
+    def find(self, title, artist, album, duration, album_artist, *, synced, local_text=""):
+        signature = (title, artist, album, duration, album_artist)
+        instrumental = False
+        if self.lrclib_unavailable is None:
+            try:
+                value = self.lrc.find(*signature, synced=synced)
+                if value:
+                    return value, "LRCLIB"
+                instrumental = value == ""
+            except ServiceUnavailable as exc:
+                self.lrclib_unavailable = exc
+
+        if not synced:
+            value = self.ovh.find(*signature)
+            if value is not None:
+                return value, "lyrics.ovh"
+
+        for client, source in ((self.netease, "NetEase"), (self.qqmusic, "QQ Music")):
+            value = client.find(*signature, synced=synced)
+            if value is not None:
+                return value, source
+
+        if synced:
+            value = self.lyricdown.find(*signature, local_text)
+            if value is not None:
+                return value, "LyricDown"
+        else:
+            value = self.genius.find(*signature)
+            if value is not None:
+                return value, "Genius"
+        if instrumental:
+            return "", "LRCLIB"
+        if self.lrclib_unavailable is not None:
+            raise self.lrclib_unavailable
+        return None, None
+
+
+def clean_title(value):
+    return REMASTER_SUFFIX.sub("", value).strip()
+
+
+def normalized(value):
+    if not isinstance(value, str):
+        return ""
+    return " ".join(normalize("NFKC", value).casefold().replace("’", "'").split())
+
+
+def folded(value):
+    value = "".join(char for char in normalize("NFKD", normalized(value)) if not combining(char))
+    value = re.sub(r"\.{2,}", " ", value)
+    return " ".join(re.sub(r"[-\u2010-\u2015]+", " ", value).split())
+
+
+def split_feature(value):
+    match = re.fullmatch(r"(.+?)\s*[\[(](?:feat\.?|ft\.?|featuring)\s+(.+?)[\])]", value, re.I)
+    return (match[1], match[2]) if match else (value, "")
+
+
+def credits(value):
+    parts = re.split(r"\s*(?:,|&|\b(?:feat|ft|featuring)\.?\s+)\s*", normalized(value))
+    return frozenset(folded(part) for part in parts if part)
+
+
+def title_key(value):
+    key = folded(clean_title(normalized(value))).strip(". !?¿¡")
+    return re.sub(r"[, (]+(?:pt|part|partie)\.?\s+(\d+)\)?$", r" part \1", key)
+
+
+def recording_score(record, title, artist, album, duration, album_artist):
+    if not isinstance(record, dict):
+        return None
+    own_title, own_feat = split_feature(clean_title(normalized(title)))
+    their_title, their_feat = split_feature(clean_title(normalized(record.get("trackName"))))
+    if not own_title or title_key(their_title) != title_key(own_title):
+        return None
+    their_album = record.get("albumName")
+    if album and title_key(their_album) != title_key(album):
+        return None
+    length = record.get("duration")
+    if type(length) not in (int, float) or not abs(length - duration) <= 3:
+        return None
+    expected = credits(artist) | credits(own_feat)
+    actual = credits(record.get("artistName")) | credits(their_feat)
+    primary = credits(album_artist)
+    full_credit = actual == expected
+    if not full_credit and not (album and primary and actual == primary and primary < expected):
+        return None
+    return (full_credit, -abs(length - duration),
+            normalized(their_album) == normalized(album), their_title == own_title)
+
+
+def usable_text(text, limit):
+    if isinstance(text, str):
+        text = text.strip()
+        if text and "\x00" not in text and len(text.encode("utf-8")) <= limit:
+            return text
+    return None
+
+
+def transcript(record, duration, synced):
+    if record.get("instrumental") is True:
+        return ""
+    text = usable_text(record.get("syncedLyrics" if synced else "plainLyrics"),
+                       MAX_LRC_BYTES if synced else 32_000)
+    if synced and text:
+        timed = [stamp for stamp, line in parse_lrc(text) if line]
+        if not timed or timed[-1] > duration + 3:
+            return None
+    return text
+
+
+def catalog_transcript(raw, duration, *, synced):
+    timed = transcript({"syncedLyrics": raw}, duration, True)
+    if timed and not synced:
+        return usable_text("\n".join(line for _, line in parse_lrc(timed) if line), 32_000)
+    return timed
+
+
+def available_transcript(candidates, fetch):
+    ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+    for _, group in groupby(ranked, key=lambda item: item[1]):
+        matches = {lyrics for identifier, _ in group if (lyrics := fetch(identifier))}
+        if matches:
+            return matches.pop() if len(matches) == 1 else None
+    return None
+
+
+def verified_lyrics(record, title, artist, album, duration, album_artist, *, synced=False):
+    if recording_score(record, title, artist, album, duration, album_artist) is None:
+        return None
+    return transcript(record, duration, synced)
+
+
+def best_transcript(records, title, artist, album, duration, album_artist, *, synced):
+    if not isinstance(records, list):
+        return None
+    candidates = []
+    for record in records:
+        score = recording_score(record, title, artist, album, duration, album_artist)
+        if score is not None:
+            text = transcript(record, duration, synced)
+            if text is not None:
+                candidates.append((score, text))
+    if not candidates:
+        return None
+    top = max(score for score, _ in candidates)
+    matches = {text for score, text in candidates if score == top}
+    return matches.pop() if len(matches) == 1 else None
+
+
+def duration_seconds(path):
+    output = command(
+        ("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe",
+         "-show_entries", "format=duration", "-of", "csv=p=0", str(path)),
+        "durée illisible",
+    )
+    try:
+        duration = round(float(output))
+    except (ValueError, OverflowError) as error:
+        raise ValueError("durée illisible") from error
+    if not 1 <= duration <= 3600:
+        raise ValueError("durée hors limites de LRCLIB")
+    return duration
+
+
+def track_version(path):
+    info = path.lstat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def stream_hashes(path):
+    return command(
+        ("ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
+         "-i", str(path), "-map", "0", "-c", "copy", "-f", "streamhash", "-hash", "sha256", "pipe:1"),
+        "empreintes audio ou image indisponibles",
+    )
+
+
+def save_lyrics(path, version, tags, lyrics):
+    scope = "-metadata:s:a:0" if path.suffix.lower() in STREAM_TAGS else "-metadata"
+    key = "lyrics-eng" if path.suffix.lower() == ".mp3" else "LYRICS"
+    with TemporaryDirectory(dir=path.parent, prefix=".paroles-") as workspace:
+        draft = Path(workspace) / path.name
+        command(
+            ("ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
+             "-i", str(path), "-map", "0", "-c", "copy", scope, f"{key}={lyrics}", str(draft)),
+            "écriture du tag LYRICS échouée",
+        )
+        try:
+            saved_tags, _ = probe(draft)
+        except subprocess.CalledProcessError as error:
+            raise ValueError("vérification des nouveaux tags impossible") from error
+        if lyrics not in (saved_tags.get(key) for key in LYRICS_TAGS):
+            raise ValueError("les paroles ne sont pas relues à l’identique")
+        if any(saved_tags.get(key) != value for key, value in tags.items() if key != "encoder"):
+            raise ValueError("des métadonnées existantes changeraient")
+        original_hashes = stream_hashes(path)
+        if not original_hashes or original_hashes != stream_hashes(draft):
+            raise ValueError("les flux audio ou image changeraient")
+        if track_version(path) != version:
+            raise ValueError("fichier modifié pendant la recherche")
+        shutil.copymode(path, draft)
+        share_file(draft, path)
+        os.replace(draft, path)
+
+
+def save_lrc(path, lyrics):
+    with NamedTemporaryFile(dir=path.parent, prefix=".paroles-", mode="w", encoding="utf-8") as draft:
+        draft.write(lyrics + "\n")
+        draft.flush()
+        share_file(draft.name, path)
+        try:
+            os.link(draft.name, path)
+        except FileExistsError:
+            return False
+    return True
+
+
+def currently_playing():
+    output = command(("playerctl", "-p", "strawberry", "metadata", "xesam:url"),
+                     "aucun morceau actif dans Strawberry")
+    url = urlsplit(output.decode().strip())
+    if url.scheme != "file" or url.netloc not in ("", "localhost"):
+        raise ValueError("le morceau actif n’est pas un fichier local")
+    return Path(unquote(url.path))
+
+
+def selected_tracks(args, root):
+    if args.tout:
+        paths = [item for item in root.iterdir()
+                 if item.name not in {INBOX, "YouTube"} and not item.name.startswith(".")]
+    elif args.chemins:
+        paths = [path.expanduser() for path in args.chemins]
+        paths = [path if path.is_absolute() else root / path for path in paths]
+    else:
+        paths = [currently_playing()]
+
+    tracks = set()
+    for path in paths:
+        if not path.exists() and not path.is_symlink() and path.is_relative_to(root):
+            parts = path.relative_to(root).parts
+            if len(parts) in (2, 3) and ".." not in parts:
+                artist = canonical_album_artist(*parts[:2])
+                if artist in {"Kurupt", "Wu-Tang Clan"} and artist != parts[0]:
+                    path = root.joinpath(artist, *parts[1:])
+        if path.is_symlink() or not path.exists() or not path.resolve().is_relative_to(root):
+            raise ValueError(f"fichier ou dossier hors bibliothèque, symbolique ou introuvable : {path}")
+        tracks.update(track.resolve() for track in audio_files(path))
+    return sorted(tracks)
+
+
+def process_track(path, client, preview, synced=False):
+    sidecar = path.with_suffix(".lrc")
+    if synced and (sidecar.exists() or sidecar.is_symlink()):
+        return "paroles synchronisées déjà présentes"
+    if not synced and path.suffix.lower() not in STREAM_TAGS | FILE_TAGS:
+        return "format non pris en charge"
+    version = track_version(path)
+    try:
+        tags, _ = probe(path)
+    except subprocess.CalledProcessError as error:
+        raise ValueError("lecture des tags échouée") from error
+    if not synced and any(tags.get(key) for key in LYRICS_TAGS):
+        return "paroles déjà intégrées"
+    title = tags.get("title")
+    artist = tags.get("artist")
+    album = tags.get("album")
+    if not title or not artist:
+        return "titre ou artiste manquant"
+    if preview:
+        return f"à rechercher · {artist} — {title}"
+    duration = duration_seconds(path)
+    local_text = next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
+    lyrics, source = client.find(title, artist, album, duration, tags.get("albumartist"),
+                                 synced=synced, local_text=local_text)
+    if lyrics is None:
+        return "aucune parole synchronisée vérifiable" if synced else "aucune parole vérifiable"
+    if not lyrics:
+        return "instrumental"
+    if synced:
+        if track_version(path) != version:
+            raise ValueError("fichier modifié pendant la recherche")
+        return (f"paroles synchronisées · fichier .lrc · {source}" if save_lrc(sidecar, lyrics)
+                else "paroles synchronisées déjà présentes")
+    save_lyrics(path, version, tags, lyrics)
+    return f"paroles intégrées · {source}"
+
+
+def run(tracks, root, preview, synced, tracking=False):
+    client = None if preview else LyricsSources()
+    workers = 1 if preview else min(TRACK_WORKERS, len(tracks))
+    activity_lock = Lock()
+    active = 0
+
+    def activity(delta):
+        nonlocal active
+        if tracking:
+            with activity_lock:
+                active += delta
+                print(f"KARA_ACTIVITE {active} {workers}", flush=True)
+
+    def work(track):
+        activity(1)
+        try:
+            return track, process_track(track, client, preview, synced), False
+        except ServiceUnavailable as error:
+            return track, str(error), True
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            return track, f"erreur : {getattr(error, 'strerror', None) or error}", True
+        finally:
+            activity(-1)
+
+    def publish(results):
+        failures = 0
+        for track, message, failed in results:
+            print(f"{track.relative_to(root)} · {message}", file=sys.stderr if failed else sys.stdout, flush=True)
+            failures += failed
+        return int(bool(failures))
+
+    if preview or len(tracks) <= 1:
+        return publish(map(work, tracks))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(work, track) for track in tracks]
+        return publish(future.result() for future in as_completed(futures))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("chemins", nargs="*", type=Path,
+                        help="fichiers ou dossiers dans ~/Music, morceau actif par défaut")
+    parser.add_argument("--tout", action="store_true", help="parcourt toute la bibliothèque classée")
+    parser.add_argument("--synchro", action="store_true", help="enregistre les paroles minutées dans un fichier .lrc")
+    parser.add_argument("--apercu", "--dry-run", action="store_true", help="affiche les pistes, sans requête ni écriture")
+    parser.add_argument("--bibliotheque", type=Path, default=LIBRARY)
+    parser.add_argument("--suivi-activite", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.tout and args.chemins:
+        parser.error("--tout ou des chemins explicites sont attendus")
+    root = args.bibliotheque.expanduser().resolve()
+    if not root.is_dir():
+        parser.error(f"bibliothèque introuvable : {root}")
+    def process_selection():
+        try:
+            tracks = selected_tracks(args, root)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            parser.error(str(error))
+        if args.suivi_activite:
+            print(f"KARA_TOTAL {len(tracks)}", flush=True)
+        if not tracks:
+            print("Aucune piste audio à traiter.")
+            return 0
+        return run(tracks, root, args.apercu, args.synchro, args.suivi_activite)
+
+    if args.apercu:
+        return process_selection()
+    if root == SHARED_LIBRARY:
+        with shared_mutation(root):
+            return process_selection()
+
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "paroles-musique"
+    state.mkdir(parents=True, exist_ok=True)
+    with (state / "lock").open("a") as lock:
+        try:
+            flock(lock, LOCK_EX | LOCK_NB)
+        except BlockingIOError:
+            parser.error("une recherche de paroles est déjà en cours")
+        return process_selection()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

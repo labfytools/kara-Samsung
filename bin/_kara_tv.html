@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Karaoké — Strawberry</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:#1e1e2e;color:#cdd6f4;font-family:Inter,Arial,sans-serif}
+body{padding:6vh 7vw;background:radial-gradient(ellipse at 50% 45%,#292a45 0,#1e1e2e 58%,#181825 100%)}
+header{position:relative;min-height:14vh;border-bottom:1px solid #45475a;padding:0 22vw 2vh 0}
+h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
+#artist{font-size:2.25vw;color:#a6adc8;margin-top:1vh}
+#score{position:absolute;right:0;top:0;color:#b4befe;font-size:6vw;font-weight:700;white-space:nowrap}
+#lyrics{text-align:center;margin-top:7vh}
+.line{white-space:pre-line;overflow-wrap:break-word;line-height:1.14;font-weight:600;margin:2.5vh auto;max-width:87vw}
+#previous{font-size:2.5vw;color:#7f849c;min-height:4vh}
+#current{font-size:5.4vw;color:#cdd6f4;min-height:9vh}
+#next{font-size:3.2vw;color:#a6adc8}
+#following{font-size:2.7vw;color:#7f849c}
+#progress{height:.6vh;min-height:4px;overflow:hidden;border-radius:20px;background:#45475a;max-width:60vw;margin:3vh auto}
+#fill{height:100%;background:#b4befe;width:0;transition:width 150ms linear}
+#status{text-align:center;color:#a6adc8;font-size:1.8vw;margin-top:4vh}
+#full{padding:.6em 1em;border:1px solid #45475a;border-radius:8px;background:#313244;color:#cdd6f4;font-size:1.3vw}
+#full:focus{outline:3px solid #b4befe}
+#refresh{padding:.6em 1em;margin-left:12px;border:1px solid #45475a;border-radius:8px;background:#313244;color:#cdd6f4;font-size:1.3vw}
+#refresh:focus{outline:3px solid #b4befe}
+#stop-tv{padding:.6em 1em;margin-left:12px;border:1px solid #45475a;border-radius:8px;background:#313244;color:#f38ba8;font-size:1.3vw}
+#stop-tv:focus{outline:3px solid #b4befe}
+#tv-closed{position:fixed;inset:0;z-index:100;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:18px;background:#181825;color:#cdd6f4;font-size:3vw;padding:30px}
+#tv-closed button{font-size:20px;color:#cdd6f4;background:#45475a;padding:12px 26px;border-radius:10px;border:1px solid #585b70}
+#tv-closed p{font-size:1.5vw;color:#a6adc8;max-width:60vw}
+#mobile-room{position:fixed;bottom:2.5vh;right:2.5vw;display:flex;align-items:center;gap:14px;z-index:10;border:1px solid #585b70;border-radius:16px;background:#181825f5;padding:12px 16px;max-width:47vw;box-shadow:0 5px 24px #0009}
+#room-qr{width:190px;height:190px;border-radius:9px;background:#fff;padding:7px;flex:none;object-fit:contain;image-rendering:auto}
+#room-main{min-width:0;max-width:30vw}#room-title{font-size:1.45vw;font-weight:750;color:#b4befe}#room-url{font-size:1.10vw;color:#a6adc8;overflow-wrap:anywhere;margin:5px 0}
+#room-members{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;max-height:15vh;overflow:hidden}
+.member{border:1px solid #45475a;background:#313244;border-radius:16px;padding:4px 8px;font-size:1.08vw}
+.member.selected{border-color:#a6e3a1}
+@media(max-width:800px){#mobile-room{max-width:65vw}#room-qr{width:100px;height:100px}#room-title{font-size:15px}#room-url,#room-members{display:none}}
+:fullscreen #full{display:none}
+:-webkit-full-screen #full{display:none}
+</style>
+</head>
+<body>
+<header><h1 id="title">Karaoké</h1><div id="artist"></div><div id="score"></div></header>
+<main id="lyrics">
+<div id="previous" class="line"></div>
+<div id="current" class="line">En attente de Strawberry…</div>
+<div id="progress"><div id="fill"></div></div>
+<div id="next" class="line"></div>
+<div id="following" class="line"></div>
+</main>
+<p id="status"></p>
+<button id="full" type="button">Plein écran</button>
+<button id="refresh" type="button" aria-label="Actualiser l’écran TV">↻ Actualiser</button>
+<button id="stop-tv" type="button" aria-label="Fermer l'affichage sur cette télévision">Fermer TV</button>
+<section id="tv-closed" aria-live="polite"><strong>Affichage TV fermé</strong><p>La musique et les téléphones restent connectés. Pour reprendre, clique sur « Actualiser TV » dans Paroles ou utilise ce bouton.</p><button id="reopen-tv" type="button">Rouvrir l’écran</button></section>
+<section id="mobile-room" aria-label="Rejoindre la salle avec un téléphone">
+  <img id="room-qr" src="__MOBILE_QR_PATH__" alt="QR code pour rejoindre la salle">
+  <div id="room-main"><div id="room-title">🎤 Rejoindre la salle</div>
+  <div id="room-url">__MOBILE_JOIN_URL__</div><div id="room-members"></div></div>
+</section>
+<script>
+(function () {
+    var seenReload = null;
+    var seenClose = null;
+    var closed = false;
+    function closeTV() {
+        closed = true;
+        element("tv-closed").style.display = "flex";
+        // Ne jamais appeler window.close() ici : certains navigateurs ferment
+        // réellement l’onglet, ce qui rendrait impossible toute réouverture
+        // par le bouton « Actualiser TV » depuis Paroles. Garder la page
+        // connectée avec un écran neutre permet de reprendre à distance.
+    }
+    function element(id) { return document.getElementById(id); }
+    function show(id, value) {
+        var node = element(id);
+        if (node.textContent !== value) node.textContent = value;
+    }
+    function render(data) {
+        // La première réponse initialise le compteur. Les suivantes peuvent
+        // déclencher un rechargement sans toucher à la musique ni à la salle.
+        if (typeof data.tv_reload === "number") {
+            if (seenReload !== null && seenReload !== data.tv_reload) {
+                location.reload();
+                return;
+            }
+            seenReload = data.tv_reload;
+        }
+        if (typeof data.tv_close === "number") {
+            if (seenClose !== null && seenClose !== data.tv_close) {
+                closeTV();
+            }
+            seenClose = data.tv_close;
+        }
+        if (closed) return;
+        var lines = data.lines || ["", "", "", ""];
+        var progress = Math.max(0, Math.min(1, data.progress || 0));
+        var current = element("current");
+        var text = lines[1] || data.notice || " ";
+        var count = Math.floor(progress * text.length);
+        show("title", data.title || "Karaoké");
+        show("artist", data.artist || "");
+        show("score", data.score == null ? "" : data.score + " %");
+        show("previous", lines[0] || "");
+        if (!current.firstChild || current.getAttribute("data-text") !== text ||
+                current.getAttribute("data-progress") !== String(count)) {
+            current.textContent = "";
+            current.setAttribute("data-text", text);
+            current.setAttribute("data-progress", String(count));
+            var sung = document.createElement("span");
+            sung.style.color = "#b4befe";
+            sung.textContent = text.slice(0, count);
+            current.appendChild(sung);
+            current.appendChild(document.createTextNode(text.slice(count)));
+        }
+        show("next", lines[2] || "");
+        show("following", lines[3] || "");
+        show("status", data.status || "");
+        element("fill").style.width = (100 * progress) + "%";
+        const names = element("room-members");names.replaceChildren();
+        const mobiles = data.connected || [];
+        show("room-title", "🎤 " + mobiles.length + " joueur(s) connecté(s)");
+        mobiles.slice(0,12).forEach(function (person) {
+            const span=document.createElement('span');span.className='member'+(person.song?' selected':'');
+            span.textContent=person.name+(person.song?' · 🎵':'');names.appendChild(span);
+        });
+    }
+    function poll() {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", location.pathname + "/etat", true);
+        xhr.timeout = 1800;
+        xhr.onloadend = function () {
+            if (xhr.status === 200) {
+                try { render(JSON.parse(xhr.responseText)); } catch (error) {}
+            } else {
+                show("status", "Connexion au PC interrompue. Reconnexion…");
+            }
+            setTimeout(poll, xhr.status === 200 ? 140 : 850);
+        };
+        xhr.send();
+    }
+    element("refresh").onclick = function () { location.reload(); };
+    element("stop-tv").onclick = closeTV;
+    element("reopen-tv").onclick = function () { location.reload(); };
+    var full = element("full");
+    var root = document.documentElement;
+    var request = root.requestFullscreen || root.webkitRequestFullscreen;
+    if (!request) full.hidden = true;
+    full.onclick = function () {
+        var result = request.call(root);
+        if (result && result.catch) result.catch(function () {});
+    };
+    poll();
+}());
+</script>
+</body>
+</html>

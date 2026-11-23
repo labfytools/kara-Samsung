@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1e1e2e">
+<title>Paroles · Rejoindre la salle</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#1e1e2e;color:#cdd6f4}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 30% 0%,#363453 0%,#1e1e2e 48%);padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+main{max-width:690px;margin:0 auto;padding:22px 16px 64px}header{display:flex;gap:11px;align-items:center;padding-bottom:17px;border-bottom:1px solid #45475a}
+.logo{width:42px;height:42px;background:#45475a;border-radius:13px;display:grid;place-items:center;font-size:23px}
+h1{font-size:22px;margin:0}h2{font-size:18px;margin:0 0 10px}.sub{font-size:12px;color:#a6adc8;margin-top:3px}section{background:#252538;border:1px solid #45475a;border-radius:17px;padding:18px;margin-top:15px}
+label{display:block;font-size:13px;color:#a6adc8;margin-bottom:9px}
+input{width:100%;font:inherit;background:#181825;border:1px solid #585b70;color:#fff;border-radius:10px;padding:13px;outline:none;min-height:47px}
+input:focus{border-color:#b4befe;box-shadow:0 0 0 2px #b4befe33}
+button{font:inherit;color:#cdd6f4;background:#45475a;border:1px solid #585b70;border-radius:10px;padding:11px 14px;cursor:pointer;min-height:43px}
+button:active{transform:scale(.99)}button:focus-visible{outline:2px solid #b4befe;outline-offset:2px}
+button.primary{background:#b4befe;color:#181825;font-weight:750;border-color:#b4befe}button:disabled{opacity:.45}
+.inline{display:flex;align-items:center;gap:9px}.inline>*{min-width:0}.inline input{flex:1}.pill{font-size:12px;border:1px solid #585b70;border-radius:20px;padding:6px 10px;color:#a6adc8;white-space:nowrap}
+#notice{min-height:23px;margin:14px 1px;color:#f9e2af;font-size:13px}#me{font-size:20px;font-weight:750}#choice{padding:13px;background:#313244;border-radius:11px;margin-top:12px;font-size:14px}
+#results{margin:10px 0 0;padding:0;list-style:none;max-height:55vh;overflow:auto}.result{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #45475a}
+.result .song{flex:1;min-width:0}.result strong{font-size:14px;display:block;overflow-wrap:anywhere}.result small{font-size:12px;color:#a6adc8;display:block;margin-top:3px}
+.result button{font-size:13px;white-space:nowrap}.status{font-size:12px;color:#a6adc8;margin:6px 0 0}
+#players{padding-left:0;list-style:none;margin:0}#players li{display:flex;gap:8px;align-items:center;border-bottom:1px solid #45475a;padding:9px 0;font-size:14px}
+#players li:last-child{border:0}.dot{width:8px;height:8px;background:#a6e3a1;border-radius:50%;flex:none}.dot.off{background:#6c7086}
+#players .pinfo{flex:1}.psong{color:#a6adc8;display:block;font-size:12px;margin-top:3px}
+#choice-actions{display:none;gap:9px;flex-wrap:wrap;margin-top:10px}#choice-actions button{flex:1;min-width:120px}#room{display:none}#leave{background:none;color:#a6adc8;border:0;font-size:13px;padding:8px 4px}.muted{color:#a6adc8;font-size:13px;line-height:1.5}
+</style>
+</head>
+<body><main>
+<header><div class="logo">🎤</div><div><h1>Paroles · Karaoké</h1><div class="sub">Salle privée sur le réseau local</div></div></header>
+<p id="notice" role="status" aria-live="polite"></p>
+<section id="join"><h2>Rejoindre la soirée</h2><p class="muted">Choisis ton pseudo. Tu apparaîtras sur la télévision même hors mode jeu.</p>
+<form id="joinform"><label for="nickname">Ton pseudo</label><div class="inline"><input id="nickname" autocomplete="nickname" maxlength="35" required placeholder="Ex. Alex"><button class="primary">Rejoindre</button></div></form></section>
+<div id="room">
+<section><div class="inline"><div style="flex:1"><div class="sub">Connecté en tant que</div><div id="me"></div></div><span class="pill" id="mode">Salle libre</span><button id="leave">Quitter</button></div>
+<div id="choice">Choisis une chanson dans la bibliothèque.</div><div id="choice-actions"><button id="change-choice" type="button" class="primary">Changer de chanson</button><button id="clear-choice" type="button">Retirer mon choix</button></div><p id="lock-info" class="status" style="display:none">Le tour est en cours : les choix sont verrouillés.</p><p class="muted">Un seul titre en attente par joueur. Un nouveau choix remplace le précédent. Le PC garde le contrôle de la partie.</p></section>
+<section><h2>Choisir ma chanson</h2><label for="search">Bibliothèque Strawberry · titres avec paroles minutées</label>
+<input id="search" type="search" placeholder="Rechercher un artiste, titre ou album…" autocomplete="off" aria-label="Rechercher une chanson">
+<p id="found" class="status">Chargement des chansons…</p><ul id="results"></ul><button id="more" style="display:none;width:100%;margin-top:12px">Afficher 30 titres de plus</button></section>
+<section><h2>Joueurs connectés</h2><ul id="players"></ul></section>
+<section><p class="muted" id="awake-info" role="status">L’écran restera allumé quand le navigateur l’autorise.</p><p class="muted">🎙️ La transmission du micro du téléphone sera disponible dans une prochaine version. Pour le moment, utilise le micro du PC ou celui de l'enceinte pour chanter.</p></section>
+</div>
+</main><script>
+(function(){
+'use strict';
+const $=id=>document.getElementById(id);
+const root=location.pathname.replace(/\/jouer\/?$/,'');
+const key='paroles.room.'+root;
+let token=localStorage.getItem(key)||'';
+let currentSearch='',offset=0,searchTimer=0,stateTimer=0,latest=0;
+const msg=(value)=>{$('notice').textContent=value||''};
+// Keep the smartphone awake while the karaoke room stays visible.
+// Android browsers require HTTPS (or localhost) for Screen Wake Lock.
+let awakeWanted=true, wakeSentinel=null;
+async function keepScreenAwake(){
+  if(!awakeWanted || document.visibilityState!=='visible' || wakeSentinel)return;
+  if(!('wakeLock' in navigator) || !window.isSecureContext){
+    $('awake-info').textContent='Écran actif : HTTPS nécessaire pour bloquer la veille.';
+    return;
+  }
+  try{
+    const sentinel=await navigator.wakeLock.request('screen');
+    if(!awakeWanted || document.visibilityState!=='visible'){
+      await sentinel.release(); return;
+    }
+    wakeSentinel=sentinel;
+    $('awake-info').textContent='Écran maintenu allumé pendant la soirée.';
+    sentinel.addEventListener('release',()=>{
+      if(wakeSentinel===sentinel)wakeSentinel=null;
+      if(awakeWanted && document.visibilityState==='visible')
+        $('awake-info').textContent='Verrou d’écran perdu : touche la page pour réactiver.';
+    });
+  }catch(e){
+    $('awake-info').textContent='Veille non bloquée : vérifie les autorisations du navigateur.';
+  }
+}
+function stopScreenAwake(){
+  awakeWanted=false;
+  if(wakeSentinel){const sentinel=wakeSentinel;wakeSentinel=null;sentinel.release().catch(()=>{});}
+}
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible')keepScreenAwake();
+});
+document.addEventListener('pointerdown',()=>{if(awakeWanted)keepScreenAwake();},{passive:true});
+window.addEventListener('pageshow',()=>{awakeWanted=true;keepScreenAwake();});
+window.addEventListener('pagehide',stopScreenAwake);
+async function api(method,action,payload,authenticated=true){
+  const headers={'Content-Type':'application/json'};
+  if(authenticated && token)headers.Authorization='Bearer '+token;
+  const response=await fetch(root+'/api/'+action,{method,headers,body:method==='POST'?JSON.stringify(payload||{}):undefined,cache:'no-store'});
+  let data={};try{data=await response.json()}catch(e){}
+  if(!response.ok)throw new Error(data.error||'Connexion au PC indisponible');
+  return data;
+}
+async function get(action,params=''){
+  const response=await fetch(root+'/api/'+action+params,{headers:{Authorization:'Bearer '+token},cache:'no-store'});
+  const data=await response.json();if(!response.ok)throw new Error(data.error||'Erreur réseau');return data;
+}
+function connected(name){$('join').style.display='none';$('room').style.display='block';$('me').textContent=name;msg('');awakeWanted=true;keepScreenAwake();refresh();search(true);}
+$('joinform').onsubmit=async ev=>{ev.preventDefault();try{
+ const value=$('nickname').value.trim();const info=await api('POST','inscription',{name:value},false);
+ token=info.token;localStorage.setItem(key,token);connected(info.name);
+}catch(e){msg(e.message)}};
+$('leave').onclick=async()=>{try{await api('POST','quitter',{})}catch(e){}
+ token='';localStorage.removeItem(key);$('room').style.display='none';$('join').style.display='block';clearTimeout(stateTimer);msg('Tu as quitté la salle.');};
+async function refresh(){if(!token)return;try{
+ const data=await get('etat');$('mode').textContent=data.game_mode?'Mode jeu':'Salle libre';
+ $('mode').style.color=data.locked?'#f9e2af':'';
+ window.karaLocked=Boolean(data.locked);
+ $('choice').textContent=data.me.song?'🎵 Mon choix : '+data.me.song+' — '+data.me.artist:'Choisis une chanson dans la bibliothèque.';
+ $('choice-actions').style.display=data.me.song?'flex':'none';
+ $('change-choice').disabled=Boolean(data.locked);
+ $('clear-choice').disabled=Boolean(data.locked);
+ $('lock-info').style.display=data.locked?'block':'none';
+ for(const button of $('results').querySelectorAll('button'))button.disabled=Boolean(data.locked);
+ const list=$('players');list.replaceChildren();
+ for(const person of data.participants){
+  const li=document.createElement('li');const dot=document.createElement('span');dot.className='dot'+(person.online?'':' off');li.append(dot);
+  const block=document.createElement('span');block.className='pinfo';block.textContent=person.name;
+  if(person.song){const song=document.createElement('small');song.className='psong';song.textContent=person.song;block.append(song)}li.append(block);list.append(li);
+ }
+ if(!data.catalogue_ready){$('found').textContent='Chargement de la bibliothèque…'}
+}catch(e){if(e.message.includes('Rejoins')||e.message.includes('expirée')){
+ token='';localStorage.removeItem(key);$('room').style.display='none';$('join').style.display='block';msg('Reconnecte-toi pour rejoindre la salle.');return;
+ }msg('Connexion interrompue. Nouvelle tentative…')}
+ stateTimer=setTimeout(refresh,2800);
+}
+async function search(reset=false){if(!token)return;const q=$('search').value.trim();
+ if(reset){offset=0;$('results').replaceChildren();currentSearch=q}const generation=++latest;
+ try{const params='?q='+encodeURIComponent(q)+'&offset='+offset;const data=await get('recherche',params);
+ if(generation!==latest || currentSearch!==q)return;
+ $('found').textContent=data.ready?data.total+' chanson(s) trouvée(s) · '+(offset+data.results.length)+' affichée(s)':'Chargement de la bibliothèque…';
+ for(const song of data.results){const li=document.createElement('li');li.className='result';
+  const detail=document.createElement('div');detail.className='song';const title=document.createElement('strong');title.textContent=song.title;detail.append(title);
+  const meta=document.createElement('small');meta.textContent=[song.artist,song.album].filter(Boolean).join(' · ');detail.append(meta);li.append(detail);
+  const pick=document.createElement('button');pick.textContent='Choisir';pick.disabled=Boolean(window.karaLocked);pick.onclick=async()=>{pick.disabled=true;try{
+   await api('POST','choix',{song_id:song.id});msg('Chanson enregistrée : '+song.title);refresh();
+  }catch(e){msg(e.message)}finally{pick.disabled=false}};li.append(pick);$('results').append(li);
+ }
+ offset+=data.results.length;$('more').style.display=offset<data.total?'block':'none';
+ }catch(e){if(generation===latest)msg(e.message)}
+}
+$('search').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>search(true),230)});
+$('change-choice').onclick=()=>{if($('change-choice').disabled)return;
+ $('search').scrollIntoView({behavior:'smooth',block:'center'});$('search').focus();$('search').select();};
+$('clear-choice').onclick=async()=>{const button=$('clear-choice');button.disabled=true;try{
+ await api('POST','retirer-choix',{});msg('Ton choix a été retiré. Tu peux sélectionner une autre chanson.');await refresh();
+ }catch(e){msg(e.message)}finally{button.disabled=false}};
+$('more').onclick=()=>search(false);
+keepScreenAwake();
+if(token){api('POST','inscription',{token},false).then(info=>connected(info.name)).catch(()=>{
+ localStorage.removeItem(key);token='';msg('La session précédente a expiré. Rejoins la salle.');});}
+}());
+</script></body>
+</html>

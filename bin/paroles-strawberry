@@ -1,0 +1,1718 @@
+#!/usr/bin/python3 -B
+"""Fenêtre de paroles synchronisées pour Strawberry, pilotée par MPRIS."""
+
+from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+from urllib.parse import unquote, urlsplit
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, Gio, GLib, Gtk
+
+from _kara_game import GameScore, LyricVocabulary, SESSION, WORKER_PYTHON, words
+from _kara_stem_playback import StemPlayback, STRENGTHS
+from _kara_stems import cached_stems
+from _kara_vocal_profile import analyze as analyze_vocal_mix, cached_profile, LOWER_DEFAULT, UPPER_DEFAULT
+from _kara_dtw_words import text_boundaries
+from _kara_timing import LyricTiming, audio_signature, highlighted_characters, line_signature, time_at_character
+from _kara_party import Party, PlayersWindow, Singer, catalogue, score_color
+from _kara_preparation_ui import PreparationWindow
+from _kara_library import MusicLibraryWindow
+from _kara_lrc_publish import publish as publish_lrc
+from _kara_import import AlbumImport
+from _kara_tv import start_receiver
+from _musique_oz import probe
+from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
+
+
+APP_ID = "fr.labfy.ParolesStrawberry"
+PLAYER = "org.mpris.MediaPlayer2.strawberry"
+OBJECT = "/org/mpris/MediaPlayer2"
+INTERFACE = "org.mpris.MediaPlayer2.Player"
+LIBRARY = Path.home() / "Music"
+COLLECTION = Path(GLib.get_user_data_dir()) / "strawberry/strawberry/strawberry.db"
+LYRICS_TAGS = ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
+FADE_HEIGHT = 56
+LYRIC_FOCUS = 0.33
+LYRIC_FADES = ("fade-near", "fade-far", "fade-distant")
+CSS = b"""
+@define-color lyrics_background #1e1e2e;
+@define-color lyrics_text #9399b2;
+window { background: @lyrics_background; color: #cdd6f4; font-family: "Inter", sans-serif; }
+headerbar { background: #181825; color: #cdd6f4; box-shadow: none; }
+.track { padding: 14px 22px 13px; border-bottom: 1px solid #313244; }
+.header-title { font-weight: 700; font-size: 15px; }
+.transport-strip { padding: 12px 18px; background: #181825; }
+.transport-strip button { border-radius: 9px; }
+.transport-strip .play-main { background: #45475a; color: #cdd6f4; font-weight: 700; }
+.media-clock { color: #a6adc8; font-size: 13px; font-variant-numeric: tabular-nums; }
+.vocal-panel { padding: 11px 18px; background: #252538; border-bottom: 1px solid #313244; }
+.section-eyebrow { color: #b4befe; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
+.karaoke-options { padding: 9px 18px; background: #181825; border-bottom: 1px solid #313244; }
+.karaoke-options expander title { color: #cdd6f4; font-weight: 600; }
+.karaoke-options .game-controls { background: transparent; padding: 12px 0 4px; }
+.playlist-tracks row { border-radius: 6px; margin: 2px 0; }
+.playlist-tracks row:hover { background: #313244; }
+.playlist-tracks row:selected { background: #45475a; border-left: 3px solid #b4befe; }
+.track-title { color: #cdd6f4; font-size: 20px; font-weight: 700; }
+.artist { color: #a6adc8; font-size: 13px; }
+.lyric {
+    color: @lyrics_text;
+    font-size: 21px;
+    font-weight: 600;
+    padding: 8px 12px;
+    transition: color 220ms ease-out;
+}
+.lyric.fade-near { color: alpha(@lyrics_text, 0.78); }
+.lyric.fade-far { color: alpha(@lyrics_text, 0.49); }
+.lyric.fade-distant { color: alpha(@lyrics_text, 0.25); }
+.lyric.active {
+    background: #313244;
+    border-radius: 10px;
+    color: #cdd6f4;
+    font-size: 26px;
+    font-weight: 700;
+    transition-duration: 0ms;
+}
+.empty { padding: 28px; }
+.empty label { color: #cdd6f4; }
+.plain-lyrics { color: #cdd6f4; font-size: 21px; }
+.lyrics-info { color: #a6adc8; font-size: 13px; }
+.lyrics-footer { padding: 12px 22px; border-top: 1px solid #313244; }
+.lyrics-fade-top {
+    background-image: linear-gradient(to bottom, @lyrics_background, alpha(@lyrics_background, 0));
+}
+.lyrics-fade-bottom {
+    background-image: linear-gradient(to top, @lyrics_background, alpha(@lyrics_background, 0));
+}
+button.fetch { background: #b4befe; color: #181825; border-radius: 8px; }
+.game-controls { background: #181825; padding: 8px 22px; }
+.game-score { color: #b4befe; font-size: 15px; font-weight: 700; }
+.party-player { background: #252538; padding: 8px; border-radius: 9px; }
+.party-current { background: #313244; border-left: 3px solid #b4befe; }
+.party-name { color: #cdd6f4; font-weight: 700; }
+.alignment-progress { margin: 7px 22px; }
+.alignment-progress progress { background-color: #b4befe; }
+.tv-address { padding: 5px 22px 9px; background: #181825; }
+.album-import { background: #181825; border-bottom: 1px solid #313244; padding: 12px 22px; }
+.album-import progressbar progress { background-color: #b4befe; min-height: 5px; }
+.album-import .import-error { color: #f38ba8; }
+"""
+
+
+def local_track(url):
+    address = urlsplit(url or "")
+    if address.scheme != "file" or address.netloc not in ("", "localhost"):
+        return None
+    path = Path(unquote(address.path)).resolve()
+    return path if path.is_relative_to(LIBRARY.resolve()) and path.is_file() else None
+
+
+def lyric_progress(position, start, end):
+    # Les LRC usuels ont un repère par ligne, sans temps par mot.
+    duration = max(0.3, min(8.0, end - start))
+    return min(1.0, max(0.0, (position - start) / duration))
+
+
+def embedded_lyrics(track):
+    try:
+        tags, _ = probe(track)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    return next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
+
+
+def read_lrc(path):
+    with path.open("rb") as source:
+        raw = source.read(MAX_LRC_BYTES + 1)
+    return parse_lrc(raw.decode("utf-8-sig")) if len(raw) <= MAX_LRC_BYTES else []
+
+
+def faded_scroll(scroll, *, top_share=0.18, bottom_share=0.30, height_limit=FADE_HEIGHT):
+    overlay = Gtk.Overlay()
+    overlay.set_child(scroll)
+    top = Gtk.Box(valign=Gtk.Align.START, can_target=False, css_classes=["lyrics-fade-top"])
+    bottom = Gtk.Box(valign=Gtk.Align.END, can_target=False, css_classes=["lyrics-fade-bottom"])
+    overlay.add_overlay(top)
+    overlay.add_overlay(bottom)
+
+    def update_fades(adjustment):
+        page = adjustment.get_page_size()
+        position = adjustment.get_value()
+        above = position - adjustment.get_lower() if page else 0
+        below = adjustment.get_upper() - page - position if page else 0
+        for fade, share, distance in ((top, top_share, above), (bottom, bottom_share, below)):
+            height = max(1, round(page * share))
+            if height_limit is not None:
+                height = min(height, height_limit)
+            if fade.get_size_request()[1] != height:
+                fade.set_size_request(-1, height)
+            fade.set_opacity(max(0.0, min(1.0, distance / height)))
+
+    adjustment = scroll.get_vadjustment()
+    adjustment.connect("changed", update_fades)
+    adjustment.connect("value-changed", update_fades)
+    update_fades(adjustment)
+    return overlay
+
+
+class LyricsWindow(Gtk.ApplicationWindow):
+    def __init__(self, application):
+        super().__init__(application=application, title="Paroles — Strawberry",
+                         default_width=670, default_height=720)
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.polling = False
+        self.updated = time.monotonic()
+        self.base_position = 0.0
+        self.duration = 0.0
+        self.rate = 0.0
+        self.track = None
+        self.file_token = None
+        self.tag_token = None
+        self.tag_job = None
+        self.tag_text = ""
+        self.tag_reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paroles")
+        self.rows = []
+        self.lyrics = []
+        self.times = []
+        self.raw_lines = []
+        self.word_marks = self.word_times = self.word_ends = ()
+        self.timing_offset = 0.0
+        self.active = -1
+        self.highlight = -1
+        self.fetching = None
+        self.fetch_message = ""
+        self.closed = False
+        self.game_score = GameScore(self.refresh_game)
+        self.vocal_effect = StemPlayback()
+        self.effect_changing = False
+        self.vocal_profiles = {}
+        self.vocal_queue = {}
+        self.vocal_job = None
+        self.vocal_completed = 0
+        self.vocal_failed = set()
+        self.vocal_analyzer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kara-mots")
+        self.stem_queue = {}
+        self.stem_job = None
+        self.stem_completed = 0
+        self.stem_failed = set()
+        state_dir = Path(GLib.get_user_state_dir()) / "kara"
+        self.party = Party(state_dir / "players.json")
+        self.players_window = None
+        self.preparation_window = None
+        self.music_window = None
+        self.playback_state = 'Stopped'
+        self.media_updated = 0.0
+        self.preparation_only = False
+        self.active_plan = {}
+        self.preload_invalid = []
+        self.preload_cancelled = False
+        self.lrc_written = set()
+        self.lrc_skipped = {}
+        self.stems_only = set()
+        self.prepared_songs = {}
+        self.timing = LyricTiming(state_dir / "lyric-timing.json")
+        self.align_queue = {}
+        self.align_job = None
+        self.align_status = ""
+        self.align_fraction = 0.0
+        self.failed_alignments = set()
+        self.validating = False
+        self.party_ready = False
+        self.validated_songs = {}
+        self.syncing_offset = False
+        self.turn_tail = None
+        self.record_turn = False
+        self.turn_phase = ""
+        self.receiver = None
+        self.mobile_players = {}  # Identifiant de session -> Singer éphémère
+        self.mobile_leaving = set()  # Déconnexions pendant un tour actif
+        self.next_tv_update = 0.0
+        self.game_status = ""
+
+        # Hiérarchie : actions secondaires dans Outils, contrôle musical toujours
+        # visible, options karaoké dans un panneau repliable.
+        header = Gtk.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Paroles · Strawberry",
+                                           css_classes=["header-title"]))
+        tools = Gtk.MenuButton(label="Outils", tooltip_text="Import et entretien de la bibliothèque")
+        tools_popover = Gtk.Popover()
+        tools_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7,
+                            margin_top=12, margin_bottom=12,
+                            margin_start=12, margin_end=12)
+        self.album_import = AlbumImport()
+        self.import_toggle = Gtk.ToggleButton(label="Importer un album")
+        self.import_toggle.connect("toggled", self.album_import.toggle)
+        tools_box.append(self.import_toggle)
+        for title, option, tooltip in (
+            ("Pochettes manquantes", "--pochettes-manquantes", "Chercher les pochettes absentes"),
+            ("Paroles manquantes", "--paroles-manquantes", "Chercher les paroles et fichiers LRC absents"),
+        ):
+            button = Gtk.Button(label=title, tooltip_text=tooltip)
+            button.connect("clicked", self.search_missing, option, title)
+            button.connect("clicked", lambda *_: tools_popover.popdown())
+            tools_box.append(button)
+        tools_popover.set_child(tools_box)
+        tools.set_popover(tools_popover)
+        header.pack_end(tools)
+        self.set_titlebar(header)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_child(root)
+        root.append(self.album_import)
+        track = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["track"])
+        self.title = Gtk.Label(xalign=0.0, wrap=True, css_classes=["track-title"])
+        self.artist = Gtk.Label(xalign=0.0, wrap=True, css_classes=["artist"])
+        track.append(self.title)
+        track.append(self.artist)
+        root.append(track)
+
+        transport = Gtk.Box(spacing=9, css_classes=["transport-strip"])
+        previous_track_button = Gtk.Button(icon_name='media-skip-backward-symbolic',
+                                           tooltip_text='Morceau précédent dans Strawberry')
+        previous_track_button.connect('clicked', lambda *_: self.player_command('Previous'))
+        self.media_previous = previous_track_button
+        transport.append(previous_track_button)
+        self.media_play = Gtk.Button(label='▶ Lecture', css_classes=["play-main"],
+                                     tooltip_text='Lecture ou pause dans Strawberry')
+        self.media_play.connect('clicked',lambda *_: self.player_command('PlayPause'))
+        transport.append(self.media_play)
+        next_track_button = Gtk.Button(icon_name='media-skip-forward-symbolic',
+                                       tooltip_text='Morceau suivant dans Strawberry')
+        next_track_button.connect('clicked',lambda *_: self.player_command('Next'))
+        self.media_next = next_track_button
+        transport.append(next_track_button)
+        transport.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        browse = Gtk.Button(label='Bibliothèque',
+                             tooltip_text='Parcourir et gérer la liste de lecture sans changer de workspace')
+        browse.connect('clicked', self.show_library)
+        transport.append(browse)
+        self.media_clock = Gtk.Label(label='0:00 / 0:00', xalign=1, hexpand=True,
+                                     css_classes=['media-clock'])
+        transport.append(self.media_clock)
+        root.append(transport)
+
+        effect_row = Gtk.Box(spacing=10, css_classes=["vocal-panel"])
+        effect_row.append(Gtk.Label(label="VOIX IA", css_classes=["section-eyebrow"]))
+        self.effect_toggle = Gtk.ToggleButton(label="Atténuer",
+                                               tooltip_text="Dosage des voix séparées par Demucs, désactivable en un clic")
+        self.effect_toggle.connect("toggled", self.toggle_vocal_effect)
+        effect_row.append(self.effect_toggle)
+        self.effect_strength = Gtk.DropDown.new_from_strings([preset[0] for preset in STRENGTHS])
+        self.effect_strength.set_selected(1)
+        self.vocal_effect.set_strength(1)
+        self.effect_strength.connect("notify::selected", self.change_vocal_strength)
+        self.effect_strength.set_tooltip_text("Volume de la voix du chanteur")
+        effect_row.append(self.effect_strength)
+        self.effect_state = Gtk.Label(label="Voix originale", xalign=0, hexpand=True,
+                                       ellipsize=3, css_classes=["lyrics-info"])
+        effect_row.append(self.effect_state)
+        root.append(effect_row)
+
+        karaoke_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                               css_classes=["karaoke-options"])
+        self.kara_expander = Gtk.Expander(label="Karaoké · Joueurs, préparation et TV")
+        self.kara_expander.set_expanded(False)
+        controls = Gtk.Box(spacing=8, css_classes=["game-controls"])
+        self.game_toggle = Gtk.ToggleButton(
+            label="Mode jeu", tooltip_text="Calcul du score, avec micro et paroles calées"
+        )
+        self.game_toggle.connect("toggled", self.toggle_game)
+        controls.append(self.game_toggle)
+        players = Gtk.Button(label="Joueurs", tooltip_text="Inscrire les joueurs et choisir leurs chansons")
+        players.connect("clicked", self.show_players)
+        controls.append(players)
+        prepare = Gtk.Button(label="Préparer des morceaux",
+                             tooltip_text="Préparer Turbo, minutages LRC et pistes IA en avance")
+        prepare.connect("clicked", self.show_preparation)
+        controls.append(prepare)
+        self.tv_toggle = Gtk.ToggleButton(label="Salle / TV", tooltip_text="Activer la salle mobile et l'écran TV sur le réseau local")
+        self.tv_toggle.connect("toggled", self.toggle_tv)
+        controls.append(self.tv_toggle)
+        self.build_timing_controls()  # Minutage manuel masqué, état interne maintenu.
+        self.score_label = Gtk.Label(xalign=1.0, hexpand=True, wrap=True, css_classes=["game-score"])
+        controls.append(self.score_label)
+        self.kara_expander.set_child(controls)
+        karaoke_box.append(self.kara_expander)
+        root.append(karaoke_box)
+
+        self.align_progress = Gtk.ProgressBar(show_text=True, visible=False, css_classes=["alignment-progress"])
+        root.append(self.align_progress)
+
+        self.tv_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                              spacing=7, visible=False, css_classes=["tv-address"])
+        self.tv_address = Gtk.Label(xalign=0, hexpand=True, wrap=True, selectable=True, css_classes=["lyrics-info"])
+        self.tv_row.append(self.tv_address)
+        self.tv_actions = Gtk.Box(spacing=8)
+        self.tv_copy = Gtk.Button(label="Copier lien joueurs")
+        self.tv_copy.connect("clicked", self.copy_tv_url)
+        self.tv_actions.append(self.tv_copy)
+        self.tv_qr_button = Gtk.MenuButton(label="QR code", tooltip_text="Afficher le QR code des joueurs sur cet ordinateur")
+        self.tv_qr_popover = Gtk.Popover()
+        self.tv_qr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9,
+                                margin_start=14, margin_end=14, margin_top=14, margin_bottom=14)
+        self.tv_qr_box.append(Gtk.Label(label="Scanne ce code pour rejoindre la salle", xalign=0))
+        self.tv_qr_image = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN)
+        self.tv_qr_image.set_size_request(235, 235)
+        self.tv_qr_box.append(self.tv_qr_image)
+        self.tv_qr_link = Gtk.Label(wrap=True, selectable=True, max_width_chars=45)
+        self.tv_qr_box.append(self.tv_qr_link)
+        self.tv_qr_popover.set_child(self.tv_qr_box)
+        self.tv_qr_button.set_popover(self.tv_qr_popover)
+        self.tv_actions.append(self.tv_qr_button)
+        self.tv_refresh_button = Gtk.Button(label="↻ Actualiser TV",
+            tooltip_text="Recharger l'affichage TV, sans interrompre Strawberry ni déconnecter les joueurs")
+        self.tv_refresh_button.connect("clicked", self.refresh_tv_display)
+        self.tv_actions.append(self.tv_refresh_button)
+        self.tv_close_button = Gtk.Button(label="Fermer TV",
+            tooltip_text="Fermer seulement l'écran karaoké de la TV, pas Paroles ni la salle des joueurs")
+        self.tv_close_button.connect("clicked", self.close_tv_display)
+        self.tv_actions.append(self.tv_close_button)
+        self.tv_row.append(self.tv_actions)
+        root.append(self.tv_row)
+
+        self.stack = Gtk.Stack(vexpand=True)
+        root.append(self.stack)
+        empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                        halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, css_classes=["empty"])
+        self.message = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=42)
+        empty.append(self.message)
+        self.stack.add_named(empty, "empty")
+
+        self.plain_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.plain_label = Gtk.Label(xalign=0.5, justify=Gtk.Justification.CENTER, wrap=True, selectable=True,
+                                    css_classes=["plain-lyrics"],
+                                    margin_start=34, margin_end=34, margin_top=24, margin_bottom=24)
+        self.plain_scroll.set_child(self.plain_label)
+        self.stack.add_named(faded_scroll(self.plain_scroll), "plain")
+
+        self.footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["lyrics-footer"])
+        self.notice = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, css_classes=["lyrics-info"])
+        self.footer.append(self.notice)
+        self.button = Gtk.Button(label="Chercher le minutage", halign=Gtk.Align.CENTER, css_classes=["fetch"])
+        self.button.connect("clicked", self.fetch)
+        self.footer.append(self.button)
+        root.append(self.footer)
+
+        self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=22, margin_end=22)
+        self.scroll.set_child(self.box)
+        self.scroll.get_vadjustment().connect("changed", self.pad_lyrics)
+        self.stack.add_named(
+            faded_scroll(self.scroll, top_share=0.25, bottom_share=0.50, height_limit=None), "lyrics"
+        )
+        self.update_vocal_effect()
+        self.clear_player()
+        self.request_player()
+        self.timers = [GLib.timeout_add(200, self.request_player), GLib.timeout_add(32, self.animate),
+                       GLib.timeout_add(450, self.poll_vocal_effect)]
+        self.connect("close-request", self.close_window)
+
+    def toggle_vocal_effect(self, button):
+        if self.effect_changing:
+            return
+        if button.get_active():
+            position = self.base_position + (time.monotonic() - self.updated) * self.rate
+            enabled = self.vocal_effect.enable(position, self.rate > 0)
+            if not enabled:
+                self.effect_changing = True
+                button.set_active(False)
+                self.effect_changing = False
+        else:
+            self.vocal_effect.disable()
+        self.update_vocal_effect()
+
+    def change_vocal_strength(self, dropdown, _spec):
+        self.vocal_effect.set_strength(dropdown.get_selected())
+        self.update_vocal_effect()
+
+    def update_vocal_effect(self):
+        effect = self.vocal_effect
+        self.effect_strength.set_sensitive(effect.active)
+        if effect.active:
+            self.effect_state.set_text(f"Mix IA · {STRENGTHS[effect.strength][0]}")
+        elif effect.error:
+            self.effect_state.set_text(effect.error)
+        elif effect.stems:
+            self.effect_state.set_text("Instrumental IA prêt · lecture normale")
+        else:
+            self.effect_state.set_text("Valide la partie pour préparer l'instrumental")
+            if self.effect_toggle.get_active():
+                self.effect_changing = True
+                self.effect_toggle.set_active(False)
+                self.effect_changing = False
+
+    def poll_vocal_effect(self):
+        if self.closed:
+            return GLib.SOURCE_REMOVE
+        if self.vocal_effect.active:
+            self.vocal_effect.poll()
+            self.update_vocal_effect()
+        return GLib.SOURCE_CONTINUE
+
+    def search_missing(self, _button, option, title):
+        self.import_toggle.set_active(True)
+        self.album_import.start_maintenance(option, title)
+
+    def show_players(self, _button):
+        if self.players_window is None:
+            self.players_window = PlayersWindow(self, COLLECTION, LIBRARY.resolve())
+        self.players_window.present()
+
+    def show_preparation(self, _button):
+        if self.preparation_window is None:
+            self.preparation_window = PreparationWindow(self, COLLECTION, LIBRARY.resolve())
+        self.preparation_window.present()
+
+    def show_library(self, _button):
+        if self.music_window is None:
+            self.music_window = MusicLibraryWindow(self, COLLECTION, LIBRARY.resolve())
+        self.music_window.present()
+        self.music_window.refresh_queue(force=True)
+
+    def player_command(self, method, parameters=None, callback=None):
+        self.bus.call(PLAYER, OBJECT, INTERFACE, method, parameters, None,
+                      Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
+
+    def prepare_song(self, song):
+        lrc = song.path.with_suffix(".lrc")
+        try:
+            info = lrc.lstat()
+            if local_track(song.path.as_uri()) != song.path or not stat.S_ISREG(info.st_mode):
+                raise OSError("Fichier local manquant")
+            token = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+            cached = self.prepared_songs.get(song.path)
+            if cached is not None and cached[0] == token:
+                return cached[1]
+            lines = read_lrc(lrc)
+        except (OSError, ValueError) as error:
+            raise ValueError("Les paroles minutées de ce morceau sont illisibles.") from error
+        vocabulary = LyricVocabulary(text for _, text in lines)
+        if not any(vocabulary.tokens):
+            raise ValueError("Ce morceau a besoin de paroles minutées lisibles pour le score.")
+        self.prepared_songs[song.path] = (token, vocabulary, tuple(lines))
+        return vocabulary
+
+    def validate_party(self, _button):
+        if self.validating or self.party.active is not None or not self.party.players:
+            return
+        songs = []
+        for player in self.party.players:
+            if player.song is None:
+                if self.players_window is not None:
+                    self.players_window.message.set_text("Chaque joueur doit choisir un morceau.")
+                return
+            songs.append(player.song)
+        self.begin_preparation(songs, for_party=True)
+
+    def preload_songs(self, songs):
+        """Prépare des chansons de la bibliothèque sans créer de partie."""
+        if (self.validating or self.party.active is not None or self.game_score.requested
+                or self.game_toggle.get_active()):
+            if self.preparation_window is not None:
+                self.preparation_window.message.set_text(
+                    "Une partie ou un traitement est déjà en cours. Termine-le avant la préparation.")
+            return False
+        return self.begin_preparation(songs, for_party=False)
+
+    def cancel_preparation(self):
+        """Annule seulement la préparation indépendante, jamais une partie."""
+        if not self.validating or not self.preparation_only or self.preload_cancelled:
+            return
+        self.preload_cancelled = True
+        self.align_queue.clear()
+        self.vocal_queue.clear()
+        self.stem_queue.clear()
+        if self.preparation_window is not None:
+            self.preparation_window.message.set_text("Annulation en cours…")
+            self.preparation_window.update_controls()
+        for job in (self.align_job, self.stem_job):
+            if job is not None:
+                try:
+                    job[1].send_signal(signal.SIGTERM)
+                except GLib.Error:
+                    pass
+        if self.align_job is None and self.vocal_job is None and self.stem_job is None:
+            self.complete_party_validation()
+
+    def begin_preparation(self, songs, *, for_party):
+        """Le même pipeline et les mêmes caches servent hors partie et en jeu."""
+        if self.closed or self.validating or self.party.active is not None:
+            return False
+        plan, align_queue, titles, lyric_titles = {}, {}, {}, {}
+        stems_only = set()
+        invalid = []
+        for song in songs:
+            path = song.path
+            if path in plan:
+                continue
+            try:
+                # Protéger la bibliothèque : seuls les fichiers locaux reconnus
+                # comme audio par Strawberry sont acceptés.
+                if local_track(path.as_uri()) != path or not path.is_file() or path.stat().st_size < 4096:
+                    raise ValueError("Fichier musical local introuvable ou invalide")
+                audio_id = audio_signature(path)
+                try:
+                    self.prepare_song(song)
+                except (OSError, ValueError):
+                    if for_party:
+                        raise
+                    # Sans LRC (ou LRC illisible), la séparation IA reste utile.
+                    # Aucun calage Turbo, analyse mot à mot ou réécriture LRC.
+                    stems_only.add(path)
+                    plan[path] = (None, audio_id)
+                else:
+                    rows = self.prepared_songs[path][2]
+                    plan[path] = (line_signature(rows), audio_id)
+                    lyric_titles[path] = song.title
+                    if not self.timing.current(path, rows):
+                        align_queue[path] = song.title
+                titles[path] = song.title
+            except (OSError, ValueError) as error:
+                if for_party:
+                    if self.players_window is not None:
+                        self.players_window.message.set_text(f"{song.title} · {error}")
+                    return False
+                invalid.append(f"{song.title} · {error}")
+        if not plan:
+            if self.preparation_window is not None and not for_party:
+                self.preparation_window.message.set_text(
+                    "Aucun morceau audio exploitable. " + "; ".join(invalid[:2]))
+            return False
+        self.preparation_only = not for_party
+        self.preload_cancelled = False
+        self.preload_invalid = invalid
+        self.lrc_written.clear()
+        self.lrc_skipped.clear()
+        self.stems_only = stems_only
+        self.active_plan = plan
+        if for_party:
+            self.party_ready = False
+            self.validated_songs = plan
+            self.game_toggle.set_active(False)
+        self.validating = True
+        self.align_queue = align_queue
+        # Calcule le cache des mots APRES le calage Turbo : ses repères peuvent changer.
+        self.vocal_queue = dict(lyric_titles)
+        self.vocal_completed = 0
+        self.vocal_failed.clear()
+        # Ne jamais demander à Demucs de retraiter des pistes déjà valides.
+        self.stem_queue = {path: title for path, title in titles.items() if cached_stems(path) is None}
+        self.stem_completed = len(titles) - len(self.stem_queue)
+        self.stem_failed.clear()
+        self.failed_alignments.clear()
+        # Les versions précédentes sauvegardaient le calage uniquement en JSON.
+        # Publier aussi un bon calage déjà présent sans repasser par Turbo.
+        for path in lyric_titles:
+            if path in align_queue:
+                continue
+            saved = self.timing.entry(path)
+            if saved.get("times"):
+                try:
+                    self.accept_alignment(path, dict(saved))
+                except (OSError, ValueError, KeyError) as error:
+                    self.lrc_skipped[path] = str(error)
+        if self.preparation_window is not None and not for_party:
+            self.preparation_window.set_busy(True)
+            self.preparation_window.set_progress("Début de la préparation des chansons…", 0)
+        if self.players_window is not None:
+            self.players_window.refresh()
+        self.start_alignment()
+        return True
+
+    def accept_alignment(self, path, event):
+        """Publie un calage sûr dans le LRC et maintient les caches cohérents."""
+        signature, audio_id = self.active_plan[path]
+        if event.get("signature") != signature or event.get("audio") != audio_id:
+            raise ValueError("Le morceau ou le LRC a changé pendant le calage")
+        fields = {key: event[key] for key in
+                  ("signature", "audio", "version", "times", "word_marks", "coverage", "changed", "refined", "model")
+                  if key in event}
+        previous = self.timing.entry(path)
+        if fields.get("times") is None and self.timing.matches(path, self.prepared_songs[path][2]):
+            for key in ("times", "word_marks", "coverage", "changed"):
+                if key in previous:
+                    fields[key] = previous[key]
+        updated = {**previous, **fields}
+        status = "unavailable"
+        new_rows = None
+        backup = None
+        if updated.get("times") is not None:
+            # Un LRC non modifiable ne doit jamais faire perdre le calage déjà
+            # calculé : il reste enregistré dans le cache privé de Paroles.
+            try:
+                status, new_rows, backup = publish_lrc(path, updated, signature)
+            except (OSError, ValueError) as error:
+                status = "protected"
+                self.lrc_skipped[path] = str(error)
+            if status == "updated":
+                new_signature = line_signature(new_rows)
+                updated["signature"] = new_signature
+                updated["lrc_original_backup"] = str(backup)
+                updated["lrc_exported"] = True
+                self.active_plan[path] = (new_signature, audio_id)
+                if not self.preparation_only:
+                    self.validated_songs[path] = (new_signature, audio_id)
+                info = path.with_suffix(".lrc").stat()
+                token = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+                vocabulary = LyricVocabulary(text for _, text in new_rows)
+                self.prepared_songs[path] = (token, vocabulary, tuple(new_rows))
+                self.file_token = None if self.track == path else self.file_token
+                self.lrc_written.add(path)
+            elif status in ("insufficient", "unavailable"):
+                self.lrc_skipped[path] = "Calage Turbo insuffisamment fiable"
+        else:
+            self.lrc_skipped[path] = "Aucun calage exploitable"
+        self.timing.save(path, updated)
+        if self.track == path:
+            self.apply_timing()
+        return status
+
+    def start_alignment(self):
+        if self.closed or not self.validating or self.align_job or self.game_score.requested:
+            return
+        while self.align_queue:
+            path = next(iter(self.align_queue))
+            self.align_title = self.align_queue.pop(path)
+            command = [sys.executable, "-B", str(SESSION), str(WORKER_PYTHON), "-B",
+                       str(Path(__file__).with_name("_kara_align.py")), str(path)]
+            flags = Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
+            try:
+                process = Gio.Subprocess.new(command, flags)
+            except GLib.Error:
+                self.failed_alignments.add(path)
+                continue
+            self.align_job = (path, process)
+            self.show_align_status("Préparation du calage…", 0)
+            stream = Gio.DataInputStream.new(process.get_stdout_pipe())
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
+            return
+        if self.vocal_queue:
+            self.start_vocal_analysis()
+            return
+        self.start_stem_generation()
+
+    def complete_party_validation(self):
+        preload = self.preparation_only
+        self.validating = False
+        if not preload:
+            self.party_ready = True
+        total = len(self.active_plan)
+        fallback = sum(self.timing.entry(path).get("times") is None or path in self.failed_alignments
+                       for path in self.active_plan if path not in self.stems_only)
+        detail = ("Préparation annulée. Les résultats déjà terminés restent en cache."
+                  if preload and self.preload_cancelled else
+                  f"Préparation terminée pour {total} morceau(x)." if preload
+                  else "Partie prête. Tu peux chanter.")
+        if not (preload and self.preload_cancelled):
+            if self.stems_only:
+                detail += f" {len(self.stems_only)} titre(s) sans LRC : séparation IA uniquement."
+            if fallback:
+                detail += f" Minutage d'origine pour {fallback} morceau(x)."
+            if self.vocal_failed:
+                detail += f" Analyse spectrale absente pour {len(self.vocal_failed)} morceau(x)."
+            if self.stem_failed:
+                detail += f" Séparation IA indisponible pour {len(self.stem_failed)} morceau(x)."
+            else:
+                detail += " Pistes instrumentales prêtes."
+            counted = sum(p.get("mots_analyses", 0) for path, p in self.vocal_profiles.items()
+                          if path in self.active_plan)
+            estimated = sum(p.get("mots_total", 0) - p.get("mots_calés", 0)
+                            for path, p in self.vocal_profiles.items() if path in self.active_plan)
+            detail += f" {counted} mots analysés dans le mix (dont {estimated} à timing estimé)."
+            if self.lrc_written:
+                detail += f" {len(self.lrc_written)} fichier(s) LRC recalé(s) avec sauvegarde."
+            if self.lrc_skipped:
+                detail += f" {len(self.lrc_skipped)} LRC non remplacé(s) (calage trop incertain ou fichier protégé)."
+            if self.preload_invalid:
+                detail += f" {len(self.preload_invalid)} morceau(x) ignoré(s) (paroles manquantes/invalides)."
+        self.show_align_status(detail, round(self.align_fraction * 100) if self.preload_cancelled else 100)
+        if self.preparation_window is not None and preload:
+            self.preparation_window.set_busy(False)
+        self.preparation_only = False
+        self.preload_cancelled = False
+        self.active_plan = {}
+        if self.players_window is not None:
+            self.players_window.refresh()
+        GLib.timeout_add(650, self.hide_alignment_bars)
+
+    def start_vocal_analysis(self):
+        if not self.validating or self.closed or self.vocal_job:
+            return
+        while self.vocal_queue:
+            path = next(iter(self.vocal_queue))
+            title = self.vocal_queue.pop(path)
+            rows = self.prepared_songs[path][2]
+            times = self.timing.times(path, rows)
+            marks = self.timing.marks(path, rows)
+            profile = cached_profile(path, rows, times, marks)
+            if profile is not None:
+                self.vocal_profiles[path] = profile
+                self.vocal_completed += 1
+                continue
+
+            def progress(done, total):
+                GLib.idle_add(self.update_vocal_progress, path, title, done, total)
+
+            future = self.vocal_analyzer.submit(analyze_vocal_mix, path, rows, times, marks, progress=progress)
+            self.vocal_job = (path, future)
+            future.add_done_callback(lambda finished: GLib.idle_add(self.complete_vocal_analysis, path, finished))
+            self.show_align_status(f"Spectre mot par mot · {title}", 0)
+            return
+        self.start_stem_generation()
+
+    def update_vocal_progress(self, path, title, done, total):
+        if self.closed or not self.validating or not self.vocal_job or path != self.vocal_job[0]:
+            return GLib.SOURCE_REMOVE
+        self.show_align_status(f"Analyse du mix mot par mot · {title} · {done}/{total}",
+                               round(100 * done / max(1, total)))
+        return GLib.SOURCE_REMOVE
+
+    def complete_vocal_analysis(self, path, future):
+        if self.closed or not self.vocal_job or self.vocal_job != (path, future):
+            return GLib.SOURCE_REMOVE
+        try:
+            profile = future.result()
+            self.vocal_profiles[path] = profile
+            # Conservation du spectre pour analyse, pas pour filtrer la musique.
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyError) as error:
+            self.vocal_failed.add(path)
+        self.vocal_completed += 1
+        self.vocal_job = None
+        self.start_vocal_analysis()
+        return GLib.SOURCE_REMOVE
+
+    def start_stem_generation(self):
+        if self.closed or not self.validating or self.stem_job:
+            return
+        while self.stem_queue:
+            path = next(iter(self.stem_queue))
+            title = self.stem_queue.pop(path)
+            if cached_stems(path):
+                self.stem_completed += 1
+                if self.track == path:
+                    self.vocal_effect.refresh_stems()
+                    self.update_vocal_effect()
+                continue
+            command = (sys.executable, "-B", str(Path(__file__).with_name("_kara_stems.py")), str(path))
+            try:
+                process = Gio.Subprocess.new(command, Gio.SubprocessFlags.STDOUT_PIPE |
+                                             Gio.SubprocessFlags.STDERR_SILENCE)
+            except GLib.Error:
+                self.stem_failed.add(path)
+                self.stem_completed += 1
+                continue
+            self.stem_job = (path, process)
+            self.show_align_status(f"Demucs · {title} · chargement du modèle", 0)
+            stream = Gio.DataInputStream.new(process.get_stdout_pipe())
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_stem_event, process)
+            return
+        self.complete_party_validation()
+
+    def read_stem_event(self, stream, result, process):
+        if self.closed or not self.stem_job or self.stem_job[1] is not process:
+            return
+        path = self.stem_job[0]
+        try:
+            line, _ = stream.read_line_finish_utf8(result)
+            event = json.loads(line) if line else None
+        except (GLib.Error, ValueError):
+            event = None
+        if not isinstance(event, dict):
+            self.stem_job = None
+            process.wait_async(None, GameScore.reaped)
+            if not cached_stems(path):
+                self.stem_failed.add(path)
+            elif self.track == path:
+                self.vocal_effect.refresh_stems()
+                self.update_vocal_effect()
+            self.stem_completed += 1
+            self.start_stem_generation()
+            return
+        if event.get("event") == "progress":
+            self.show_align_status(f"Demucs · {event.get('status', 'Séparation en cours')}",
+                                   min(100, max(0, int(event.get("percent", 0)))))
+        elif event.get("event") == "error":
+            self.stem_failed.add(path)
+            if self.players_window is not None:
+                self.players_window.message.set_text(event.get("message", "Séparation IA indisponible"))
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_stem_event, process)
+
+    def hide_alignment_bars(self):
+        if not self.closed and not self.validating:
+            self.align_progress.set_visible(False)
+            if self.players_window is not None:
+                self.players_window.align_progress.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    def show_align_status(self, detail, progress):
+        total = max(1, len(self.active_plan))
+        if self.align_job:
+            index = total - len(self.align_queue)
+            total_progress = .55 * (index - 1 + progress / 100) / total
+            detail = f"Morceau {index}/{total} · {self.align_title} · {detail}"
+        elif self.vocal_job:
+            index = self.vocal_completed + 1
+            total_progress = .55 + .10 * (self.vocal_completed + progress / 100) / total
+            detail = f"Morceau {index}/{total} · {detail}"
+        elif self.stem_job:
+            index = self.stem_completed + 1
+            # Albums entièrement sans LRC : seul Demucs travaille, la barre
+            # progresse de 0 à 100 % plutôt que de démarrer directement à 65 %.
+            stems_base = 0.0 if len(self.stems_only) == len(self.active_plan) else .65
+            total_progress = stems_base + (1.0 - stems_base) * (self.stem_completed + progress / 100) / total
+            detail = f"Morceau {index}/{total} · {detail}"
+        else:
+            total_progress = progress / 100
+        self.align_fraction = max(0.0, min(1.0, total_progress))
+        self.align_status = f"{detail} · {round(self.align_fraction * 100)} %"
+        bars = [self.align_progress]
+        if self.players_window is not None and not self.preparation_only:
+            self.players_window.message.set_text(detail)
+            bars.append(self.players_window.align_progress)
+        if self.preparation_window is not None and self.preparation_only:
+            self.preparation_window.set_progress(detail, self.align_fraction)
+        for bar in bars:
+            bar.set_visible(True)
+            bar.set_fraction(self.align_fraction)
+            bar.set_text(f"{round(self.align_fraction * 100)} %")
+
+    def read_alignment(self, stream, result, process):
+        if self.closed or not self.align_job or self.align_job[1] is not process:
+            return
+        path = self.align_job[0]
+        try:
+            line, _ = stream.read_line_finish_utf8(result)
+            event = json.loads(line) if line else None
+        except (GLib.Error, ValueError):
+            event = None
+        if not isinstance(event, dict):
+            self.align_job = None
+            process.wait_async(None, GameScore.reaped)
+            rows = self.prepared_songs[path][2]
+            if not self.timing.current(path, rows):
+                self.failed_alignments.add(path)
+            self.start_alignment()
+            return
+        kind = event.get("event")
+        if kind == "progress":
+            detail = ("Calage ligne par ligne" if event.get("phase") == "lines"
+                      else "Repérage de la voix dans le morceau")
+            self.show_align_status(detail, int(event.get("percent", 0)))
+        elif kind == "error":
+            self.failed_alignments.add(path)
+        elif kind == "alignment":
+            try:
+                self.accept_alignment(path, event)
+            except (OSError, ValueError, KeyError):
+                self.failed_alignments.add(path)
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
+
+    def build_timing_controls(self):
+        self.timing_menu = Gtk.MenuButton(label="Minutage", tooltip_text="Ajuster le défilement PC et TV")
+        popover = Gtk.Popover()
+        self.timing_menu.set_popover(popover)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                          margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        popover.set_child(content)
+        content.append(Gtk.Label(label="Décalage des paroles en secondes", xalign=0))
+        row = Gtk.Box(spacing=6)
+        earlier = Gtk.Button(label="Avancer")
+        later = Gtk.Button(label="Retarder")
+        self.timing_spin = Gtk.SpinButton.new_with_range(-30, 30, .5)
+        self.timing_spin.set_digits(1)
+        self.timing_spin.connect("value-changed", self.change_timing)
+        earlier.connect("clicked", lambda *_: self.timing_spin.spin(Gtk.SpinType.STEP_BACKWARD, .5))
+        later.connect("clicked", lambda *_: self.timing_spin.spin(Gtk.SpinType.STEP_FORWARD, .5))
+        row.append(earlier)
+        row.append(self.timing_spin)
+        row.append(later)
+        content.append(row)
+        reset = Gtk.Button(label="Remettre le décalage à zéro")
+        reset.connect("clicked", lambda *_: self.timing_spin.set_value(0))
+        content.append(reset)
+        self.timing_message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
+        content.append(self.timing_message)
+        return self.timing_menu
+
+    def apply_timing(self):
+        self.times = self.timing.times(self.track, self.raw_lines)
+        self.word_marks = self.timing.marks(self.track, self.raw_lines)
+        self.timing_offset = self.timing.offset(self.track)
+        self.word_times = tuple(
+            tuple(time_at_character(marks, (start + stop) / 2) + self.timing_offset
+                  for _, start, stop in text_boundaries(text)) if marks else ()
+            for marks, (_, text) in zip(self.word_marks, self.raw_lines)
+        )
+        self.word_ends = tuple(marks[-1][0] + self.timing_offset if marks else None
+                               for marks in self.word_marks)
+        # Strawberry peut lire un morceau directement, sans avoir ouvert
+        # l'éditeur de partie. Réutiliser alors le profil enregistré sur disque.
+        if self.track is not None and self.raw_lines:
+            profile = self.vocal_profiles.get(self.track)
+            if profile is None:
+                profile = cached_profile(self.track, self.raw_lines, self.times, self.word_marks)
+                if profile is not None:
+                    self.vocal_profiles[self.track] = profile
+            # Cette mesure spectrale n'affecte pas le son : le jeu utilise les stems IA.
+        self.highlight = -1
+        self.next_tv_update = 0
+        self.timing_menu.set_sensitive(bool(self.track and self.raw_lines))
+        self.syncing_offset = True
+        self.timing_spin.set_value(self.timing.offset(self.track))
+        self.syncing_offset = False
+        calibrated = self.timing.current(self.track, self.raw_lines) and self.timing.entry(self.track).get("times") is not None
+        marked = sum(bool(marks) for marks in self.word_marks)
+        lyric_lines = sum(bool(words(text)) for _, text in self.raw_lines)
+        if marked:
+            detail = f"Repères par mot sur {marked}/{lyric_lines} lignes."
+            if marked < lyric_lines:
+                detail += " Les autres lignes suivent le minutage par ligne."
+        else:
+            detail = "Réglage par rapport au calage Turbo." if calibrated else "Réglage par rapport au fichier LRC."
+        self.timing_message.set_text(detail)
+
+    def change_timing(self, spin):
+        if self.syncing_offset or self.track is None or not self.raw_lines:
+            return
+        try:
+            self.timing.set_offset(self.track, spin.get_value())
+        except OSError:
+            self.timing_message.set_text("Impossible d’enregistrer le décalage.")
+            return
+        self.apply_timing()
+
+    def start_turn(self, player):
+        if self.party.active is not None or player.song is None or not self.party_ready:
+            return
+        try:
+            vocabulary = self.prepare_song(player.song)
+            rows = self.prepared_songs[player.song.path][2]
+            current = line_signature(rows), audio_signature(player.song.path)
+        except (OSError, ValueError) as error:
+            self.players_window.message.set_text(str(error))
+            return
+        if self.validated_songs.get(player.song.path) != current:
+            self.party_ready = False
+            self.players_window.message.set_text("Le morceau a changé. Valide à nouveau la partie.")
+            self.players_window.refresh()
+            return
+        self.previous_result = player.score, player.done
+        player.score, player.done = 0, False
+        self.party.active = player
+        self.turn_phase = "preparing"
+        self.turn_tail = None
+        self.record_turn = self.players_window.record_next.get_active()
+        self.players_window.record_next.set_active(False)
+        self.turn_opened = False
+        self.turn_deadline = time.monotonic() + 45.0
+        self.game_score.set_round(vocabulary.lines, vocabulary)
+        self.players_window.message.set_text("")
+        self.players_window.refresh()
+        self.game_toggle.set_active(True)
+        self.sync_game()
+
+    def begin_playback(self, player):
+        self.turn_phase = "opening"
+        self.turn_deadline = time.monotonic() + 12.0
+
+        def opened(bus, result):
+            if player is not self.party.active or self.turn_phase != "opening":
+                return
+            try:
+                bus.call_finish(result)
+            except GLib.Error:
+                self.finish_turn(error="Impossible d’ouvrir le morceau dans Strawberry.")
+            else:
+                self.turn_opened = True
+
+        self.player_command("OpenUri", GLib.Variant("(s)", (player.song.path.as_uri(),)), opened)
+        self.refresh_game()
+
+    def observe_turn(self, playback, previous_track, previous_position, previous_duration, previous_times,
+                     previous_word_times, previous_word_ends, previous_rate, now):
+        player = self.party.active
+        if player is None:
+            return
+        song = player.song.path
+        if self.turn_phase == "opening" and self.turn_opened:
+            if self.track == song and self.rate > 0 and self.base_position < 2.0:
+                if not self.times:
+                    self.finish_turn(pause=True, error="Les paroles minutées ne sont plus disponibles.")
+                    return
+                scored = [text for position, text in zip(self.times, self.lyrics)
+                          if not self.duration or position < self.duration - 0.08]
+                if not any(words(text) for text in scored):
+                    self.finish_turn(pause=True, error="Les repères des paroles sont hors de la chanson.")
+                    return
+                vocabulary = self.game_score.vocabulary
+                if vocabulary.lines != tuple(self.lyrics):
+                    vocabulary = LyricVocabulary(self.lyrics)
+                self.game_score.set_round(scored, vocabulary)
+                if self.record_turn:
+                    start = self.updated - self.base_position / self.rate
+                    self.record_turn = self.game_score.record_turn(start, player.song.title)
+                self.turn_phase = "playing"
+            return
+        if self.turn_phase != "playing" or (self.track == song and playback != "Stopped"):
+            return
+        if self.record_turn:
+            self.game_score.record_turn()
+            self.record_turn = False
+        self.turn_phase = "finishing"
+        self.turn_deadline = now + 12.0
+        if previous_track == song and previous_duration and previous_position >= previous_duration - 1:
+            rate = previous_rate or 1.0
+            end_time = now + (previous_duration - previous_position) / rate
+            self.turn_tail = (previous_times, previous_duration, end_time,
+                              previous_word_times, previous_word_ends, rate)
+            if self.track != song and playback == "Playing":
+                self.player_command("Pause")
+
+    def advance_turn(self, now):
+        player = self.party.active
+        if player is None:
+            return
+        game = self.game_score
+        if self.turn_phase == "preparing":
+            if game.ready:
+                self.begin_playback(player)
+            elif game.process is None or now >= self.turn_deadline:
+                self.finish_turn(error=game.message or "Le micro ne s’est pas préparé.")
+        elif self.turn_phase == "opening" and now >= self.turn_deadline:
+            self.finish_turn(error="Strawberry n’a pas démarré la chanson sélectionnée.")
+        elif self.turn_phase == "playing" and game.requested and game.process is None:
+            self.finish_turn(pause=True, error=game.message or "Le moteur de score s’est arrêté.")
+        elif self.turn_phase == "finishing":
+            if self.turn_tail is not None:
+                game.flush_round(*self.turn_tail)
+            if not game.pending or now >= self.turn_deadline:
+                self.finish_turn()
+
+    def finish_turn(self, *, pause=False, error=""):
+        player = self.party.active
+        if player is None:
+            return
+        if pause and self.track == player.song.path and self.rate > 0:
+            self.player_command("Pause")
+        if self.turn_phase in ("playing", "finishing"):
+            player.score = self.game_score.score or 0
+            player.done = True
+        else:
+            player.score, player.done = self.previous_result
+        if self.record_turn:
+            self.game_score.record_turn()
+            self.record_turn = False
+        self.party.active = None
+        if player.mobile_id in self.mobile_leaving:
+            self.mobile_leaving.discard(player.mobile_id)
+            self.party.players = [p for p in self.party.players if p is not player]
+            self.mobile_players.pop(player.mobile_id, None)
+            self.party_ready = False
+        self.turn_phase = ""
+        self.turn_tail = None
+        self.game_score.set_round()
+        self.game_toggle.set_active(False)
+        self.refresh_game()
+        if self.players_window is not None:
+            self.players_window.message.set_text(error)
+            self.players_window.refresh()
+
+    def toggle_game(self, button):
+        if button.get_active():
+            self.kara_expander.set_expanded(True)
+        if not button.get_active():
+            self.finish_turn()
+            self.game_score.stop()
+        self.sync_game()
+
+    def sync_game(self):
+        playing = self.track is not None and self.times and self.rate > 0
+        if self.party.active is not None:
+            playing = (self.turn_phase in ("preparing", "opening", "finishing")
+                       or (self.turn_phase == "playing" and playing and self.track == self.party.active.song.path))
+        if self.game_toggle.get_active() and playing and not self.validating:
+            if self.turn_phase in ("", "playing") and self.game_score.vocabulary.lines != tuple(self.lyrics):
+                self.game_score.configure_voice(self.lyrics)
+            self.game_score.start()
+        else:
+            self.game_score.pause()
+            self.start_alignment()
+        self.refresh_game()
+
+    def refresh_game(self):
+        game = self.game_score
+        if not self.game_toggle.get_active():
+            self.game_status = ""
+            self.score_label.set_text("")
+            return
+        player = self.party.active
+        if player is not None:
+            new_score = game.score or 0
+            if player.score != new_score:
+                player.score = new_score
+                if self.players_window is not None:
+                    self.players_window.refresh_scores()
+        score = f"Score {game.score} %" if game.score is not None else "Score —"
+        if self.turn_phase == "opening":
+            status = "Ouverture dans Strawberry…"
+        elif self.turn_phase == "finishing":
+            status = "Calcul du score final…"
+        elif game.message:
+            status = game.message
+        elif not self.times:
+            status = "Paroles minutées nécessaires"
+        elif not self.rate:
+            status = "En pause"
+        elif game.feedback:
+            status = game.feedback
+        else:
+            status = "Micro filtré" if game.echo else "Micro actif"
+        if game.ready and game.model == "Turbo":
+            status += " · Turbo"
+        if game.recording:
+            status += " · Enregistrement du tour"
+        self.game_status = status
+        if player is None:
+            self.score_label.set_text(f"{score} · {status}")
+        else:
+            name = GLib.markup_escape_text(player.name)
+            detail = GLib.markup_escape_text(status)
+            self.score_label.set_markup(
+                f'{name} · <span foreground="{score_color(player.score)}">{player.score} %</span> · {detail}'
+            )
+
+    def mobile_event(self, action, member):
+        """Mise à jour du jeu UNIQUEMENT depuis la boucle GTK principale."""
+        if self.closed or self.receiver is None:
+            return GLib.SOURCE_REMOVE
+        token = member.get('token')
+        player = self.mobile_players.get(token)
+        if action == 'join':
+            if player is None:
+                player = Singer(member['name'], mobile_id=token)
+                self.mobile_players[token] = player
+                self.party.players.append(player)
+                self.party_ready = False
+        elif action == 'choose':
+            if player is not None and self.party.active is None and not self.validating:
+                song = self.receiver.room.song_for(member.get('song'))
+                if song is not None:
+                    try:
+                        self.prepare_song(song)
+                    except (OSError, ValueError) as error:
+                        if self.players_window is not None:
+                            self.players_window.message.set_text(
+                                f'{member["name"]} · chanson non exploitable : {error}')
+                    else:
+                        player.song = song
+                        player.score = 0
+                        player.done = False
+                        self.party_ready = False
+        elif action == 'clear':
+            if player is not None and self.party.active is None and not self.validating:
+                player.song = None
+                player.score = 0
+                player.done = False
+                self.party_ready = False
+        elif action == 'leave':
+            if player is self.party.active:
+                self.mobile_leaving.add(token)
+            elif player is not None:
+                self.party.players = [p for p in self.party.players if p is not player]
+                self.mobile_players.pop(token, None)
+                self.party_ready = False
+        if self.players_window is not None:
+            self.players_window.refresh()
+        self.next_tv_update = 0.0
+        return GLib.SOURCE_REMOVE
+
+    def remove_mobile(self, player):
+        if self.party.active is player:
+            if self.players_window is not None:
+                self.players_window.message.set_text('Termine le tour avant de retirer le joueur.')
+            return
+        if self.receiver is not None:
+            self.receiver.room.kick(player.mobile_id)
+        else:
+            self.party.players = [p for p in self.party.players if p is not player]
+            self.mobile_players.pop(player.mobile_id, None)
+            self.party_ready = False
+            if self.players_window is not None:
+                self.players_window.refresh()
+
+    def mobile_catalogue_loaded(self, future, receiver):
+        if self.closed or self.receiver is not receiver:
+            return GLib.SOURCE_REMOVE
+        try:
+            receiver.room.update_catalogue(future.result())
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.tv_address.set_text(f'Bibliothèque inaccessible : {error}')
+        return GLib.SOURCE_REMOVE
+
+    def toggle_tv(self, button):
+        if not button.get_active():
+            if self.receiver is not None:
+                self.receiver.close()
+                self.receiver = None
+                # Les identités liées aux téléphones sont valables pour cette
+                # salle uniquement. Les joueurs créés sur PC sont préservés.
+                active = self.party.active
+                self.party.players = [p for p in self.party.players
+                                      if p.mobile_id is None or p is active]
+                self.mobile_players = ({active.mobile_id: active}
+                                       if active is not None and active.mobile_id else {})
+                if active is not None and active.mobile_id:
+                    self.mobile_leaving.add(active.mobile_id)
+                self.party_ready = False
+                if self.players_window is not None:
+                    self.players_window.refresh()
+            self.tv_row.set_visible(False)
+            return
+        try:
+            self.receiver = start_receiver(
+                on_mobile=self.mobile_event,
+                reserved_names=(p.name for p in self.party.players if p.mobile_id is None))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.tv_address.set_text(str(error))
+            self.tv_copy.set_visible(False)
+        else:
+            self.tv_address.set_text(
+                f"TV : {self.receiver.url} · Joueurs : {self.receiver.join_url}")
+            if self.receiver.qr:
+                try:
+                    qr_texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(self.receiver.qr))
+                    self.tv_qr_image.set_paintable(qr_texture)
+                except GLib.Error:
+                    self.tv_qr_image.set_paintable(None)
+            else:
+                self.tv_qr_image.set_paintable(None)
+            self.tv_qr_link.set_text(self.receiver.join_url)
+            self.next_tv_update = 0.0
+            self.tv_copy.set_visible(True)
+            receiver = self.receiver
+            self.tag_reader.submit(catalogue, COLLECTION, LIBRARY.resolve()).add_done_callback(
+                lambda future: GLib.idle_add(self.mobile_catalogue_loaded, future, receiver))
+        self.tv_row.set_visible(True)
+
+    def copy_tv_url(self, _button):
+        if self.receiver is not None:
+            self.get_display().get_clipboard().set(self.receiver.join_url)
+
+    def refresh_tv_display(self, _button):
+        if self.receiver is None:
+            self.tv_address.set_text("Active d’abord Salle / TV pour actualiser l’écran.")
+            return
+        self.receiver.request_tv_reload()
+        self.tv_refresh_button.set_label("Demande envoyée ✓")
+        GLib.timeout_add(1800, self.reset_tv_refresh_button)
+
+    def reset_tv_refresh_button(self):
+        if not self.closed:
+            self.tv_refresh_button.set_label("↻ Actualiser TV")
+        return GLib.SOURCE_REMOVE
+
+    def close_tv_display(self, _button):
+        if self.receiver is None:
+            self.tv_address.set_text("Active d’abord Salle / TV pour fermer l’écran.")
+            return
+        self.receiver.request_tv_close()
+        self.tv_close_button.set_label("Fermeture demandée ✓")
+        GLib.timeout_add(1800, self.reset_tv_close_button)
+
+    def reset_tv_close_button(self):
+        if not self.closed:
+            self.tv_close_button.set_label("Fermer TV")
+        return GLib.SOURCE_REMOVE
+
+    def update_tv(self, position, now):
+        if self.receiver is None or now < self.next_tv_update:
+            return
+        self.next_tv_update = now + 0.12
+        self.receiver.room.set_mode(
+            locked=(self.validating or self.party.active is not None or self.game_score.requested),
+            game_mode=self.game_toggle.get_active() or self.party_ready,
+            current=(self.party.active.name if self.party.active is not None else self.title.get_label()))
+        connected = self.receiver.room.public_roster()
+        if self.validating and not self.preparation_only:
+            self.receiver.update({
+                "title": "Chargement de la partie", "artist": "", "score": None,
+                "lines": ["", "", "", ""], "progress": self.align_fraction, "notice": " ",
+                "status": self.align_status, "players": self.party.board(),
+                "connected": connected,
+            })
+            return
+        active = bisect_right(self.times, position) - 1
+        lines = [self.lyrics[i] if 0 <= i < len(self.lyrics) else "" for i in range(active - 1, active + 3)]
+        fraction = self.display_progress(position, active, utf16=True) if active >= 0 else 0.0
+        if self.title.get_label():
+            notice = "Paroles minutées indisponibles" if not self.times else " "
+        else:
+            notice = "En attente de Strawberry…"
+        self.receiver.update({
+            "title": self.title.get_label(), "artist": self.artist.get_label(),
+            "score": self.game_score.score, "lines": lines, "progress": fraction, "notice": notice,
+            "status": self.game_status or ("Partie prête" if self.party_ready and self.party.next_player() else ""),
+            "players": self.party.board(), "connected": connected,
+        })
+
+    def close_window(self, _window):
+        self.vocal_effect.disable()
+        self.game_toggle.set_active(False)
+        self.tv_toggle.set_active(False)
+        if self.album_import.running:
+            self.set_visible(False)
+            return True
+        self.album_import.cancel_search()
+        self.closed = True
+        if self.align_job is not None:
+            self.align_job[1].send_signal(signal.SIGTERM)
+        if self.stem_job is not None:
+            self.stem_job[1].send_signal(signal.SIGTERM)
+        for timer in self.timers:
+            GLib.source_remove(timer)
+        self.tag_reader.shutdown(wait=False, cancel_futures=True)
+        self.vocal_analyzer.shutdown(wait=False, cancel_futures=True)
+        return False
+
+    def clear_player(self):
+        self.title.set_label("")
+        self.artist.set_label("")
+        self.playback_state = 'Stopped'
+        self.media_play.set_label('▶ Lecture')
+        self.media_clock.set_text('0:00 / 0:00')
+        self.rate = 0.0
+        self.set_track(None)
+        self.sync_game()
+        self.show_empty("Lance un morceau local dans Strawberry.")
+
+    def set_track(self, track):
+        if track == self.track:
+            return
+        self.track = track
+        self.vocal_effect.set_song(track)
+        self.update_vocal_effect()
+        self.file_token = None
+        self.tag_token = None
+        self.tag_text = ""
+        self.fetch_message = ""
+        self.set_lines([])
+
+    def request_player(self):
+        if not self.polling:
+            self.polling = True
+            self.poll_started = time.monotonic()
+            self.bus.call(PLAYER, OBJECT, "org.freedesktop.DBus.Properties", "GetAll",
+                          GLib.Variant("(s)", (INTERFACE,)), GLib.VariantType.new("(a{sv})"),
+                          Gio.DBusCallFlags.NO_AUTO_START, 700, None, self.player_reply)
+        return GLib.SOURCE_CONTINUE
+
+    def player_reply(self, bus, result):
+        self.polling = False
+        if self.closed:
+            return
+        try:
+            properties, = bus.call_finish(result).unpack()
+        except GLib.Error:
+            if self.turn_phase == "playing":
+                if self.record_turn:
+                    self.game_score.record_turn()
+                    self.record_turn = False
+                self.turn_phase = "finishing"
+                self.turn_deadline = time.monotonic() + 3.0
+            self.clear_player()
+            return
+        now = time.monotonic()
+        previous_track, previous_duration, previous_times = self.track, self.duration, self.times
+        previous_word_times, previous_word_ends, previous_rate = self.word_times, self.word_ends, self.rate
+        previous_position = self.base_position + (now - self.updated) * self.rate
+        metadata = properties.get("Metadata", {})
+        title = metadata.get("xesam:title", "")
+        self.title.set_label(title)
+        self.artist.set_label(" · ".join(metadata.get("xesam:artist", [])))
+        self.base_position = properties.get("Position", 0) / 1_000_000
+        self.updated = (self.poll_started + now) / 2
+        self.duration = metadata.get("mpris:length", 0) / 1_000_000
+        playback = properties.get("PlaybackStatus", "Stopped")
+        self.playback_state = playback
+        self.media_play.set_label('⏸ Pause' if playback == 'Playing' else '▶ Lecture')
+        # Ne pas changer de chanson au milieu du tour d'un joueur.
+        navigation = self.party.active is None
+        self.media_previous.set_sensitive(navigation)
+        self.media_next.set_sensitive(navigation)
+        self.rate = properties.get("Rate", 1.0) if playback == "Playing" else 0.0
+        if self.music_window is not None:
+            self.music_window.update_current(metadata.get('mpris:trackid'), playback)
+        self.set_track(local_track(metadata.get("xesam:url")))
+        self.load_lines()
+        if self.vocal_effect.active:
+            position = self.base_position + (time.monotonic() - self.updated) * self.rate
+            self.vocal_effect.sync(self.track, position, self.rate > 0)
+        self.observe_turn(playback, previous_track, previous_position, previous_duration, previous_times,
+                          previous_word_times, previous_word_ends, previous_rate, now)
+        self.sync_game()
+
+    def load_lines(self):
+        if self.track is None:
+            self.show_empty("Lance un morceau de ~/Music dans Strawberry.", fetch=False)
+            return
+        path = self.track.with_suffix(".lrc")
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            self.file_token = None
+            if self.rows:
+                self.set_lines([])
+            if self.fetching == self.track:
+                notice = "Recherche des paroles minutées…"
+            else:
+                notice = self.fetch_message or "Les paroles minutées de ce morceau sont absentes."
+            self.show_fallback(notice)
+            return
+        except OSError:
+            self.show_lrc_error("Le fichier .lrc de ce morceau est illisible.")
+            return
+        if not stat.S_ISREG(entry.st_mode):
+            self.show_lrc_error("Le fichier .lrc doit être un fichier ordinaire.")
+            return
+        token = (path, entry.st_dev, entry.st_ino, entry.st_mtime_ns, entry.st_size)
+        if token != self.file_token:
+            self.file_token = token
+            try:
+                lines = read_lrc(path)
+            except (OSError, ValueError):
+                lines = []
+            self.set_lines(lines if any(text for _, text in lines) else [])
+        if not self.rows:
+            self.show_fallback("Le fichier .lrc de ce morceau est illisible.", fetch=False)
+
+    def show_lrc_error(self, message):
+        self.file_token = None
+        if self.rows:
+            self.set_lines([])
+        self.show_fallback(message, fetch=False)
+
+    def load_embedded(self):
+        try:
+            info = self.track.stat()
+        except OSError:
+            return ""
+        token = (self.track, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+        if self.tag_job is not None:
+            pending, future = self.tag_job
+            if future.done():
+                self.tag_job = None
+                if pending == token:
+                    self.tag_text = future.result()
+                    self.tag_token = token
+        if token == self.tag_token:
+            return self.tag_text
+        if self.tag_job is None:
+            self.tag_job = token, self.tag_reader.submit(embedded_lyrics, self.track)
+        return None
+
+    def show_fallback(self, message, *, fetch=True):
+        text = self.load_embedded()
+        if not text:
+            self.show_empty("Lecture des paroles intégrées…" if text is None else message, fetch=fetch)
+            return
+        if self.plain_label.get_text() != text or self.stack.get_visible_child_name() != "plain":
+            self.plain_label.set_text(text)
+            self.plain_scroll.get_vadjustment().set_value(0)
+        status = "Paroles non synchronisées"
+        if self.fetching == self.track or self.fetch_message or not fetch:
+            status += f" · {message}"
+        self.set_footer(status, fetch)
+        self.stack.set_visible_child_name("plain")
+
+    def set_footer(self, notice, fetch):
+        self.notice.set_text(notice)
+        self.notice.set_visible(bool(notice))
+        self.button.set_visible(fetch)
+        self.button.set_sensitive(self.fetching is None)
+        self.footer.set_visible(bool(notice) or fetch)
+
+    def show_empty(self, message, *, fetch=True):
+        self.message.set_text(message)
+        self.set_footer("", fetch and self.track is not None)
+        self.stack.set_visible_child_name("empty")
+
+    def fetch(self, _button):
+        track = self.track
+        if self.fetching is not None or track is None:
+            return
+        try:
+            process = Gio.Subprocess.new(
+                [str(Path.home() / ".local/bin/paroles-musique"), "--synchro", str(track)],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE,
+            )
+        except GLib.Error:
+            self.fetch_message = "Impossible de lancer paroles-musique."
+            self.load_lines()
+            return
+        self.fetch_message = ""
+        self.fetching = track
+        self.load_lines()
+        process.communicate_utf8_async(None, None, self.fetch_complete, track)
+
+    def fetch_complete(self, process, result, track):
+        self.fetching = None
+        if self.closed or track != self.track:
+            return
+        try:
+            _, output, _ = process.communicate_utf8_finish(result)
+        except GLib.Error:
+            output = ""
+        if not process.get_successful():
+            self.fetch_message = "La recherche a échoué. Tu peux réessayer."
+        elif "instrumental" in (output or "") and not self.tag_text:
+            self.fetch_message = "La source indique un morceau instrumental."
+        else:
+            self.fetch_message = "Aucune source n’a fourni de paroles minutées vérifiables."
+        self.load_lines()
+
+    def set_lines(self, lines):
+        for label in self.rows:
+            self.box.remove(label)
+        self.rows = []
+        self.raw_lines = lines
+        self.apply_timing()
+        self.lyrics = [text for _, text in lines]
+        if self.party.active is None:
+            if self.lyrics:
+                self.game_score.configure_voice(self.lyrics)
+            self.game_score.reset()
+        self.refresh_game()
+        self.active = -1
+        self.highlight = -1
+        for text in self.lyrics:
+            label = Gtk.Label(label=text, xalign=0.5, justify=Gtk.Justification.CENTER, wrap=True,
+                              css_classes=["lyric"])
+            self.box.append(label)
+            self.rows.append(label)
+        self.scroll.get_vadjustment().set_value(0)
+        if self.rows:
+            self.style_lines()
+            self.set_footer("", False)
+            self.stack.set_visible_child_name("lyrics")
+
+    def style_lines(self):
+        anchor = max(0, self.active)
+        for index, row in enumerate(self.rows):
+            classes = ["lyric"]
+            if index == self.active:
+                classes.append("active")
+            else:
+                distance = abs(index - anchor) + (1 if index < anchor else 0)
+                if distance >= 2:
+                    classes.append(LYRIC_FADES[min(distance - 2, len(LYRIC_FADES) - 1)])
+            row.set_css_classes(classes)
+
+    def animate(self):
+        now = time.monotonic()
+        position = self.base_position + (now - self.updated) * self.rate
+        if now >= self.media_updated:
+            self.media_updated = now + .35
+            def clock(seconds):
+                whole = max(0,int(seconds))
+                return f'{whole//60}:{whole%60:02d}'
+            self.media_clock.set_text(f'{clock(position)} / {clock(self.duration)}')
+        self.advance_turn(now)
+        if self.game_toggle.get_active() and self.turn_phase in ("", "playing"):
+            self.game_score.tick(self.times, self.duration, position, self.rate, now,
+                                 self.word_times, self.word_ends)
+        self.update_tv(position, now)
+        if not self.rows:
+            return GLib.SOURCE_CONTINUE
+        active = bisect_right(self.times, position) - 1
+        if active != self.active:
+            if self.active >= 0:
+                self.rows[self.active].set_text(self.lyrics[self.active])
+            self.active = active
+            self.highlight = -1
+            self.style_lines()
+
+        if active >= 0:
+            self.progress_line(position, active)
+            self.center_line(self.rows[active])
+        else:
+            adjustment = self.scroll.get_vadjustment()
+            adjustment.set_value(adjustment.get_value() * 0.8)
+        return GLib.SOURCE_CONTINUE
+
+    def display_progress(self, position, active, *, utf16=False):
+        text = self.lyrics[active]
+        if not text:
+            return 0.0
+        marks = self.word_marks[active] if self.word_marks else None
+        if not marks:
+            start = self.times[active]
+            end = self.times[active + 1] if active + 1 < len(self.times) else max(start + 1.0, self.duration)
+            return lyric_progress(position, start, end)
+        shown = max(0.0, min(len(text), highlighted_characters(marks, position - self.timing_offset)))
+        if utf16:
+            prefix = int(shown)
+            units = len(text[:prefix].encode("utf-16-le")) / 2
+            units += (shown - prefix) * (len(text[prefix:prefix + 1].encode("utf-16-le")) / 2)
+            return units / (len(text.encode("utf-16-le")) / 2)
+        return shown / len(text)
+
+    def progress_line(self, position, active):
+        text = self.lyrics[active]
+        count = int(self.display_progress(position, active) * len(text) + 1e-8)
+        if count != self.highlight:
+            done = GLib.markup_escape_text(text[:count])
+            pending = GLib.markup_escape_text(text[count:])
+            self.rows[active].set_markup(
+                f'<span background="#b4befe" foreground="#181825">{done}</span>{pending}'
+            )
+            self.highlight = count
+
+    def pad_lyrics(self, adjustment):
+        # La première et la dernière ligne peuvent aussi atteindre le point de lecture.
+        page = round(adjustment.get_page_size())
+        if page:
+            top = round(page * LYRIC_FOCUS)
+            if self.box.get_margin_top() != top or self.box.get_margin_bottom() != page - top:
+                self.box.set_margin_top(top)
+                self.box.set_margin_bottom(page - top)
+
+    def center_line(self, row):
+        adjustment = self.scroll.get_vadjustment()
+        found, bounds = row.compute_bounds(self.box)
+        if not found or not adjustment.get_page_size():
+            return
+        middle = bounds.get_y() + bounds.get_height() / 2
+        desired = middle + self.box.get_margin_top() - adjustment.get_page_size() * LYRIC_FOCUS
+        maximum = max(0.0, adjustment.get_upper() - adjustment.get_page_size())
+        desired = min(maximum, max(0.0, desired))
+        old = adjustment.get_value()
+        adjustment.set_value(desired if abs(desired - old) < 1 else old + (desired - old) * 0.2)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        window = self.get_active_window() or next(iter(self.get_windows()), None)
+        if window is None:
+            style = Gtk.CssProvider()
+            style.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), style,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            window = LyricsWindow(self)
+        window.present()
+
+
+if __name__ == "__main__":
+    raise SystemExit(App().run(None))

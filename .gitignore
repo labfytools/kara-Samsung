@@ -1,0 +1,37 @@
+# Runtime Tizen SDK / émulateur / environnements Python / modèles / certificats
+.runtime/
+
+# Artefacts Python/C/Tizen
+__pycache__/
+*.py[cod]
+*.o
+*.so
+*.a
+*.wgt
+*.log
+*.bak*
+bin/_kara_dtw
+**/.buildResult/
+
+# Secrets, certificats, profils, données locales
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.db
+*.sqlite
+*.sqlite3
+*.token
+*credentials*
+*secret*
+*password*
+
+# Éditeurs
+*.swp
+*.swo
+.DS_Store

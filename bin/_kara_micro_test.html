@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Kara · Test du micro</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,Arial;background:#1e1e2e;color:#cdd6f4}
+body{margin:0;padding:24px 16px;min-height:100vh}
+main{max-width:480px;margin:auto}
+h1{color:#cba6f7;font-size:1.65em}
+p{line-height:1.5}
+button{font-size:1.1rem;padding:15px 22px;border:0;border-radius:12px;background:#b4befe;color:#181825;font-weight:bold}
+button:disabled{opacity:.5}
+#stop{background:#f38ba8}
+#status,#wake{padding:12px;background:#313244;border-radius:12px;margin-top:14px}
+small{color:#a6adc8;display:block;margin-top:16px}
+</style></head><body><main>
+<h1>🎤 Kara · Micro sans fil</h1>
+<p>Ce test envoie ta voix à <b>Arch Linux</b>, puis vers la sortie audio PipeWire active. Commence avec un volume faible pour éviter le Larsen.</p>
+<p><label for="output">Sortie à comparer :</label>
+<select id="output" style="font:inherit;width:100%;padding:12px;background:#313244;color:#cdd6f4;border-radius:10px">
+<option value="default">EDENWOOD / sortie active du PC (Bluetooth)</option>
+<option value="analog">Haut-parleurs ou prise casque analogique du PC</option>
+</select></p>
+<p><label for="mic-gain">Niveau de la voix : <output id="mic-gain-value">90 %</output></label>
+<input id="mic-gain" type="range" min="0" max="100" step="5" value="90" style="width:100%">
+</p>
+<p><label for="speaker-volume">Volume de retour (PipeWire) : <output id="speaker-volume-value">160 %</output></label>
+<input id="speaker-volume" type="range" min="50" max="180" step="5" value="160" style="width:100%">
+</p>
+<p><button id="start">Activer le micro</button> <button id="stop" disabled>Couper</button></p>
+<p><button id="calibrate">Mesurer sortie audio (sans écho)</button></p>
+<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara envoie trois courtes copies indépendantes sur l’enceinte, mesure le décalage depuis les échantillons réellement captés, puis affiche médiane et dispersion. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
+<div id="status" role="status">Micro inactif.</div>
+<p><small>Le volume de retour agit sur le flux microphone uniquement, pas sur Strawberry. Commence à 160 % et baisse si tu entends de la distorsion.</small></p>
+<p><small>Capture AudioWorklet en temps réel, sans ScriptProcessor ni conversion 16 kHz. Test audio propre : pas de double amplification. Commence à 90 % et baisse si nécessaire. La musique n’est pas modifiée.</small></p>
+<div id="levels" role="status">Niveau micro : en attente…</div>
+<small>Réduction du bruit activée et gain automatique désactivé pour éviter de remonter les sons ambiants.</small>
+<small>Mode de transfert : blocs de 20 ms (moins de messages réseau, même sortie 48 kHz).</small>
+<div id="losses" role="status">Paquets audio : en attente…</div>
+<div id="timing" role="status">Mesures de latence : en attente…</div>
+<div id="startup" role="status">Activation : en attente…</div>
+<div id="latency" role="status">Réseau Wi-Fi : en attente…</div>
+<div id="stages" role="status">Diagnostic horodaté : en attente…</div>
+<div id="network" role="status">Régularité audio réseau : en attente…</div>
+<small>Diagnostic passif : comparer les pauses audio sur le téléphone et leur arrivée sur Arch. Les compteurs ne mesurent pas le retard Bluetooth et ne distinguent pas à eux seuls une pause du navigateur d’un incident Wi-Fi.</small>
+<div id="wake" role="status">Préparation du maintien de l'écran allumé…</div>
+<small>La page doit rester au premier plan. Le micro et le verrouillage de l'écran exigent une connexion HTTPS de confiance. Aucun son n'est conservé.</small>
+<script>
+'use strict';
+const $=x=>document.getElementById(x);
+const status=s=>{$('status').textContent=s};
+const wakeStatus=s=>{$('wake').textContent=s};
+const token=new URLSearchParams(location.search).get('token')||'';
+let ws=null,stream=null,context=null,processor=null,source=null,silence=null,statsTimer=null;
+let roundTrips=[], captureStart=0, sentPackets=0, clientDropped=0;
+let lastMicPacketAt=0, clientGapsOver40=0, clientGapsOver100=0, clientMaxGap=0;
+let packetSequence=0, workletAge=[], beforeSendDelay=[], clientBufferedMax=0;
+let calibrationMode=false, calibrationSamples=[], calibrationTimer=null;
+let calibrationRate=48000, temporaryVolume=null, calibrationCancelled=false;
+let calibrationSending=false, calibrationSession=null;
+let wake=null,awake=true;
+async function keepAwake(){
+ if(!awake||document.visibilityState!=='visible'||wake)return;
+ if(!window.isSecureContext||!('wakeLock' in navigator)){
+  wakeStatus('Veille non bloquée : navigateur HTTPS de confiance nécessaire.');return;
+ }
+ try{
+  const locked=await navigator.wakeLock.request('screen');
+  if(!awake||document.visibilityState!=='visible'){await locked.release();return;}
+  wake=locked;
+  wakeStatus('Écran maintenu allumé pendant le test.');
+  locked.addEventListener('release',()=>{
+   if(wake===locked)wake=null;
+   if(awake)wakeStatus('Verrou perdu : touche la page pour le réactiver.');
+  });
+ }catch(error){wakeStatus('Maintien d’écran refusé : '+error.name);}
+}
+async function stop(){
+ if(statsTimer){clearInterval(statsTimer);statsTimer=null;}
+ if(calibrationTimer){clearTimeout(calibrationTimer);calibrationTimer=null;}
+ calibrationCancelled=true;calibrationSending=false;
+ if(ws&&ws.readyState===WebSocket.OPEN&&calibrationMode){
+   ws.send('monitor:off');
+ }
+ if(calibrationMode&&temporaryVolume!==null&&ws&&ws.readyState===WebSocket.OPEN){
+   ws.send('volume:'+temporaryVolume);
+ }
+ calibrationMode=false;temporaryVolume=null;
+ $('calibrate').disabled=false;
+ $('start').disabled=false;$('stop').disabled=true;$('output').disabled=false;
+ if(processor){processor.port.onmessage=null;processor.disconnect();processor=null;}
+ if(source){source.disconnect();source=null;}
+ if(silence){silence.disconnect();silence=null;}
+ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+ if(context){await context.close().catch(()=>{});context=null;}
+ if(ws){try{ws.send('stop');ws.close()}catch(e){}ws=null;}
+ status('Micro coupé.');
+}
+async function startMic(calibration=false){
+ if(!window.isSecureContext||!navigator.mediaDevices){
+  status('Le micro exige une page HTTPS avec un certificat de confiance.');return;
+ }
+ $('start').disabled=true;$('output').disabled=true;
+ $('calibrate').disabled=true;
+ calibrationMode=calibration;calibrationCancelled=false;calibrationSending=false;calibrationSamples=[];
+ captureStart=performance.now();sentPackets=0;clientDropped=0;
+ packetSequence=0;workletAge=[];beforeSendDelay=[];clientBufferedMax=0;
+ lastMicPacketAt=0;clientGapsOver40=0;clientGapsOver100=0;clientMaxGap=0;
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({audio:{
+   echoCancellation:!calibration,noiseSuppression:!calibration,autoGainControl:false},video:false});
+  await keepAwake();
+  context=new AudioContext({latencyHint:'interactive',sampleRate:48000});
+  await context.resume();
+  ws=new WebSocket('wss://'+location.host+'/audio?token='+encodeURIComponent(token)+'&output='+encodeURIComponent($('output').value)+'&rate='+encodeURIComponent(context.sampleRate)+(calibration?'&calibration=1':''));
+  ws.binaryType='arraybuffer';
+  await new Promise((resolve,reject)=>{
+   const timeout=setTimeout(()=>reject(Error('Délai réseau dépassé')),5000);
+   ws.onmessage=event=>{
+    try{if(JSON.parse(event.data).ready){clearTimeout(timeout);resolve()}}catch(e){}
+   };
+   ws.onerror=()=>{clearTimeout(timeout);reject(Error('Connexion audio impossible'))};
+   ws.onclose=()=>{clearTimeout(timeout);reject(Error('Connexion interrompue'))};
+  });
+  await context.audioWorklet.addModule('/worklet.js?token='+encodeURIComponent(token));
+  source=context.createMediaStreamSource(stream);
+  processor=new AudioWorkletNode(context,'kara-micro',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
+  processor.port.postMessage({gain:Number($('mic-gain').value)/100});
+  processor.port.onmessage=event=>{
+    const payload=event.data.pcm;
+    const endSec=event.data.endSec;
+    if(!calibrationMode){
+      const arrived=performance.now();
+      // Both values use AudioContext's clock, avoiding wall-clock sync.
+      const ageMs=Math.max(0,(context.currentTime-endSec)*1000);
+      workletAge.push(ageMs);
+      if(workletAge.length>1200)workletAge.shift();
+      if(lastMicPacketAt){
+        const gap=arrived-lastMicPacketAt;
+        if(gap>40)clientGapsOver40++;
+        if(gap>100)clientGapsOver100++;
+        clientMaxGap=Math.max(clientMaxGap,gap);
+      }
+      lastMicPacketAt=arrived;
+    }
+    if(calibrationMode) calibrationSamples.push(new Int16Array(payload));
+    if(calibrationMode)return; // NEVER forward live microphone in calibration
+    if(ws&&ws.readyState===WebSocket.OPEN&&ws.bufferedAmount<4000){
+      // KTS1 + u32 sequence + f64 client send timestamp (milliseconds).
+      // Audio remains identical after stripping the 16-byte header on Arch.
+      const binary=new ArrayBuffer(16+payload.byteLength);
+      const header=new DataView(binary);
+      header.setUint8(0,75);header.setUint8(1,84);header.setUint8(2,83);header.setUint8(3,49);
+      header.setUint32(4,packetSequence++,true);
+      const stamp=performance.now();header.setFloat64(8,stamp,true);
+      new Uint8Array(binary,16).set(new Uint8Array(payload));
+      ws.send(binary);sentPackets++;
+      beforeSendDelay.push(performance.now()-stamp);
+      if(beforeSendDelay.length>1200)beforeSendDelay.shift();
+      clientBufferedMax=Math.max(clientBufferedMax,ws.bufferedAmount);
+    }else{clientDropped++;packetSequence++;}
+  };
+  silence=context.createGain();silence.gain.value=0;
+  source.connect(processor);processor.connect(silence);silence.connect(context.destination);
+  ws.onmessage=event=>{
+   if(typeof event.data==='string' && event.data.startsWith('pong:')){
+    const sent=Number(event.data.slice(5));
+    const rtt=performance.now()-sent;
+    if(Number.isFinite(rtt) && rtt>=0 && rtt<10000){
+      roundTrips.push(rtt);if(roundTrips.length>8)roundTrips.shift();
+      const median=[...roundTrips].sort((a,b)=>a-b)[Math.floor(roundTrips.length/2)];
+      const highest=Math.max(...roundTrips);
+      const lowest=Math.min(...roundTrips);
+      $('latency').textContent='WebSocket aller-retour : médiane '+Math.round(median)+' ms · min '+Math.round(lowest)+' ms · max '+Math.round(highest)+' ms (hors Bluetooth et capture).';
+    }
+    return;
+   }
+   try{
+    const data=JSON.parse(event.data);
+    if(data.levels){
+     const db=data.rms>0?Math.round(20*Math.log10(data.rms)):'silence';
+     $('levels').textContent='Niveau reçu : '+db+' dBFS · crêtes '+Math.round(data.peak*100)+' % · échantillons saturés : '+data.clipped;
+     $('losses').textContent='Paquets émis : '+sentPackets+' · ignorés téléphone : '+clientDropped+' · reçus Arch : '+data.rx_packets+' · perdus Arch : '+data.queue_drops+' ('+data.drop_per_sec+'/s)';
+     $('timing').textContent='Test : '+data.uptime_sec+' s · écriture PipeWire moy. '+data.write_avg_ms+' ms / max '+data.write_max_ms+' ms · écritures >10 ms : '+data.write_over_10ms+' · attente tampon '+data.queue_wait_last_ms+' ms / max '+data.queue_wait_max_ms+' ms · tampon actuel ~'+data.queue_est_ms+' ms';
+     const quantile=(v,q)=>{if(!v.length)return 0;const a=[...v].sort((x,y)=>x-y);return a[Math.floor((a.length-1)*q)];};
+     $('stages').textContent='Étapes : Worklet → JS p95 '+quantile(workletAge,.95).toFixed(1)+' ms / max '+Math.max(0,...workletAge).toFixed(1)+' ms · préparation WebSocket p95 '+quantile(beforeSendDelay,.95).toFixed(2)+' ms · tampon WebSocket max '+clientBufferedMax+' octets · transport relatif Arch p95 '+data.transport_excess_p95_ms+' ms / max '+data.transport_excess_max_ms+' ms · séquences manquantes '+data.sequence_missing+'.';
+     $('network').textContent='Audio toutes les 20 ms — Téléphone : interruptions >40 ms '+clientGapsOver40+' / >100 ms '+clientGapsOver100+' · max '+Math.round(clientMaxGap)+' ms. Arrivée Arch : intervalle p95 '+data.rx_gap_p95_ms+' ms · interruptions >40 ms '+data.rx_gaps_over_40+' / >100 ms '+data.rx_gaps_over_100+' · max '+data.rx_gap_max_ms+' ms · rafales <5 ms '+data.rx_bursts_under_5+'.';
+    }
+   }catch(e){}
+  };
+  if(calibration){
+    temporaryVolume=$('speaker-volume').value;
+    ws.send('monitor:off');
+    ws.send('volume:85');
+  }else if(ws&&ws.readyState===WebSocket.OPEN){
+    ws.send('volume:'+$('speaker-volume').value);
+  }
+  roundTrips=[];
+  statsTimer=setInterval(()=>{
+    if(ws&&ws.readyState===WebSocket.OPEN){
+      ws.send('levels');ws.send('ping:'+performance.now());
+    }
+  },650);
+  $('stop').disabled=false;
+  $('startup').textContent='Activation totale : '+Math.round(performance.now()-captureStart)+' ms (téléphone + serveur + Worklet)';
+  status('Micro actif → Arch → '+($('output').value==='analog'?'sortie analogique':'sortie PipeWire active')+'. Parle doucement.');
+  ws.onclose=()=>{if(stream)stop();};
+  if(calibration){
+    calibrationRate=context.sampleRate;
+    await runAutomaticCalibration();
+  }
+ }catch(error){await stop();status('Échec : '+error.message);}
+}
+$('start').onclick=()=>startMic(false);
+$('calibrate').onclick=()=>{
+  if(stream){$('calibration').textContent='Coupe d’abord le micro normal, puis relance la calibration.';return;}
+  startMic(true);
+};
+// Fixed pseudorandom phase-coded carrier; two recordings compare the same
+// emitted signal with Karaoke monitor disabled vs enabled.
+function makeCalibrationTone(rate){
+ const length=Math.round(rate*0.36), out=new Float32Array(length);
+ let seed=0x12f35a9b, phase=0;
+ for(let i=0;i<length;i++){
+  const chip=Math.floor(i/(rate*0.012));
+  if(i===0||Math.floor((i-1)/(rate*0.012))!==chip){
+   seed=(Math.imul(seed,1664525)+1013904223)>>>0;
+  }
+  const carrier=seed&1?1550:2350;
+  phase+=2*Math.PI*carrier/rate;
+  const fade=Math.min(1,i/(rate*.025),(length-1-i)/(rate*.025));
+  out[i]=0.22*Math.sin(phase)*Math.max(0,fade);
+ }
+ return out;
+}
+function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+function playCalibrationTone(samples){
+ const buffer=context.createBuffer(1,samples.length,context.sampleRate);
+ buffer.copyToChannel(samples,0);
+ const emitter=context.createBufferSource();emitter.buffer=buffer;
+ const volume=context.createGain();volume.gain.value=0.65;
+ emitter.connect(volume);volume.connect(context.destination);
+ emitter.onended=()=>{emitter.disconnect();volume.disconnect();};
+ emitter.start();
+}
+function flattenCalibration(packets){
+ const total=packets.reduce((sum,p)=>sum+p.length,0);
+ const array=new Float32Array(total);
+ let offset=0;
+ for(const packet of packets){
+  for(let i=0;i<packet.length;i++) array[offset+i]=packet[i]/32768;
+  offset+=packet.length;
+ }
+ return array;
+}
+function correlateTone(recording,tone,rate){
+ // Compare at 8kHz to keep analysis responsive on older phones.
+ const stride=Math.max(1,Math.round(rate/8000));
+ const segment=Math.floor(tone.length/stride);
+ const template=new Float32Array(segment);
+ for(let i=0;i<segment;i++)template[i]=tone[i*stride];
+ const signal=new Float32Array(Math.floor(recording.length/stride));
+ for(let i=0;i<signal.length;i++)signal[i]=recording[i*stride];
+ let templateEnergy=0;
+ for(const v of template)templateEnergy+=v*v;
+ const peaks=[];
+ const step=Math.max(1,Math.round(.002*rate/stride));
+ for(let offset=0;offset+segment<signal.length;offset+=step){
+  let dot=0,energy=0;
+  for(let i=0;i<segment;i++){
+   const v=signal[offset+i];dot+=v*template[i];energy+=v*v;
+  }
+  const score=dot/Math.sqrt(Math.max(1e-12,energy*templateEnergy));
+  peaks.push({ms:offset*stride*1000/rate,score});
+ }
+ return peaks;
+}
+function findCorrelationPeak(data,startMs,endMs){
+ let best=null;
+ for(const p of data){
+  if(p.ms<startMs||p.ms>endMs)continue;
+  if(!best||p.score>best.score)best=p;
+ }
+ return best;
+}
+// Only transmit a previously captured, finite reference sample to Arch.
+// Never forward the live mic during calibration: breaks acoustic feedback loop.
+function findRecordedTone(recording,rate){
+ const window=Math.round(rate*0.25), hop=Math.round(rate*0.01);
+ const from=Math.round(rate*.22), to=Math.min(recording.length-window,Math.round(rate*.9));
+ let bestOffset=-1,bestEnergy=0;
+ for(let offset=from;offset<to;offset+=hop){
+  let e=0;
+  for(let i=0;i<window;i+=8){const v=recording[offset+i];e+=v*v;}
+  if(e>bestEnergy){bestEnergy=e;bestOffset=offset;}
+ }
+ return bestOffset<0?null:{clip:recording.slice(bestOffset,bestOffset+window),energy:Math.sqrt(bestEnergy/Math.ceil(window/8))};
+}
+async function transmitRecordedClip(clip,rate){
+ const frame=Math.round(rate/50);
+ for(let offset=0;offset<clip.length;offset+=frame){
+  if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
+  const bytes=new Int16Array(frame);
+  for(let i=0;i<frame&&offset+i<clip.length;i++){
+   bytes[i]=Math.round(Math.max(-1,Math.min(1,clip[offset+i]*0.65))*32767);
+  }
+  ws.send(bytes.buffer);
+  await sleep(20);
+ }
+}
+function calibrationFrames(){
+ return calibrationSamples.reduce((sum,block)=>sum+block.length,0);
+}
+function analyzeRecordedReturn(recording,clip,rate,sendSample){
+ const response=correlateTone(recording,clip,rate);
+ // Send time is anchored in captured PCM samples, not a guessed 350 ms timeout.
+ // A postMessage frame boundary contributes up to ~20ms of uncertainty.
+ const anchor=sendSample*1000/rate;
+ const best=findCorrelationPeak(response,anchor+35,anchor+1150);
+ if(!best||best.score<0.10){
+  return {ok:false,confidence:Math.round((best?.score||0)*100),reason:'corrélation insuffisante'};
+ }
+ const delay=Math.round(best.ms-anchor);
+ if(delay<35||delay>1150){
+  return {ok:false,confidence:Math.round(best.score*100),reason:'retard hors plage'};
+ }
+ return {ok:true,delay,confidence:Math.round(best.score*100)};
+}
+function median(values){
+ const a=[...values].sort((x,y)=>x-y);
+ return a.length%2?a[(a.length-1)/2]:(a[a.length/2-1]+a[a.length/2])/2;
+}
+async function runAutomaticCalibration(){
+ const label=$('calibration');
+ const rate=context.sampleRate,tone=makeCalibrationTone(rate);
+ try{
+  // The live microphone is NEVER transmitted to the PC in calibration mode.
+  ws.send('monitor:off');
+  label.textContent='Référence : un bip sur le téléphone. Ne parle pas.';
+  await sleep(350);
+  if(calibrationCancelled)throw Error('Calibration interrompue');
+  calibrationSamples=[];
+  await sleep(350);
+  playCalibrationTone(tone);
+  await sleep(800);
+  const detected=findRecordedTone(flattenCalibration(calibrationSamples),rate);
+  calibrationSamples=[];
+  if(!detected||detected.energy<0.006){
+   await stop();
+   label.textContent='Signal direct insuffisant. Augmente légèrement le volume média du téléphone ; aucun retour enceinte déclenché.';
+   return;
+  }
+  const results=[];
+  // 3 independent bursts; clear previous captures and wait for speaker decay.
+  for(let trial=1;trial<=3;trial++){
+   if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
+   label.textContent='Mesure '+trial+'/3 : un seul signal bref sur l’enceinte, micro en écoute seule.';
+   ws.send('monitor:off');
+   await sleep(650);
+   calibrationSamples=[];
+   await sleep(400);
+   const sendSample=calibrationFrames();
+   ws.send('monitor:on');
+   await transmitRecordedClip(detected.clip,rate);
+   ws.send('monitor:off');
+   await sleep(1100);
+   const captured=flattenCalibration(calibrationSamples);
+   const result=analyzeRecordedReturn(captured,detected.clip,rate,sendSample);
+   results.push(result);
+   calibrationSamples=[];
+  }
+  const valid=results.filter(r=>r.ok);
+  const delays=valid.map(r=>r.delay);
+  const mid=delays.length?median(delays):null;
+  const spread=delays.length>=2?Math.max(...delays)-Math.min(...delays):null;
+  let verdict;
+  if(valid.length<2||spread>90){
+   verdict='Mesure non concluante : '+valid.length+'/3 signaux reconnus'+(spread!==null?', dispersion '+spread+' ms':'')+'. Essais : '+results.map(r=>r.ok?r.delay+' ms':'rejeté ('+r.confidence+' %)').join(' · ')+'. Aucune correction appliquée.';
+  }else{
+   verdict='Retard réseau + sortie estimé : médiane '+Math.round(mid)+' ms · dispersion '+spread+' ms · '+valid.length+'/3 essais valides · corrélation médiane '+Math.round(median(valid.map(r=>r.confidence)))+' %. Mesure de sortie uniquement : ne comprend pas toute la latence de capture Android. Aucune correction appliquée.';
+  }
+  await stop();
+  label.textContent=verdict;
+ }catch(error){
+  calibrationSamples=[];
+  await stop();
+  label.textContent='Calibration annulée : '+error.message;
+ }
+}
+$('speaker-volume').oninput=()=>{
+  $('speaker-volume-value').textContent=$('speaker-volume').value+' %';
+  if(ws&&ws.readyState===WebSocket.OPEN)ws.send('volume:'+$('speaker-volume').value);
+};
+$('mic-gain').oninput=()=>{
+  $('mic-gain-value').textContent=$('mic-gain').value+' %';
+  if(processor)processor.port.postMessage({gain:Number($('mic-gain').value)/100});
+};
+$('stop').onclick=stop;
+document.addEventListener('visibilitychange',()=>{
+ if(document.visibilityState==='visible')keepAwake();
+ else if(stream)stop();
+});
+document.addEventListener('pointerdown',keepAwake,{passive:true});
+window.addEventListener('pageshow',()=>{awake=true;keepAwake();});
+window.addEventListener('pagehide',()=>{awake=false;stop();if(wake)wake.release().catch(()=>{});});
+keepAwake();
+</script></main></body></html>

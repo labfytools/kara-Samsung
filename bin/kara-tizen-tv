@@ -1,0 +1,81 @@
+#!/usr/bin/python3 -B
+"""Lance la télé Tizen dans son conteneur Ubuntu et libère la dictée à la sortie."""
+from fcntl import LOCK_EX, LOCK_NB, flock
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+from _kara_voice_session import interrupted, without_dictation
+
+
+CONTAINER = "kara-tizen-tv"
+IMAGE = "localhost/kara-tizen-tv:ubuntu24"
+WORKSPACE = Path.home() / ".local/share/kara/tizen-runtime"
+
+
+def notify(message):
+    print(message, file=sys.stderr, flush=True)
+    try:
+        subprocess.run(("notify-send", "Émulateur Samsung", message), check=False, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def run_tv(display):
+    command = [
+        "podman", "run", "--rm", "--pull=never", "--name", CONTAINER,
+        "--userns=keep-id", "--network=host", "--group-add=keep-groups",
+        "--device=/dev/kvm", "--device=/dev/dri/renderD128",
+        "--env", f"DISPLAY={display}", "--env", "QT_QPA_PLATFORM=xcb",
+        "--volume", "/tmp/.X11-unix:/tmp/.X11-unix:ro",
+        "--volume", f"{WORKSPACE}:/home/ubuntu:rw",
+        IMAGE, "bash", "/home/ubuntu/launch-tv.sh",
+    ]
+    log = WORKSPACE / "emulateur.log"
+    with log.open("w") as output:
+        with subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True) as process:
+            try:
+                return process.wait()
+            finally:
+                if process.poll() is None:
+                    try:
+                        subprocess.run(("podman", "stop", "-t", "5", CONTAINER),
+                                       capture_output=True, timeout=12)
+                    finally:
+                        if process.poll() is None:
+                            process.terminate()
+
+
+def main():
+    display = os.environ.get("DISPLAY")
+    if not display:
+        notify("Ouvre la session graphique avant de lancer la télé virtuelle.")
+        return 1
+    if not (WORKSPACE / "launch-tv.sh").is_file():
+        notify("La télé virtuelle est en cours de préparation.")
+        return 1
+
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    try:
+        with (runtime / "kara-tizen-tv.lock").open("a") as lock:
+            try:
+                flock(lock, LOCK_EX | LOCK_NB)
+            except BlockingIOError:
+                notify("La télé virtuelle est déjà ouverte.")
+                return 0
+            with without_dictation(notify=lambda kind, msg: notify(msg) if kind == "error" else None):
+                code = run_tv(display)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        notify(f"Lancement impossible · {error}")
+        return 1
+    if code:
+        notify(f"L’émulateur s’est arrêté. Journal dans {WORKSPACE / 'emulateur.log'}.")
+    return code
+
+
+if __name__ == "__main__":
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, interrupted)
+    raise SystemExit(main())

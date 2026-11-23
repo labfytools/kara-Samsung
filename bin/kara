@@ -1,0 +1,713 @@
+#!/usr/bin/python3 -B
+"""Prépare un album YouTube Music ou complète la bibliothèque partagée."""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass
+from fcntl import LOCK_EX, LOCK_NB, flock
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+from tempfile import TemporaryDirectory, mkdtemp
+from threading import Event, Lock, RLock
+import time
+from unicodedata import normalize
+from urllib.parse import parse_qs, urlsplit
+
+from _musique_oz import INBOX, SHARED_LIBRARY, audio_files
+
+BIN = Path(__file__).resolve().parent
+CATALOGUE_PYTHON = Path.home() / ".local/share/kara/catalogue/bin/python"
+CATALOGUE = BIN / "_kara_catalogue.py"
+DOWNLOAD_WORKERS = 20
+YT_COMMAND = ("yt-dlp", "--cookies-from-browser", "firefox", "--yes-playlist")
+
+
+YT_PROGRESS = (
+    "--no-simulate", "--newline", "--progress", "--progress-delta", "0.35", "--color", "never",
+    "--print", "before_dl:KARA_ITEM %(playlist_index,playlist_autonumber|1)d %(playlist_count,n_entries|0)d %(title)j",
+    "--progress-template",
+    "download:KARA_BYTES %(info.playlist_index,info.playlist_autonumber|1)d "
+    "%(info.playlist_count,info.n_entries|0)d %(progress.downloaded_bytes|0)d "
+    "%(progress.total_bytes,progress.total_bytes_estimate|0)d %(progress.status|unknown)s",
+    "--progress-template",
+    "postprocess:KARA_CONVERT %(info.playlist_index,info.playlist_autonumber|1)d %(progress.status|unknown)s",
+    "--print", "after_move:KARA_DONE %(playlist_index,playlist_autonumber|1)d",
+)
+
+
+class ImportProgress:
+    def __init__(self, report=None):
+        self.report = report
+        self.total = 0
+        self.titles = {}
+        self.download_fraction = 0.0
+        self.track_progress = {}
+        self.selected = None
+        self.workers = 1
+        self.transferring = set()
+        self.download_lock = Lock()
+        self.slot_notice = False
+        self.imported = 0
+        self.skipped = ""
+        self.failures = []
+        self.lyrics_added = 0
+        self.lyrics_synced = 0
+        self.cover_counts = (0, 0)
+
+    def emit(self, message, fraction=None, *, event="progress"):
+        if self.report is not None:
+            self.report(message, fraction)
+            return
+        print(json.dumps({"event": event, "message": message, "fraction": fraction},
+                         ensure_ascii=False), flush=True)
+
+    def track_status(self, verb, index, finished=0.0):
+        label = f"{verb} · piste {index}"
+        if self.total:
+            label += f"/{self.total}"
+        if index in self.titles:
+            label += f" — {self.titles[index]}"
+        if self.workers > 1:
+            label = f"{len(self.transferring)}/{self.workers} transferts actifs · {label}"
+        if self.selected:
+            self.track_progress[index] = max(self.track_progress.get(index, 0.0), finished)
+            measured = sum(self.track_progress.get(position, 0.0) for position in self.selected)
+            self.download_fraction = 0.74 * measured / len(self.selected)
+        elif self.total:
+            measured = 0.74 * min(1.0, (index - 1 + finished) / self.total)
+            self.download_fraction = max(self.download_fraction, measured)
+        self.emit(label, self.download_fraction if self.selected or self.total else None)
+
+    def yt_line(self, line):
+        marker, _, payload = line.partition(" ")
+        try:
+            if marker == "KARA_ITEM":
+                index, total, title = payload.split(maxsplit=2)
+                index = max(1, int(index))
+                self.total = max(self.total, int(total))
+                title = " ".join(str(json.loads(title) or "").split())[:160]
+                if title:
+                    self.titles[index] = title
+                self.track_status("Téléchargement", index)
+            elif marker == "KARA_BYTES":
+                index, total, downloaded, size, status = payload.split()
+                index = max(1, int(index))
+                self.total = max(self.total, int(total))
+                estimate = max(0.0, min(1.0, int(downloaded) / int(size))) if int(size) > 0 else 0.0
+                if status == "finished":
+                    self.transferring.discard(index)
+                    self.track_status("Préparation de l’audio", index, 0.94)
+                elif status == "downloading":
+                    self.transferring.add(index)
+                    self.track_status("Téléchargement", index, estimate * 0.92)
+            elif marker == "KARA_CONVERT":
+                index, status = payload.split()
+                if status != "finished":
+                    self.track_status("Préparation de l’audio", int(index), 0.95)
+            elif marker == "KARA_DONE":
+                index = int(payload)
+                self.transferring.discard(index)
+                self.track_status("Piste enregistrée", index, 1.0)
+        except (ValueError, IndexError):
+            return
+
+    def finish(self, code, reason=""):
+        if not code and self.skipped:
+            self.emit(self.skipped, 1.0, event="skip")
+            return
+        if not code:
+            message = f"Import terminé · {self.imported} piste(s) ajoutée(s)."
+        elif self.imported:
+            detail = reason or ", ".join(label for label, _ in self.failures)
+            message = f"{self.imported} piste(s) importée(s) · enrichissement ou import incomplet."
+            if detail:
+                message += f" {detail}"
+        else:
+            detail = reason or next((error for _, error in self.failures if error), "")
+            message = f"Import impossible · {detail}" if detail else "Aucune piste complète à importer."
+        self.emit(message, 1.0 if not code else None, event="success" if not code else "failure")
+
+
+def run(label, command, *, progress=None, fraction=None, download=False, announce=True,
+        total=0, unit="pistes traitées", span=0.0):
+    if announce:
+        if progress is None:
+            print(f"\n{label}", flush=True)
+        else:
+            progress.emit(label, fraction)
+    env = None if download else {**os.environ, "KARA_SHARED_WAIT": "suivi" if progress else "texte"}
+    if progress is None:
+        return subprocess.run(command, env=env).returncode
+    error = ""
+    processed = 0
+    active = None
+
+    def report_activity():
+        activity = f"{active[0]}/{active[1]} en cours · " if active is not None else ""
+        progress.emit(f"{label} · {activity}{processed}/{total} {unit}", fraction + span * processed / total)
+
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          encoding="utf-8", errors="replace", env=env) as process:
+        for raw in process.stdout:
+            line = raw.strip()
+            if line == "KARA_ATTENTE_BIBLIOTHEQUE":
+                progress.emit(f"En attente de la bibliothèque · {label}", fraction)
+                continue
+            if line == "KARA_BIBLIOTHEQUE_DISPONIBLE":
+                progress.emit(label, fraction)
+                continue
+            if download:
+                with progress.download_lock:
+                    progress.yt_line(line)
+            if line.startswith("KARA_TOTAL "):
+                count = line.removeprefix("KARA_TOTAL ").strip()
+                if count.isdecimal():
+                    total = int(count)
+                    if total:
+                        report_activity()
+                continue
+            if line.startswith("KARA_POCHETTES "):
+                counts = line.split()[1:]
+                if len(counts) == 2 and all(value.isdecimal() for value in counts):
+                    progress.cover_counts = (int(counts[0]), int(counts[1]))
+                continue
+            if total and line.startswith("KARA_ACTIVITE "):
+                parts = line.split()
+                if len(parts) == 3 and all(part.isdecimal() for part in parts[1:]):
+                    amount, capacity = map(int, parts[1:])
+                    if 0 <= amount <= capacity:
+                        active = amount, capacity
+                        report_activity()
+                continue
+            if total and " · " in line:
+                processed = min(total, processed + 1)
+                report_activity()
+            if label == "Paroles pour Strawberry" and " · paroles intégrées · " in line:
+                progress.lyrics_added += 1
+            if label == "Paroles synchronisées pour le karaoké" and " · paroles synchronisées · fichier .lrc · " in line:
+                progress.lyrics_synced += 1
+            if line.startswith("ERROR:"):
+                error = line.removeprefix("ERROR:").strip()
+            elif " · erreur :" in line:
+                error = line.partition(" · erreur :")[2].strip()
+        result = process.wait()
+    if result:
+        with progress.download_lock:
+            progress.failures.append((label, error[:220]))
+    return result
+
+
+def fetch_covers(cover_args, progress, *, start, span):
+    cover_count = len(cover_args) - 1 if cover_args[:1] == ["--"] else 0
+    activity = ["--suivi-activite"] if progress else []
+    return run("Pochettes", [str(BIN / "musique-pochettes"), "--en-ligne",
+                           "--bibliotheque", str(SHARED_LIBRARY), *activity, *cover_args],
+               progress=progress, fraction=start, total=cover_count, unit="albums traités", span=span)
+
+
+def enrich(cover_args, lyric_args, progress=None):
+    covers = fetch_covers(cover_args, progress, start=0.82, span=0.06)
+    lyrics = fetch_lyrics(lyric_args, progress, start=0.89, synced_start=0.95)
+    return int(any((covers, lyrics)))
+
+
+def fetch_lyrics(lyric_args, progress, *, start, synced_start):
+    activity = ["--suivi-activite"] if progress else []
+    base = [str(BIN / "paroles-musique"), "--bibliotheque", str(SHARED_LIBRARY), *activity]
+    track_count = len(lyric_args) - 1 if lyric_args[:1] == ["--"] else 0
+    lyrics = run("Paroles pour Strawberry", [*base, *lyric_args], progress=progress, fraction=start,
+                 total=track_count, span=synced_start - start)
+    timed = run("Paroles synchronisées pour le karaoké", [*base, "--synchro", *lyric_args],
+                progress=progress, fraction=synced_start, total=track_count, span=0.99 - synced_start)
+    return int(any((lyrics, timed)))
+
+
+def find_missing_lyrics(progress=None):
+    if not SHARED_LIBRARY.is_dir():
+        raise ValueError(f"Bibliothèque partagée introuvable : {SHARED_LIBRARY}")
+    code = fetch_lyrics(["--tout"], progress, start=0.0, synced_start=0.5)
+    if progress:
+        message = (f"Recherche terminée · {progress.lyrics_added} piste(s) enrichie(s) · "
+                   f"{progress.lyrics_synced} fichier(s) .lrc ajouté(s).")
+        if code:
+            detail = next((error for _, error in progress.failures if error), "")
+            message += f" Erreur pendant la recherche{f' · {detail}' if detail else '.'}"
+        progress.emit(message, 1.0, event="failure" if code else "success")
+    return code
+
+
+def find_missing_covers(progress=None):
+    if not SHARED_LIBRARY.is_dir():
+        raise ValueError(f"Bibliothèque partagée introuvable : {SHARED_LIBRARY}")
+    code = fetch_covers(["--manquantes"], progress, start=0.0, span=1.0)
+    if progress:
+        added, unresolved = progress.cover_counts
+        message = (f"Recherche terminée · {added} pochette(s) ajoutée(s) · "
+                   f"{unresolved} album(s) encore sans pochette.")
+        if code:
+            detail = next((error for _, error in progress.failures if error), "")
+            message += f" Erreur pendant la recherche{f' · {detail}' if detail else '.'}"
+        progress.emit(message, 1.0, event="failure" if code else "success")
+    return code
+
+
+def revise():
+    if not SHARED_LIBRARY.is_dir():
+        raise SystemExit(f"Bibliothèque partagée introuvable : {SHARED_LIBRARY}")
+    print(f"Révision de {SHARED_LIBRARY}", flush=True)
+    return enrich([], ["--tout"])
+
+
+def album_preflight(url, root):
+    parsed = urlsplit(url)
+    playlist = parse_qs(parsed.query).get("list", [""])[0]
+    if not parsed.path.startswith("/browse/MPRE") and not playlist.startswith("OLAK5uy_"):
+        return None
+    if not CATALOGUE_PYTHON.is_file() or not CATALOGUE.is_file():
+        raise ValueError("La recherche d’albums de kara est indisponible.")
+    try:
+        result = subprocess.run(
+            [str(CATALOGUE_PYTHON), "-B", str(CATALOGUE), "preparer", url, str(root)],
+            capture_output=True, encoding="utf-8", timeout=70,
+        )
+        report = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise ValueError("Impossible de vérifier l’album dans la collection.") from error
+    if result.returncode:
+        raise ValueError(report.get("error") or "Impossible de vérifier l’album dans la collection.")
+    return report["data"]
+
+
+def playlist_positions(url, album):
+    if "list" not in parse_qs(urlsplit(url).query):
+        return None
+    try:
+        result = subprocess.run(
+            [*YT_COMMAND, "--flat-playlist", "--skip-download", "--color", "never",
+             "--print", "%(playlist_index)j %(id)j %(title)j", "--", url],
+            capture_output=True, encoding="utf-8", timeout=25,
+        )
+        if result.returncode:
+            return None
+        entries = {}
+        decoder = json.JSONDecoder()
+        for line in result.stdout.splitlines():
+            position, _, rest = line.partition(" ")
+            if not position.isdecimal():
+                return None
+            video, end = decoder.raw_decode(rest)
+            title = json.loads(rest[end:].lstrip())
+            if not isinstance(video, str) or not isinstance(title, str) or int(position) in entries:
+                return None
+            entries[int(position)] = (video, title)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if not entries:
+        return None
+
+    tracks = (album or {}).get("tracks") or []
+    if not tracks or not any(track["present"] for track in tracks):
+        return sorted(entries)
+
+    def title_key(value):
+        folded = " ".join(normalize("NFKC", value).casefold().replace("’", "'").split())
+        # YouTube Music peut ajouter les crédits d’invités après le titre du morceau.
+        return re.sub(r"\s*[\[(](?:avec|feat\.?|ft\.?|featuring|with)\s+[^)\]]+[\])]$", "", folded)
+
+    same_order = sorted(entries) == list(range(1, len(tracks) + 1)) and all(
+        track["id"] == entries[index][0] or title_key(track["title"]) == title_key(entries[index][1])
+        for index, track in enumerate(tracks, 1)
+    )
+    if same_order:
+        return [index for index, track in enumerate(tracks, 1) if not track["present"]]
+
+    # Si les ordres divergent, seuls les identifiants présents sont certains.
+    known_ids = {track["id"] for track in tracks if track["present"] and track["id"]}
+    return [index for index in sorted(entries) if entries[index][0] not in known_ids]
+
+
+def download_audio(url, album, batch, progress):
+    positions = playlist_positions(url, album)
+    if positions == []:
+        if progress:
+            progress.skipped = f"Les pistes de cette playlist sont déjà dans la collection · {album['title']}."
+        else:
+            print(f"Les pistes de cette playlist sont déjà dans la collection · {album['title']}.", flush=True)
+        return None
+    worker_count = min(DOWNLOAD_WORKERS, len(positions)) if positions else 1
+    if progress:
+        progress.selected = tuple(positions) if positions else None
+        progress.workers = worker_count
+    if worker_count > 1:
+        label = f"Téléchargement via Firefox · {worker_count} pistes en parallèle"
+        if progress:
+            progress.emit(label)
+        else:
+            print(f"\n{label}", flush=True)
+    def group(indices):
+        return download_group(url, batch, indices, progress, announce=worker_count == 1,
+                              parallel=worker_count > 1)
+
+    groups = download_groups(positions)
+    if worker_count == 1:
+        return group(groups[0])
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        codes = list(pool.map(group, groups))
+    return next((code for code in codes if code), 0)
+
+
+@contextmanager
+def transfer_slot(inbox, progress):
+    directory = inbox / ".kara-transferts"
+    directory.mkdir(mode=0o770, exist_ok=True)
+    while True:
+        for index in range(DOWNLOAD_WORKERS):
+            with (directory / str(index)).open("a") as handle:
+                try:
+                    flock(handle, LOCK_EX | LOCK_NB)
+                except BlockingIOError:
+                    continue
+                yield
+                return
+        if progress:
+            with progress.download_lock:
+                if not progress.slot_notice:
+                    progress.slot_notice = True
+                    progress.emit("En attente d’une place de téléchargement…")
+        time.sleep(0.15)
+
+
+def download_group(url, batch, indices, progress, *, announce, parallel):
+    label = "Téléchargement via Firefox"
+    options = [
+        *YT_COMMAND, "--abort-on-error",
+        "-f", "bestaudio", "-x", "--audio-format", "best", "--embed-metadata",
+        "--parse-metadata", "%(album,playlist_title)s:%(meta_album)s",
+        "--parse-metadata", "%(track_number,playlist_index)s:%(meta_track)s",
+        "-P", str(batch), "-o", "%(playlist_index)02d - %(title).150B [%(id)s].%(ext)s",
+        *(YT_PROGRESS if progress else ("--newline",) if parallel else ()),
+    ]
+    selection = ["--playlist-items", ",".join(map(str, indices))] if indices else []
+    try:
+        with transfer_slot(batch.parent, progress):
+            return run(label, [*options, *selection, "--", url], progress=progress, download=True,
+                       announce=announce)
+    finally:
+        if progress and indices:
+            with progress.download_lock:
+                progress.transferring.difference_update(indices)
+
+
+def download_groups(positions):
+    if not positions:
+        return [None]
+    count = min(DOWNLOAD_WORKERS, len(positions))
+    return [positions[offset::count] for offset in range(count)]
+
+def prepare(url, progress=None):
+    root = SHARED_LIBRARY
+    inbox = root / INBOX
+    if not inbox.is_dir():
+        raise SystemExit(f"Dossier de réception introuvable : {inbox}")
+    if progress:
+        progress.emit("Vérification de l’album dans la collection…")
+    album = album_preflight(url, root)
+    if album:
+        if album["present"]:
+            message = f"Déjà dans la collection · {album['title']}."
+            if progress:
+                progress.skipped = message
+            else:
+                print(message, flush=True)
+            return 0
+        url = album["url"]
+    batch = new_batch(inbox)
+    try:
+        download = download_audio(url, album, batch, progress)
+        if download is None:
+            return 0
+        return import_audio(batch, download, progress, (album or {}).get("artist"))
+    finally:
+        close_batch(batch, progress)
+
+
+def new_batch(inbox):
+    batch = Path(mkdtemp(dir=inbox, prefix=".kara-"))
+    batch.chmod(0o770)
+    return batch
+
+
+def sort_audio(batch, download, progress, album_artist=None):
+    root = SHARED_LIBRARY
+    if not any(audio_files(batch)):
+        if progress is None:
+            print("Aucune piste complète à importer.", flush=True)
+        return download or 1, []
+    with TemporaryDirectory(prefix="kara-rapport-") as temporary:
+        report = Path(temporary) / "pistes.json"
+        credit = ["--artiste-album", album_artist] if album_artist else []
+        sort = run("Tri dans l’audiothèque partagée",
+                   [str(BIN / "musique-tri"), "--rapport", str(report), *credit, str(batch)],
+                   progress=progress, fraction=0.76)
+        tracks = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else []
+    if progress:
+        progress.imported = len(tracks)
+    return int(any((download, sort, not tracks))), tracks
+
+
+def enrich_tracks(tracks, progress):
+    albums = sorted({str(Path(track).parent) for track in tracks})
+    result = enrich(["--", *albums], ["--", *tracks], progress)
+    if progress is None:
+        print(f"\n{len(tracks)} piste(s) dans {', '.join(str(Path(album).relative_to(SHARED_LIBRARY)) for album in albums)}.",
+              flush=True)
+    return result
+
+
+def import_audio(batch, download, progress, album_artist=None):
+    code, tracks = sort_audio(batch, download, progress, album_artist)
+    enrichment = enrich_tracks(tracks, progress) if tracks else 0
+    return int(any((code, enrichment)))
+
+
+def close_batch(batch, progress):
+    if any(batch.iterdir()):
+        visible = batch.with_name(batch.name.removeprefix("."))
+        batch.rename(visible)
+        if progress is None:
+            print(f"Fichiers restants dans {visible}.", flush=True)
+    else:
+        batch.rmdir()
+
+
+@dataclass
+class BatchAlbum:
+    url: str
+    title: str
+    positions: list[int] | None = None
+    artist: str | None = None
+    folder: Path | None = None
+    progress: ImportProgress | None = None
+    fraction: float = 0.0
+    status: str = ""
+    error: str = ""
+    download_code: int = 0
+
+
+def plan_album(item, root, stop):
+    if stop.is_set():
+        return
+    try:
+        album = album_preflight(item.url, root)
+        if album:
+            item.title = album["title"] or item.title
+            item.artist = album.get("artist")
+            item.url = album["url"]
+            if album["present"]:
+                item.status = "present"
+                return
+        item.positions = playlist_positions(item.url, album)
+        if item.positions == []:
+            item.status = "present"
+    except (OSError, ValueError) as error:
+        item.status = "failure"
+        item.error = str(error)
+
+
+def prepare_batch(urls, progress, stop):
+    root = SHARED_LIBRARY
+    inbox = root / INBOX
+    if not inbox.is_dir():
+        raise ValueError(f"Dossier de réception introuvable : {inbox}")
+    items = [BatchAlbum(url, f"Album {index}") for index, url in enumerate(dict.fromkeys(urls), 1)]
+    lock = RLock()
+    downloading = False
+    enrichment_failed = False
+
+    def report(item, message, fraction=None):
+        with lock:
+            if fraction is not None:
+                item.fraction = max(item.fraction, fraction)
+            total = sum(album.fraction for album in items) / len(items)
+            if downloading:
+                active = sum(len(album.progress.transferring) for album in items if album.progress)
+                message = f"{active}/{DOWNLOAD_WORKERS} transferts actifs · {item.title} · {message}"
+            else:
+                message = f"{item.title} · {message}"
+            progress.emit(message, total)
+
+    def transfer(job):
+        item, indices = job
+        try:
+            with lock:
+                if item.folder is None:
+                    if stop.is_set():
+                        return
+                    item.folder = new_batch(inbox)
+            code = download_group(item.url, item.folder, indices, item.progress, announce=False, parallel=True)
+        except OSError as error:
+            with lock:
+                item.error = str(error)
+            code = 1
+        finally:
+            if not indices and item.progress:
+                with lock:
+                    item.progress.transferring.clear()
+        if code:
+            with lock:
+                item.download_code = code
+
+    try:
+        progress.emit(f"Vérification des {len(items)} albums dans la collection…", 0.0)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(lambda item: plan_album(item, root, stop), items))
+
+        tasks = []
+        seen = set()
+        for item in items:
+            if item.status in {"present", "failure"}:
+                item.fraction = 1.0
+                continue
+            if item.url in seen:
+                item.status = "duplicate"
+                item.fraction = 1.0
+                continue
+            seen.add(item.url)
+            item.progress = ImportProgress(lambda message, fraction, album=item: report(album, message, fraction))
+            item.progress.download_lock = lock
+            item.progress.selected = tuple(item.positions) if item.positions else None
+            tasks.extend((item, indices) for indices in download_groups(item.positions))
+
+        if not stop.is_set() and tasks:
+            downloading = True
+            progress.emit(f"Préparation du téléchargement · jusqu’à {DOWNLOAD_WORKERS} transferts simultanés")
+            with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+                list(pool.map(transfer, tasks))
+            downloading = False
+
+        received = []
+        tracks = set()
+        for item in items:
+            if item.folder is None:
+                continue
+            report(item, "Pistes reçues, préparation de l’import", 0.74)
+            try:
+                code, imported = sort_audio(item.folder, item.download_code, item.progress, item.artist)
+            except (OSError, ValueError) as error:
+                item.error = str(error)
+                code, imported = 1, []
+            item.status = "failure" if code else "imported"
+            if imported:
+                received.append(item)
+                tracks.update(imported)
+            report(item, "Pistes classées" if not code else "Import incomplet ou en échec", 0.81 if imported else 1.0)
+
+        if tracks:
+            def enrichment_progress(message, fraction):
+                if fraction is not None:
+                    for item in received:
+                        item.fraction = max(item.fraction, fraction)
+                progress.emit(message, sum(item.fraction for item in items) / len(items))
+
+            enrichment_failed = bool(enrich_tracks(sorted(tracks), ImportProgress(enrichment_progress)))
+            for item in received:
+                item.fraction = 1.0
+    finally:
+        for item in items:
+            if item.folder is not None:
+                close_batch(item.folder, item.progress)
+
+    added = sum(item.status == "imported" for item in items)
+    present = sum(item.status == "present" for item in items)
+    duplicates = sum(item.status == "duplicate" for item in items)
+    failures = [item for item in items if item.status == "failure"]
+    pending = sum(not item.status for item in items)
+    summary = [f"{added} album(s) importé(s)", f"{present} déjà en collection"]
+    if duplicates:
+        summary.append(f"{duplicates} lien(s) en double")
+    if pending:
+        summary.append(f"{pending} arrêté(s) avant téléchargement")
+    if failures:
+        first = failures[0]
+        detail = first.error
+        if not detail and first.progress:
+            detail = next((error for _, error in first.progress.failures if error), "")
+        summary += [f"{len(failures)} échec(s)", f"{first.title} · {detail}" if detail else first.title]
+    if enrichment_failed:
+        summary.append("pochettes ou paroles incomplètes après import")
+    fraction = sum(item.fraction for item in items) / len(items)
+    failed = bool(failures) or enrichment_failed
+    progress.emit(" · ".join(summary), fraction, event="failure" if failed else "success")
+    return int(failed)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("url", nargs="?", help="lien de l’album ou de sa playlist YouTube Music")
+    mode.add_argument("--lot", nargs="+", help=argparse.SUPPRESS)
+    mode.add_argument("--revision", action="store_true",
+                      help="recherche les pochettes et les paroles manquantes dans toute la bibliothèque")
+    mode.add_argument("--paroles-manquantes", action="store_true",
+                      help="cherche uniquement les paroles absentes de la bibliothèque")
+    mode.add_argument("--pochettes-manquantes", action="store_true",
+                      help="cherche uniquement les pochettes absentes de la bibliothèque")
+    parser.add_argument("--suivi-json", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.suivi_json and args.revision:
+        parser.error("--suivi-json demande un lien d’album")
+    if args.lot and not args.suivi_json:
+        parser.error("--lot demande --suivi-json")
+    progress = ImportProgress() if args.suivi_json else None
+    for url in args.lot or ([args.url] if args.url is not None else []):
+        try:
+            parsed = urlsplit(url)
+            valid = parsed.scheme == "https" and parsed.hostname in {
+                "music.youtube.com", "www.youtube.com", "youtube.com", "youtu.be",
+            }
+        except ValueError:
+            valid = False
+        if not valid:
+            message = "Lien HTTPS YouTube Music ou YouTube attendu."
+            if progress:
+                progress.finish(2, message)
+                return 2
+            parser.error(message)
+    os.umask(0o007)
+    maintenance = (find_missing_lyrics if args.paroles_manquantes else
+                   find_missing_covers if args.pochettes_manquantes else None)
+    if progress:
+        try:
+            if maintenance:
+                return maintenance(progress)
+            if args.lot:
+                stop = Event()
+                signal.signal(signal.SIGUSR1, lambda *_: stop.set())
+                return prepare_batch(args.lot, progress, stop)
+            result = prepare(args.url, progress)
+        except (SystemExit, OSError, ValueError) as error:
+            progress.finish(1, str(error))
+            return 1
+        except KeyboardInterrupt:
+            progress.finish(130, "Import interrompu.")
+            return 130
+        progress.finish(result)
+        return result
+    try:
+        if maintenance:
+            return maintenance()
+        return revise() if args.revision else prepare(args.url)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

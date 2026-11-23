@@ -1,0 +1,103 @@
+#!/usr/bin/python3 -B
+"""Vérifie le jumelage et l’affichage de l’application Samsung en local."""
+from errno import EADDRINUSE
+import importlib.util
+import os
+from pathlib import Path
+from secrets import token_hex
+from shutil import which
+import sys
+
+home = Path.home()
+if importlib.util.find_spec("selenium") is None:
+    existing_python = home / ".cache/trainlog/web-e2e-venv-v1/bin/python"
+    if existing_python.is_file() and Path(sys.executable) != existing_python:
+        os.execv(existing_python, [str(existing_python), "-B", str(Path(__file__).resolve())])
+    raise SystemExit("Ce test demande Selenium pour Python.")
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+
+sys.path.insert(0, str(home / ".local/bin"))
+from _kara_tv import Receiver, lan_address
+
+app = home / ".local/share/kara/samsung-tv/index.html"
+host = lan_address()
+code = token_hex(4)
+options = Options()
+options.add_argument("-headless")
+options.set_preference("network.proxy.type", 0)
+firefox_driver = which("geckodriver")
+if not firefox_driver:
+    cached = sorted((home / ".cache/selenium/geckodriver/linux64").glob("*/geckodriver"))
+    if not cached:
+        raise SystemExit("Ce test demande geckodriver.")
+    firefox_driver = str(cached[-1])
+service = Service(firefox_driver)
+driver = None
+try:
+    receiver = Receiver(host, b"", port=8765, code=code)
+except OSError as error:
+    if error.errno != EADDRINUSE:
+        raise
+    raise SystemExit("Le port 8765 est occupé. Ferme le mode TV de Paroles Strawberry, puis relance ce test.") from error
+
+def payload(score, line, progress):
+    return {"title":"Piste de test", "artist":"Artiste de test", "score":score,
+            "lines":["Ligne précédente",line,"Ligne suivante",""],"progress":progress}
+
+def field(name):
+    return driver.find_element(By.ID, name)
+
+def render(text, score):
+    wait.until(lambda _: field("score").text == f"{score} %")
+    assert field("current").text == text, field("current").text
+
+try:
+    receiver.update(payload(42,"Première ligne",.42))
+    driver = webdriver.Firefox(options=options, service=service)
+    wait = WebDriverWait(driver, 12)
+    driver.set_window_size(1920, 1080)
+    driver.get(app.as_uri())
+    wait.until(lambda _: driver.switch_to.active_element.get_attribute("id") == "code")
+    field("code").send_keys(Keys.ARROW_UP)
+    assert driver.switch_to.active_element.get_attribute("id") == "pc"
+    field("pc").clear()
+    field("pc").send_keys(host, Keys.ARROW_DOWN)
+    assert driver.switch_to.active_element.get_attribute("id") == "code"
+    wrong = "00000000" if code != "00000000" else "11111111"
+    field("code").send_keys(wrong)
+    field("join").click()
+    wait.until(lambda _: "Vérifie le code" in field("hint").text)
+    print("Télécommande simulée et rejet d’un code erroné : OK",flush=True)
+    field("code").clear()
+    field("code").send_keys(code)
+    field("join").click()
+    render("Première ligne",42)
+    print("Lancement des fichiers du paquet et jumelage réel via le réseau : OK",flush=True)
+    receiver.update(payload(87,"La ligne et le score changent",.87))
+    render("La ligne et le score changent",87)
+    assert driver.execute_script("return document.getElementById('fill').style.width") == "87%"
+    driver.set_window_size(960, 540)
+    assert driver.execute_script("return document.documentElement.scrollWidth <= innerWidth")
+    driver.refresh()
+    render("La ligne et le score changent",87)
+    print("Paroles, score, progression et mémorisation : OK",flush=True)
+    receiver.close()
+    receiver = None
+    wait.until(lambda _: "En attente du mode TV" in field("status").text)
+    receiver = Receiver(host, b"", port=8765, code=code)
+    receiver.update(payload(98,"Retour du signal",.98))
+    render("Retour du signal",98)
+    driver.execute_script("document.dispatchEvent(new KeyboardEvent('keydown', {keyCode: 10009, bubbles: true}));")
+    wait.until(lambda _: field("pair").is_displayed())
+    assert not field("screen").is_displayed()
+    print("Reconnexion et touche Retour de la télécommande : OK",flush=True)
+finally:
+    if driver is not None:
+        driver.quit()
+    if receiver is not None:
+        receiver.close()
