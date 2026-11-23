@@ -30,7 +30,7 @@ small{color:#a6adc8;display:block;margin-top:16px}
 </p>
 <p><button id="start">Activer le micro</button> <button id="stop" disabled>Couper</button></p>
 <p><button id="calibrate">Mesurer sortie audio (sans écho)</button></p>
-<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara envoie trois courtes copies indépendantes sur l’enceinte, mesure le décalage depuis les échantillons réellement captés, puis affiche médiane et dispersion. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
+<div id="calibration" role="status">Calibration sans Larsen : le micro reste en écoute seule. Après le bip de référence, Kara effectue un essai d’amorçage non comptabilisé, puis cinq mesures acoustiques. Les pics ambigus sont rejetés avant d’afficher la médiane et la dispersion. Aucun son du micro n’est retransmis en direct. Volume modéré. Aucun enregistrement sur disque.</div>
 <div id="status" role="status">Micro inactif.</div>
 <p><small>Le volume de retour agit sur le flux microphone uniquement, pas sur Strawberry. Commence à 160 % et baisse si tu entends de la distorsion.</small></p>
 <p><small>Capture AudioWorklet en temps réel, sans ScriptProcessor ni conversion 16 kHz. Test audio propre : pas de double amplification. Commence à 90 % et baisse si nécessaire. La musique n’est pas modifiée.</small></p>
@@ -343,15 +343,27 @@ async function transmitRecordedClip(clip,rate){
 }
 function analyzeRecordedReturn(recording,clip,rate,anchorMs){
  const response=correlateTone(recording,clip,rate);
- const best=findCorrelationPeak(response,anchorMs+35,anchorMs+1150);
- if(!best||best.score<0.10){
-  return {ok:false,confidence:Math.round((best?.score||0)*100),reason:'corrélation insuffisante'};
+ const start=anchorMs+35,end=anchorMs+1150;
+ const candidates=response.filter(p=>p.ms>=start&&p.ms<=end);
+ const best=candidates.reduce((top,p)=>!top||p.score>top.score?p:top,null);
+ const confidence=Math.round(Math.max(0,best?.score||0)*100);
+ if(!best||best.score<0.30){
+  return {ok:false,confidence,reason:'corrélation insuffisante'};
  }
  const delay=Math.round(best.ms-anchorMs);
  if(delay<35||delay>1150){
-  return {ok:false,confidence:Math.round(best.score*100),reason:'retard hors plage'};
+  return {ok:false,confidence,reason:'retard hors plage'};
  }
- return {ok:true,delay,confidence:Math.round(best.score*100)};
+ // Distinct, plausible echoes or wrong matches cannot be resolved merely by
+ // selecting the largest correlation peak. Neighbouring 2ms peaks belong to
+ // the same acoustic arrival and are not separate candidates.
+ const rivals=candidates.filter(p=>Math.abs(p.ms-best.ms)>=35);
+ const rival=rivals.reduce((top,p)=>!top||p.score>top.score?p:top,null);
+ const rivalRatio=rival&&rival.score>0?rival.score/best.score:0;
+ if(rivalRatio>=0.85){
+  return {ok:false,delay,confidence,rivalRatio:Math.round(rivalRatio*100),reason:'pic acoustique ambigu'};
+ }
+ return {ok:true,delay,confidence,rivalRatio:Math.round(rivalRatio*100)};
 }
 function median(values){
  const a=[...values].sort((x,y)=>x-y);
@@ -378,10 +390,13 @@ async function runAutomaticCalibration(){
    return;
   }
   const results=[];
-  // 3 independent bursts; clear previous captures and wait for speaker decay.
-  for(let trial=1;trial<=3;trial++){
+  // Prime audio playback once, then measure five independent acoustic bursts.
+  // All runs stay finite and the microphone is NEVER sent live to the server.
+  for(let trial=0;trial<=5;trial++){
    if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
-   label.textContent='Mesure '+trial+'/3 : un seul signal bref sur l’enceinte, micro en écoute seule.';
+   const warmup=trial===0;
+   label.textContent=warmup?'Amorçage : signal non comptabilisé.':
+     'Calibration V3 : mesure '+trial+'/5, micro en écoute seule.';
    ws.send('monitor:off');
    await sleep(650);
    resetCalibrationCapture();
@@ -394,29 +409,45 @@ async function runAutomaticCalibration(){
    const captured=flattenCalibration(calibrationSamples);
    const anchorMs=(sent.sendContextSec-calibrationCaptureStartSec)*1000;
    const result=analyzeRecordedReturn(captured,detected.clip,rate,anchorMs);
-   result.anchorMs=Math.round(anchorMs);
    result.maxLateMs=Math.round(sent.maxLateMs);
    result.gapMs=Math.round(sent.maxGapMs);
    result.maxBuffered=sent.maxBuffered;
-   results.push(result);
+   if(!warmup)results.push(result);
    resetCalibrationCapture();
   }
   const valid=results.filter(r=>r.ok);
   const delays=valid.map(r=>r.delay);
-  const mid=delays.length?median(delays):null;
+  const firstMedian=delays.length?median(delays):null;
+  // A cluster check is descriptive, not a hidden automatic correction:
+  // require >=3 confident arrivals in a 30ms window and disclose exclusions.
+  let cluster=[];
+  for(const value of delays){
+   const group=delays.filter(d=>Math.abs(d-value)<=15);
+   if(group.length>cluster.length)cluster=group;
+  }
+  const mid=cluster.length?median(cluster):null;
   const spread=delays.length>=2?Math.max(...delays)-Math.min(...delays):null;
+  const clusterSpread=cluster.length>=2?Math.max(...cluster)-Math.min(...cluster):null;
   const details=results.map((r,i)=>
-   'Essai '+(i+1)+' : '+(r.ok?r.delay+' ms':'rejeté ('+r.reason+')')+
-   ' · corrélation '+r.confidence+' % · émission max +'+r.maxLateMs+
+   'Essai '+(i+1)+' : '+(r.ok?r.delay+' ms':
+      'rejeté ('+r.reason+(r.delay!==undefined?', '+r.delay+' ms':'')+')')+
+   ' · corrélation '+r.confidence+' %'+
+   (r.rivalRatio!==undefined?' · pic concurrent '+r.rivalRatio+' %':'')+
+   ' · émission max +'+r.maxLateMs+
    ' ms · intervalle max '+r.gapMs+' ms · tampon WS max '+r.maxBuffered+' octets');
+  const conclusive=cluster.length>=3&&clusterSpread<=30&&valid.length>=3;
   let verdict;
-  if(valid.length<2||spread>90){
-   verdict='Calibration V2 non concluante : '+valid.length+'/3 signaux reconnus'+
-     (spread!==null?', dispersion '+spread+' ms':'')+'. Aucune correction appliquée.';
+  if(!conclusive){
+   verdict='Calibration V3 non concluante : '+valid.length+'/5 signaux valides'+
+     (spread!==null?', dispersion totale '+spread+' ms':'')+
+     ' · groupe cohérent '+cluster.length+'/5'+
+     (clusterSpread!==null?' sur '+clusterSpread+' ms':'')+
+     '. Aucune correction appliquée.';
   }else{
-   verdict='Calibration V2 : retard réseau + sortie estimé '+Math.round(mid)+
-     ' ms (médiane) · dispersion '+spread+' ms · corrélation médiane '+
-     Math.round(median(valid.map(r=>r.confidence)))+' %. Aucune correction appliquée.';
+   verdict='Calibration V3 : retour acoustique estimé '+Math.round(mid)+
+     ' ms (médiane du groupe '+cluster.length+'/5) · dispersion groupe '+clusterSpread+
+     ' ms · dispersion totale '+spread+' ms. '+
+     'Les valeurs exclues restent visibles ci-dessous. Aucune correction appliquée.';
   }
   verdict+=' Détail : '+details.join(' | ')+
     '. Mesure de retour acoustique uniquement ; capture Android exclue.';
