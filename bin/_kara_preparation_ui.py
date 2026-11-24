@@ -31,8 +31,7 @@ class PreparationWindow(Gtk.Window):
         heading = Gtk.Label(label="Préparer des chansons à l'avance", xalign=0,
                             css_classes=["track-title"])
         root.append(heading)
-        intro = Gtk.Label(label="Sélectionne des morceaux ou des albums. Avec LRC : calage Turbo, analyse mot par mot "
-                          "et séparation Demucs. Sans LRC : séparation IA des voix uniquement.",
+        intro = Gtk.Label(label="Kara cherche les paroles manquantes et prépare les repères Turbo et l’instrumental.",
                           xalign=0, wrap=True, css_classes=["lyrics-info"])
         root.append(intro)
 
@@ -79,6 +78,9 @@ class PreparationWindow(Gtk.Window):
         self.prepare_button = Gtk.Button(label="Préparer la sélection", css_classes=["suggested-action"])
         self.prepare_button.connect("clicked", self.prepare)
         actions.append(self.prepare_button)
+        self.force_button = Gtk.Button(label="Relancer l’analyse Turbo")
+        self.force_button.connect("clicked", self.prepare, True)
+        actions.append(self.force_button)
         self.cancel_button = Gtk.Button(label="Annuler la préparation")
         self.cancel_button.connect("clicked", lambda *_: self.controller.cancel_preparation())
         actions.append(self.cancel_button)
@@ -143,7 +145,7 @@ class PreparationWindow(Gtk.Window):
             label = " · ".join(s for s in (song.title, song.artist, song.album) if s)
             has_lyrics = song.path.with_suffix(".lrc").is_file()
             if not has_lyrics:
-                label += " · Sans LRC : séparation IA seule"
+                label += " · Paroles à rechercher"
             if cached_stems(song.path):
                 label += " · IA prête"
             row = Gtk.CheckButton(label=label, active=song.path in self.selected,
@@ -154,9 +156,9 @@ class PreparationWindow(Gtk.Window):
             self.listbox.append(row)
         unavailable = sum(not song.path.with_suffix(".lrc").is_file() for song, _ in matches)
         if len(matches) > self.list_limit:
-            self.results_info.set_text(f"{len(matches)} titres · {unavailable} sans LRC (IA seule) · {self.list_limit} affichés")
+            self.results_info.set_text(f"{len(matches)} titres · {unavailable} sans LRC local · {self.list_limit} affichés")
         else:
-            self.results_info.set_text(f"{len(matches)} titres · {unavailable} sans LRC (IA seule)")
+            self.results_info.set_text(f"{len(matches)} titres · {unavailable} sans LRC local")
         self.update_controls()
 
     def toggle_song(self, control, song):
@@ -194,7 +196,7 @@ class PreparationWindow(Gtk.Window):
         self.message.set_text(
             f"{album} · {len(matches)}/{len(matches)} titres sélectionnés"
             + f" · {with_lyrics} avec LRC"
-            + (f" · {without_lyrics} sans LRC (IA seule)" if without_lyrics else "")
+            + (f" · {without_lyrics} sans LRC local" if without_lyrics else "")
             + f" · {len(self.selected)-before} nouveau(x) titre(s)")
         self.render()
 
@@ -212,9 +214,10 @@ class PreparationWindow(Gtk.Window):
         count = len(self.selected)
         with_lyrics = sum(song.path.with_suffix(".lrc").is_file() for song in self.selected.values())
         self.selected_info.set_text(
-            f"{count} titre(s) · {with_lyrics} avec LRC · {count - with_lyrics} sans LRC (IA seule)"
+            f"{count} titre(s) · {with_lyrics} avec LRC local"
             if count else "Aucun morceau sélectionné")
         self.prepare_button.set_sensitive(count > 0 and not self.busy and not self.controller.validating)
+        self.force_button.set_sensitive(self.prepare_button.get_sensitive())
         self.clear.set_sensitive(count > 0 and not self.busy)
         self.add_party.set_sensitive(not self.busy)
         self.album_select.set_sensitive(not self.busy and not self.loading
@@ -242,7 +245,7 @@ class PreparationWindow(Gtk.Window):
         self.progress.set_fraction(max(0., min(1., fraction)))
         self.progress.set_text(f"{round(self.progress.get_fraction() * 100)} %")
 
-    def prepare(self, _button):
+    def prepare(self, _button, force=False):
         if not self.selected or self.busy:
             return
-        self.controller.preload_songs(tuple(self.selected.values()))
+        self.controller.preload_songs(tuple(self.selected.values()), force=force)

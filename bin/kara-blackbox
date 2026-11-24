@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Explore Kara captures locally, with streaming filters and JSON output."""
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+import wave
+
+from _kara_blackbox import (FORMAT, GRAPH_TRACKS, ROOT, TRACK_NAME, digest, events, float_header,
+                            private_file, session_folders, wave_layout)
+from _kara_scoring import score_reference_line
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def output(value):
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def matching(args, folder):
+    for item in events(folder / "events.jsonl"):
+        if any(value is not None and item.get(field) != value
+               for field, value in ((field, getattr(args, field))
+                                    for field in ("turn", "player", "song", "component", "event", "id"))):
+            continue
+        if args.since is not None and item["monotonic_ns"] < args.since:
+            continue
+        if args.until is not None and item["monotonic_ns"] > args.until:
+            continue
+        yield item
+
+
+def validate(folder, manifest):
+    if manifest["format"] != FORMAT or manifest["session"] != folder.name:
+        raise ValueError("Manifeste incompatible.")
+    if manifest["status"] == "recording":
+        raise ValueError("La session est en cours ou doit être récupérée par Parole.")
+    if not {"events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"} <= set(manifest["files"]):
+        raise ValueError("Inventaire de session invalide.")
+    audio = {}
+    for name, entry in manifest["files"].items():
+        path = folder / name
+        if path.is_symlink():
+            raise ValueError("Chemin de capture invalide.")
+        if name not in ("events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"):
+            if not name.startswith("audio/") or not TRACK_NAME.fullmatch(name.removeprefix("audio/")) or path.parent.is_symlink():
+                raise ValueError("Chemin de capture invalide.")
+            audio[name] = wave_layout(path)
+        if path.stat().st_size != entry["bytes"] or digest(path) != entry["sha256"]:
+            raise ValueError(f"Intégrité invalide pour {name}.")
+    previous = 0
+    graph_tail, gaps = {}, 0
+    for item in events(folder / "events.jsonl"):
+        if item["session"] != folder.name or item["id"] <= previous:
+            raise ValueError("Identité ou ordre d’événement invalide.")
+        if item["event"] == "pcm":
+            data = item["data"]
+            rate, channels, frames, width, _ = audio[data["file"]]
+            graph = data["track"] in GRAPH_TRACKS
+            if (data["rate"], data["channels"], width) != (rate, channels, 4 if graph else 2) or not (
+                    0 <= data["sample"] < data["sample"] + data["frames"] <= frames):
+                raise ValueError("Index PCM invalide.")
+            if graph:
+                clock = data["clock"]
+                expected_planes = 6 if data["track"] == "monitor" else 1
+                if (any(type(clock[k]) is not int or clock[k] < 0 for k in
+                        ("driver", "epoch", "frame", "xrun", "monotonic_ns", "quantum", "present"))
+                        or clock["quantum"] != data["frames"]
+                        or clock["present"] & expected_planes != expected_planes):
+                    raise ValueError("Horloge PipeWire invalide.")
+                key = (item["turn"], data["track"], clock["epoch"])
+                last = graph_tail.get(key)
+                if last:
+                    if (clock["driver"] != last["driver"] or clock["xrun"] != last["xrun"]
+                            or clock["monotonic_ns"] <= last["monotonic_ns"]
+                            or clock["frame"] < last["frame"] + last["quantum"]):
+                        raise ValueError("Discontinuité d’horloge PipeWire dans une même fenêtre.")
+                    gaps += clock["frame"] > last["frame"] + last["quantum"]
+                graph_tail[key] = clock
+        previous = item["id"]
+    output({"valid": True, "status": manifest["status"], "session": folder.name, "graph_index_gaps": gaps})
+
+
+def extract_pcm(folder, item, destination, count):
+    data = item["data"]
+    name = data["file"]
+    if not name.startswith("audio/") or not TRACK_NAME.fullmatch(name.removeprefix("audio/")) or (folder / "audio").is_symlink():
+        raise ValueError("Piste PCM invalide.")
+    path = folder / name
+    rate, channels, frames, width, offset = wave_layout(path)
+    count = data["frames"] if count is None else count
+    if not 0 < count <= 30 * rate or not 0 <= data["sample"] < data["sample"] + count <= frames:
+        raise ValueError("Extraction hors segment ou supérieure à 30 secondes.")
+    stride = channels * width
+    with open(path, "rb", opener=private_file) as source:
+        source.seek(offset + data["sample"] * stride)
+        pcm = source.read(count * stride)
+    if len(pcm) != count * stride:
+        raise ValueError("Segment PCM tronqué.")
+    with os.fdopen(os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as target:
+        if width == 4:
+            target.write(float_header(rate, channels, len(pcm)))
+            target.write(pcm)
+        else:
+            with wave.open(target, "wb") as wav:
+                wav.setparams((channels, width, rate, count, "NONE", "not compressed"))
+                wav.writeframes(pcm)
+    return {"turn": item["turn"], "track": data["track"], "frames": count,
+            "rate": rate, "channels": channels, "clock": data.get("clock"),
+            "clocked_frames": data["frames"] if count > data["frames"] else count, "output": str(destination)}
+
+
+def extract_window(folder, window, output_path):
+    data = window["data"]
+    lower, upper = float(data["capture_begin"]), float(data["capture_end"])
+    rate = 16000
+    frames = round((upper - lower) * rate)
+    if not 0 < frames <= 32 * rate:
+        raise ValueError("Fenêtre vocale hors limites.")
+    pcm = bytearray(2 * frames)
+    coverage, cursor = 0, 0
+    for item in events(folder / "events.jsonl"):
+        chunk = item["data"]
+        if (item["event"] != "pcm" or item["turn"] != window["turn"] or chunk["track"] != "whisper"
+                or chunk["capture_end_s"] is None):
+            continue
+        begin = chunk["capture_end_s"] - chunk["frames"] / rate
+        offset = round((begin - lower) * rate)
+        first, last = max(cursor, offset), min(frames, offset + chunk["frames"])
+        if first >= last:
+            continue
+        name = chunk["file"]
+        if not name.startswith("audio/") or not TRACK_NAME.fullmatch(name.removeprefix("audio/")):
+            raise ValueError("Piste PCM invalide.")
+        with wave.open(str(folder / name), "rb") as source:
+            if (source.getframerate(), source.getnchannels(), source.getsampwidth()) != (rate, 1, 2):
+                raise ValueError("Format de piste PCM incompatible.")
+            source.setpos(chunk["sample"] + first - offset)
+            block = source.readframes(last - first)
+            if len(block) != 2 * (last - first):
+                raise ValueError("Données PCM tronquées.")
+        pcm[first * 2:last * 2] = block
+        coverage += last - first
+        cursor = last
+    if not coverage:
+        raise ValueError("Cette fenêtre n’a pas de piste Whisper enregistrée.")
+    with os.fdopen(os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as stream:
+        with wave.open(stream, "wb") as target:
+            target.setparams((1, 2, rate, frames, "NONE", "not compressed"))
+            target.writeframes(pcm)
+    return {"window": data["window"], "coverage": coverage / frames, "frames": frames, "output": str(output_path)}
+
+
+def replay_whisper(args, folder, window):
+    from _kara_paths import BIN, DATA
+    data = window["data"]
+    if bool(args.backing) != bool(args.original):
+        raise ValueError("Fournis ensemble le fichier original et l’instrumental de ce tour.")
+    turn = next((row for row in events(folder / "events.jsonl")
+                 if row["turn"] == window["turn"] and row["event"] == "turn-start"), None)
+    if args.original and turn:
+        reference_hash = (turn["data"].get("reference") or {}).get("audio_sha256")
+        if reference_hash and digest(args.original) != reference_hash:
+            raise ValueError("Le fichier musical ne correspond pas à la référence de la session.")
+    guide = None
+    if data.get("guide"):
+        if not args.backing or not args.original:
+            raise ValueError("Cette fenêtre exige les références musicales séparées du tour.")
+        evidence = next((row["data"]["files"] for row in events(folder / "events.jsonl")
+                         if row["turn"] == window["turn"] and row["event"] == "reference"), {})
+        guide = args.backing.with_name("vocals.flac")
+        if (not guide.is_file() or digest(guide) != evidence.get("original_voice", {}).get("sha256")
+                or digest(args.backing) != evidence.get("instrumental", {}).get("sha256")):
+            raise ValueError("Les pistes séparées ne correspondent pas aux références de la fenêtre.")
+    python = DATA / "hyprwhspr/venv/bin/python"
+    interpreter = python if python.is_file() else sys.executable
+    with TemporaryDirectory(prefix="kara-replay-") as draft:
+        clip = Path(draft) / "window.wav"
+        capture = extract_window(folder, window, clip)
+        if capture["coverage"] < .5:
+            raise ValueError("Couverture de la fenêtre insuffisante pour Whisper.")
+        arguments = [str(interpreter), "-B", str(BIN / "_kara_blackbox_replay.py"), str(clip),
+                     data["language"], str(window["position"]), str(data["track_end"]), "--device", args.device]
+        if args.backing:
+            arguments += ["--backing", str(args.backing), "--original", str(args.original)]
+        if guide:
+            arguments += ["--guide", str(guide)]
+        result = subprocess.run(arguments, check=True, capture_output=True, text=True, timeout=200)
+    replay = json.loads(result.stdout)
+    score = next((row for row in events(folder / "events.jsonl")
+                  if row["turn"] == window["turn"] and row["event"] == "line-decision"
+                  and row["data"]["window"] == data["window"]), None)
+    output({"window": data["window"], "coverage": capture["coverage"], "replayed": replay,
+            "original_observed": score["data"]["raw_observed"] if score else None,
+            "original_classification": score["data"]["source"] if score else None})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
+                                          "score", "inspect", "replay", "extract", "extract-pcm", "replay-whisper",
+                                          "analyze", "delete", "prune"))
+    parser.add_argument("session", nargs="?", default="latest")
+    for field in ("turn", "player", "song", "component", "event"):
+        parser.add_argument("--" + field)
+    for field in ("id", "since", "until"):
+        parser.add_argument("--" + field, type=int)
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--frames", type=int)
+    parser.add_argument("--days", type=int)
+    parser.add_argument("--device", choices=("cpu", "gpu"), default="gpu")
+    parser.add_argument("--backing", type=Path)
+    parser.add_argument("--original", type=Path)
+    args = parser.parse_args()
+    try:
+        available = [path.name for path in session_folders(args.root)]
+        if args.action == "list":
+            output(available)
+            return 0
+        if args.action == "prune":
+            if args.days is None or not 1 <= args.days <= 3650:
+                raise ValueError("Fournis une durée de conservation avec --days (1 à 3650).")
+            before = datetime.now(timezone.utc) - timedelta(days=args.days)
+            expired = []
+            for name in available:
+                folder = args.root / name
+                manifest = read(folder / "manifest.json")
+                if manifest["status"] == "recording" or not manifest.get("ended"):
+                    continue
+                if datetime.fromisoformat(manifest["ended"]) < before:
+                    expired.append(name)
+                    if args.yes:
+                        shutil.rmtree(folder)
+            output({"expired": expired, "deleted": args.yes})
+            return 0
+        name = available[-1] if args.session == "latest" and available else args.session
+        if name not in available:
+            raise ValueError("Session BlackBox introuvable.")
+        folder = args.root / name
+        if args.action == "inspect":
+            output(read(folder / "manifest.json"))
+        elif args.action == "summary":
+            output(read(folder / "summary.json"))
+        elif args.action == "validate":
+            validate(folder, read(folder / "manifest.json"))
+        elif args.action == "analyze":
+            print((folder / "REPORT.md").read_text(), end="")
+        elif args.action == "extract-pcm":
+            if args.id is None or args.output is None:
+                raise ValueError("Indique un événement PCM (--id) et un fichier de sortie (--output).")
+            item = next((row for row in matching(args, folder) if row["event"] == "pcm"), None)
+            if item is None:
+                raise ValueError("Événement PCM introuvable.")
+            output(extract_pcm(folder, item, args.output, args.frames))
+        elif args.action in ("extract", "replay-whisper"):
+            if args.id is None:
+                raise ValueError("Fournis l’identifiant d’événement de fenêtre avec --id.")
+            if args.action == "extract" and args.output is None:
+                raise ValueError("Fournis le chemin de sortie WAV avec --output.")
+            window = next((item for item in matching(args, folder) if item["event"] == "window"), None)
+            if window is None:
+                raise ValueError("Fenêtre vocale introuvable.")
+            if args.action == "extract":
+                output(extract_window(folder, window, args.output))
+            else:
+                replay_whisper(args, folder, window)
+        elif args.action == "delete":
+            if not args.yes or read(folder / "manifest.json")["status"] == "recording":
+                raise ValueError("Suppression refusée. Sélectionne une session terminée et ajoute --yes.")
+            shutil.rmtree(folder)
+        else:
+            from itertools import islice
+            from _kara_blackbox import INCIDENTS
+            kind = args.action
+            rows = (item for item in matching(args, folder)
+                    if (kind in ("timeline",) or (kind == "incidents" and item["event"] in INCIDENTS)
+                        or (kind == "turns" and item["event"] in ("turn-start", "turn-end"))
+                        or (kind in ("score", "replay") and item["event"] == "line-decision")))
+            count = 0
+            for item in islice(rows, max(0, args.limit)):
+                count += 1
+                if kind == "replay":
+                    data = item["data"]
+                    decisions = score_reference_line(data["reference"], data["observed"],
+                                                     data["tolerance"], source=data["source"])
+                    output({"event_id": item["id"], "turn": item["turn"], "same": decisions == data["decisions"],
+                            "original": data["decisions"], "replayed": decisions})
+                else:
+                    output(item)
+            if kind == "replay" and not count:
+                raise ValueError("Aucune fenêtre de notation disponible pour le replay.")
+        return 0
+    except (ValueError, KeyError, OSError, wave.Error, subprocess.SubprocessError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

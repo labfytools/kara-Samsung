@@ -58,9 +58,10 @@ static void print_tokens(struct whisper_context *context, int length_cs, bool li
     }
 }
 
-static struct whisper_context *open_model(const char *model)
+static struct whisper_context *open_model(const char *model, bool gpu)
 {
     struct whisper_context_params config = whisper_context_default_params();
+    config.use_gpu = gpu;
     config.flash_attn = false;
     config.dtw_token_timestamps = true;
     config.dtw_aheads_preset = WHISPER_AHEADS_LARGE_V3_TURBO;
@@ -92,7 +93,7 @@ static int aligned_file(int argc, char **argv)
     float *audio = read_pcm(&length);
     if (!audio)
         return 3;
-    struct whisper_context *context = open_model(argv[1]);
+    struct whisper_context *context = open_model(argv[1], true);
     if (!context) {
         free(audio);
         return 4;
@@ -125,7 +126,7 @@ static int aligned_file(int argc, char **argv)
 static int stream_audio(const char *model, const char *language, bool live)
 {
     enum { MAX_SAMPLES = 18 * WHISPER_SAMPLE_RATE, MAX_PROMPT = 2048 };
-    struct whisper_context *context = open_model(model);
+    struct whisper_context *context = open_model(model, true);
     if (!context)
         return 4;
     int16_t *pcm = malloc(MAX_SAMPLES * sizeof(*pcm));
@@ -176,8 +177,110 @@ static int stream_audio(const char *model, const char *language, bool live)
     return result;
 }
 
+static void print_prepared(struct whisper_context *context)
+{
+    printf("language %s\n", whisper_lang_str(whisper_full_lang_id(context)));
+    const int eot = whisper_token_eot(context);
+    for (int i = 0; i < whisper_full_n_segments(context); i++) {
+        printf("segment %" PRId64 " %" PRId64 " %.5f\n",
+               whisper_full_get_segment_t0(context, i), whisper_full_get_segment_t1(context, i),
+               whisper_full_get_segment_no_speech_prob(context, i));
+        for (int j = 0; j < whisper_full_n_tokens(context, i); j++) {
+            whisper_token_data token = whisper_full_get_token_data(context, i, j);
+            const unsigned char *part = (const unsigned char *)whisper_full_get_token_text(context, i, j);
+            if (token.id >= eot || part == NULL || *part == '\0')
+                continue;
+            printf("token %" PRId64 " %.5f ", token.t_dtw, token.p);
+            for (; *part; part++)
+                printf("%02x", *part);
+            putchar('\n');
+        }
+    }
+}
+
+static int prepare_stream(const char *model, bool gpu, int threads)
+{
+    enum { MAX_SAMPLES = 29 * WHISPER_SAMPLE_RATE, MAX_LANG = 15 };
+    struct whisper_context *context = open_model(model, gpu);
+    float *samples = malloc(MAX_SAMPLES * sizeof(*samples));
+    if (!context || !samples) {
+        if (context)
+            whisper_free(context);
+        free(samples);
+        return 4;
+    }
+    puts("ready");
+    fflush(stdout);
+    int status = 0;
+    unsigned char header[5];
+    while (true) {
+        size_t size = fread(header, 1, sizeof(header), stdin);
+        if (size == 0 && feof(stdin))
+            break;
+        if (size != sizeof(header)) {
+            status = 6;
+            break;
+        }
+        // Each request contains a little-endian PCM frame and a language code.
+        // The model is process-owned and survives requests and language changes.
+        uint32_t count = (uint32_t)header[0] | (uint32_t)header[1] << 8 |
+                         (uint32_t)header[2] << 16 | (uint32_t)header[3] << 24;
+        // The low bits retain the original language-length encoding.
+        // The high bit selects beam search for an unprompted local retry.
+        const bool beam = (header[4] & 0x80u) != 0;
+        unsigned int lang_length = header[4] & 0x7fu;
+        char language[MAX_LANG + 1];
+        if (count == 0 || count > MAX_SAMPLES || lang_length == 0 || lang_length > MAX_LANG ||
+            fread(language, 1, lang_length, stdin) != lang_length) {
+            status = 6;
+            break;
+        }
+        language[lang_length] = '\0';
+        for (uint32_t offset = 0; offset < count;) {
+            unsigned char pcm[8192];
+            uint32_t batch = count - offset > sizeof(pcm) / 2 ? sizeof(pcm) / 2 : count - offset;
+            if (fread(pcm, 2, batch, stdin) != batch) {
+                status = 6;
+                break;
+            }
+            for (uint32_t i = 0; i < batch; i++) {
+                int value = pcm[2 * i] | (int)pcm[2 * i + 1] << 8;
+                samples[offset + i] = (value >= 32768 ? value - 65536 : value) / 32768.0f;
+            }
+            offset += batch;
+        }
+        if (status)
+            break;
+        struct whisper_full_params params = decode_options(language);
+        params.n_threads = threads;
+        params.audio_ctx = 0;
+        params.greedy.best_of = 1;
+        if (beam) {
+            params.strategy = WHISPER_SAMPLING_BEAM_SEARCH;
+            params.beam_search.beam_size = 3;
+        }
+        if (whisper_full(context, params, samples, (int)count) == 0)
+            print_prepared(context);
+        else
+            puts("error");
+        puts("done");
+        fflush(stdout);
+    }
+    free(samples);
+    whisper_free(context);
+    return status;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 5 && strcmp(argv[1], "--prepare") == 0) {
+        char *end;
+        long threads = strtol(argv[4], &end, 10);
+        if (*end || threads < 1 || threads > 32 ||
+            (strcmp(argv[3], "cpu") != 0 && strcmp(argv[3], "gpu") != 0))
+            return 2;
+        return prepare_stream(argv[2], strcmp(argv[3], "gpu") == 0, (int)threads);
+    }
     if (argc == 4 && strcmp(argv[1], "--stream") == 0)
         return stream_audio(argv[2], argv[3], false);
     if (argc == 4 && strcmp(argv[1], "--live") == 0)

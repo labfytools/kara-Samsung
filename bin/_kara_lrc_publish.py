@@ -13,10 +13,11 @@ from math import isfinite
 from tempfile import NamedTemporaryFile
 import time
 
+from _kara_paths import STATE
 from _kara_timing import line_signature
 from _paroles_lrc import MAX_LRC_BYTES, OFFSET, STAMP, WORD_STAMP, parse_lrc
 
-BACKUPS = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'kara' / 'lrc-backups'
+BACKUPS = STATE / 'kara/lrc-backups'
 MIN_COVERAGE = .55
 MIN_REFINED_FRACTION = .65
 

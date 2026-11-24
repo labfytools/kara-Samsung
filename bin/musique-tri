@@ -1,0 +1,298 @@
+#!/usr/bin/python3 -B
+"""Classe des fichiers audio dans Artiste/Album à partir de leurs tags."""
+import argparse
+from collections import defaultdict
+import json
+from errno import EXDEV
+from hashlib import file_digest
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile, TemporaryDirectory
+
+from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file, audio_files,
+                         canonical_album_artist, component, probe, share_file, shared_mutation,
+                         SHARED_LIBRARY, source_video, title_pair)
+
+TAG_WRITABLE = {".opus", ".ogg", ".oga", ".flac", ".m4a", ".mp3"}
+
+
+def same_content(first, second):
+    if not second.is_file() or second.is_symlink():
+        return False
+    if first.stat().st_size != second.stat().st_size:
+        return False
+    with first.open("rb") as source, second.open("rb") as target:
+        return file_digest(source, "sha256").digest() == file_digest(target, "sha256").digest()
+
+
+def same_import_track(source, target, tags):
+    url = tags.get("purl")
+    if not url or not target.is_file() or target.is_symlink():
+        return False
+    try:
+        target_tags, _ = probe(target)
+        if target_tags.get("purl") != url:
+            return False
+        hashes = []
+        for track in (source, target):
+            result = subprocess.run(
+                ("ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
+                 "-i", str(track), "-map", "0:a:0", "-c", "copy", "-f", "hash", "-hash", "sha256", "pipe:1"),
+                capture_output=True, check=True, timeout=30,
+            )
+            hashes.append(result.stdout)
+        return bool(hashes[0]) and hashes[0] == hashes[1]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def move_track(source, target):
+    if not target.is_relative_to(SHARED_LIBRARY):
+        try:
+            os.link(source, target)
+        except OSError as error:
+            if error.errno != EXDEV:
+                raise
+        else:
+            source.unlink()
+            return
+    with NamedTemporaryFile(dir=target.parent, prefix=".tri-") as draft:
+        if target.is_relative_to(SHARED_LIBRARY):
+            shutil.copyfile(source, draft.name)
+            share_file(draft.name, target)
+        else:
+            shutil.copy2(source, draft.name)
+        os.link(draft.name, target)
+    source.unlink()
+
+
+def number(tag):
+    match = re.fullmatch(r"(\d{1,3})(?:/\d{1,3})?", tag or "")
+    return int(match[1]) if match else 0
+
+
+def album_artists(items, root):
+    credits = defaultdict(set)
+    for _, tags in items:
+        artist, album = title_pair(tags)
+        if artist and album:
+            credits[album].add(artist)
+
+    existing = {}
+    for album in credits:
+        directory = component(album, UNKNOWN_ALBUM)
+        existing[album] = {
+            artist.name.casefold()
+            for artist in root.iterdir()
+            if not artist.is_symlink()
+            and (artist / directory).is_dir()
+            and not (artist / directory).is_symlink()
+        }
+
+    resolved = {}
+    for track, tags in items:
+        artist, album = title_pair(tags)
+        if artist and album and not tags.get("albumartist"):
+            # Garde les collaborations permanentes et ne déduit un featuring
+            # que si le crédit de base est attesté pour ce même album.
+            parts = artist.split(", ")
+            def known_credit(credit):
+                return (credit in credits[album] or
+                        component(credit, UNKNOWN_ARTIST).casefold() in existing[album])
+
+            prefixes = (", ".join(parts[:end]) for end in range(1, len(parts)))
+            prefix = next((credit for credit in prefixes if known_credit(credit)), None)
+            if prefix is not None:
+                artist = prefix
+            else:
+                # Certains crédits placent l’invité en tête. Le crédit de
+                # fin doit être unique et attesté pour ce même album.
+                suffixes = (", ".join(parts[start:]) for start in range(1, len(parts)))
+                matches = {credit for credit in suffixes if known_credit(credit)}
+                if len(matches) == 1:
+                    artist = matches.pop()
+        resolved[track] = canonical_album_artist(artist, album)
+    return resolved
+
+
+def write_tags(source, target, tags, updates):
+    ffmpeg_keys = {"albumartist": "album_artist", "album": "album"}
+    metadata = []
+    for key, value in updates.items():
+        assignment = f"{ffmpeg_keys[key]}={value}"
+        metadata.extend(("-metadata", assignment, "-metadata:s:a:0", assignment))
+    with TemporaryDirectory(dir=target.parent, prefix=".tri-") as temp:
+        draft = Path(temp) / source.name
+        subprocess.run(
+            ("ffmpeg", "-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file,pipe",
+             "-i", str(source), "-map", "0", "-c", "copy", *metadata, str(draft)),
+            capture_output=True, check=True, timeout=60,
+        )
+        expected = tags | updates
+        new_tags, _ = probe(draft)
+        if any(new_tags.get(key) != value for key, value in expected.items() if key != "encoder"):
+            raise ValueError("vérification des tags après copie sans réencodage échouée")
+        shutil.copymode(source, draft)
+        share_file(draft, target)
+        if source == target:
+            os.replace(draft, target)
+        else:
+            os.link(draft, target)
+            source.unlink()
+
+
+def target_parts(source, tags, artist, album):
+    title = component(tags.get("title") or source.stem, "Titre sans nom")
+    track = number(tags.get("track") or tags.get("tracknumber"))
+    disc = number(tags.get("disc") or tags.get("discnumber"))
+    prefix = f"{track:02d} - " if track else ""
+    if track and disc > 1:
+        prefix = f"{disc:02d}-{prefix}"
+    return (component(artist, UNKNOWN_ARTIST), component(album, UNKNOWN_ALBUM),
+            prefix + title, source.suffix.lower())
+
+
+def classify(source, tags, album_artist, album_title, root, preview, reserved, importing, known_sources):
+    artist, album, name, extension = target_parts(source, tags, album_artist, album_title)
+    updates = {}
+    if album_title != tags.get("album"):
+        if extension not in TAG_WRITABLE:
+            raise ValueError("renommage de l’album indisponible pour ce format")
+        updates["album"] = album_title
+    if album_artist and album_title and extension in TAG_WRITABLE and tags.get("albumartist") != album_artist:
+        updates["albumartist"] = album_artist
+    artist_dir = root / artist
+    folder = artist_dir / album
+    if artist_dir.is_symlink() or folder.is_symlink():
+        raise ValueError("dossier de destination symbolique")
+    if not preview:
+        folder.mkdir(parents=True, exist_ok=True)
+    video = source_video(tags.get("purl")) if importing and not preview else ""
+    position = (number(tags.get("disc") or tags.get("discnumber")) or 1,
+                number(tags.get("track") or tags.get("tracknumber")))
+    identity = (video, position, None if position[1] else name)
+    if video:
+        # A retry may choose a different codec or have new tags. Reuse the same
+        # source at the same album position, under the shared library lock.
+        if folder not in known_sources:
+            sources = known_sources[folder] = {}
+            for existing in audio_files(folder):
+                try:
+                    existing_tags, _ = probe(existing)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    continue
+                existing_video = source_video(existing_tags.get("purl"))
+                if existing_video:
+                    disc = number(existing_tags.get("disc") or existing_tags.get("discnumber")) or 1
+                    track = number(existing_tags.get("track") or existing_tags.get("tracknumber"))
+                    sources.setdefault((existing_video, (disc, track), None if track else existing.stem), existing)
+        existing = known_sources[folder].get(identity)
+        if existing is not None and source != existing and audio_file(existing):
+            source.unlink()
+            print(f"Déjà dans la bibliothèque : {existing.relative_to(root)}")
+            return existing, False
+    for attempt in range(1, 10_000):
+        suffix = "" if attempt == 1 else f" [{attempt}]"
+        target = folder / (name + suffix + extension)
+        if source == target:
+            if updates:
+                if not preview:
+                    write_tags(source, target, tags, updates)
+                print(f"{source.name} · tags de l’album : {album_artist} / {album_title}")
+            return target, False
+        if target in reserved or target.exists() or target.is_symlink():
+            if importing and not preview and (same_content(source, target) or same_import_track(source, target, tags)):
+                source.unlink()
+                print(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
+                return target, False
+            if same_content(source, reserved.get(target, target)):
+                print(f"Identique, conservé à la source : {source.name}")
+                return (target if target.is_file() else None), False
+            continue
+        if not preview:
+            try:
+                if updates:
+                    write_tags(source, target, tags, updates)
+                else:
+                    move_track(source, target)
+            except FileExistsError:
+                continue
+        if preview:
+            reserved[target] = source
+        elif video:
+            known_sources[folder][identity] = target
+        print(f"{source.name} → {target.relative_to(root)}")
+        return target, not preview
+    raise ValueError("aucun nom de fichier libre")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("sources", nargs="*", type=Path,
+                        help="fichiers ou dossiers, par défaut A_trier et YouTube s'il existe")
+    parser.add_argument("--bibliotheque", type=Path, default=SHARED_LIBRARY)
+    parser.add_argument("--apercu", "--dry-run", action="store_true",
+                        help="affiche les destinations sans déplacer les fichiers")
+    parser.add_argument("--artiste-album", help="impose l’artiste de l’album pour les sources sélectionnées")
+    parser.add_argument("--nom-album", help="impose le titre de l’album pour les sources sélectionnées")
+    parser.add_argument("--rapport", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--rapport-detaille", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    for option, value in (("--artiste-album", args.artiste_album), ("--nom-album", args.nom_album)):
+        if value is not None and (not args.sources or not value.strip()):
+            parser.error(f"{option} demande des sources explicites et un nom")
+    root = args.bibliotheque.expanduser().resolve()
+    if not root.is_dir():
+        parser.error(f"bibliothèque absente : {root}")
+    sources = args.sources or [path for path in (root / INBOX, root / "YouTube") if path.is_dir()]
+    if any(not path.expanduser().exists() for path in sources):
+        parser.error("au moins un chemin source est introuvable")
+    with shared_mutation(root, not args.apercu):
+        tracks = sorted({track.resolve() for source in sources
+                         for track in audio_files(source.expanduser().absolute())})
+        if not tracks:
+            print("Aucun fichier audio à classer.")
+        failures = 0
+        items = []
+        for track in tracks:
+            try:
+                tags, _ = probe(track)
+                items.append((track, tags))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                failures += 1
+                print(f"Erreur pour {track.name} : {error}", file=sys.stderr)
+
+        artists = album_artists(items, root)
+        reserved = {}
+        known_sources = {}
+        destinations = set()
+        added = 0
+        for track, tags in items:
+            try:
+                artist = args.artiste_album.strip() if args.artiste_album else artists[track]
+                album = args.nom_album.strip() if args.nom_album else tags.get("album")
+                importing = (args.rapport is not None and track.parent.parent == root / INBOX
+                             and track.parent.name.startswith(".kara-"))
+                if importing and args.artiste_album:
+                    artist = canonical_album_artist(artist, album)
+                target, moved = classify(track, tags, artist, album, root, args.apercu, reserved, importing,
+                                         known_sources)
+                if target is not None:
+                    destinations.add(str(target))
+                added += moved
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                failures += 1
+                print(f"Erreur pour {track.name} : {error}", file=sys.stderr)
+        if args.rapport:
+            tracks = sorted(destinations)
+            report = {"tracks": tracks, "added": added} if args.rapport_detaille else tracks
+            args.rapport.write_text(json.dumps(report), encoding="utf-8")
+        return int(failures != 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

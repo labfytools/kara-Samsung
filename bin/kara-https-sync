@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Verify and atomically import Kara's dedicated certificate from ArchServer."""
+import argparse
+from hashlib import sha256
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from tempfile import mkdtemp
+
+from _kara_blackbox import sync_directory
+from _kara_paths import STATE
+
+REMOTE = "/home/admin/.local/state/kara-acme"
+DEFAULT_NAME = "kara.labfytools.com"
+
+
+def run(*args, output=False, timeout=20):
+    return subprocess.run(args, check=True, stdout=subprocess.PIPE if output else subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=timeout).stdout
+
+
+def ssh(args, command, *, output=False, timeout=20):
+    config = ("-F", str(args.ssh_config)) if args.ssh_config else ()
+    return run("ssh", *config, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", args.host, shlex.join(command),
+               output=output, timeout=timeout)
+
+
+def fetch(args, folder):
+    live = Path(REMOTE) / "config/live" / args.name
+    for filename, restricted in (("fullchain.pem", "kara-chain"), ("privkey.pem", "kara-key")):
+        command = (restricted,) if args.ssh_config else ("cat", str(live / filename))
+        payload = ssh(args, command, output=True)
+        if not payload or len(payload) > 32 * 1024:
+            raise ValueError(f"Fichier TLS invalide ({filename}).")
+        (folder / filename).write_bytes(payload)
+    chain, key = folder / "fullchain.pem", folder / "privkey.pem"
+    split = re.findall(rb"-----BEGIN CERTIFICATE-----\r?\n.*?-----END CERTIFICATE-----\r?\n?",
+                       chain.read_bytes(), re.DOTALL)
+    if len(split) < 2:
+        raise ValueError("Chaîne TLS incomplète.")
+    leaf, intermediates = folder / "leaf.pem", folder / "intermediates.pem"
+    leaf.write_bytes(split[0])
+    intermediates.write_bytes(b"\n".join(split[1:]))
+    run("openssl", "verify", "-verify_hostname", args.name, "-purpose", "sslserver",
+        "-untrusted", str(intermediates), str(leaf))
+    run("openssl", "x509", "-checkend", "86400", "-noout", "-in", str(leaf))
+    if run("openssl", "x509", "-pubkey", "-noout", "-in", str(leaf), output=True) != run(
+            "openssl", "pkey", "-in", str(key), "-pubout", output=True):
+        raise ValueError("La clé ne correspond pas au certificat.")
+    leaf.unlink()
+    intermediates.unlink()
+    for path in (chain, key):
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+    sync_directory(folder)
+    return sha256(chain.read_bytes()).hexdigest()[:20]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("pull", "renew"))
+    parser.add_argument("--host", default="srv-admin-lan")
+    parser.add_argument("--name", default=DEFAULT_NAME)
+    parser.add_argument("--ssh-config", type=Path, help="use the dedicated three-command SSH transport")
+    args = parser.parse_args()
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}", args.host):
+        parser.error("Alias SSH invalide.")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,120}[a-z0-9]", args.name) or ".." in args.name:
+        parser.error("Nom de certificat invalide.")
+    if args.ssh_config and args.name != DEFAULT_NAME:
+        parser.error("Le transport dédié est réservé à la lignée Kara.")
+    os.umask(0o077)
+    root = STATE / "kara/https"
+    stage = None
+    link = None
+    try:
+        if args.action == "renew":
+            # The dedicated lineage stays outside system Certbot. The timer
+            # owns scheduling jitter so it cannot consume the SSH deadline.
+            command = (("kara-renew",) if args.ssh_config else
+                       ("certbot", "renew", "--non-interactive", "--no-random-sleep-on-renew", "--cert-name", args.name,
+                        "--config-dir", REMOTE + "/config", "--work-dir", REMOTE + "/work",
+                        "--logs-dir", REMOTE + "/log", "--quiet"))
+            ssh(args, command, timeout=240)
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
+            raise OSError("Le dossier HTTPS doit être privé (0700).")
+        stage = Path(mkdtemp(prefix=".candidate-", dir=root))
+        identity = fetch(args, stage)
+        # Publish one directory pointer so both listeners see the same
+        # verified pair. Re-importing unchanged material is idempotent.
+        target = root / ("cert-" + identity)
+        if target.exists():
+            if any((target / name).read_bytes() != (stage / name).read_bytes()
+                   for name in ("fullchain.pem", "privkey.pem")):
+                raise ValueError("La génération locale est incohérente.")
+        else:
+            stage.rename(target)
+            stage = None
+        if not (root / "current").is_symlink() or (root / "current").readlink() != Path(target.name):
+            link = root / (".current-" + str(os.getpid()))
+            link.symlink_to(target.name, target_is_directory=True)
+            link.replace(root / "current")
+            link = None
+            sync_directory(root)
+        print(f"Certificat HTTPS vérifié et publié pour {args.name}.")
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"Publication HTTPS échouée ({type(error).__name__}). La paire active reste disponible.",
+              file=sys.stderr)
+        return 1
+    finally:
+        if stage:
+            shutil.rmtree(stage)
+        if link:
+            link.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

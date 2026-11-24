@@ -8,7 +8,7 @@ OFFSET = re.compile(r"^\[offset:\s*([+-]?\d+)\s*\]\s*$", re.I | re.M)
 WORD_STAMP = re.compile(r"<\d{1,3}:[0-5]\d(?:[.:]\d{1,3})?>")
 
 
-def parse_lrc(text):
+def parse_lrc(text, *, sort=True):
     offset = OFFSET.search(text)
     offset_seconds = int(offset[1]) / 1000 if offset else 0
     lines = {}
@@ -27,4 +27,18 @@ def parse_lrc(text):
                 lines[time] = old + "\n" + phrase
             elif not old:
                 lines[time] = phrase
-    return sorted(lines.items())
+    return sorted(lines.items()) if sort else list(lines.items())
+
+
+def source_orders(text):
+    """A single-stamp LRC can carry correct lyric order despite inverted times."""
+    chronological = parse_lrc(text)
+    for row in text.splitlines():
+        row = row.lstrip("\ufeff \t")
+        stamp = STAMP.match(row)
+        if stamp and STAMP.match(row[stamp.end():].lstrip()):
+            # Multi-stamp refrains encode occurrences in the timestamps.
+            return {"timestamps": chronological}
+    physical = parse_lrc(text, sort=False)
+    return ({"timestamps": chronological, "file": physical} if physical != chronological else
+            {"timestamps": chronological})

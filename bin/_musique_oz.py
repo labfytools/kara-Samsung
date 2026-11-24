@@ -7,6 +7,9 @@ from pathlib import Path
 import re
 import subprocess
 from unicodedata import combining, normalize
+from urllib.parse import parse_qs, urlsplit
+
+from _kara_paths import music_library
 
 AUDIO = frozenset((".aac", ".aif", ".aiff", ".alac", ".flac", ".m4a", ".mp3",
                    ".ogg", ".oga", ".opus", ".wav", ".wma"))
@@ -152,7 +155,23 @@ def canonical_album_artist(credit, album=None):
     return credit or None
 
 
-SHARED_LIBRARY = Path("/home/Partage/Music")
+def source_video(url):
+    try:
+        parsed = urlsplit(url or "")
+        if parsed.hostname == "youtu.be":
+            video = parsed.path.strip("/")
+        elif parsed.hostname in {"youtube.com", "www.youtube.com", "music.youtube.com"}:
+            video = parse_qs(parsed.query).get("v", [""])[0]
+        else:
+            return ""
+    except ValueError:
+        return ""
+    return video if re.fullmatch(r"[A-Za-z0-9_-]{11}", video) else ""
+
+
+# Keep the personal music directory (a link to the shared collection on ArchASP)
+# and explicit CLI destinations on the same canonical path for locks and ACLs.
+SHARED_LIBRARY = music_library()
 
 
 def share_file(draft, destination):

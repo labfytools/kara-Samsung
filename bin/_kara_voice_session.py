@@ -123,7 +123,10 @@ def main(command):
             with without_dictation():
                 if any(events & POLLHUP for _, events in input_poll.poll(0)):
                     return 0
-                worker = subprocess.Popen(command)
+                # The private datagram route, when supplied by Parole, is
+                # inherited only by the score worker, never by system tools.
+                passed = (3,) if os.environ.get("KARA_NETWORK_MIC_FD") == "3" else ()
+                worker = subprocess.Popen(command, pass_fds=passed)
                 return wait_for_worker(worker, input_poll)
     except (OSError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         if isinstance(error, subprocess.SubprocessError):

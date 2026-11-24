@@ -27,7 +27,7 @@ def all_songs(database, library):
     """Lecture du catalogue local, y compris les titres sans paroles LRC."""
     library = Path(library).resolve()
     unique, songs = set(), []
-    with sqlite3.connect(f'file:{database}?mode=ro', uri=True, timeout=3) as connection:
+    with sqlite3.connect(Path(database).absolute().as_uri() + '?mode=ro', uri=True, timeout=3) as connection:
         rows = connection.execute('SELECT url, title, artist, album FROM songs WHERE unavailable = 0 ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE, title COLLATE NOCASE')
         for uri, title, artist, album in rows:
             address = urlsplit(uri or '')

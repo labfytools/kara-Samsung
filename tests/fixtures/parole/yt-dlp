@@ -1,0 +1,55 @@
+#!/usr/bin/python3 -B
+"""Serve fixture YouTube metadata and delegate media processing to real yt-dlp."""
+import json
+import os
+from pathlib import Path
+import sys
+from tempfile import NamedTemporaryFile
+from urllib.parse import parse_qs, urlsplit
+
+arguments = sys.argv[1:]
+query = parse_qs(urlsplit(arguments[-1]).query)
+config = json.loads(Path(os.environ["PAROLE_TEST_CONFIG"]).read_text())
+if "--flat-playlist" in arguments:
+    playlist = query["list"][0]
+    if failure := config["playlist_failures"].get(playlist):
+        print(failure, file=sys.stderr)
+        sys.exit(1)
+    album = config["playlists"][playlist]
+    for index, track in enumerate(album["tracks"], 1):
+        if track.get("hidden"):
+            continue
+        print(json.dumps({"playlist_index": index, "id": track["id"], "title": track["title"],
+                          "playlist_title": "Album - " + album["title"], "playlist_count": len(album["tracks"])}))
+    sys.exit(0)
+
+video = query["v"][0]
+with Path(config["requests"]).open("a", encoding="utf-8") as handle:
+    handle.write(video + "\n")
+if video in config["transfer_failures"]:
+    scratch = next(value.removeprefix("temp:") for value in arguments if value.startswith("temp:"))
+    Path(scratch).mkdir(parents=True, exist_ok=True)
+    (Path(scratch) / f"{video}.opus").write_bytes(b"Unpublished postprocessor draft")
+    print(f"ERROR: [youtube] {video}: unexpected media failure", file=sys.stderr)
+    sys.exit(1)
+album, track = next((album, track) for album in config["playlists"].values()
+                    for track in album["tracks"] if track["id"] == video)
+url = arguments[-1]
+info = {
+    "id": video, "title": track["title"], "artist": config["artist"], "duration": 4,
+    "webpage_url": url, "original_url": url, "extractor": "youtube", "extractor_key": "Youtube",
+    "formats": [{"url": config["media"], "format_id": "fixture", "ext": "opus",
+                 "acodec": "opus", "vcodec": "none", "protocol": "http"}],
+}
+if album.get("source_album"):
+    info["album"] = album["source_album"]
+# Replace only extraction/authentication. The application still runs yt-dlp's
+# real media download, FFmpeg metadata postprocessor and after_move hooks.
+with NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".info.json", dir=config["temp"]) as draft:
+    json.dump(info, draft)
+    draft.flush()
+    position = arguments.index("--cookies-from-browser")
+    del arguments[position:position + 2]
+    import subprocess
+    sys.exit(subprocess.run([config["real_downloader"], "--ignore-config", *arguments[:-2],
+                             "--load-info-json", draft.name]).returncode)

@@ -11,7 +11,9 @@ h1{color:#cba6f7;font-size:1.65em}
 p{line-height:1.5}
 button{font-size:1.1rem;padding:15px 22px;border:0;border-radius:12px;background:#b4befe;color:#181825;font-weight:bold}
 button:disabled{opacity:.5}
-#stop{background:#f38ba8}
+#stop,#cancel-calibration{background:#f38ba8}
+table{border-collapse:collapse;font-size:.78rem;width:100%}td,th{padding:5px;border-bottom:1px solid #45475a;text-align:left;white-space:nowrap}details{margin-top:12px}pre{font:inherit;font-size:.8rem}
+#calibration{white-space:pre-line;font-size:.85rem;line-height:1.5;margin-top:14px}
 #status,#wake{padding:12px;background:#313244;border-radius:12px;margin-top:14px}
 small{color:#a6adc8;display:block;margin-top:16px}
 </style></head><body><main>
@@ -19,33 +21,54 @@ small{color:#a6adc8;display:block;margin-top:16px}
 <p>Ce test envoie ta voix à <b>Arch Linux</b>, puis vers la sortie audio PipeWire active. Commence avec un volume faible pour éviter le Larsen.</p>
 <p><label for="output">Sortie à comparer :</label>
 <select id="output" style="font:inherit;width:100%;padding:12px;background:#313244;color:#cdd6f4;border-radius:10px">
-<option value="default">EDENWOOD / sortie active du PC (Bluetooth)</option>
+<option value="default">Sortie active du PC</option>
 <option value="analog">Haut-parleurs ou prise casque analogique du PC</option>
 </select></p>
+<p><label for="profile">Profil du retour micro</label>
+<select id="profile" style="font:inherit;width:100%;padding:12px;background:#313244;color:#cdd6f4;border-radius:10px">
+<option value="stable">Stable (référence)</option>
+<option value="balanced">Équilibré</option>
+<option value="low-latency">Faible latence</option>
+</select></p>
+<p><button id="restore-stable" type="button" disabled>Revenir à Stable</button></p>
+<p id="monitor-preset" role="status" hidden></p>
+<div id="monitor-profile" role="status"></div>
 <p><label for="mic-gain">Niveau de la voix : <output id="mic-gain-value">90 %</output></label>
 <input id="mic-gain" type="range" min="0" max="100" step="5" value="90" style="width:100%">
 </p>
-<p><label for="speaker-volume">Volume de retour (PipeWire) : <output id="speaker-volume-value">160 %</output></label>
-<input id="speaker-volume" type="range" min="50" max="180" step="5" value="160" style="width:100%">
+<p><label><input id="echo-guard" type="checkbox" checked> Protection contre les répétitions</label></p>
+<p><label for="speaker-volume">Volume de retour (PipeWire) : <output id="speaker-volume-value">50 %</output></label>
+<input id="speaker-volume" type="range" min="50" max="100" step="5" value="50" style="width:100%">
 </p>
 <p><button id="start">Activer le micro</button> <button id="stop" disabled>Couper</button></p>
-<p><button id="calibrate">Mesurer sortie audio (sans écho)</button></p>
-<div id="calibration" role="status">Calibration V6 sans Larsen : Kara transmet directement un signal numérique synthétique vers Arch (aucun bip sur le téléphone). Après un amorçage, cinq retours acoustiques sont analysés. Le microphone reste en écoute seule et n’est jamais retransmis en direct. Volume modéré ; aucun enregistrement sur disque.</div>
+<p><button id="calibrate">Calibration complète</button> <button id="cancel-calibration" hidden>Annuler</button></p>
+<div id="calibration" role="status">Un amorçage puis 6 chirps et 6 séquences PN sont émis par Arch. Le micro reste en écoute locale. Choisis un volume modéré. La capture reste temporaire. Le délai mesuré inclut le transport aller et la capture.</div>
+<div id="calibration-level" role="status"></div>
+<details id="calibration-details"><summary>Détails des mesures</summary><div style="overflow-x:auto"><table id="calibration-table"></table></div><pre id="calibration-meta" style="white-space:pre-wrap"></pre></details>
 <div id="status" role="status">Micro inactif.</div>
-<p><small>Le volume de retour agit sur le flux microphone uniquement, pas sur Strawberry. Commence à 160 % et baisse si tu entends de la distorsion.</small></p>
-<p><small>Capture AudioWorklet en temps réel, sans ScriptProcessor ni conversion 16 kHz. Test audio propre : pas de double amplification. Commence à 90 % et baisse si nécessaire. La musique n’est pas modifiée.</small></p>
 <div id="levels" role="status">Niveau micro : en attente…</div>
-<small>Réduction du bruit activée et gain automatique désactivé pour éviter de remonter les sons ambiants.</small>
-<small>Mode de transfert : blocs de 20 ms (moins de messages réseau, même sortie 48 kHz).</small>
+<section aria-labelledby="voice-latency-title">
+<h2 id="voice-latency-title">Diagnostic de latence vocale</h2>
+<div id="latency">WebSocket aller-retour : en attente…</div>
+<div id="timing">Délais internes : en attente…</div>
+<div id="network">Files et tampons : en attente…</div>
 <div id="losses" role="status">Paquets audio : en attente…</div>
-<div id="timing" role="status">Mesures de latence : en attente…</div>
-<div id="startup" role="status">Activation : en attente…</div>
-<div id="latency" role="status">Réseau Wi-Fi : en attente…</div>
-<div id="stages" role="status">Diagnostic horodaté : en attente…</div>
-<div id="network" role="status">Régularité audio réseau : en attente…</div>
-<small>Diagnostic passif : comparer les pauses audio sur le téléphone et leur arrivée sur Arch. Les compteurs ne mesurent pas le retard Bluetooth et ne distinguent pas à eux seuls une pause du navigateur d’un incident Wi-Fi.</small>
+<div id="stages"></div>
+<small>Délais mesurés sur chaque horloge locale. Capture Android, aller simple, sortie acoustique et délai total : inconnus ici. Le délai total nécessite un micro témoin.</small>
+<details><summary>Détails techniques du retour</summary>
+<p><label><input id="chrome-echo" type="checkbox" checked> Annulation d’écho de Chrome</label></p>
+<p><label><input id="chrome-noise" type="checkbox" checked> Réduction de bruit de Chrome</label></p>
+<p><label><input id="short-buffer" type="checkbox"> Tampon Pulse court (profils Équilibré et Faible latence)</label></p>
+<div id="startup">Activation : en attente…</div>
+<pre id="monitor-json" style="white-space:pre-wrap"></pre>
+</details>
+</section>
+<details><summary>Comparaison des sessions de retour</summary>
+<p>Dernier relevé par sortie, profil et état de la protection.</p>
+<div style="overflow-x:auto"><table id="monitor-comparison"></table></div></details>
 <div id="wake" role="status">Préparation du maintien de l'écran allumé…</div>
 <small>La page doit rester au premier plan. Le micro et le verrouillage de l'écran exigent une connexion HTTPS de confiance. Aucun son n'est conservé.</small>
+<script src="/calibration.js"></script>
 <script>
 'use strict';
 const $=x=>document.getElementById(x);
@@ -53,13 +76,119 @@ const status=s=>{$('status').textContent=s};
 const wakeStatus=s=>{$('wake').textContent=s};
 const token=new URLSearchParams(location.search).get('token')||'';
 let ws=null,stream=null,context=null,processor=null,source=null,silence=null,statsTimer=null;
-let roundTrips=[], captureStart=0, sentPackets=0, clientDropped=0;
-let lastMicPacketAt=0, clientGapsOver40=0, clientGapsOver100=0, clientMaxGap=0;
-let packetSequence=0, workletAge=[], beforeSendDelay=[], clientBufferedMax=0;
-let calibrationMode=false, calibrationSamples=[], calibrationTimer=null;
-let calibrationRate=48000, temporaryVolume=null, calibrationCancelled=false;
-let calibrationSending=false, calibrationSession=null;
-let calibrationCaptureStartSec=null, calibrationCaptureFrames=0;
+let captureStart=0, sentPackets=0, clientDropped=0;
+let normalOwner=0;
+let cancelReady=null, normalBusy=false, monitorChanged=false;
+let preferenceRead=0, displayedPreference=null;
+const monitorSessions=new Map();
+const profileNames={stable:'Stable',balanced:'Équilibré','low-latency':'Faible latence'};
+function updateRestore(){
+ $('restore-stable').disabled=Boolean(calibrationOwner)||$('profile').value==='stable';
+}
+function updateEchoVolume(){
+ const volume=$('speaker-volume');
+ volume.max=$('echo-guard').checked?'100':'180';
+ if(Number(volume.value)>Number(volume.max))volume.value=volume.max;
+ $('speaker-volume-value').textContent=volume.value+' %';
+}
+async function refreshOutputPreference(){
+ const read=++preferenceRead;
+ const output=$('output').value;
+ try{
+  const query=new URLSearchParams({token,output});
+  const response=await fetch('/monitor-preferences?'+query,{signal:AbortSignal.timeout(4500)});
+  if(!response.ok)throw Error('Sortie audio indisponible ou modifiée');
+  const {settings,saved,route}=await response.json();
+  if(read!==preferenceRead||$('output').value!==output)return null;
+  if(typeof route!=='string'||!Object.hasOwn(profileNames,settings.profile))throw Error('Profil de sortie incompatible');
+  const signature=JSON.stringify(settings);
+  // Apply a new route or saved revision once. Refreshing the same preset
+  // before activation preserves manual adjustments made for the next trial.
+  if(displayedPreference?.route!==route||displayedPreference.signature!==signature){
+   $('profile').value=settings.profile;
+   $('echo-guard').checked=settings.echo_guard;
+   $('chrome-echo').checked=settings.chrome_echo;
+   $('chrome-noise').checked=settings.chrome_noise;
+   $('short-buffer').checked=settings.pulse_buffer==='short';
+   $('mic-gain').value=String(settings.mic_gain_percent);
+   $('mic-gain-value').textContent=settings.mic_gain_percent+' %';
+   updateEchoVolume();
+   $('speaker-volume').value=String(settings.volume_percent);
+   updateEchoVolume();
+   updateRestore();
+  }
+  displayedPreference={route,signature};
+  $('monitor-preset').hidden=!saved;
+  $('monitor-preset').textContent=saved?(settings.experimental?'Profil expérimental chargé.':'Profil enregistré chargé.'):'';
+  return route;
+ }catch(error){
+  if(read!==preferenceRead)return null;
+  $('monitor-preset').hidden=false;
+  $('monitor-preset').textContent='Impossible de vérifier la sortie audio.';
+  throw error;
+ }
+}
+function showMonitorComparison(){
+ const table=$('monitor-comparison');table.replaceChildren();
+ const rows=[['Sortie','Profil','Protection','Durée','Ignorés tél.','Séq. manquantes','Écartés Arch','Attentes source','Sous-alim. Pulse']];
+ for(const [output,settings,levels,client] of monitorSessions.values())
+  rows.push([output==='analog'?'Analogique':'Sortie par défaut',profileNames[settings.profile],settings.echo_guard?'Activée':'Désactivée',
+   levels.uptime_sec+' s',client.dropped,levels.sequence_missing,levels.queue_drops,levels.source_starvations,levels.pulse_underruns??'—']);
+ for(const [index,values] of rows.entries()){
+  const row=document.createElement('tr');
+  for(const value of values){const cell=document.createElement(index?'td':'th');cell.textContent=String(value);row.appendChild(cell);}
+  table.appendChild(row);
+ }
+}
+function appendSample(samples,when,value){
+ samples.push([when,value]);
+ if(samples.length>1200)samples.splice(0,200);
+}
+function percentile(ordered,p){
+ return ordered[Math.ceil(ordered.length*p)-1];
+}
+function describeSamples(samples,trendKey='trend_ms_per_s'){
+ const values=samples.map(x=>x[1]).sort((a,b)=>a-b),n=values.length;
+ const rounded=x=>Math.round(x*1000)/1000;
+ const result={n,p50:n>=5?rounded(percentile(values,.50)):null,p95:n>=20?rounded(percentile(values,.95)):null,
+  p99:n>=100?rounded(percentile(values,.99)):null,max:n?rounded(values[n-1]):null,[trendKey]:null};
+ if(n>=20&&samples[n-1][0]-samples[0][0]>=5000){
+  const size=Math.floor(n/4), first=samples.slice(0,size), last=samples.slice(-size);
+  const dt=last[Math.floor(size/2)][0]-first[Math.floor(size/2)][0];
+  const mid=group=>percentile(group.map(x=>x[1]).sort((a,b)=>a-b),.5);
+  if(dt>0)result[trendKey]=rounded(1000*(mid(last)-mid(first))/dt);
+ }
+ return result;
+}
+function measuredRate(samples){
+ if(samples.length<2)return null;
+ const [start,first]=samples[0],[end,last]=samples[samples.length-1];
+ return end-start>=5000?Math.round(10000*(last-first)/(end-start))/10:null;
+}
+function sampleText(value,unit=' ms'){return Number.isFinite(value)?value+unit:'—';}
+function renderVoiceDiagnostic(client,data){
+ const times=client.timings_ms, server=data.diagnostic;
+ const rtt=times.rtt_ms;
+ $('latency').textContent='RTT WebSocket (aller-retour) · p50 '+sampleText(rtt.p50)+' · p95 '+sampleText(rtt.p95)+
+  ' · variation relative envoi → réception p95 '+sampleText(server?.relative_transit_ms.p95);
+ const parts=[['Constitution du bloc',times.assembly_audio_ms],['Âge fin Worklet → JS',times.worklet_age_audio_ms],
+  ['JS avant envoi',times.js_before_send_ms],['File Arch',server?.timings_ms.queue_ms],
+  ['DSP',server?.timings_ms.dsp_encode_ms],['stdin + drain',server?.timings_ms.stdin_write_drain_ms]];
+ $('timing').textContent='Délais internes (p95) · '+parts.map(([name,stat])=>name+' '+sampleText(stat?.p95)).join(' · ');
+ const backlog=server?.player_backlog;
+ $('network').textContent='Tampons en cours · navigateur '+sampleText(client.buffered_bytes,' o')+
+  ' · file Arch '+sampleText(data.queue_est_ms)+' · asyncio '+sampleText(backlog?.asyncio_bytes,' o')+
+  ' · tube Linux '+sampleText(backlog?.kernel_pipe_bytes,' o');
+ const rising=parts.filter(([name,stat])=>name!=='Constitution du bloc'&&stat?.trend_ms_per_s>=1)
+  .map(([name,stat])=>name+' +'+stat.trend_ms_per_s+' ms/s');
+ const relative=server?.relative_transit_ms.trend_ms_per_s;
+ if(relative>=1)rising.push('transport relatif / horloges +'+relative+' ms/s');
+ const browser=client.buffered_samples_bytes.trend_bytes_per_s;
+ if(browser>=96)rising.push('tampon navigateur +'+browser+' o/s');
+ const pipe=server?.player_backlog_samples_ms?.kernel_pipe_pcm_ms.trend_ms_per_s;
+ if(pipe>=1)rising.push('tube Linux +'+pipe+' ms PCM/s');
+ $('stages').textContent=rising.length?'Hausse observée · '+rising.join(' · '):'';
+}
 let wake=null,awake=true;
 async function keepAwake(){
  if(!awake||document.visibilityState!=='visible'||wake)return;
@@ -79,110 +208,164 @@ async function keepAwake(){
 }
 async function stop(){
  if(statsTimer){clearInterval(statsTimer);statsTimer=null;}
- if(calibrationTimer){clearTimeout(calibrationTimer);calibrationTimer=null;}
- calibrationCancelled=true;calibrationSending=false;
- if(ws&&ws.readyState===WebSocket.OPEN&&calibrationMode){
-   ws.send('monitor:off');
- }
- if(calibrationMode&&temporaryVolume!==null&&ws&&ws.readyState===WebSocket.OPEN){
-   ws.send('volume:'+temporaryVolume);
- }
- calibrationMode=false;temporaryVolume=null;
+ normalOwner++;
+ normalBusy=false;
+ if(cancelReady)cancelReady();
+ if(calibrationOwner){$('calibration').textContent='Calibration annulée.';releaseCalibration(calibrationOwner);}
  $('calibrate').disabled=false;
  $('start').disabled=false;$('stop').disabled=true;$('output').disabled=false;
- if(processor){processor.port.onmessage=null;processor.disconnect();processor=null;}
+ if(processor){processor.port.onmessage=null;processor.port.close();processor.disconnect();processor=null;}
  if(source){source.disconnect();source=null;}
  if(silence){silence.disconnect();silence=null;}
- if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
- if(context){await context.close().catch(()=>{});context=null;}
- if(ws){try{ws.send('stop');ws.close()}catch(e){}ws=null;}
+ $('profile').disabled=false;$('echo-guard').disabled=false;$('chrome-echo').disabled=false;
+ $('chrome-noise').disabled=false;$('short-buffer').disabled=false;updateRestore();
+ if(stream){stream.getTracks().forEach(t=>{t.onended=null;t.stop();});stream=null;}
+ const closingContext=context;context=null;
+ if(closingContext)closingContext.onstatechange=null;
+ const closingSocket=ws;ws=null;
+ if(closingSocket){closingSocket.onclose=null;closingSocket.onmessage=null;closingSocket.onerror=null;try{if(closingSocket.readyState===WebSocket.OPEN)closingSocket.send('stop');closingSocket.close();}catch(e){}}
  status('Micro coupé.');
+ $('monitor-profile').textContent='';
+ if(monitorChanged){showMonitorComparison();monitorChanged=false;}
+ if(closingContext)await closingContext.close().catch(()=>{});
 }
-async function startMic(calibration=false){
+async function startMic(){
+ if(calibrationOwner||normalBusy)return;
+ const owner=++normalOwner;
+ const active=()=>{if(owner!==normalOwner)throw Error('Activation annulée');};
  if(!window.isSecureContext||!navigator.mediaDevices){
   status('Le micro exige une page HTTPS avec un certificat de confiance.');return;
  }
  $('start').disabled=true;$('output').disabled=true;
+ normalBusy=true;
+ $('profile').disabled=true;$('echo-guard').disabled=true;$('chrome-echo').disabled=true;
+ $('chrome-noise').disabled=true;$('short-buffer').disabled=true;updateRestore();
  $('calibrate').disabled=true;
- calibrationMode=calibration;calibrationCancelled=false;calibrationSending=false;calibrationSamples=[];
+ $('stop').disabled=false;
+ let lastWorkletSequence=-1, workletDuplicates=0;
+ let lastFrame=null, lastArrival=null, missingInputFrames=0, clientBufferedMax=0, sourceQuantumMax=0;
+ const workletEndFrames=[];
+ const bufferedSamples=[];
+ const probes={assembly_audio_ms:[],worklet_age_audio_ms:[],callback_gap_ms:[],
+  js_before_send_ms:[],ws_send_api_ms:[],rtt_ms:[]};
+ const skipped={old:0,backlog:0,closed:0};
+ $('levels').textContent='Niveau micro : en attente…';
+ $('losses').textContent='Paquets audio : en attente…';
+ $('latency').textContent='WebSocket aller-retour : en attente…';
+ $('timing').textContent='Délais internes : en attente…';
+ $('network').textContent='Files et tampons : en attente…';
+ $('stages').textContent='';$('monitor-json').textContent='';
  captureStart=performance.now();sentPackets=0;clientDropped=0;
- packetSequence=0;workletAge=[];beforeSendDelay=[];clientBufferedMax=0;
- lastMicPacketAt=0;clientGapsOver40=0;clientGapsOver100=0;clientMaxGap=0;
  try{
-  stream=await navigator.mediaDevices.getUserMedia({audio:{
-   echoCancellation:!calibration,noiseSuppression:!calibration,autoGainControl:false},video:false});
-  await keepAwake();
+  const route=await refreshOutputPreference();active();
+  if(!route)throw Error('Sortie audio modifiée');
+  const profile=$('profile').value, output=$('output').value, echoGuard=$('echo-guard').checked;
+  const acquired=await navigator.mediaDevices.getUserMedia({audio:{
+   // Isolate Chrome's track setting from Kara's separate return gain guard.
+   echoCancellation:$('chrome-echo').checked,noiseSuppression:$('chrome-noise').checked,
+   autoGainControl:false},video:false});
+  if(owner!==normalOwner){acquired.getTracks().forEach(t=>t.stop());return;}
+  stream=acquired;
+  const tracks=stream.getAudioTracks();
+  if(tracks.length!==1||tracks[0].readyState!=='live')throw Error('Une seule piste micro active est requise.');
+  const track=tracks[0];
+  track.onended=()=>{if(owner===normalOwner){stop();status('Micro coupé. Piste audio terminée.');}};
+  await keepAwake();active();
   context=new AudioContext({latencyHint:'interactive',sampleRate:48000});
-  await context.resume();
-  ws=new WebSocket('wss://'+location.host+'/audio?token='+encodeURIComponent(token)+'&output='+encodeURIComponent($('output').value)+'&rate='+encodeURIComponent(context.sampleRate)+(calibration?'&calibration=1':''));
-  ws.binaryType='arraybuffer';
-  await new Promise((resolve,reject)=>{
-   const timeout=setTimeout(()=>reject(Error('Délai réseau dépassé')),5000);
-   ws.onmessage=event=>{
-    try{if(JSON.parse(event.data).ready){clearTimeout(timeout);resolve()}}catch(e){}
+  await context.resume();active();
+  const query=new URLSearchParams({token,output,rate:context.sampleRate,profile,route,
+   echo_guard:echoGuard?'1':'0',volume:$('speaker-volume').value});
+  if(profile!=='stable'&&$('short-buffer').checked)query.set('pulse_buffer','short');
+  const socket=ws=new WebSocket('wss://'+location.host+'/audio?'+query);
+  socket.binaryType='arraybuffer';
+  const settings=await new Promise((resolve,reject)=>{
+   function finish(error,value){
+    clearTimeout(timeout);cancelReady=null;
+    error?reject(Error(error)):resolve(value);
+   }
+   const timeout=setTimeout(()=>finish('Délai réseau dépassé'),5000);
+   cancelReady=()=>finish('Activation annulée');
+   socket.onmessage=event=>{
+    try{const data=JSON.parse(event.data);if(data.ready)finish(null,data);}catch(e){}
    };
-   ws.onerror=()=>{clearTimeout(timeout);reject(Error('Connexion audio impossible'))};
-   ws.onclose=()=>{clearTimeout(timeout);reject(Error('Connexion interrompue'))};
+   socket.onerror=()=>finish('Connexion audio impossible');
+   socket.onclose=()=>finish('Connexion interrompue');
   });
+  active();
+  if(settings.profile!==profile||![10,20].includes(settings.block_ms)||!Number.isFinite(settings.queue_max_ms))throw Error('Profil serveur incompatible');
+  if(settings.echo_guard!==echoGuard)throw Error('Réglage de protection incompatible');
+  socket.onclose=()=>{if(owner===normalOwner){stop();status('Micro coupé. Connexion audio interrompue.');}};
+  socket.onerror=null;
+  context.onstatechange=()=>{if(owner===normalOwner&&context.state!=='running'){stop();status('Micro coupé. Contexte audio suspendu.');}};
+  const trackSettings=track.getSettings(), capture={context_rate_hz:context.sampleRate};
+  if(Number.isFinite(context.baseLatency))capture.base_latency_ms=context.baseLatency*1000;
+  for(const key of ['latency','sampleRate','channelCount','echoCancellation','noiseSuppression','autoGainControl'])
+   if(typeof trackSettings[key]==='boolean'||Number.isFinite(trackSettings[key]))capture[key]=trackSettings[key];
+  if(['all','remote-only'].includes(trackSettings.echoCancellation))capture.echoCancellation=trackSettings.echoCancellation;
+  const backend=profile==='stable'?'pw-cat':'pacat';
+  $('monitor-profile').textContent=profileNames[profile]+' · blocs '+settings.block_ms+' ms · file Arch max. '+settings.queue_max_ms+' ms · '+backend+' : '+settings.requested_latency_ms+' ms demandées'+
+   (echoGuard?' · protection active (−'+settings.echo_guard_attenuation_db+' dB sur le retour)':' · protection désactivée');
+  const maxSocketBytes=(Math.round(context.sampleRate*settings.block_ms/1000)*2+16)*settings.queue_max_ms/settings.block_ms;
   await context.audioWorklet.addModule('/worklet.js?token='+encodeURIComponent(token));
+  active();
   source=context.createMediaStreamSource(stream);
-  processor=new AudioWorkletNode(context,'kara-micro',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
+  processor=new AudioWorkletNode(context,'kara-micro',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1],
+   processorOptions:{monitorBlockMs:settings.block_ms}});
   processor.port.postMessage({gain:Number($('mic-gain').value)/100});
   processor.port.onmessage=event=>{
-    const payload=event.data.pcm;
-    const endSec=event.data.endSec;
-    if(!calibrationMode){
-      const arrived=performance.now();
-      // Both values use AudioContext's clock, avoiding wall-clock sync.
-      const ageMs=Math.max(0,(context.currentTime-endSec)*1000);
-      workletAge.push(ageMs);
-      if(workletAge.length>1200)workletAge.shift();
-      if(lastMicPacketAt){
-        const gap=arrived-lastMicPacketAt;
-        if(gap>40)clientGapsOver40++;
-        if(gap>100)clientGapsOver100++;
-        clientMaxGap=Math.max(clientMaxGap,gap);
-      }
-      lastMicPacketAt=arrived;
+    if(owner!==normalOwner)return;
+    const {pcm:payload,endSec,endFrame,sequence,readySpanFrames,quantumFrames}=event.data;
+    // Keep the capture identity even across a browser-side drop. Replaying a
+    // Worklet message cannot acquire a fresh sequence on the main thread.
+    if(!Number.isSafeInteger(sequence)||sequence<=lastWorkletSequence){workletDuplicates++;return;}
+    lastWorkletSequence=sequence;
+    const arrived=performance.now();
+    // Compare clocks within the browser. After a main-thread stall the
+    // experimental profiles discard old audio before it enters ordered TCP.
+    const ageMs=Math.max(0,(context.currentTime-endSec)*1000);
+    appendSample(probes.worklet_age_audio_ms,arrived,ageMs);
+    if(lastArrival!==null)appendSample(probes.callback_gap_ms,arrived,arrived-lastArrival);
+    lastArrival=arrived;
+    if(Number.isSafeInteger(endFrame)){
+      if(lastFrame!==null)missingInputFrames+=Math.max(0,endFrame-lastFrame-payload.byteLength/2);
+      lastFrame=endFrame;
+      appendSample(workletEndFrames,arrived,endFrame);
     }
-    if(calibrationMode){
-      // Timestamp every captured PCM frame on the SAME AudioContext clock
-      // as the outgoing test burst. Never infer time from a reset array length.
-      const block=new Int16Array(payload);
-      if(calibrationCaptureStartSec===null){
-        calibrationCaptureStartSec=endSec-block.length/context.sampleRate;
-      }
-      calibrationCaptureFrames+=block.length;
-      calibrationSamples.push(block);
-    }
-    if(calibrationMode)return; // NEVER forward live microphone in calibration
-    if(ws&&ws.readyState===WebSocket.OPEN&&ws.bufferedAmount<4000){
+    if(Number.isSafeInteger(readySpanFrames))appendSample(probes.assembly_audio_ms,arrived,1000*readySpanFrames/context.sampleRate);
+    if(Number.isSafeInteger(quantumFrames))sourceQuantumMax=Math.max(sourceQuantumMax,quantumFrames);
+    const bufferedBefore=socket.bufferedAmount;
+    appendSample(bufferedSamples,arrived,bufferedBefore);
+    const tooOld=profile!=='stable'&&!(ageMs<=settings.queue_max_ms);
+    const backlog=profile==='stable'?bufferedBefore>=4000:bufferedBefore+16+payload.byteLength>maxSocketBytes;
+    clientBufferedMax=Math.max(clientBufferedMax,bufferedBefore);
+    if(socket.readyState===WebSocket.OPEN&&!tooOld&&!backlog){
       // KTS1 + u32 sequence + f64 client send timestamp (milliseconds).
       // Audio remains identical after stripping the 16-byte header on Arch.
       const binary=new ArrayBuffer(16+payload.byteLength);
       const header=new DataView(binary);
       header.setUint8(0,75);header.setUint8(1,84);header.setUint8(2,83);header.setUint8(3,49);
-      header.setUint32(4,packetSequence++,true);
-      const stamp=performance.now();header.setFloat64(8,stamp,true);
+      header.setUint32(4,sequence,true);
       new Uint8Array(binary,16).set(new Uint8Array(payload));
-      ws.send(binary);sentPackets++;
-      beforeSendDelay.push(performance.now()-stamp);
-      if(beforeSendDelay.length>1200)beforeSendDelay.shift();
-      clientBufferedMax=Math.max(clientBufferedMax,ws.bufferedAmount);
-    }else{clientDropped++;packetSequence++;}
+      const stamp=performance.now();header.setFloat64(8,stamp,true);
+      socket.send(binary);sentPackets++;
+      const sentAt=performance.now();
+      appendSample(probes.js_before_send_ms,stamp,stamp-arrived);
+      appendSample(probes.ws_send_api_ms,sentAt,sentAt-stamp);
+      clientBufferedMax=Math.max(clientBufferedMax,socket.bufferedAmount);
+    }else{
+      clientDropped++;
+      skipped[socket.readyState!==WebSocket.OPEN?'closed':tooOld?'old':'backlog']++;
+    }
   };
   silence=context.createGain();silence.gain.value=0;
   source.connect(processor);processor.connect(silence);silence.connect(context.destination);
+  let lastLocalDiagnostics=-Infinity;
   ws.onmessage=event=>{
    if(typeof event.data==='string' && event.data.startsWith('pong:')){
     const sent=Number(event.data.slice(5));
-    const rtt=performance.now()-sent;
+    const now=performance.now(), rtt=now-sent;
     if(Number.isFinite(rtt) && rtt>=0 && rtt<10000){
-      roundTrips.push(rtt);if(roundTrips.length>8)roundTrips.shift();
-      const median=[...roundTrips].sort((a,b)=>a-b)[Math.floor(roundTrips.length/2)];
-      const highest=Math.max(...roundTrips);
-      const lowest=Math.min(...roundTrips);
-      $('latency').textContent='WebSocket aller-retour : médiane '+Math.round(median)+' ms · min '+Math.round(lowest)+' ms · max '+Math.round(highest)+' ms (hors Bluetooth et capture).';
+      appendSample(probes.rtt_ms,now,rtt);
     }
     return;
    }
@@ -191,22 +374,31 @@ async function startMic(calibration=false){
     if(data.levels){
      const db=data.rms>0?Math.round(20*Math.log10(data.rms)):'silence';
      $('levels').textContent='Niveau reçu : '+db+' dBFS · crêtes '+Math.round(data.peak*100)+' % · échantillons saturés : '+data.clipped;
-     $('losses').textContent='Paquets émis : '+sentPackets+' · ignorés téléphone : '+clientDropped+' · reçus Arch : '+data.rx_packets+' · perdus Arch : '+data.queue_drops+' ('+data.drop_per_sec+'/s)';
-     $('timing').textContent='Test : '+data.uptime_sec+' s · écriture PipeWire moy. '+data.write_avg_ms+' ms / max '+data.write_max_ms+' ms · écritures >10 ms : '+data.write_over_10ms+' · attente tampon '+data.queue_wait_last_ms+' ms / max '+data.queue_wait_max_ms+' ms · tampon actuel ~'+data.queue_est_ms+' ms';
-     const quantile=(v,q)=>{if(!v.length)return 0;const a=[...v].sort((x,y)=>x-y);return a[Math.floor((a.length-1)*q)];};
-     $('stages').textContent='Étapes : Worklet → JS p95 '+quantile(workletAge,.95).toFixed(1)+' ms / max '+Math.max(0,...workletAge).toFixed(1)+' ms · préparation WebSocket p95 '+quantile(beforeSendDelay,.95).toFixed(2)+' ms · tampon WebSocket max '+clientBufferedMax+' octets · transport relatif Arch p95 '+data.transport_excess_p95_ms+' ms / max '+data.transport_excess_max_ms+' ms · séquences manquantes '+data.sequence_missing+'.';
-     $('network').textContent='Audio toutes les 20 ms — Téléphone : interruptions >40 ms '+clientGapsOver40+' / >100 ms '+clientGapsOver100+' · max '+Math.round(clientMaxGap)+' ms. Arrivée Arch : intervalle p95 '+data.rx_gap_p95_ms+' ms · interruptions >40 ms '+data.rx_gaps_over_40+' / >100 ms '+data.rx_gaps_over_100+' · max '+data.rx_gap_max_ms+' ms · rafales <5 ms '+data.rx_bursts_under_5+'.';
+     $('losses').textContent='Ignorés tél. : '+clientDropped+' · séquences manquantes : '+data.sequence_missing+' · écartés Arch : '+data.queue_drops+' · attentes source : '+data.source_starvations+
+      (data.transport_stale_drops?' · périmés après un trou réseau : '+data.transport_stale_drops:'')+
+      (data.pulse_underruns==null?'':' · sous-alimentations Pulse : '+data.pulse_underruns)+'.';
+     const timings_ms=Object.fromEntries(Object.entries(probes).map(([key,list])=>[key,describeSamples(list)]));
+     const client={sent:sentPackets,dropped:clientDropped,drop_reasons:{...skipped},
+      worklet_duplicates:workletDuplicates,worklet_missing_frames:missingInputFrames,
+      max_quantum_frames:sourceQuantumMax||null,worklet_frames_per_s:measuredRate(workletEndFrames),
+      buffered_bytes:socket.bufferedAmount,buffered_bytes_max:clientBufferedMax,
+      buffered_samples_bytes:describeSamples(bufferedSamples,'trend_bytes_per_s'),timings_ms};
+     const now=performance.now();
+     if(settings.local_diagnostics&&socket.readyState===WebSocket.OPEN&&socket.bufferedAmount===0
+        &&now-lastLocalDiagnostics>=3000){
+      socket.send('diagnostics:'+JSON.stringify({capture,client}));
+      lastLocalDiagnostics=now;
+     }
+     renderVoiceDiagnostic(client,data);
+     $('monitor-json').textContent=JSON.stringify({settings,capture,output,client,server:data,
+      unmeasured_ms:{android_adc_to_worklet:null,network_one_way:null,stdin_to_acoustic:null,
+       voice_to_acoustic:null}},null,2);
+     monitorChanged=true;
+     monitorSessions.set(output+'/'+profile+'/'+echoGuard,[output,settings,data,client]);
     }
    }catch(e){}
   };
-  if(calibration){
-    temporaryVolume=$('speaker-volume').value;
-    ws.send('monitor:off');
-    ws.send('volume:85');
-  }else if(ws&&ws.readyState===WebSocket.OPEN){
-    ws.send('volume:'+$('speaker-volume').value);
-  }
-  roundTrips=[];
+  ws.send('volume:'+$('speaker-volume').value);
   statsTimer=setInterval(()=>{
     if(ws&&ws.readyState===WebSocket.OPEN){
       ws.send('levels');ws.send('ping:'+performance.now());
@@ -215,341 +407,266 @@ async function startMic(calibration=false){
   $('stop').disabled=false;
   $('startup').textContent='Activation totale : '+Math.round(performance.now()-captureStart)+' ms (téléphone + serveur + Worklet)';
   status('Micro actif → Arch → '+($('output').value==='analog'?'sortie analogique':'sortie PipeWire active')+'. Parle doucement.');
-  ws.onclose=()=>{if(stream)stop();};
-  if(calibration){
-    calibrationRate=context.sampleRate;
-    await runAutomaticCalibration();
-  }
- }catch(error){await stop();status('Échec : '+error.message);}
+ }catch(error){if(owner===normalOwner){await stop();status('Échec : '+error.message);}}
 }
-$('start').onclick=()=>startMic(false);
-$('calibrate').onclick=()=>{
-  if(stream){$('calibration').textContent='Coupe d’abord le micro normal, puis relance la calibration.';return;}
-  startMic(true);
+$('profile').onchange=updateRestore;
+$('output').onchange=()=>refreshOutputPreference().catch(()=>{});
+$('echo-guard').onchange=updateEchoVolume;
+$('restore-stable').onclick=()=>{
+ if(calibrationOwner)return;
+ if(normalBusy)stop();
+ $('profile').value='stable';updateRestore();
+ status('Profil Stable sélectionné. Active le micro pour reprendre.');
 };
-// V5: nonrepeating, phase-coded frequency sweep. Earlier switching between
-// only two fixed frequencies produced strongly correlated false arrivals.
-// A smooth gated sweep with changing chips has a distinct time signature.
-function makeCalibrationTone(rate){
- const duration=0.36,length=Math.round(rate*duration);
- const out=new Float32Array(length);
- let seed=0x12f35a9b,phase=0,chipSign=1,lastChip=-1;
- for(let i=0;i<length;i++){
-  const t=i/rate,chip=Math.floor(t/0.0073);
-  if(chip!==lastChip){
-   seed=(Math.imul(seed,1664525)+1013904223)>>>0;
-   chipSign=(seed&1)?1:-1;
-   lastChip=chip;
-  }
-  const fraction=t/duration;
-  const hz=950+2600*fraction+380*Math.sin(2*Math.PI*3.1*t);
-  phase+=2*Math.PI*hz/rate;
-  const fade=Math.min(1,t/.008,(duration-t)/.008);
-  // Deterministic phase-code, smooth transitions suppress clicks.
-  const chipPhase=(t/0.0073)-chip;
-  const gate=Math.sin(Math.PI*chipPhase)**2;
-  out[i]=0.20*chipSign*Math.sin(phase)*gate*Math.max(0,fade);
- }
- return out;
+$('start').onclick=()=>startMic();
+$('calibrate').onclick=()=>startCalibration();
+// Calibration owns its socket and capture independently of normal streaming.
+let calibrationOwner=null;
+const CAL_LIMITS={sessionMs:90000,packetSeconds:5,referenceFrames:4800};
+const CAL_SERVER_ERRORS=new Map([
+ ['target_unavailable','Sortie PipeWire indisponible'],
+ ['probe_failed','Échec de lecture sur la sortie PipeWire sélectionnée'],
+ ['probe_in_progress','Une sonde est déjà en cours'],
+ ['probe_rate_limited','Intervalle minimal entre deux sondes non respecté'],
+ ['probe_limit','Quota de sondes atteint'],
+ ['session_timeout','Durée maximale de la session serveur atteinte'],
+ ['idle_timeout','Session serveur inactive'],
+ ['unsupported_command','Commande de calibration refusée par le serveur'],
+ ['invalid_or_rate_limited_ping','Mesure réseau refusée par le serveur'],
+]);
+function calibrationActive(owner){
+ if(calibrationOwner!==owner||owner.cancelled)throw Error('Calibration annulée');
 }
-function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
-function playCalibrationTone(samples){
- const buffer=context.createBuffer(1,samples.length,context.sampleRate);
- buffer.copyToChannel(samples,0);
- const emitter=context.createBufferSource();emitter.buffer=buffer;
- const volume=context.createGain();volume.gain.value=0.65;
- emitter.connect(volume);volume.connect(context.destination);
- emitter.onended=()=>{emitter.disconnect();volume.disconnect();};
- emitter.start();
+function calibrationWait(owner,ms){
+ return new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>{owner.waiters.delete(cancel);resolve();},ms);
+  const cancel=()=>{clearTimeout(timer);reject(Error('Calibration annulée'));};
+  owner.waiters.add(cancel);
+ });
 }
-function flattenCalibration(packets){
- const total=packets.reduce((sum,p)=>sum+p.length,0);
- const array=new Float32Array(total);
- let offset=0;
- for(const packet of packets){
-  for(let i=0;i<packet.length;i++) array[offset+i]=packet[i]/32768;
-  offset+=packet.length;
+function releaseCalibration(owner){
+ if(!owner||owner.cancelled)return;
+ owner.cancelled=true;clearTimeout(owner.deadline);
+ for(const cancel of owner.waiters)cancel();owner.waiters.clear();
+ if(owner.socket){
+  owner.socket.onmessage=null;owner.socket.onclose=null;owner.socket.onerror=null;
+  try{if(owner.socket.readyState===WebSocket.OPEN)owner.socket.send('stop');owner.socket.close();}catch(e){}
  }
- return array;
+ if(owner.node){owner.node.port.onmessage=null;owner.node.disconnect();}
+ if(owner.source)owner.source.disconnect();
+ if(owner.mute)owner.mute.disconnect();
+ if(owner.stream)owner.stream.getTracks().forEach(t=>{t.onended=null;t.stop();});
+ if(owner.context)owner.context.close().catch(()=>{});
+ owner.packets=[];owner.reference=null;owner.pending=null;
+ if(calibrationOwner===owner){
+  calibrationOwner=null;
+  $('start').disabled=false;$('calibrate').disabled=false;
+  $('cancel-calibration').hidden=true;$('output').disabled=false;
+  $('profile').disabled=false;$('echo-guard').disabled=false;updateRestore();
+ }
 }
-function correlateTone(recording,tone,rate){
- // Compare at 8kHz to keep analysis responsive on older phones.
- const stride=Math.max(1,Math.round(rate/8000));
- const segment=Math.floor(tone.length/stride);
- const template=new Float32Array(segment);
- for(let i=0;i<segment;i++)template[i]=tone[i*stride];
- const signal=new Float32Array(Math.floor(recording.length/stride));
- for(let i=0;i<signal.length;i++)signal[i]=recording[i*stride];
- let templateEnergy=0;
- for(const v of template)templateEnergy+=v*v;
- const peaks=[];
- const step=Math.max(1,Math.round(.002*rate/stride));
- for(let offset=0;offset+segment<signal.length;offset+=step){
-  let dot=0,energy=0;
-  for(let i=0;i<segment;i++){
-   const v=signal[offset+i];dot+=v*template[i];energy+=v*v;
-  }
-  const score=dot/Math.sqrt(Math.max(1e-12,energy*templateEnergy));
-  peaks.push({ms:offset*stride*1000/rate,score});
- }
- return peaks;
+function boundedCalibration(owner,promise,ms){
+ return new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>finish(Error('Délai de préparation dépassé')),ms);
+  const cancel=()=>finish(Error('Calibration annulée'));
+  function finish(error,value){clearTimeout(timer);owner.waiters.delete(cancel);error?reject(error):resolve(value);}
+  owner.waiters.add(cancel);promise.then(value=>finish(null,value),finish);
+ });
 }
-function findCorrelationPeak(data,startMs,endMs){
- let best=null;
- for(const p of data){
-  if(p.ms<startMs||p.ms>endMs)continue;
-  if(!best||p.score>best.score)best=p;
+function calibrationPacket(owner,data){
+ if(calibrationOwner!==owner||owner.cancelled)return;
+ const pcm=new Int16Array(data.pcm),end=data.endFrame;
+ if(!Number.isSafeInteger(end)||!pcm.length||pcm.length>owner.context.sampleRate/10){owner.captureError='Horodatage micro invalide';return;}
+ const start=end-pcm.length;
+ if(owner.lastEnd!==null&&(start!==owner.lastEnd||data.sequence!==owner.lastSequence+1))owner.captureError='Perte ou rupture de capture';
+ owner.lastEnd=end;owner.lastSequence=data.sequence;
+ const age=Math.max(0,(owner.context.currentTime-end/owner.context.sampleRate)*1000);
+ if(Number.isFinite(age)){(owner.ages||(owner.ages=[])).push(age);if(owner.ages.length>1200)owner.ages.shift();}
+ owner.packets.push({start,end,pcm});owner.frames+=pcm.length;
+ if(!owner.levelAt||end-owner.levelAt>=owner.context.sampleRate/5){
+  owner.levelAt=end;
+  const level=KaraCalibration.levels(Float32Array.from(pcm,x=>x/32768));
+  const db=x=>x>0?(20*Math.log10(x)).toFixed(1)+' dBFS':'silence';
+  $('calibration-level').textContent='Micro : '+db(level.rms)+' · crête '+(level.peak*100).toFixed(1)+' % · saturés '+level.clipped+' · bruit ambiant '+(owner.noiseRms===undefined?'en mesure…':db(owner.noiseRms))+(level.clipped>0?' · ⚠ saturation : réduire le volume':level.rms>.15?' · ⚠ niveau élevé':level.rms<.0001?' · niveau très faible':'');
  }
- return best;
+ const limit=owner.context.sampleRate*CAL_LIMITS.packetSeconds;
+ while(owner.frames>limit){owner.frames-=owner.packets.shift().pcm.length;}
 }
-// Legacy V2-V5 helper retained for regression tests only.
-// V6 sends the original digital tone, never a captured microphone clip.
-function findRecordedTone(recording,rate){
- const window=Math.round(rate*0.25), hop=Math.round(rate*0.01);
- const from=Math.round(rate*.22), to=Math.min(recording.length-window,Math.round(rate*.9));
- let bestOffset=-1,bestEnergy=0;
- for(let offset=from;offset<to;offset+=hop){
-  let e=0;
-  for(let i=0;i<window;i+=8){const v=recording[offset+i];e+=v*v;}
-  if(e>bestEnergy){bestEnergy=e;bestOffset=offset;}
+function calibrationRecording(owner,start,end){
+ if(owner.captureError)throw Error(owner.captureError);
+ const packets=owner.packets.filter(p=>p.end>start&&p.start<end);
+ if(!packets.length||packets[0].start>start||packets[packets.length-1].end<end)throw Error('Capture incomplète ou livraison trop tardive');
+ const origin=packets[0].start,last=packets[packets.length-1].end;
+ const samples=new Float32Array(last-origin);let next=origin;
+ for(const p of packets){
+  if(p.start!==next)throw Error('Rupture de capture');
+  for(let i=0;i<p.pcm.length;i++)samples[p.start-origin+i]=p.pcm[i]/32768;
+  next=p.end;
  }
- return bestOffset<0?null:{clip:recording.slice(bestOffset,bestOffset+window),energy:Math.sqrt(bestEnergy/Math.ceil(window/8))};
+ return {samples,origin};
 }
-function resetCalibrationCapture(){
- calibrationSamples=[];
- calibrationCaptureStartSec=null;
- calibrationCaptureFrames=0;
+function calibrationTelemetry(data){
+ const result={};
+ for(const key of ['rate','channels','frames','duration_ms','configured_latency_ms','process_startup_ms','startup_guard_ms','request_to_write_ms','drain_ms','request_to_drain_ms','request_to_exit_ms','completed_count','server_ready_ms']){
+  if(Number.isFinite(data[key]))result[key]=data[key];
+ }
+ return result;
 }
-// Transmit only a bounded, deterministic DIGITAL tone. Never transmit live mic.
-// Monotonic deadlines prevent setTimeout drift from accumulating frame by frame.
-async function transmitRecordedClip(clip,rate){
- const frame=Math.round(rate/50), period=1000*frame/rate;
- const count=Math.ceil(clip.length/frame), timeline=[];
- const startPerformance=performance.now();
- let firstSendContextSec=null, maxBuffered=0, maxLateMs=0;
- for(let index=0;index<count;index++){
-  const deadline=startPerformance+index*period;
-  if(index>0)await sleep(Math.max(0,deadline-performance.now()));
-  if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)
-   throw Error('Calibration interrompue');
-  const bytes=new Int16Array(frame), offset=index*frame;
-  for(let i=0;i<frame&&offset+i<clip.length;i++){
-   bytes[i]=Math.round(Math.max(-1,Math.min(1,clip[offset+i]))*32767);
-  }
-  if(index===0)firstSendContextSec=context.currentTime;
-  const now=performance.now();
-  maxLateMs=Math.max(maxLateMs,Math.max(0,now-deadline));
-  timeline.push(now);
-  ws.send(bytes.buffer);
-  maxBuffered=Math.max(maxBuffered,ws.bufferedAmount);
- }
- const gaps=timeline.slice(1).map((time,i)=>time-timeline[i]);
- return {sendContextSec:firstSendContextSec,
-         maxLateMs, maxBuffered,
-         minGapMs:gaps.length?Math.min(...gaps):0,
-         maxGapMs:gaps.length?Math.max(...gaps):0};
-}
-function analyzeRecordedReturn(recording,clip,rate,anchorMs){
- const response=correlateTone(recording,clip,rate);
- const start=anchorMs+35,end=anchorMs+1150;
- const candidates=response.filter(p=>p.ms>=start&&p.ms<=end);
- const best=candidates.reduce((top,p)=>!top||p.score>top.score?p:top,null);
- const confidence=Math.round(Math.max(0,best?.score||0)*100);
- if(!best||best.score<0.30){
-  return {ok:false,confidence,reason:'corrélation insuffisante'};
- }
- const delay=Math.round(best.ms-anchorMs);
- if(delay<35||delay>1150){
-  return {ok:false,confidence,reason:'retard hors plage'};
- }
- // Distinct, plausible echoes or wrong matches cannot be resolved merely by
- // selecting the largest correlation peak. Neighbouring 2ms peaks belong to
- // the same acoustic arrival and are not separate candidates.
- const rivals=candidates.filter(p=>Math.abs(p.ms-best.ms)>=35);
- const rival=rivals.reduce((top,p)=>!top||p.score>top.score?p:top,null);
- const rivalRatio=rival&&rival.score>0?rival.score/best.score:0;
- if(rivalRatio>=0.85){
-  return {ok:false,delay,confidence,rivalRatio:Math.round(rivalRatio*100),reason:'pic acoustique ambigu'};
- }
- return {ok:true,delay,confidence,rivalRatio:Math.round(rivalRatio*100)};
-}
-// Diagnostics are calculated in browser RAM on already captured audio. They
-// never create files or transmit microphone data other than the finite reference.
-// V6 uses the original DIGITAL reference, but the return is acoustically
-// recorded after Android/Arch processing. Values are relative, NOT THD.
-function waveformDiagnostics(recording,reference,rate,peakMs){
- const offset=Math.round(peakMs*rate/1000);
- const length=Math.min(reference.length,recording.length-offset);
- if(!Number.isFinite(offset)||offset<0||length<rate*.1)return null;
- let sumRef=0,sumRx=0,clipCount=0;
- const refEnv=[],rxEnv=[],hop=Math.max(1,Math.round(rate*.01));
- for(let start=0;start<length;start+=hop){
-  let a=0,b=0;
-  for(let i=start;i<Math.min(length,start+hop);i++){
-   const x=reference[i],y=recording[offset+i];
-   a+=x*x;b+=y*y;clipCount+=Math.abs(y)>=.995;
-  }
-  sumRef+=a;sumRx+=b;
-  refEnv.push(Math.sqrt(a/Math.min(hop,length-start)));
-  rxEnv.push(Math.sqrt(b/Math.min(hop,length-start)));
- }
- const n=refEnv.length;
- const av=refEnv.reduce((a,b)=>a+b,0)/n;
- const bv=rxEnv.reduce((a,b)=>a+b,0)/n;
- let cov=0,va=0,vb=0;
- for(let i=0;i<n;i++){
-  const a=refEnv[i]-av,b=rxEnv[i]-bv;
-  cov+=a*b;va+=a*a;vb+=b*b;
- }
- const envCorr=va>1e-12&&vb>1e-12?cov/Math.sqrt(va*vb):0;
- const referenceDb=10*Math.log10(Math.max(1e-12,sumRef/length));
- const returnDb=10*Math.log10(Math.max(1e-12,sumRx/length));
- return {referenceDb:Math.round(referenceDb),returnDb:Math.round(returnDb),
-  levelDeltaDb:Math.round(returnDb-referenceDb),
-  envelopeCorr:Math.round(Math.max(-1,Math.min(1,envCorr))*100),
-  clippedPercent:Math.round(10000*clipCount/length)/100};
-}
-// V4: select the FIRST sufficiently supported acoustic arrival, rather than
-// assuming the strongest correlation peak is always the direct sound.
-// Strong later reflections may dominate, especially in a room with a speaker.
-// Report both onset and dominant peaks; no claims of end-to-end Android delay.
-function analyzeFirstArrival(recording,clip,rate,anchorMs){
- const response=correlateTone(recording,clip,rate);
- const window=response.filter(p=>p.ms>=anchorMs+35&&p.ms<=anchorMs+1150);
- const dominant=window.reduce((best,p)=>!best||p.score>best.score?p:best,null);
- const diagnostic=dominant?waveformDiagnostics(recording,clip,rate,dominant.ms):null;
- if(!dominant||dominant.score<0.40){
-  return {ok:false,confidence:Math.round(Math.max(0,dominant?.score||0)*100),
-   reason:'signal trop faible ou non identifié',diagnostic};
- }
- // A distinct local maximum must stand above the measured room/background
- // correlation and be at least 70% of the strongest possible arrival.
- const background=response.filter(p=>p.ms<anchorMs-30);
- const noiseScores=background.map(p=>Math.max(0,p.score)).sort((a,b)=>a-b);
- const noiseP95=noiseScores.length?noiseScores[Math.floor(.95*(noiseScores.length-1))]:0;
- const threshold=Math.max(.40,dominant.score*.70,noiseP95+.16);
- const peaks=[];
- for(let i=1;i<window.length-1;i++){
-  const p=window[i];
-  if(p.score>=threshold&&p.score>=window[i-1].score&&p.score>window[i+1].score){
-   const previous=peaks[peaks.length-1];
-   // Merge peaks only 2ms apart into one acoustic event.
-   if(previous&&p.ms-previous.ms<24){
-    if(p.score>previous.score)peaks[peaks.length-1]=p;
-   }else peaks.push(p);
-  }
- }
- // The dominant peak itself can lie at a filter boundary.
- if(!peaks.length){
-  return {ok:false,confidence:Math.round(dominant.score*100),
-   reason:'aucune première arrivée fiable',noiseP95:Math.round(noiseP95*100),diagnostic};
- }
- const first=peaks[0];
- const delay=Math.round(first.ms-anchorMs);
- const dominantDelay=Math.round(dominant.ms-anchorMs);
- const confidence=Math.round(first.score*100);
- if(delay<35||delay>1150)return {ok:false,confidence,reason:'retard hors plage'};
- const echoes=peaks.filter(p=>p.ms-first.ms>=35);
- return {ok:true,delay,confidence,dominantDelay,
-  dominantConfidence:Math.round(dominant.score*100),
-  echoes:echoes.length, noiseP95:Math.round(noiseP95*100),
-  onsetRelative:Math.round(first.score/Math.max(.0001,dominant.score)*100),diagnostic};
-}
-function median(values){
- const a=[...values].sort((x,y)=>x-y);
- return a.length%2?a[(a.length-1)/2]:(a[a.length/2-1]+a[a.length/2])/2;
-}
-async function runAutomaticCalibration(){
- const label=$('calibration');
- const rate=context.sampleRate;
- // V6: the SAME deterministic digital waveform is sent to Arch and used as
- // the correlation reference. Do not play it on the phone or capture it first.
- const digitalTone=makeCalibrationTone(rate);
- const reference=Float32Array.from(digitalTone,s=>s*0.65);
+function calibrationMessage(owner,event){
+ if(calibrationOwner!==owner||owner.cancelled)return;
  try{
-  // Strict anti-Larsen: only a finite generated reference reaches WebSocket.
-  // AudioWorklet microphone samples stay entirely on the phone in this mode.
-  ws.send('monitor:off');
-  label.textContent='V6 : référence numérique directe, aucun bip sur le téléphone.';
-  await sleep(350);
-  if(calibrationCancelled)throw Error('Calibration interrompue');
-  resetCalibrationCapture();
-  const results=[];
-  // Prime audio playback once, then measure five independent acoustic bursts.
-  // All runs stay finite and the microphone is NEVER sent live to the server.
-  for(let trial=0;trial<=5;trial++){
-   if(calibrationCancelled||!ws||ws.readyState!==WebSocket.OPEN)throw Error('Calibration interrompue');
-   const warmup=trial===0;
-   label.textContent=warmup?'Amorçage : signal non comptabilisé.':
-     'Calibration V6 : mesure '+trial+'/5, micro en écoute seule.';
-   ws.send('monitor:off');
-   await sleep(650);
-   resetCalibrationCapture();
-   await sleep(400);
-   if(calibrationCaptureStartSec===null)throw Error('Capture micro inactive');
-   ws.send('monitor:on');
-   const sent=await transmitRecordedClip(reference,rate);
-   ws.send('monitor:off');
-   await sleep(1100);
-   const captured=flattenCalibration(calibrationSamples);
-   const anchorMs=(sent.sendContextSec-calibrationCaptureStartSec)*1000;
-   const result=analyzeFirstArrival(captured,reference,rate,anchorMs);
-   result.maxLateMs=Math.round(sent.maxLateMs);
-   result.gapMs=Math.round(sent.maxGapMs);
-   result.maxBuffered=sent.maxBuffered;
-   if(!warmup)results.push(result);
-   resetCalibrationCapture();
+  if(event.data instanceof ArrayBuffer){
+   if(!owner.pending||owner.reference||event.data.byteLength%2||!event.data.byteLength||event.data.byteLength!==CAL_LIMITS.referenceFrames*2)throw Error('Référence serveur invalide');
+   const view=new DataView(event.data),reference=new Float32Array(view.byteLength/2);
+   for(let i=0;i<reference.length;i++)reference[i]=view.getInt16(i*2,true)/32768;
+   owner.reference=reference;return;
   }
-  const valid=results.filter(r=>r.ok);
-  const delays=valid.map(r=>r.delay);
-  // A cluster check is descriptive, not a hidden automatic correction:
-  // require >=3 confident arrivals in a 30ms window and disclose exclusions.
-  let cluster=[];
-  for(const value of delays){
-   const group=delays.filter(d=>Math.abs(d-value)<=15);
-   if(group.length>cluster.length)cluster=group;
+  if(event.data.startsWith('pong:')){
+   const rtt=performance.now()-Number(event.data.slice(5));
+   if(Number.isFinite(rtt)&&rtt>=0&&rtt<10000)owner.rtt=rtt;
+   return;
   }
-  const mid=cluster.length?median(cluster):null;
-  const spread=delays.length>=2?Math.max(...delays)-Math.min(...delays):null;
-  const clusterSpread=cluster.length>=2?Math.max(...cluster)-Math.min(...cluster):null;
-  const details=results.map((r,i)=>
-   'Essai '+(i+1)+' : '+(r.ok?r.delay+' ms':
-      'rejeté ('+r.reason+(r.delay!==undefined?', '+r.delay+' ms':'')+')')+
-   ' · première arrivée '+r.confidence+' %'+
-   (r.dominantDelay!==undefined?' · pic maximal '+r.dominantDelay+' ms ('+r.dominantConfidence+' %)':'')+
-   (r.echoes!==undefined?' · échos distincts '+r.echoes:'')+
-   (r.dominantDelay!==undefined?' · écart pic '+(r.dominantDelay-r.delay)+' ms':'')+
-   (r.noiseP95!==undefined?' · bruit corrélation p95 '+r.noiseP95+' %':'')+
-   (r.diagnostic?' · référence '+r.diagnostic.referenceDb+' dBFS · retour '+
-    r.diagnostic.returnDb+' dBFS · écart niveau '+r.diagnostic.levelDeltaDb+
-    ' dB · enveloppe '+r.diagnostic.envelopeCorr+' % · saturation '+
-    r.diagnostic.clippedPercent+' %':' · diagnostic indisponible')+
-   ' · émission max +'+r.maxLateMs+
-   ' ms · intervalle max '+r.gapMs+' ms · tampon WS max '+r.maxBuffered+' octets');
-  const conclusive=cluster.length>=3&&clusterSpread<=30&&valid.length>=3;
-  let verdict;
-  if(!conclusive){
-   verdict='Calibration V6 non concluante : '+valid.length+'/5 signaux valides'+
-     (spread!==null?', dispersion totale '+spread+' ms':'')+
-     ' · groupe cohérent '+cluster.length+'/5'+
-     (clusterSpread!==null?' sur '+clusterSpread+' ms':'')+
-     '. Aucune correction appliquée.';
-  }else{
-   verdict='Calibration V6 : première arrivée acoustique estimée '+Math.round(mid)+
-     ' ms (médiane du groupe '+cluster.length+'/5) · dispersion groupe '+clusterSpread+
-     ' ms · dispersion totale '+spread+' ms. '+
-     'Les valeurs exclues restent visibles ci-dessous. Aucune correction appliquée.';
+  const data=JSON.parse(event.data);
+  if(data.ready){owner.ready=calibrationTelemetry(data);owner.deviceType=owner.output==='analog'?'Sortie analogique / câble':/bluez|bluetooth/i.test(String(data.device||data.target||''))?'Sortie Bluetooth (identifiant masqué)':'Sortie active par défaut (identifiant masqué)';return;}
+  if(data.probe){
+   if(data.rate!==48000||data.channels!==1||data.format!=='s16le'||data.frames!==CAL_LIMITS.referenceFrames)throw Error('Format de référence serveur inattendu');
+   if(!owner.pending||data.probe!==owner.pending.method||!owner.reference)throw Error('Réponse de sonde inattendue');
+   owner.pending.response={reference:owner.reference,metadata:calibrationTelemetry(data),responseMs:performance.now()-owner.pending.sent};
+   owner.reference=null;
   }
-  verdict+=' Détail : '+details.join(' | ')+
-    '. Référence numérique originale ; retour mesuré acoustiquement. '+
-    'Capture Android du chant exclue ; niveau, enveloppe et corrélation indicatifs.';
-  await stop();
-  label.textContent=verdict;
- }catch(error){
-  calibrationSamples=[];
-  await stop();
-  label.textContent='Calibration annulée : '+error.message;
+  if(data.error)throw Error(CAL_SERVER_ERRORS.get(data.error)||'Calibration refusée par le serveur');
+ }catch(error){owner.failure=error.message;}
+}
+async function calibrationUntil(owner,predicate,ms){
+ const deadline=performance.now()+ms;
+ while(true){
+  calibrationActive(owner);
+  if(owner.failure)throw Error(owner.failure);
+  if(predicate())return;
+  if(performance.now()>=deadline)throw Error('Réponse ou capture hors délai');
+  await calibrationWait(owner,25);
  }
+}
+function calibrationDetails(summary,owner,trials){
+ const fmt=(n,d=1)=>Number.isFinite(n)?n.toFixed(d):'—';
+ const table=$('calibration-table');table.replaceChildren();
+ function row(values,header=false){
+  const tr=document.createElement('tr');
+  for(const value of values){const cell=document.createElement(header?'th':'td');cell.textContent=String(value);tr.appendChild(cell);}
+  table.appendChild(tr);
+ }
+ row(['Méthode','Acceptés / total','Retenus','Médiane ms','MAD ms','Min / max ms'],true);
+ for(const m of summary.methods)row([m.method,m.accepted+'/'+m.total,m.inliers,fmt(m.medianMs),fmt(m.madMs),fmt(m.minMs)+' / '+fmt(m.maxMs)]);
+ row(['Essai','Méthode','Délai ms / rejet','Motif','Bruit RMS','Aberrant','Écart ms','Corr.','Confiance','RMS','Crête','Saturés','Gain dB','S/B dB','Polarité','Réflexions','Réponse ms'],true);
+ summary.trials.forEach((t,i)=>row([i+1,t.method,t.ok?fmt(t.delayMs):'rejeté',t.reason||'—',fmt(t.noiseRms,5),t.outlier?'oui':'non',fmt(t.deviationMs),fmt(t.correlation,3),fmt(t.confidence,3),fmt(t.rms,4),fmt(t.peak,4),t.clipped,fmt(t.gainDb),fmt(t.snrDb),t.polarity,JSON.stringify(t.reflections||[]),fmt(trials[i].responseMs)]));
+ const metadata=[
+  'Périphérique : '+owner.deviceType+' · capture '+owner.context.sampleRate+' Hz · référence 48000 Hz.',
+  'Piste : '+JSON.stringify(owner.settings)+' · Les réglages absents restent inconnus. Kara demande la désactivation des traitements au navigateur.',
+  'Toute rupture de paquet interrompt la campagne entière.',
+  owner.rtt===undefined?'RTT indisponible. La durée de réponse des sondes reste affichée.':'RTT WebSocket : '+fmt(owner.rtt)+' ms (hors sortie et capture).',
+  'Horloge serveur : durées de préparation et d’écriture du processus. Le délai propre à la sortie reste inconnu.',
+  'Worklet → JS p95 : '+fmt((owner.ages||[]).slice().sort((a,b)=>a-b)[Math.floor(((owner.ages||[]).length-1)*.95)])+' ms (1200 paquets maximum).',
+  'Prêt serveur : '+JSON.stringify(owner.ready),
+  ...trials.map((t,i)=>(i+1)+' '+t.method+' · processus serveur '+JSON.stringify(t.server))
+ ];
+ $('calibration-meta').textContent=metadata.join('\n');
+ const best=summary.best;
+ const advice=[];
+ if(trials.some(t=>t.clipped>0))advice.push('Réduire le volume pour éviter la saturation.');
+ if(trials.some(t=>t.noiseRms>.03||Number.isFinite(t.snrDb)&&t.snrDb<12))advice.push('Réduire le bruit ambiant et rapprocher le micro de la sortie.');
+ if(trials.some(t=>t.reflections&&t.reflections.length))advice.push('Éloigner les surfaces réfléchissantes ou rapprocher le micro de l’enceinte.');
+ const measured=summary.methods.filter(m=>Number.isFinite(m.medianMs));
+ if(measured.length===2&&Math.abs(measured[0].medianMs-measured[1].medianMs)>8)advice.push('Chirp et PN divergent : stabiliser la position puis recommencer.');
+ return ({reliable:'Mesure fiable',indicative:'Mesure indicative',failed:'Mesure non concluante'}[summary.status]||'Mesure non concluante')+
+  (best?' · meilleur résultat : '+best.method+' · '+fmt(best.medianMs)+' ms (MAD '+fmt(best.madMs)+' ms, '+best.inliers+' retenus)':' · aucun résultat retenu')+
+  '. Délai commande → micro reçu : transport aller, sortie et capture inclus. Aucune mesure du chant en direct. Aucune correction appliquée.'+(advice.length?' '+advice.join(' '):'');
+}
+async function startCalibration(){
+ if(calibrationOwner||normalBusy)return;
+ if(!window.isSecureContext||!navigator.mediaDevices){$('calibration').textContent='Le micro exige une page HTTPS de confiance.';return;}
+ if(!window.KaraCalibration){$('calibration').textContent='Moteur de calibration indisponible.';return;}
+ const owner={cancelled:false,waiters:new Set(),packets:[],frames:0,lastEnd:null,lastSequence:null,pending:null,reference:null};
+ calibrationOwner=owner;owner.output=$('output').value;
+ $('start').disabled=true;$('calibrate').disabled=true;$('output').disabled=true;$('cancel-calibration').hidden=false;
+ $('profile').disabled=true;$('echo-guard').disabled=true;updateRestore();
+ $('calibration').textContent='Préparation du micro… Annulation disponible.';
+ $('calibration-table').replaceChildren();$('calibration-meta').textContent='';$('calibration-level').textContent='Bruit ambiant : en attente…';
+ owner.deadline=setTimeout(()=>{if(calibrationOwner===owner){$('calibration').textContent='Calibration arrêtée : durée maximale atteinte.';releaseCalibration(owner);}},CAL_LIMITS.sessionMs);
+ try{
+  const media=navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
+  media.then(value=>{if(owner.cancelled)value.getTracks().forEach(t=>t.stop());},()=>{});
+  owner.stream=await boundedCalibration(owner,media,10000);calibrationActive(owner);
+  const tracks=owner.stream.getAudioTracks();
+  if(tracks.length!==1||tracks[0].readyState!=='live'||!tracks[0].enabled||tracks[0].muted)throw Error('Piste micro inactive');
+  const track=tracks[0];owner.settings={};
+  const settings=track.getSettings();
+  for(const key of ['sampleRate','channelCount','echoCancellation','noiseSuppression','autoGainControl']){
+   if(typeof settings[key]==='boolean'||Number.isFinite(settings[key]))owner.settings[key]=settings[key];
+  }
+  for(const key of ['echoCancellation','noiseSuppression','autoGainControl'])if(owner.settings[key]===true)throw Error('Traitement micro actif : '+key);
+  if(owner.settings.sampleRate!==undefined&&(!Number.isFinite(owner.settings.sampleRate)||owner.settings.sampleRate<8000||owner.settings.sampleRate>192000))throw Error('Fréquence de piste invalide');
+  track.onended=()=>{if(calibrationOwner===owner){$('calibration').textContent='Calibration arrêtée : piste terminée.';releaseCalibration(owner);}};
+  owner.context=new AudioContext({sampleRate:48000,latencyHint:'interactive'});
+  await boundedCalibration(owner,owner.context.resume(),5000);calibrationActive(owner);
+  if(owner.context.state!=='running'||![44100,48000].includes(owner.context.sampleRate))throw Error('Horloge audio inactive ou fréquence invalide');
+  await boundedCalibration(owner,owner.context.audioWorklet.addModule('/worklet.js?token='+encodeURIComponent(token)),5000);calibrationActive(owner);
+  owner.source=owner.context.createMediaStreamSource(owner.stream);
+  owner.node=new AudioWorkletNode(owner.context,'kara-micro',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
+  owner.node.port.postMessage({gain:1});
+  owner.node.port.onmessage=e=>{
+   calibrationPacket(owner,e.data);
+   if(owner.captureError&&calibrationOwner===owner){
+    $('calibration').textContent='Calibration arrêtée : '+owner.captureError+'.';
+    releaseCalibration(owner);
+   }
+  };
+  owner.mute=owner.context.createGain();owner.mute.gain.value=0;
+  owner.source.connect(owner.node);owner.node.connect(owner.mute);owner.mute.connect(owner.context.destination);
+  const socket=owner.socket=new WebSocket('wss://'+location.host+'/audio?calibration=1&token='+encodeURIComponent(token)+'&output='+encodeURIComponent($('output').value)+'&rate='+owner.context.sampleRate);
+  socket.binaryType='arraybuffer';socket.onmessage=e=>calibrationMessage(owner,e);
+  socket.onerror=()=>{owner.failure='Connexion audio impossible';};
+  socket.onclose=()=>{
+   if(calibrationOwner!==owner)return;
+   $('calibration').textContent='Calibration arrêtée : '+(owner.failure||'connexion interrompue')+'.';
+   releaseCalibration(owner);
+  };
+  await calibrationUntil(owner,()=>owner.ready,5000);
+  socket.send('ping:'+performance.now().toFixed(3));
+  const trials=[],rate=owner.context.sampleRate;
+  for(let i=-1;i<12;i++){
+   const method=i<0?'warmup':i%2?'pn':'chirp';
+   $('calibration').textContent=i<0?'Amorçage serveur…':('Mesure '+(i+1)+'/12 · '+method+' · micro en écoute locale.');
+   // Ambient capture and pre-roll also ensure >1s between commands.
+   await calibrationWait(owner,1100);calibrationActive(owner);
+   if(owner.captureError)throw Error(owner.captureError);
+   const preAnchor=owner.context.currentTime*rate;
+   const pre=calibrationRecording(owner,Math.floor(preAnchor-rate*.4),Math.floor(preAnchor-rate*.1));
+   if(track.readyState!=='live'||track.muted||owner.context.state!=='running')throw Error('Capture micro suspendue');
+   const ambient=KaraCalibration.levels(pre.samples),noise=ambient.rms;
+   owner.noiseRms=noise;
+   if(!Number.isFinite(noise)||!Number.isFinite(ambient.peak)||ambient.clipped>0)throw Error('Bruit ambiant invalide ou saturé');
+   // Anchor on the audio clock after preparing the ambient measurement.
+   // Main-thread preparation must not be counted as command transport.
+   owner.pending={method,sent:performance.now()};
+   const anchor=owner.context.currentTime*rate;
+   socket.send('probe:'+method);
+   await calibrationUntil(owner,()=>owner.pending.response,5000);
+   const response=owner.pending.response;
+   const reference=KaraCalibration.resample(response.reference,48000,rate);
+   // Search includes 800ms delay, the full reference and 250ms margin.
+   const end=Math.ceil(anchor+rate*(.8+.25)+reference.length);
+   await calibrationUntil(owner,()=>owner.lastEnd>=end,5000);
+   const recording=calibrationRecording(owner,Math.floor(anchor-rate*.4),end);
+   if(i>=0){
+    const result=KaraCalibration.analyze(recording.samples,reference,rate,anchor-recording.origin,noise);
+    trials.push({method,...result,noiseRms:noise,responseMs:response.responseMs,server:response.metadata});
+   }
+   owner.pending=null;owner.reference=null;
+  }
+  const summary=KaraCalibration.summarize(trials);
+  $('calibration').textContent=calibrationDetails(summary,owner,trials);
+ }catch(error){if(calibrationOwner===owner)$('calibration').textContent='Calibration arrêtée : '+error.message;}
+ finally{releaseCalibration(owner);}
 }
 $('speaker-volume').oninput=()=>{
   $('speaker-volume-value').textContent=$('speaker-volume').value+' %';
@@ -560,12 +677,15 @@ $('mic-gain').oninput=()=>{
   if(processor)processor.port.postMessage({gain:Number($('mic-gain').value)/100});
 };
 $('stop').onclick=stop;
+$('cancel-calibration').onclick=stop;
 document.addEventListener('visibilitychange',()=>{
  if(document.visibilityState==='visible')keepAwake();
- else if(stream)stop();
+ else if(normalBusy||calibrationOwner)stop();
 });
 document.addEventListener('pointerdown',keepAwake,{passive:true});
 window.addEventListener('pageshow',()=>{awake=true;keepAwake();});
 window.addEventListener('pagehide',()=>{awake=false;stop();if(wake)wake.release().catch(()=>{});});
+updateEchoVolume();
+refreshOutputPreference().catch(()=>{});
 keepAwake();
 </script></main></body></html>

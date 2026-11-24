@@ -21,10 +21,10 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 
-sys.path.insert(0, str(home / ".local/bin"))
+from _kara_paths import BIN
 from _kara_tv import Receiver, lan_address
 
-app = home / ".local/share/kara/samsung-tv/index.html"
+app = BIN.parent / "tizen/app/index.html"
 host = lan_address()
 code = token_hex(4)
 options = Options()

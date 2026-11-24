@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -B
 """Capture et transcription locale déclenchées par le mode jeu."""
 from collections import deque
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -15,12 +16,15 @@ from threading import Event, Lock, Thread
 import time
 
 import numpy as np
+import socket
+import struct
 from pywhispercpp.model import Model
 
 from _kara_capture import TurnCapture
 from _kara_dtw_words import read_timing
 from _kara_scoring import AudioWindow, SCORE_TOLERANCE, add_evidence, same_word
 from _kara_words import IGNORED_HINTS, words
+from _kara_turbo import TurboDecoder, build_decoder
 
 
 RATE = 16_000
@@ -116,6 +120,22 @@ class Microphone:
             self.started.set()
         emit("error", message="La capture du micro s’est arrêtée.")
 
+    def read_network(self):
+        # A datagram is one ingress block with its position already expressed
+        # on the server monotonic clock. Gaps stay visible in samples().
+        while message := self.stream.recv(649):
+            if len(message) not in (328, 648):
+                continue
+            end, = struct.unpack_from("<d", message)
+            with self.lock:
+                self.blocks.append((end, message[8:]))
+                if self.capture is not None:
+                    try:
+                        self.capture.append(end, message[8:])
+                    except OSError:
+                        self.close_capture()
+            self.started.set()
+
     def record(self, begin):
         with self.lock:
             if self.capture is None:
@@ -140,7 +160,7 @@ class Microphone:
         with self.lock:
             self.close_capture()
 
-    def samples(self, begin, end):
+    def samples(self, begin, end, *, minimum_coverage=.5):
         time.sleep(max(0.0, min(.50, end + .18 - time.monotonic())))
         with self.lock:
             blocks = list(self.blocks)
@@ -160,7 +180,7 @@ class Microphone:
                 samples[first:last] = data[first - offset:last - offset] / 32768
                 coverage += last - first
                 written = last
-        return samples if coverage >= size * .5 else np.empty(0, dtype=np.float32)
+        return samples if coverage >= size * minimum_coverage else np.empty(0, dtype=np.float32)
 
 
 class NativeDecoder:
@@ -291,7 +311,7 @@ def recover_words(audio, window, expected, confirmed, decode, tolerance):
 
 def transcribe_line(model, audio, job, turbo, *, diagnostics=None):
     language = job.get("language", "")
-    prompt = job.get("prompt", "")
+    prompt = ""  # The player's decoder never takes a text prompt from the job.
     timed = job.get("timed", False)
     expected = job.get("expected", ())
     tolerance = job.get("tolerance", SCORE_TOLERANCE)
@@ -335,16 +355,215 @@ def transcribe_line(model, audio, job, turbo, *, diagnostics=None):
     return spans, signal, sorted(confirmed.items())
 
 
+@dataclass(frozen=True)
+class PlayerDecoding:
+    """The stride owns timestamps; padding supplies neighboring audio only."""
+    stride: int = 16
+    padding: float = 1.
+    beam: bool = False
+
+
+PLAYER_DECODING = PlayerDecoding()
+
+
+def transcribe_player(decoder, audio, language, *, decoding=None, diagnostics=None):
+    """Decode without lyric context and keep sample-relative token timestamps."""
+    decoding = decoding or PLAYER_DECODING
+    frames = len(audio) // 800
+    if frames < 3:
+        return [], "silence"
+    blocks = audio[:frames * 800].reshape(-1, 800)
+    energies = np.sqrt(np.mean((blocks - blocks.mean(axis=1, keepdims=True)) ** 2, axis=1))
+    floor = max(QUIET_VOICE_FLOOR, 2.2 * float(np.percentile(energies, 20)))
+    voiced = energies[energies > min(VOICE_FLOOR, floor)]
+    if len(voiced) < 3:
+        return [], "silence"
+    gain = max(1., min(12., .065 / float(np.percentile(voiced, 75))))
+    pcm = np.clip(audio * gain * 32768, -32768, 32767).astype("<i2")
+    heard = []
+    stride, pad = round(decoding.stride * RATE), round(decoding.padding * RATE)
+    for low in range(0, len(pcm), stride):
+        high = min(len(pcm), low + stride)
+        begin, end = max(0, low - pad), min(len(pcm), high + pad)
+        clip = pcm[begin:end]
+        if len(clip) < RATE * 1.2:
+            clip = np.pad(clip, (0, int(RATE * 1.2) - len(clip)))
+        _, segments = decoder.decode(clip.tobytes(), language, begin / RATE, beam=decoding.beam)
+        if diagnostics is not None:
+            diagnostics.setdefault("decodes", []).append({
+                "begin": begin / RATE, "end": end / RATE, "owner": [low / RATE, high / RATE],
+                "segments": [{"text": span.text, "start": span.start, "end": span.end,
+                              "no_speech": span.no_speech} for span in segments],
+            })
+        for segment in segments:
+            if segment.no_speech > .65:
+                continue
+            for word in segment.words:
+                if low <= round(word.start * RATE) < high:
+                    left = max(0, int(word.start * 20) - 1)
+                    right = min(frames, int(word.start * 20) + 4)
+                    confidence = word.confidence
+                    if right <= left or max(energies[left:right]) <= min(VOICE_FLOOR, floor):
+                        confidence = 0.
+                    heard.append({"word": word.text, "start": word.start, "end": word.end,
+                                  "confidence": confidence})
+    return sorted(heard, key=lambda word: word["start"]), "voice"
+
+
+def replay_alignment(received, expected):
+    """Find the highest normalized correlation on the decimated PCM grid."""
+    n = len(received)
+    if len(expected) < n or n < RATE // 10:
+        return 0., 0
+    energy = float(received @ received)
+    if energy <= 1e-12:
+        return 0., 0
+    fft_size = 1 << (len(expected) + n - 1).bit_length()
+    product = np.fft.rfft(expected, fft_size) * np.fft.rfft(received[::-1], fft_size)
+    cross = np.fft.irfft(product, fft_size)[n - 1:len(expected)]
+    power = np.concatenate(([0.], np.cumsum(expected * expected)))
+    reference_power = power[n:] - power[:-n]
+    valid = reference_power >= max(1e-12, float(reference_power.max()) * .1)
+    if not valid.any():
+        return 0., 0
+    correlation = np.zeros_like(cross)
+    correlation[valid] = np.abs(cross[valid]) / np.sqrt(energy * reference_power[valid])
+    index = int(correlation.argmax())
+    return min(1., float(correlation[index])), index
+
+
+def replay_features(samples):
+    # First differences suppress DC and slow level changes. The correlation
+    # lag is evidence of replay only and never changes the scoring clock.
+    return np.diff(samples, prepend=samples[0])[::4].astype(np.float64)
+
+
+def backing_similarity(samples, reference):
+    return replay_alignment(replay_features(samples), replay_features(reference))[0]
+
+
+REPLAY_LOW_BAND = np.hanning(33)
+REPLAY_LOW_BAND /= REPLAY_LOW_BAND.sum()
+
+
+def filtered_replay_fraction(received, expected):
+    """Estimate how much held-out energy a short playback filter explains."""
+    similarity, offset = replay_alignment(received, expected)
+    if similarity < .65 or len(received) < RATE // 4:
+        return 0.
+    # A 25-tap filter spans ±3 ms around the coarse lag at 4 kHz. Fit on
+    # alternating half-second blocks and check the others, so a locally
+    # matching beat cannot alone justify excluding the full window.
+    radius = 12
+    design = np.lib.stride_tricks.sliding_window_view(np.pad(expected, radius), 2 * radius + 1)
+    indices = np.arange(0, len(received), 3)
+    training = indices // (RATE // 8) % 2 == 0
+    fit, check = indices[training], indices[~training]
+    matrix = design[offset + fit]
+    covariance = matrix.T @ matrix
+    ridge = float(covariance.trace()) * 1e-4 / len(covariance)
+    target = received[check]
+    power = float(target @ target)
+    if ridge <= 0. or power <= 1e-12:
+        return 0.
+    covariance.flat[::len(covariance) + 1] += ridge
+    coefficients = np.linalg.solve(covariance, matrix.T @ received[fit])
+    residual = design[offset + check] @ coefficients - target
+    return max(0., 1. - float(residual @ residual) / power)
+
+
+def transcribe_prepared_job(decoder, audio, job, *, decoding=None, diagnostics=None):
+    if not job.get("instrumental"):
+        return [], "unverified"
+    if float(np.max(np.abs(audio), initial=0.)) < QUIET_VOICE_FLOOR:
+        return [], "silence"
+    start = max(0., job["track_start"] - 1.25)
+    duration = job["track_end"] - start + 1.25
+    # An audible guide has the same words as the singer. Without a verified
+    # acoustic separation, that overlap cannot earn credit. A conservative
+    # decoded-stem gate still lets guide-free passages use the normal checks.
+    for name in ("guide", "backing", "original"):
+        if name == "guide" and not job.get(name):
+            continue
+        # No audio device is involved. Read the playback media only, so a
+        # common waveform cannot turn instrumental leak into player credit.
+        try:
+            raw = subprocess.check_output(
+                ["ffmpeg", "-v", "error", "-nostdin", "-protocol_whitelist", "file,pipe",
+                 "-ss", str(start), "-i", job[name], "-map", "0:a:0", "-vn", "-sn", "-dn",
+                 "-t", str(duration), "-ac", "1", "-ar", str(RATE), "-f", "f32le", "pipe:1"],
+                stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return [], "unverified"
+        reference = np.frombuffer(raw, dtype="<f4")
+        if not len(reference):
+            return [], "unverified"
+        if name == "guide":
+            present = float(np.max(np.abs(reference))) >= .0003
+            if diagnostics is not None:
+                diagnostics["guide_present"] = present
+            if present:
+                return [], "guide"
+            continue
+        reference = np.pad(reference, (0, max(0, len(audio) - len(reference))))
+        similarity = backing_similarity(audio, reference)
+        if diagnostics is not None:
+            diagnostics.setdefault("similarity", {})[name] = similarity
+        if similarity >= .72:
+            return [], "backing"
+        # Frequency shaping can hide a replay from broadband correlation.
+        # The short, checked filter extends the rejection gate only. It
+        # neither subtracts the backing waveform nor adjusts scoring times.
+        if name == "backing":
+            low_audio = replay_features(np.convolve(audio, REPLAY_LOW_BAND, mode="same"))
+        low_ref = replay_features(np.convolve(reference, REPLAY_LOW_BAND, mode="same"))
+        explained = filtered_replay_fraction(low_audio, low_ref)
+        if diagnostics is not None:
+            diagnostics.setdefault("filtered_replay_fraction", {})[name] = explained
+        if explained >= .94:
+            return [], "backing"
+    return transcribe_player(decoder, audio, job["language"], decoding=decoding, diagnostics=diagnostics)
+
+
+def record_prepared_diagnosis(stats, job, source, heard=(), diagnostic=None):
+    if stats is None or "lignes" not in stats:
+        return
+    # The WAV and sidecar share the capture origin. The musical clock and
+    # worker job ID let the comparator reproduce the same decision offline.
+    origin = stats["_capture_begin"]
+    stats["lignes"].append({
+        "id": job["id"], "ligne": job["line"], "debut_s": round(job["begin"] - origin, 4),
+        "fin_s": round(job["end"] - origin, 4), "debut_morceau_s": job["track_start"],
+        "fin_morceau_s": job["track_end"], "vitesse": job.get("rate", 1.),
+        "source": source, "mots_fenetre": heard, "diagnostic": diagnostic,
+    })
+
+
 def process_jobs(mic, jobs, model, turbo, stats=None):
     while True:
         job = jobs.get()
         began = time.monotonic()
         try:
-            audio = mic.samples(job["begin"], job["end"])
+            minimum_coverage = .90 if job.get("prepared") else .50
+            audio = mic.samples(job["begin"], job["end"], minimum_coverage=minimum_coverage)
             if len(audio) < RATE * (job["end"] - job["begin"]) * 0.50:
                 if stats is not None:
                     stats["captures_incompletes"] += 1
-                emit("skipped", id=job["id"])
+                if job.get("prepared"):
+                    record_prepared_diagnosis(stats, job, "capture")
+                emit("skipped", id=job["id"], source="capture")
+                continue
+            if job.get("prepared"):
+                diagnostic = {} if job.get("trace") or stats is not None and "lignes" in stats else None
+                heard, source = transcribe_prepared_job(model, audio, job, diagnostics=diagnostic)
+                if stats is not None:
+                    stats["lignes_analysees"] += 1
+                    stats["lignes_signal_faible"] += source == "silence"
+                    stats["mots_transcrits"] = stats.get("mots_transcrits", 0) + len(heard)
+                    record_prepared_diagnosis(stats, job, source, heard, diagnostic)
+                extra = ({"diagnostics": diagnostic, "inference_seconds": time.monotonic() - began}
+                         if job.get("trace") else {})
+                emit("score", id=job["id"], heard=heard, source=source, **extra)
                 continue
             lexical = set() if stats is not None else None
             spans, signal, evidence = transcribe_line(model, audio, job, turbo, diagnostics=lexical)
@@ -373,10 +592,12 @@ def process_jobs(mic, jobs, model, turbo, stats=None):
         except (OSError, EOFError):
             emit("error", message="Le moteur Whisper s’est arrêté.")
             return
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError, TimeoutError):
             if stats is not None:
                 stats["echecs_decodeur"] += 1
-            emit("skipped", id=job["id"])
+            if job.get("prepared"):
+                record_prepared_diagnosis(stats, job, "decoder")
+            emit("skipped", id=job["id"], source="decoder")
         finally:
             if stats is not None:
                 stats["traitement_max_s"] = max(stats["traitement_max_s"], round(time.monotonic() - began, 2))
@@ -426,36 +647,49 @@ def load_model(mode):
 
 
 def main(mode="base", language=""):
-    echo = recorder = native = mic = None
+    echo = recorder = native = prepared_decoder = mic = None
     stats = {"lignes_demandees": 0, "lignes_analysees": 0, "lignes_signal_faible": 0,
              "captures_incompletes": 0, "echecs_decodeur": 0, "file_pleine": 0,
              "mots_attendus": 0, "mots_reconnus_a_temps": 0,
              "mots_reconnus_hors_delai": 0, "niveau_max_dbfs": -120., "traitement_max_s": 0.,
              "filtre_echo": False}
+    if mode == "prepared":
+        stats["comparaison"] = "reference_turbo_gtk"
     try:
-        microphone = pulse("get-default-source")
-        if not microphone or microphone.endswith(".monitor"):
-            raise ValueError("Sélectionne un vrai micro dans les réglages audio.")
+        wireless = os.environ.get("KARA_NETWORK_MIC_FD") == "3"
+        if not wireless:
+            microphone = pulse("get-default-source")
+            if not microphone or microphone.endswith(".monitor"):
+                raise ValueError("Sélectionne un vrai micro dans les réglages audio.")
+        if mode == "prepared":
+            emit("status", message="Chargement de Whisper large-v3-turbo…")
+            device = os.environ.get("KARA_TURBO_DEVICE", "gpu")
+            prepared_decoder = TurboDecoder(build_decoder(), TURBO_MODEL, device, 8 if device == "cpu" else 4)
         if mode == "turbo" and TURBO_MODEL.is_file():
             emit("status", message="Chargement de Whisper Turbo…")
             try:
                 native = NativeDecoder(language, live=True)
             except (OSError, RuntimeError):
                 pass
-        model, label = (native, "Turbo") if native is not None else load_model(mode)
-        echo, source = echo_filter(microphone)
-        stats["filtre_echo"] = echo is not None
-        recorder = subprocess.Popen(
-            ("parec", "--raw", "--format=s16le", "--channels=1", f"--rate={RATE}",
-             "--latency-msec=75", "--process-time-msec=20", "--client-name=Karaoké",
-             f"--device={source}"),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-        mic = Microphone(recorder.stdout)
+        decoder = prepared_decoder or native
+        model, label = (decoder, "Turbo") if decoder is not None else load_model(mode)
         jobs = Queue(maxsize=8)
-        Thread(target=mic.read, daemon=True).start()
-        if not mic.started.wait(timeout=2.0):
-            raise ValueError("Aucun flux audio reçu du micro sélectionné.")
+        if wireless:
+            mic = Microphone(socket.socket(fileno=3))
+            Thread(target=mic.read_network, daemon=True).start()
+        else:
+            echo, source = echo_filter(microphone)
+            stats["filtre_echo"] = echo is not None
+            recorder = subprocess.Popen(
+                ("parec", "--raw", "--format=s16le", "--channels=1", f"--rate={RATE}",
+                 "--latency-msec=75", "--process-time-msec=20", "--client-name=Karaoké",
+                 f"--device={source}"),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            mic = Microphone(recorder.stdout)
+            Thread(target=mic.read, daemon=True).start()
+            if not mic.started.wait(timeout=2.0):
+                raise ValueError("Aucun flux audio reçu du micro sélectionné.")
         Thread(target=process_jobs, args=(mic, jobs, model, label == "Turbo", stats), daemon=True).start()
         emit("ready", echo=echo is not None, model=label)
         for line in sys.stdin:
@@ -474,6 +708,9 @@ def main(mode="base", language=""):
                     stats["capture_locale"] = str(path)
                     stats["morceau"] = job.get("song", "")
                     stats["_capture_begin"] = begin
+                    if mode == "prepared":
+                        stats.update({key: job[key] for key in ("reference_id", "reference_lrc",
+                                                                 "reference_revision", "tolerance") if key in job})
                     stats["lignes"] = []
                     emit("recording", active=True)
             elif command == "record-stop":
@@ -486,9 +723,11 @@ def main(mode="base", language=""):
                 jobs.put_nowait(job)
             except Full:
                 stats["file_pleine"] += 1
-                emit("skipped", id=job["id"])
+                if job.get("prepared"):
+                    record_prepared_diagnosis(stats, job, "decoder")
+                emit("skipped", id=job["id"], source="decoder")
         return 0
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+    except (EOFError, OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         emit("error", message=str(error))
         return 1
     finally:
@@ -499,6 +738,8 @@ def main(mode="base", language=""):
         stop_process(echo)
         if native is not None:
             native.close()
+        if prepared_decoder is not None:
+            prepared_decoder.close()
 
 
 if __name__ == "__main__":

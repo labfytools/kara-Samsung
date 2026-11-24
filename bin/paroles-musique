@@ -28,7 +28,7 @@ from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_art
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 
-LIBRARY = Path.home() / "Music"
+LIBRARY = SHARED_LIBRARY
 STREAM_TAGS = {".opus", ".ogg", ".oga"}
 FILE_TAGS = {".flac", ".m4a", ".mp3"}
 LYRICS_TAGS = {"lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx"}
@@ -816,6 +816,15 @@ def selected_tracks(args, root):
     return sorted(tracks)
 
 
+def retrieve_lyrics(path, client, tags, *, synced):
+    title, artist = tags.get("title"), tags.get("artist")
+    if not title or not artist:
+        raise ValueError("titre ou artiste manquant")
+    local_text = next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
+    return client.find(title, artist, tags.get("album"), duration_seconds(path), tags.get("albumartist"),
+                       synced=synced, local_text=local_text)
+
+
 def process_track(path, client, preview, synced=False):
     sidecar = path.with_suffix(".lrc")
     if synced and (sidecar.exists() or sidecar.is_symlink()):
@@ -831,15 +840,11 @@ def process_track(path, client, preview, synced=False):
         return "paroles déjà intégrées"
     title = tags.get("title")
     artist = tags.get("artist")
-    album = tags.get("album")
     if not title or not artist:
         return "titre ou artiste manquant"
     if preview:
         return f"à rechercher · {artist} — {title}"
-    duration = duration_seconds(path)
-    local_text = next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
-    lyrics, source = client.find(title, artist, album, duration, tags.get("albumartist"),
-                                 synced=synced, local_text=local_text)
+    lyrics, source = retrieve_lyrics(path, client, tags, synced=synced)
     if lyrics is None:
         return "aucune parole synchronisée vérifiable" if synced else "aucune parole vérifiable"
     if not lyrics:
@@ -900,12 +905,30 @@ def main():
     parser.add_argument("--apercu", "--dry-run", action="store_true", help="affiche les pistes, sans requête ni écriture")
     parser.add_argument("--bibliotheque", type=Path, default=LIBRARY)
     parser.add_argument("--suivi-activite", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--lrc-stdout", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.tout and args.chemins:
         parser.error("--tout ou des chemins explicites sont attendus")
     root = args.bibliotheque.expanduser().resolve()
     if not root.is_dir():
         parser.error(f"bibliothèque introuvable : {root}")
+    if args.lrc_stdout:
+        # Preparation retrieves a candidate without taking a mutation lock or
+        # writing to the library. Turbo must still validate the exact recording.
+        if args.tout or len(args.chemins) != 1 or not args.chemins[0].is_file():
+            parser.error("un fichier audio est requis")
+        path = args.chemins[0].resolve()
+        if not path.is_relative_to(root):
+            parser.error("le fichier est hors de la bibliothèque")
+        try:
+            tags, _ = probe(path)
+            lyrics, source = retrieve_lyrics(path, LyricsSources(), tags, synced=True)
+        except (OSError, ValueError, ServiceUnavailable, subprocess.SubprocessError) as error:
+            parser.exit(1, f"{error}\n")
+        if not lyrics:
+            parser.exit(1, "Aucune parole minutée vérifiable.\n")
+        print(json.dumps({"lyrics": lyrics, "provider": source}, ensure_ascii=False))
+        return 0
     def process_selection():
         try:
             tracks = selected_tracks(args, root)

@@ -4,10 +4,12 @@
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
 import json
+from math import isfinite
+import os
 from pathlib import Path
+from secrets import token_hex
 import signal
 import sqlite3
-import stat
 import subprocess
 import sys
 import time
@@ -18,18 +20,24 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 
-from _kara_game import GameScore, LyricVocabulary, SESSION, WORKER_PYTHON, words
+from _kara_game import GameScore, LyricVocabulary, words
+from _kara_acoustic_capture import AcousticCapture
+from _kara_blackbox import BlackBox, digest
+from _kara_remote_party import RemoteParty
+from _kara_room_audio import RoomAudio
+from _kara_mobile_imports import MobileImports
+from _kara_prepare import PreparedCache, file_token, lrc_token
+from _kara_reference import display_marks
 from _kara_stem_playback import StemPlayback, STRENGTHS
 from _kara_stems import cached_stems
-from _kara_vocal_profile import analyze as analyze_vocal_mix, cached_profile, LOWER_DEFAULT, UPPER_DEFAULT
-from _kara_dtw_words import text_boundaries
-from _kara_timing import LyricTiming, audio_signature, highlighted_characters, line_signature, time_at_character
-from _kara_party import Party, PlayersWindow, Singer, catalogue, score_color
+from _kara_timing import LyricTiming, highlighted_characters
+from _kara_party import Party, PlayersWindow, Singer, Song, catalogue, score_color, search_key
 from _kara_preparation_ui import PreparationWindow
 from _kara_library import MusicLibraryWindow
-from _kara_lrc_publish import publish as publish_lrc
 from _kara_import import AlbumImport
-from _kara_tv import start_receiver
+from _kara_paths import BIN, music_library
+from _labfy_sync import MusicSync
+from _kara_tv import https_configured, start_receiver
 from _musique_oz import probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
@@ -38,7 +46,7 @@ APP_ID = "fr.labfy.ParolesStrawberry"
 PLAYER = "org.mpris.MediaPlayer2.strawberry"
 OBJECT = "/org/mpris/MediaPlayer2"
 INTERFACE = "org.mpris.MediaPlayer2.Player"
-LIBRARY = Path.home() / "Music"
+LIBRARY = music_library()
 COLLECTION = Path(GLib.get_user_data_dir()) / "strawberry/strawberry/strawberry.db"
 LYRICS_TAGS = ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
 FADE_HEIGHT = 56
@@ -192,15 +200,22 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.fetching = None
         self.fetch_message = ""
         self.closed = False
-        self.game_score = GameScore(self.refresh_game)
+        self.blackbox = BlackBox(max_bytes=int(os.environ["KARA_BLACKBOX_MAX_BYTES"])
+                                 if "KARA_BLACKBOX_MAX_BYTES" in os.environ else None)
+        self.blackbox_ui = None
+        self.bb_line = None
+        self.tv_line_revision = 0
+        self.bb_turn = None
+        self.remote_party = RemoteParty(self)
+        self.room_audio = RoomAudio(self.blackbox)
+        self.acoustic = AcousticCapture(self.blackbox)
+        self.next_capture_clock = 0.
+        self.mobile_imports = MobileImports(self)
+        self.game_score = GameScore(self.refresh_game, diagnostics=self.blackbox)
+        self.seek_signal = self.bus.signal_subscribe(PLAYER, INTERFACE, "Seeked", OBJECT, None,
+                                                      Gio.DBusSignalFlags.NONE, self.player_seeked)
         self.vocal_effect = StemPlayback()
         self.effect_changing = False
-        self.vocal_profiles = {}
-        self.vocal_queue = {}
-        self.vocal_job = None
-        self.vocal_completed = 0
-        self.vocal_failed = set()
-        self.vocal_analyzer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kara-mots")
         self.stem_queue = {}
         self.stem_job = None
         self.stem_completed = 0
@@ -214,24 +229,32 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.media_updated = 0.0
         self.preparation_only = False
         self.active_plan = {}
-        self.preload_invalid = []
+        self.training_only = set()
         self.preload_cancelled = False
-        self.lrc_written = set()
-        self.lrc_skipped = {}
-        self.stems_only = set()
-        self.prepared_songs = {}
         self.timing = LyricTiming(state_dir / "lyric-timing.json")
-        self.align_queue = {}
+        self.references = PreparedCache(state_dir / "prepared")
+        self.active_reference = None
         self.align_job = None
+        self.align_finished = set()
+        self.batch_ready = {}
+        self.batch_failed = {}
+        self.batch_reports = {}
+        self.preparation_reports = {}
         self.align_status = ""
         self.align_fraction = 0.0
-        self.failed_alignments = set()
+        self.failed_alignments = {}
+        self.party_selection = ()
         self.validating = False
         self.party_ready = False
         self.validated_songs = {}
         self.syncing_offset = False
         self.turn_tail = None
         self.record_turn = False
+        self.turn_mix_strength = None
+        self.music_volume = None
+        self.turn_music_restore = None
+        self.guide_intervals = []
+        self.turn_scored = True
         self.turn_phase = ""
         self.receiver = None
         self.mobile_players = {}  # Identifiant de session -> Singer éphémère
@@ -250,6 +273,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
                             margin_top=12, margin_bottom=12,
                             margin_start=12, margin_end=12)
         self.album_import = AlbumImport()
+        self.album_import.can_launch = lambda: not (self.validating or self.party.active or self.remote_party.locked)
+        self.album_import.on_update = self.mobile_imports.update
         self.import_toggle = Gtk.ToggleButton(label="Importer un album")
         self.import_toggle.connect("toggled", self.album_import.toggle)
         tools_box.append(self.import_toggle)
@@ -261,9 +286,19 @@ class LyricsWindow(Gtk.ApplicationWindow):
             button.connect("clicked", self.search_missing, option, title)
             button.connect("clicked", lambda *_: tools_popover.popdown())
             tools_box.append(button)
+        self.music_sync = MusicSync(self, LIBRARY, BIN)
+        if self.music_sync.launcher is not None and self.music_sync.launcher.is_file():
+            sync_settings = Gtk.Button(label="Réglages de synchronisation USB")
+            sync_settings.connect("clicked", lambda *_: tools_popover.popdown())
+            sync_settings.connect("clicked", self.music_sync.open_settings)
+            tools_box.append(sync_settings)
         tools_popover.set_child(tools_box)
         tools.set_popover(tools_popover)
         header.pack_end(tools)
+        header.pack_end(self.music_sync.button)
+        self.blackbox_button = Gtk.Button(label="BlackBox", tooltip_text="Enregistrer les diagnostics de la partie")
+        self.blackbox_button.connect("clicked", self.toggle_blackbox)
+        header.pack_start(self.blackbox_button)
         self.set_titlebar(header)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -356,6 +391,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.tv_copy = Gtk.Button(label="Copier lien joueurs")
         self.tv_copy.connect("clicked", self.copy_tv_url)
         self.tv_actions.append(self.tv_copy)
+        admin = Gtk.Button(label="Code organisateur")
+        admin.connect("clicked", self.show_admin_code)
+        self.tv_actions.append(admin)
         self.tv_qr_button = Gtk.MenuButton(label="QR code", tooltip_text="Afficher le QR code des joueurs sur cet ordinateur")
         self.tv_qr_popover = Gtk.Popover()
         self.tv_qr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9,
@@ -414,11 +452,18 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.clear_player()
         self.request_player()
         self.timers = [GLib.timeout_add(200, self.request_player), GLib.timeout_add(32, self.animate),
-                       GLib.timeout_add(450, self.poll_vocal_effect)]
+                       GLib.timeout_add(450, self.poll_vocal_effect),
+                       GLib.timeout_add(350, self.update_party_services)]
         self.connect("close-request", self.close_window)
+        self.tag_reader.submit(self.blackbox.recover)
+        if https_configured():
+            self.tv_toggle.set_active(True)
 
     def toggle_vocal_effect(self, button):
         if self.effect_changing:
+            return
+        if button.get_active() and os.environ.get("KARA_SILENT") == "1":
+            button.set_active(False)
             return
         if button.get_active():
             position = self.base_position + (time.monotonic() - self.updated) * self.rate
@@ -437,7 +482,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def update_vocal_effect(self):
         effect = self.vocal_effect
-        self.effect_strength.set_sensitive(effect.active)
+        self.effect_strength.set_sensitive(effect.active and self.party.active is None)
+        self.effect_toggle.set_sensitive(self.party.active is None)
         if effect.active:
             self.effect_state.set_text(f"Mix IA · {STRENGTHS[effect.strength][0]}")
         elif effect.error:
@@ -464,9 +510,170 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.album_import.start_maintenance(option, title)
 
     def show_players(self, _button):
+        self.ensure_players_window()
+        self.players_window.present()
+
+    def ensure_players_window(self):
         if self.players_window is None:
             self.players_window = PlayersWindow(self, COLLECTION, LIBRARY.resolve())
-        self.players_window.present()
+
+    def show_admin_code(self, _button):
+        if self.receiver is None:
+            Gtk.AlertDialog(message="Ouvre d’abord la salle Kara.").show(self)
+            return
+        code = self.receiver.room.issue_admin_code()
+        dialog = Gtk.AlertDialog(message=f"Code organisateur · {code}",
+                                 detail="À saisir dans Admin sur ton téléphone. Valable cinq minutes.")
+        dialog.show(self)
+
+    def start_blackbox(self, consent, voice=False):
+        self.blackbox.start(consent=consent, voice=voice, configuration={
+            "capture": "diagnostics", "score_tolerance_s": self.game_score.tolerance,
+            "whisper": "large-v3-turbo", "turbo_device": os.environ.get("KARA_TURBO_DEVICE", "gpu"),
+            "lyric_offset_s": self.timing_offset,
+        })
+        self.bb_line = None
+        self.blackbox.emit("party", "recording-start", mode="diagnostics+pcm" if voice else "diagnostics")
+
+    def stop_blackbox(self, reason="manual", *, wait=False):
+        self.acoustic.update()
+        self.blackbox.stop(reason, wait=wait)
+
+    def toggle_blackbox(self, _button):
+        status = self.blackbox.status()
+        if status["active"]:
+            self.stop_blackbox()
+        elif not status["finalizing"]:
+            detail = "Confirme l’accord des participants et des responsables des mineurs. "
+            detail += "Le mode diagnostics enregistre les événements, les paroles et la notation. "
+            detail += ("Le mode audio enregistre aussi le monitor et le micro témoin pendant la lecture des tours. "
+                       "Obtiens l’accord explicite de chaque participant. Prévois environ 4 à 5 Go par heure de jeu.")
+            if status["latest"]:
+                detail += f"\n\nDernière session : {status['latest']['session']}"
+            dialog = Gtk.AlertDialog(message="Activer BlackBox ?", detail=detail,
+                                     buttons=["Annuler", "Diagnostics", "Diagnostics + audio"],
+                                     cancel_button=0, default_button=0)
+
+            def confirmed(source, result):
+                try:
+                    choice = source.choose_finish(result)
+                    if choice in (1, 2):
+                        self.start_blackbox(True, voice=choice == 2)
+                except (OSError, ValueError, GLib.Error) as error:
+                    Gtk.AlertDialog(message="BlackBox indisponible", detail=str(error)).show(self)
+
+            dialog.choose(self, None, confirmed)
+
+    def update_party_services(self):
+        state = self.blackbox.status()
+        label = ("● BlackBox active" if state["active"] else "Finalisation BlackBox…"
+                 if state["finalizing"] else "BlackBox")
+        if (label, state["error"], state["latest"]) != self.blackbox_ui:
+            self.blackbox_ui = label, state["error"], state["latest"]
+            self.blackbox_button.set_label(label)
+            self.blackbox_button.set_sensitive(not state["finalizing"])
+            if state["active"]:
+                self.blackbox_button.add_css_class("destructive-action")
+            else:
+                self.blackbox_button.remove_css_class("destructive-action")
+            self.blackbox_button.set_tooltip_text(state["error"] or (state["latest"] or {}).get("session")
+                                                   or "Enregistrer les diagnostics de la partie")
+        self.album_import.launch_next()
+        return GLib.SOURCE_CONTINUE
+
+    def set_remote_music_volume(self, percent):
+        if type(percent) is not int or not 0 <= percent <= 100:
+            raise ValueError("Volume musical invalide.")
+        if self.turn_music_restore is not None:
+            self.turn_music_restore = percent / 100
+            if self.party.active is not None:
+                self.apply_player_mix(self.party.active)
+        else:
+            self.write_music_volume(percent / 100)
+        self.blackbox.emit("audio", "music-volume", percent=percent)
+
+    def write_music_volume(self, level, callback=None, *, stage=False):
+        if not stage:
+            self.music_volume = level
+            self.vocal_effect.set_master(level)
+        self.bus.call(PLAYER, OBJECT, "org.freedesktop.DBus.Properties", "Set",
+                      GLib.Variant("(ssv)", (INTERFACE, "Volume", GLib.Variant("d", level))),
+                      None, Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
+
+    def apply_player_mix(self, player, *, music_changed=True, original_changed=True):
+        if self.turn_music_restore is None or self.turn_phase not in ("opening", "playing"):
+            return
+        ceiling = round(100 * min(1., self.turn_music_restore))
+        music = player.music_volume if player.music_volume is not None else 100
+        self.vocal_effect.set_turn_mix(music, player.original_voice, ceiling)
+        if original_changed:
+            position = max(0., self.base_position + (time.monotonic() - self.updated) * self.rate)
+            if self.turn_phase == "opening":
+                position = 0.
+            if player.original_voice and (not self.guide_intervals or self.guide_intervals[-1][1] is not None):
+                if len(self.guide_intervals) >= 128:
+                    self.guide_intervals[:] = [(0., None)]
+                else:
+                    self.guide_intervals.append((max(0., position - .25), None))
+            elif (not player.original_voice and self.guide_intervals
+                  and self.guide_intervals[-1][1] is None and len(self.guide_intervals) < 128):
+                begin, _ = self.guide_intervals[-1]
+                self.guide_intervals[-1] = (begin, max(begin, position) + 2.)
+        self.blackbox.emit("audio", "stem-mix", turn=self.bb_turn, player=player.name,
+                           song=player.song.title, position=self.base_position if self.turn_phase == "playing" else 0.,
+                           music_requested=music, music_applied=min(music, ceiling),
+                           original_applied=player.original_voice,
+                           music_gain=self.vocal_effect.targets["music"], original_gain=self.vocal_effect.targets["vocal"])
+
+    def refresh_after_import(self, task, jobs):
+        receiver = self.receiver
+        paths = {Path(path).resolve() for outcome in task.outcomes.values() for path in outcome.get("tracks", [])}
+        paths.update(Path(path).resolve() for job in jobs for outcome in job["results"].values()
+                     for path in outcome.get("tracks", []))
+        if receiver is None and not jobs:
+            if self.music_window:
+                self.music_window.load_library()
+            return
+
+        def reload():
+            try:
+                rows = catalogue(COLLECTION, LIBRARY.resolve())
+            except (OSError, sqlite3.Error):
+                rows = []
+            indexed = {song.path for song, _ in rows}
+            for path in paths - indexed:
+                if not path.is_relative_to(LIBRARY.resolve()) or not path.is_file():
+                    continue
+                try:
+                    tags, _ = probe(path)
+                    song = Song(path, tags.get("title") or path.stem, tags.get("artist", ""),
+                                tags.get("album", ""))
+                    rows.append((song, search_key(f"{song.title} {song.artist} {song.album}")))
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    continue
+            return rows
+
+        def done(future):
+            if self.closed:
+                return GLib.SOURCE_REMOVE
+            rows = future.result()
+            linked = receiver if self.receiver is receiver else None
+            if linked is not None:
+                linked.room.update_catalogue(rows)
+            self.mobile_imports.integrated(jobs, linked, {song.path for song, _ in rows})
+            if self.music_window:
+                self.music_window.load_library()
+                # Strawberry's filesystem watcher may publish its scan just
+                # after the importer, especially for a multi-disc release.
+                GLib.timeout_add_seconds(4, self.refresh_import_library_window)
+            return GLib.SOURCE_REMOVE
+
+        self.tag_reader.submit(reload).add_done_callback(lambda future: GLib.idle_add(done, future))
+
+    def refresh_import_library_window(self):
+        if not self.closed and self.music_window:
+            self.music_window.load_library()
+        return GLib.SOURCE_REMOVE
 
     def show_preparation(self, _button):
         if self.preparation_window is None:
@@ -480,316 +687,196 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.music_window.refresh_queue(force=True)
 
     def player_command(self, method, parameters=None, callback=None):
+        if os.environ.get("KARA_SILENT") == "1" and method in ("Play", "PlayPause", "OpenUri", "Next", "Previous"):
+            return
         self.bus.call(PLAYER, OBJECT, INTERFACE, method, parameters, None,
                       Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
 
-    def prepare_song(self, song):
-        lrc = song.path.with_suffix(".lrc")
-        try:
-            info = lrc.lstat()
-            if local_track(song.path.as_uri()) != song.path or not stat.S_ISREG(info.st_mode):
-                raise OSError("Fichier local manquant")
-            token = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
-            cached = self.prepared_songs.get(song.path)
-            if cached is not None and cached[0] == token:
-                return cached[1]
-            lines = read_lrc(lrc)
-        except (OSError, ValueError) as error:
-            raise ValueError("Les paroles minutées de ce morceau sont illisibles.") from error
-        vocabulary = LyricVocabulary(text for _, text in lines)
-        if not any(vocabulary.tokens):
-            raise ValueError("Ce morceau a besoin de paroles minutées lisibles pour le score.")
-        self.prepared_songs[song.path] = (token, vocabulary, tuple(lines))
-        return vocabulary
+    def player_seeked(self, _bus, _sender, _path, _interface, _member, parameters):
+        # Seeked supplies a position on the player timeline. Reception anchors
+        # it on the Linux monotonic clock without involving phone or TV clocks.
+        position, = parameters.unpack()
+        self.base_position = max(0., position / 1_000_000)
+        self.updated = time.monotonic()
+        self.game_score.mark_seek()
+        self.blackbox.emit("lyrics", "seek", turn=self.bb_turn, position=self.base_position)
+
+    def party_choice(self):
+        return tuple((player, player.song) for player in self.party.players)
 
     def validate_party(self, _button):
         if self.validating or self.party.active is not None or not self.party.players:
             return
-        songs = []
-        for player in self.party.players:
-            if player.song is None:
-                if self.players_window is not None:
-                    self.players_window.message.set_text("Chaque joueur doit choisir un morceau.")
-                return
-            songs.append(player.song)
+        songs = [player.song for player in self.party.players]
+        if None in songs:
+            self.players_window.message.set_text("Chaque joueur doit choisir un morceau.")
+            return
         self.begin_preparation(songs, for_party=True)
 
-    def preload_songs(self, songs):
+    def can_skip_failed(self):
+        return (not self.validating and not self.party_ready and bool(self.failed_alignments)
+                and bool(self.validated_songs) and self.party_choice() == self.party_selection)
+
+    def skip_failed(self, _button):
+        if self.can_skip_failed():
+            self.party.excluded = set(self.failed_alignments)
+            self.party_ready = True
+            self.players_window.message.set_text("Partie prête. Les morceaux en échec ont été écartés.")
+            self.players_window.refresh()
+
+    def unscored_choices(self):
+        if self.validating or self.party_ready or self.party_choice() != self.party_selection:
+            return set()
+        return {path for path in self.failed_alignments if local_track(path.as_uri()) == path}
+
+    def allow_unscored(self, _button):
+        paths = self.unscored_choices()
+        if paths:
+            self.party.unscored = paths
+            self.party.excluded = self.failed_alignments.keys() - paths
+            self.party_ready = True
+            self.players_window.message.set_text("Partie prête. Les morceaux signalés seront chantés sans note.")
+            self.players_window.refresh()
+
+    def preparation_status(self, path):
+        report = self.preparation_reports.get(path)
+        if path in self.validated_songs and report:
+            return f"Prêt à noter · {report['word_coverage']:.0%} de mots évaluables"
+        if path in self.failed_alignments:
+            return (f"Référence insuffisante · {report['word_coverage']:.0%} de mots repérés"
+                    if report and "word_coverage" in report else "Préparation indisponible")
+        return ""
+
+    def preload_songs(self, songs, *, force=False):
         """Prépare des chansons de la bibliothèque sans créer de partie."""
-        if (self.validating or self.party.active is not None or self.game_score.requested
-                or self.game_toggle.get_active()):
-            if self.preparation_window is not None:
-                self.preparation_window.message.set_text(
-                    "Une partie ou un traitement est déjà en cours. Termine-le avant la préparation.")
+        if self.validating or self.party.active is not None or self.game_toggle.get_active():
+            self.preparation_window.message.set_text("Termine la partie ou le traitement en cours.")
             return False
-        return self.begin_preparation(songs, for_party=False)
+        return self.begin_preparation(songs, for_party=False, force=force)
 
     def cancel_preparation(self):
-        """Annule seulement la préparation indépendante, jamais une partie."""
         if not self.validating or not self.preparation_only or self.preload_cancelled:
             return
         self.preload_cancelled = True
-        self.align_queue.clear()
-        self.vocal_queue.clear()
         self.stem_queue.clear()
-        if self.preparation_window is not None:
-            self.preparation_window.message.set_text("Annulation en cours…")
-            self.preparation_window.update_controls()
-        for job in (self.align_job, self.stem_job):
-            if job is not None:
+        self.preparation_window.message.set_text("Annulation en cours…")
+        self.preparation_window.update_controls()
+        processes = (self.align_job, self.stem_job[1] if self.stem_job else None)
+        for process in processes:
+            if process is not None:
                 try:
-                    job[1].send_signal(signal.SIGTERM)
+                    process.send_signal(signal.SIGTERM)
                 except GLib.Error:
                     pass
-        if self.align_job is None and self.vocal_job is None and self.stem_job is None:
+        if all(process is None for process in processes):
             self.complete_party_validation()
 
-    def begin_preparation(self, songs, *, for_party):
-        """Le même pipeline et les mêmes caches servent hors partie et en jeu."""
+    def begin_preparation(self, songs, *, for_party, force=False, force_paths=()):
         if self.closed or self.validating or self.party.active is not None:
             return False
-        plan, align_queue, titles, lyric_titles = {}, {}, {}, {}
-        stems_only = set()
-        invalid = []
-        for song in songs:
-            path = song.path
-            if path in plan:
-                continue
-            try:
-                # Protéger la bibliothèque : seuls les fichiers locaux reconnus
-                # comme audio par Strawberry sont acceptés.
-                if local_track(path.as_uri()) != path or not path.is_file() or path.stat().st_size < 4096:
-                    raise ValueError("Fichier musical local introuvable ou invalide")
-                audio_id = audio_signature(path)
-                try:
-                    self.prepare_song(song)
-                except (OSError, ValueError):
-                    if for_party:
-                        raise
-                    # Sans LRC (ou LRC illisible), la séparation IA reste utile.
-                    # Aucun calage Turbo, analyse mot à mot ou réécriture LRC.
-                    stems_only.add(path)
-                    plan[path] = (None, audio_id)
-                else:
-                    rows = self.prepared_songs[path][2]
-                    plan[path] = (line_signature(rows), audio_id)
-                    lyric_titles[path] = song.title
-                    if not self.timing.current(path, rows):
-                        align_queue[path] = song.title
-                titles[path] = song.title
-            except (OSError, ValueError) as error:
-                if for_party:
-                    if self.players_window is not None:
-                        self.players_window.message.set_text(f"{song.title} · {error}")
-                    return False
-                invalid.append(f"{song.title} · {error}")
+        plan = {song.path: song.title for song in songs}
         if not plan:
-            if self.preparation_window is not None and not for_party:
-                self.preparation_window.message.set_text(
-                    "Aucun morceau audio exploitable. " + "; ".join(invalid[:2]))
             return False
         self.preparation_only = not for_party
         self.preload_cancelled = False
-        self.preload_invalid = invalid
-        self.lrc_written.clear()
-        self.lrc_skipped.clear()
-        self.stems_only = stems_only
         self.active_plan = plan
+        self.training_only = (self.remote_party.training_paths()[1]
+                              if for_party and self.remote_party.phase == "preparing" else set())
+        self.align_finished.clear()
+        self.batch_failed = {}
+        self.batch_reports = {}
+        self.batch_ready = {}
         if for_party:
+            self.party_selection = self.party_choice()
             self.party_ready = False
-            self.validated_songs = plan
-            self.game_toggle.set_active(False)
+            self.party.excluded.clear()
+            self.party.unscored.clear()
+        self.game_toggle.set_active(False)
         self.validating = True
-        self.align_queue = align_queue
-        # Calcule le cache des mots APRES le calage Turbo : ses repères peuvent changer.
-        self.vocal_queue = dict(lyric_titles)
-        self.vocal_completed = 0
-        self.vocal_failed.clear()
-        # Ne jamais demander à Demucs de retraiter des pistes déjà valides.
-        self.stem_queue = {path: title for path, title in titles.items() if cached_stems(path) is None}
-        self.stem_completed = len(titles) - len(self.stem_queue)
+        retried = [str(path) for path in plan if path in force_paths]
+        self.blackbox.emit("turbo", "preparation-start", count=len(plan), force=force,
+                           retried=len(retried), for_party=for_party)
+        self.stem_queue = {}
+        self.stem_completed = 0
         self.stem_failed.clear()
-        self.failed_alignments.clear()
-        # Les versions précédentes sauvegardaient le calage uniquement en JSON.
-        # Publier aussi un bon calage déjà présent sans repasser par Turbo.
-        for path in lyric_titles:
-            if path in align_queue:
-                continue
-            saved = self.timing.entry(path)
-            if saved.get("times"):
-                try:
-                    self.accept_alignment(path, dict(saved))
-                except (OSError, ValueError, KeyError) as error:
-                    self.lrc_skipped[path] = str(error)
-        if self.preparation_window is not None and not for_party:
+        for path in plan:
+            if local_track(path.as_uri()) != path:
+                self.batch_failed[path] = "Fichier audio local introuvable."
+                self.align_finished.add(path)
+        if self.preparation_window is not None and self.preparation_only:
             self.preparation_window.set_busy(True)
-            self.preparation_window.set_progress("Début de la préparation des chansons…", 0)
         if self.players_window is not None:
             self.players_window.refresh()
-        self.start_alignment()
+        paths = [str(path) for path in plan if path not in self.batch_failed]
+        if paths:
+            command = [sys.executable, "-B", str(BIN / "_kara_prepare.py"),
+                       "--cache", str(self.references.root),
+                       *(["--force"] if force else []),
+                       *(["--trace"] if self.blackbox.status()["active"] else []),
+                       *(arg for path in retried for arg in ("--force-path", path)), *paths]
+            try:
+                process = Gio.Subprocess.new(command, Gio.SubprocessFlags.STDOUT_PIPE |
+                                             Gio.SubprocessFlags.STDERR_SILENCE)
+            except GLib.Error as error:
+                for path in paths:
+                    self.batch_failed[Path(path)] = str(error)
+            else:
+                self.align_job = process
+                self.show_align_status("Vérification de la préparation Turbo…", 0)
+                stream = Gio.DataInputStream.new(process.get_stdout_pipe())
+                stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
+                return True
+        self.complete_party_validation()
         return True
-
-    def accept_alignment(self, path, event):
-        """Publie un calage sûr dans le LRC et maintient les caches cohérents."""
-        signature, audio_id = self.active_plan[path]
-        if event.get("signature") != signature or event.get("audio") != audio_id:
-            raise ValueError("Le morceau ou le LRC a changé pendant le calage")
-        fields = {key: event[key] for key in
-                  ("signature", "audio", "version", "times", "word_marks", "coverage", "changed", "refined", "model")
-                  if key in event}
-        previous = self.timing.entry(path)
-        if fields.get("times") is None and self.timing.matches(path, self.prepared_songs[path][2]):
-            for key in ("times", "word_marks", "coverage", "changed"):
-                if key in previous:
-                    fields[key] = previous[key]
-        updated = {**previous, **fields}
-        status = "unavailable"
-        new_rows = None
-        backup = None
-        if updated.get("times") is not None:
-            # Un LRC non modifiable ne doit jamais faire perdre le calage déjà
-            # calculé : il reste enregistré dans le cache privé de Paroles.
-            try:
-                status, new_rows, backup = publish_lrc(path, updated, signature)
-            except (OSError, ValueError) as error:
-                status = "protected"
-                self.lrc_skipped[path] = str(error)
-            if status == "updated":
-                new_signature = line_signature(new_rows)
-                updated["signature"] = new_signature
-                updated["lrc_original_backup"] = str(backup)
-                updated["lrc_exported"] = True
-                self.active_plan[path] = (new_signature, audio_id)
-                if not self.preparation_only:
-                    self.validated_songs[path] = (new_signature, audio_id)
-                info = path.with_suffix(".lrc").stat()
-                token = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
-                vocabulary = LyricVocabulary(text for _, text in new_rows)
-                self.prepared_songs[path] = (token, vocabulary, tuple(new_rows))
-                self.file_token = None if self.track == path else self.file_token
-                self.lrc_written.add(path)
-            elif status in ("insufficient", "unavailable"):
-                self.lrc_skipped[path] = "Calage Turbo insuffisamment fiable"
-        else:
-            self.lrc_skipped[path] = "Aucun calage exploitable"
-        self.timing.save(path, updated)
-        if self.track == path:
-            self.apply_timing()
-        return status
-
-    def start_alignment(self):
-        if self.closed or not self.validating or self.align_job or self.game_score.requested:
-            return
-        while self.align_queue:
-            path = next(iter(self.align_queue))
-            self.align_title = self.align_queue.pop(path)
-            command = [sys.executable, "-B", str(SESSION), str(WORKER_PYTHON), "-B",
-                       str(Path(__file__).with_name("_kara_align.py")), str(path)]
-            flags = Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
-            try:
-                process = Gio.Subprocess.new(command, flags)
-            except GLib.Error:
-                self.failed_alignments.add(path)
-                continue
-            self.align_job = (path, process)
-            self.show_align_status("Préparation du calage…", 0)
-            stream = Gio.DataInputStream.new(process.get_stdout_pipe())
-            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
-            return
-        if self.vocal_queue:
-            self.start_vocal_analysis()
-            return
-        self.start_stem_generation()
 
     def complete_party_validation(self):
         preload = self.preparation_only
         self.validating = False
+        selected = self.party_choice() == self.party_selection
         if not preload:
-            self.party_ready = True
-        total = len(self.active_plan)
-        fallback = sum(self.timing.entry(path).get("times") is None or path in self.failed_alignments
-                       for path in self.active_plan if path not in self.stems_only)
-        detail = ("Préparation annulée. Les résultats déjà terminés restent en cache."
-                  if preload and self.preload_cancelled else
-                  f"Préparation terminée pour {total} morceau(x)." if preload
-                  else "Partie prête. Tu peux chanter.")
-        if not (preload and self.preload_cancelled):
-            if self.stems_only:
-                detail += f" {len(self.stems_only)} titre(s) sans LRC : séparation IA uniquement."
-            if fallback:
-                detail += f" Minutage d'origine pour {fallback} morceau(x)."
-            if self.vocal_failed:
-                detail += f" Analyse spectrale absente pour {len(self.vocal_failed)} morceau(x)."
-            if self.stem_failed:
-                detail += f" Séparation IA indisponible pour {len(self.stem_failed)} morceau(x)."
-            else:
-                detail += " Pistes instrumentales prêtes."
-            counted = sum(p.get("mots_analyses", 0) for path, p in self.vocal_profiles.items()
-                          if path in self.active_plan)
-            estimated = sum(p.get("mots_total", 0) - p.get("mots_calés", 0)
-                            for path, p in self.vocal_profiles.items() if path in self.active_plan)
-            detail += f" {counted} mots analysés dans le mix (dont {estimated} à timing estimé)."
-            if self.lrc_written:
-                detail += f" {len(self.lrc_written)} fichier(s) LRC recalé(s) avec sauvegarde."
-            if self.lrc_skipped:
-                detail += f" {len(self.lrc_skipped)} LRC non remplacé(s) (calage trop incertain ou fichier protégé)."
-            if self.preload_invalid:
-                detail += f" {len(self.preload_invalid)} morceau(x) ignoré(s) (paroles manquantes/invalides)."
+            # Training needs the source audio and stems. A lyric-reference
+            # failure still blocks paths used by at least one scored turn.
+            for path in self.training_only & self.batch_failed.keys():
+                if path not in self.stem_failed and local_track(path.as_uri()) == path and cached_stems(path):
+                    self.batch_failed.pop(path)
+            for path in self.active_plan:
+                if path in self.stem_failed:
+                    self.batch_failed[path] = "Pistes séparées indisponibles pour le mixage."
+            self.failed_alignments = self.batch_failed
+            self.preparation_reports = self.batch_reports
+            self.validated_songs = self.batch_ready
+            self.party_ready = selected and not self.failed_alignments and bool(self.validated_songs or self.training_only)
+            if self.receiver is not None:
+                self.receiver.room.set_prepared(self.validated_songs)
+        elif any(path in self.validated_songs and current != self.validated_songs[path]
+                 for path, current in self.batch_ready.items()) or self.batch_failed.keys() & self.validated_songs.keys():
+            self.party_ready = False
+        ready = len(self.batch_ready.keys() | (self.training_only - self.batch_failed.keys()))
+        if self.preload_cancelled:
+            detail = "Préparation annulée. Les morceaux terminés restent en cache."
+        elif self.batch_failed:
+            total = len(self.active_plan)
+            errors = [f"{self.active_plan[path]} · {error}" for path, error in self.batch_failed.items()]
+            detail = f"{ready}/{total} morceau(x) prêt(s). " + " / ".join(errors)
+        elif not preload and self.party_ready:
+            detail = f"Partie prête · {ready} morceau(x)."
+        elif not preload:
+            detail = "La sélection des joueurs a changé. Relance la préparation."
+        else:
+            detail = f"{ready} morceau(x) prêt(s) dans le cache Turbo."
+        if self.stem_failed:
+            detail += f" Instrumental indisponible pour {len(self.stem_failed)} morceau(x)."
         self.show_align_status(detail, round(self.align_fraction * 100) if self.preload_cancelled else 100)
         if self.preparation_window is not None and preload:
             self.preparation_window.set_busy(False)
         self.preparation_only = False
         self.preload_cancelled = False
         self.active_plan = {}
+        self.blackbox.emit("turbo", "preparation-end", ready=ready, failed=len(self.batch_failed))
+        self.remote_party.prepared()
         if self.players_window is not None:
             self.players_window.refresh()
         GLib.timeout_add(650, self.hide_alignment_bars)
-
-    def start_vocal_analysis(self):
-        if not self.validating or self.closed or self.vocal_job:
-            return
-        while self.vocal_queue:
-            path = next(iter(self.vocal_queue))
-            title = self.vocal_queue.pop(path)
-            rows = self.prepared_songs[path][2]
-            times = self.timing.times(path, rows)
-            marks = self.timing.marks(path, rows)
-            profile = cached_profile(path, rows, times, marks)
-            if profile is not None:
-                self.vocal_profiles[path] = profile
-                self.vocal_completed += 1
-                continue
-
-            def progress(done, total):
-                GLib.idle_add(self.update_vocal_progress, path, title, done, total)
-
-            future = self.vocal_analyzer.submit(analyze_vocal_mix, path, rows, times, marks, progress=progress)
-            self.vocal_job = (path, future)
-            future.add_done_callback(lambda finished: GLib.idle_add(self.complete_vocal_analysis, path, finished))
-            self.show_align_status(f"Spectre mot par mot · {title}", 0)
-            return
-        self.start_stem_generation()
-
-    def update_vocal_progress(self, path, title, done, total):
-        if self.closed or not self.validating or not self.vocal_job or path != self.vocal_job[0]:
-            return GLib.SOURCE_REMOVE
-        self.show_align_status(f"Analyse du mix mot par mot · {title} · {done}/{total}",
-                               round(100 * done / max(1, total)))
-        return GLib.SOURCE_REMOVE
-
-    def complete_vocal_analysis(self, path, future):
-        if self.closed or not self.vocal_job or self.vocal_job != (path, future):
-            return GLib.SOURCE_REMOVE
-        try:
-            profile = future.result()
-            self.vocal_profiles[path] = profile
-            # Conservation du spectre pour analyse, pas pour filtrer la musique.
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyError) as error:
-            self.vocal_failed.add(path)
-        self.vocal_completed += 1
-        self.vocal_job = None
-        self.start_vocal_analysis()
-        return GLib.SOURCE_REMOVE
 
     def start_stem_generation(self):
         if self.closed or not self.validating or self.stem_job:
@@ -803,7 +890,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                     self.vocal_effect.refresh_stems()
                     self.update_vocal_effect()
                 continue
-            command = (sys.executable, "-B", str(Path(__file__).with_name("_kara_stems.py")), str(path))
+            command = (sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path))
             try:
                 process = Gio.Subprocess.new(command, Gio.SubprocessFlags.STDOUT_PIPE |
                                              Gio.SubprocessFlags.STDERR_SILENCE)
@@ -856,21 +943,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def show_align_status(self, detail, progress):
         total = max(1, len(self.active_plan))
-        if self.align_job:
-            index = total - len(self.align_queue)
-            total_progress = .55 * (index - 1 + progress / 100) / total
-            detail = f"Morceau {index}/{total} · {self.align_title} · {detail}"
-        elif self.vocal_job:
-            index = self.vocal_completed + 1
-            total_progress = .55 + .10 * (self.vocal_completed + progress / 100) / total
-            detail = f"Morceau {index}/{total} · {detail}"
-        elif self.stem_job:
-            index = self.stem_completed + 1
-            # Albums entièrement sans LRC : seul Demucs travaille, la barre
-            # progresse de 0 à 100 % plutôt que de démarrer directement à 65 %.
-            stems_base = 0.0 if len(self.stems_only) == len(self.active_plan) else .65
-            total_progress = stems_base + (1.0 - stems_base) * (self.stem_completed + progress / 100) / total
-            detail = f"Morceau {index}/{total} · {detail}"
+        if self.stem_job:
+            total_progress = .85 + .15 * (self.stem_completed + progress / 100) / total
         else:
             total_progress = progress / 100
         self.align_fraction = max(0.0, min(1.0, total_progress))
@@ -887,9 +961,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             bar.set_text(f"{round(self.align_fraction * 100)} %")
 
     def read_alignment(self, stream, result, process):
-        if self.closed or not self.align_job or self.align_job[1] is not process:
+        if self.closed or self.align_job is not process:
             return
-        path = self.align_job[0]
         try:
             line, _ = stream.read_line_finish_utf8(result)
             event = json.loads(line) if line else None
@@ -898,23 +971,56 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if not isinstance(event, dict):
             self.align_job = None
             process.wait_async(None, GameScore.reaped)
-            rows = self.prepared_songs[path][2]
-            if not self.timing.current(path, rows):
-                self.failed_alignments.add(path)
-            self.start_alignment()
+            if not self.preload_cancelled:
+                for path in self.active_plan.keys() - self.align_finished:
+                    self.batch_failed[path] = "La préparation Turbo a été interrompue."
+                # Preserve instrumental preparation independently of lyric recovery.
+                self.stem_queue = {path: title for path, title in self.active_plan.items()
+                                   if local_track(path.as_uri()) == path and cached_stems(path) is None}
+                self.stem_completed = len(self.active_plan) - len(self.stem_queue)
+            self.start_stem_generation()
             return
-        kind = event.get("event")
-        if kind == "progress":
-            detail = ("Calage ligne par ligne" if event.get("phase") == "lines"
-                      else "Repérage de la voix dans le morceau")
-            self.show_align_status(detail, int(event.get("percent", 0)))
-        elif kind == "error":
-            self.failed_alignments.add(path)
-        elif kind == "alignment":
-            try:
-                self.accept_alignment(path, event)
-            except (OSError, ValueError, KeyError):
-                self.failed_alignments.add(path)
+        path = Path(event.get("path", ""))
+        if path in self.active_plan:
+            kind = event.get("event")
+            title = self.active_plan[path]
+            count = len(self.active_plan)
+            done = len(self.align_finished)
+            if kind == "evidence":
+                self.blackbox.emit("turbo", event["kind"], song=title, evidence=event["evidence"])
+            elif kind in ("error", "progress", "result"):
+                self.blackbox.emit("turbo", kind, song=title,
+                                   phase=event.get("phase"), progress=event.get("percent"),
+                                   ready=event.get("ready"), report=event.get("report"),
+                                   duration=event.get("duration"), cached=event.get("cached"))
+            if kind == "progress":
+                stages = {"cache": "Vérification du cache", "lyrics": "Récupération des paroles",
+                          "model": "Chargement du modèle", "transcription": "Analyse audio par Turbo",
+                          "comparison": "Comparaison des paroles", "correction": "Correction des timestamps",
+                          "words": "Synchronisation mot par mot", "separation": "Séparation de la voix",
+                          "refinement": "Analyse locale des passages incertains",
+                          "vocal_refinement": "Vérification locale sur la piste vocale",
+                          "saving": "Enregistrement", "cached_insufficient": "Référence insuffisante · cache",
+                          "ready": "Morceau prêt", "cached": "Morceau prêt · cache"}
+                stage = stages.get(event.get("phase"), "Préparation")
+                progress = round(85 * (done + event.get("percent", 0) / 100) / count)
+                self.show_align_status(f"Morceau {min(count, done + 1)}/{count} · {title} · {stage}", progress)
+            elif kind in ("result", "error"):
+                self.align_finished.add(path)
+                self.batch_reports[path] = event.get("report", {})
+                item = self.references.cached(path, verify=False) if event.get("ready") else None
+                if item is not None:
+                    self.batch_ready[path] = (item["prepared_at"], item["lrc_sha256"])
+                else:
+                    report = event.get("report", {})
+                    message = event.get("message") or report.get("message", "Préparation Turbo indisponible.")
+                    if "word_coverage" in report:
+                        message += (f" {report['word_coverage']:.0%} des mots et "
+                                    f"{report['line_coverage']:.0%} des débuts de ligne repérés.")
+                    self.batch_failed[path] = message
+                if path == self.track:
+                    self.file_token = None
+                    self.load_lines()
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
 
     def build_timing_controls(self):
@@ -940,37 +1046,37 @@ class LyricsWindow(Gtk.ApplicationWindow):
         reset = Gtk.Button(label="Remettre le décalage à zéro")
         reset.connect("clicked", lambda *_: self.timing_spin.set_value(0))
         content.append(reset)
+        self.original_timing = Gtk.CheckButton(label="Afficher le LRC d’origine")
+        self.original_timing.connect("toggled", lambda *_: self.load_lines() if self.track else None)
+        content.append(self.original_timing)
         self.timing_message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
         content.append(self.timing_message)
         return self.timing_menu
 
     def apply_timing(self):
-        self.times = self.timing.times(self.track, self.raw_lines)
-        self.word_marks = self.timing.marks(self.track, self.raw_lines)
-        self.timing_offset = self.timing.offset(self.track)
-        self.word_times = tuple(
-            tuple(time_at_character(marks, (start + stop) / 2) + self.timing_offset
-                  for _, start, stop in text_boundaries(text)) if marks else ()
-            for marks, (_, text) in zip(self.word_marks, self.raw_lines)
-        )
-        self.word_ends = tuple(marks[-1][0] + self.timing_offset if marks else None
-                               for marks in self.word_marks)
-        # Strawberry peut lire un morceau directement, sans avoir ouvert
-        # l'éditeur de partie. Réutiliser alors le profil enregistré sur disque.
-        if self.track is not None and self.raw_lines:
-            profile = self.vocal_profiles.get(self.track)
-            if profile is None:
-                profile = cached_profile(self.track, self.raw_lines, self.times, self.word_marks)
-                if profile is not None:
-                    self.vocal_profiles[self.track] = profile
-            # Cette mesure spectrale n'affecte pas le son : le jeu utilise les stems IA.
+        scoring = self.game_toggle.get_active() or self.party.active is not None
+        show_original = self.original_timing.get_active() and not scoring
+        self.timing_offset = 0. if scoring else self.timing.offset(self.track)
+        if self.active_reference and not show_original:
+            lines = self.active_reference["lines"]
+            self.times = [line["display_start"] + self.timing_offset for line in lines]
+            self.word_marks = tuple(display_marks(line) for line in lines)
+            self.word_times = tuple(tuple(word["start"] for word in line["words"]) for line in lines)
+            self.word_ends = tuple(line["end"] for line in lines)
+        elif show_original:
+            self.times = [stamp + self.timing_offset for stamp, _ in self.raw_lines]
+            self.word_marks = self.word_times = self.word_ends = ()
+        else:
+            self.times = self.timing.times(self.track, self.raw_lines)
+            self.word_marks = self.timing.marks(self.track, self.raw_lines)
+            self.word_times = self.word_ends = ()
         self.highlight = -1
         self.next_tv_update = 0
-        self.timing_menu.set_sensitive(bool(self.track and self.raw_lines))
+        self.timing_menu.set_sensitive(bool(self.track and self.raw_lines and not scoring))
         self.syncing_offset = True
         self.timing_spin.set_value(self.timing.offset(self.track))
         self.syncing_offset = False
-        calibrated = self.timing.current(self.track, self.raw_lines) and self.timing.entry(self.track).get("times") is not None
+        calibrated = bool(self.active_reference) and not show_original
         marked = sum(bool(marks) for marks in self.word_marks)
         lyric_lines = sum(bool(words(text)) for _, text in self.raw_lines)
         if marked:
@@ -982,7 +1088,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.timing_message.set_text(detail)
 
     def change_timing(self, spin):
-        if self.syncing_offset or self.track is None or not self.raw_lines:
+        if self.syncing_offset or self.track is None or not self.raw_lines or self.game_toggle.get_active():
             return
         try:
             self.timing.set_offset(self.track, spin.get_value())
@@ -992,38 +1098,88 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.apply_timing()
 
     def start_turn(self, player):
-        if self.party.active is not None or player.song is None or not self.party_ready:
+        if self.validating or self.party.active is not None or player.song is None or not self.party_ready:
             return
-        try:
-            vocabulary = self.prepare_song(player.song)
-            rows = self.prepared_songs[player.song.path][2]
-            current = line_signature(rows), audio_signature(player.song.path)
-        except (OSError, ValueError) as error:
-            self.players_window.message.set_text(str(error))
+        if os.environ.get("KARA_SILENT") == "1":
+            self.players_window.message.set_text("La lecture et le microphone sont désactivés pour cette séance.")
             return
-        if self.validated_songs.get(player.song.path) != current:
+        path = player.song.path
+        if path in self.party.excluded:
+            return
+        scored = path not in self.party.unscored and not player.training
+        reference = self.references.cached(path, verify=False) if scored else None
+        if scored and (reference is None or self.validated_songs.get(path) != (
+                reference["prepared_at"], reference["lrc_sha256"])):
             self.party_ready = False
             self.players_window.message.set_text("Le morceau a changé. Valide à nouveau la partie.")
             self.players_window.refresh()
             return
-        self.previous_result = player.score, player.done
-        player.score, player.done = 0, False
+        if not scored and local_track(path.as_uri()) != path:
+            self.party_ready = False
+            self.players_window.message.set_text("Le fichier du morceau est indisponible.")
+            self.players_window.refresh()
+            return
+        if not cached_stems(path):
+            self.party_ready = False
+            self.players_window.message.set_text("Les pistes du mixage ont changé. Prépare à nouveau la partie.")
+            self.players_window.refresh()
+            return
+        self.game_toggle.set_active(False)
+        self.bb_turn = self.remote_party.turn_id or token_hex(8)
+        if self.remote_party.current and player.mobile_id:
+            try:
+                self.game_score.network_socket = self.room_audio.open_turn(
+                    player.mobile_id, player.name, self.bb_turn, player.song.title, scoring=scored)
+                self.vocal_effect.output_override = self.room_audio.selected_sink()
+            except ValueError as error:
+                self.bb_turn = None
+                self.players_window.message.set_text(str(error))
+                self.blackbox.emit("audio", "error", operation="turn-route", player=player.name)
+                return
+        self.previous_result = player.score, player.done, player.result
+        player.score, player.done, player.result = None, False, None
         self.party.active = player
+        self.game_score.diagnostic_turn = {"turn": self.bb_turn, "player": player.name, "song": player.song.title}
+        self.blackbox.emit("party", "turn-start", **self.game_score.diagnostic_turn, scored=scored, training=player.training,
+                           reference={**{key: reference.get(key) for key in ("song_id", "prepared_at", "lrc_sha256",
+                                       "language", "duration", "settings")},
+                                      "audio_sha256": reference["audio"]["sha256"]} if reference else None)
+        self.turn_scored = scored
+        self.game_toggle.set_sensitive(scored)
         self.turn_phase = "preparing"
         self.turn_tail = None
-        self.record_turn = self.players_window.record_next.get_active()
+        self.record_turn = scored and self.players_window.record_next.get_active()
         self.players_window.record_next.set_active(False)
         self.turn_opened = False
         self.turn_deadline = time.monotonic() + 45.0
-        self.game_score.set_round(vocabulary.lines, vocabulary)
+        if scored:
+            vocabulary = LyricVocabulary(line["text"] for line in reference["lines"])
+            self.game_score.set_round(vocabulary.lines, vocabulary, reference=reference)
+        else:
+            self.game_score.set_round()
         self.players_window.message.set_text("")
         self.players_window.refresh()
-        self.game_toggle.set_active(True)
-        self.sync_game()
+        self.update_vocal_effect()
+        if scored:
+            self.game_toggle.set_active(True)
+            self.sync_game()
+        elif self.game_score.network_socket is not None:
+            self.turn_phase = "awaiting-mic"
+            self.turn_deadline = time.monotonic() + 75.
+        else:
+            # Explicit sing-only turns use the ordinary player path. They
+            # never acquire the scoring worker, capture or recording route.
+            self.begin_playback(player)
 
     def begin_playback(self, player):
         self.turn_phase = "opening"
         self.turn_deadline = time.monotonic() + 12.0
+        if self.music_volume is None:
+            self.finish_turn(error="Le volume de Strawberry est indisponible.")
+            return
+        self.turn_music_restore = self.music_volume
+        self.guide_intervals.clear()
+        self.apply_player_mix(player)
 
         def opened(bus, result):
             if player is not self.party.active or self.turn_phase != "opening":
@@ -1035,48 +1191,97 @@ class LyricsWindow(Gtk.ApplicationWindow):
             else:
                 self.turn_opened = True
 
-        self.player_command("OpenUri", GLib.Variant("(s)", (player.song.path.as_uri(),)), opened)
+        def muted(bus, result):
+            if player is not self.party.active or self.turn_phase != "opening":
+                return
+            try:
+                bus.call_finish(result)
+            except GLib.Error:
+                self.finish_turn(error="Impossible d’isoler la sortie originale de Strawberry.")
+                return
+            self.player_command("OpenUri", GLib.Variant("(s)", (player.song.path.as_uri(),)), opened)
+
+        # Strawberry remains the song/position owner. Its native mix must
+        # already be silent when OpenUri begins, including at a guide of 0 %.
+        self.write_music_volume(0., muted, stage=True)
         self.refresh_game()
 
+    def scoring_source(self):
+        effect = self.vocal_effect
+        if effect.active and effect.playing and effect.stems:
+            if effect.turn_mix and effect.turn_mix[1] and self.guide_intervals:
+                position = self.base_position + (time.monotonic() - self.updated) * self.rate
+                begin, end = self.guide_intervals[-1]
+                if end is None and position < begin:
+                    # A backwards seek can replay guide audio at positions
+                    # preceding the original fader change.
+                    self.guide_intervals[-1] = (0., None)
+            return str(effect.stems[0]), str(effect.song), str(effect.stems[1]), tuple(self.guide_intervals)
+        return None
+
     def observe_turn(self, playback, previous_track, previous_position, previous_duration, previous_times,
-                     previous_word_times, previous_word_ends, previous_rate, now):
+                     previous_word_times, previous_word_ends, previous_rate, previous_source, now):
         player = self.party.active
         if player is None:
             return
         song = player.song.path
         if self.turn_phase == "opening" and self.turn_opened:
             if self.track == song and self.rate > 0 and self.base_position < 2.0:
+                if not self.turn_scored:
+                    if not self.enable_turn_mix():
+                        return
+                    self.turn_phase = "playing"
+                    self.log_playback_reference(player.song.path)
+                    return
                 if not self.times:
                     self.finish_turn(pause=True, error="Les paroles minutées ne sont plus disponibles.")
                     return
-                scored = [text for position, text in zip(self.times, self.lyrics)
-                          if not self.duration or position < self.duration - 0.08]
-                if not any(words(text) for text in scored):
-                    self.finish_turn(pause=True, error="Les repères des paroles sont hors de la chanson.")
+                if not self.active_reference or self.game_score.reference["prepared_at"] != self.active_reference["prepared_at"]:
+                    self.finish_turn(pause=True, error="La préparation du morceau a changé.")
                     return
-                vocabulary = self.game_score.vocabulary
-                if vocabulary.lines != tuple(self.lyrics):
-                    vocabulary = LyricVocabulary(self.lyrics)
-                self.game_score.set_round(scored, vocabulary)
                 if self.record_turn:
                     start = self.updated - self.base_position / self.rate
                     self.record_turn = self.game_score.record_turn(start, player.song.title)
+                if not self.enable_turn_mix():
+                    return
                 self.turn_phase = "playing"
+                self.log_playback_reference(player.song.path)
             return
-        if self.turn_phase != "playing" or (self.track == song and playback != "Stopped"):
+        if self.turn_phase != "playing":
+            return
+        if self.track == song and playback == "Playing" and not self.vocal_effect.active:
+            self.finish_turn(pause=True, error="Le mixage des pistes s’est arrêté.")
+            return
+        if not self.turn_scored:
+            if self.track != song or playback == "Stopped":
+                self.finish_turn()
+            return
+        if self.track == song and playback != "Stopped":
+            if not self.active_reference or self.game_score.reference["prepared_at"] != self.active_reference["prepared_at"]:
+                self.finish_turn(pause=True, error="La préparation a changé pendant le tour.")
             return
         if self.record_turn:
             self.game_score.record_turn()
             self.record_turn = False
         self.turn_phase = "finishing"
+        self.acoustic.update()
+        self.room_audio.close_turn()
         self.turn_deadline = now + 12.0
         if previous_track == song and previous_duration and previous_position >= previous_duration - 1:
             rate = previous_rate or 1.0
             end_time = now + (previous_duration - previous_position) / rate
             self.turn_tail = (previous_times, previous_duration, end_time,
-                              previous_word_times, previous_word_ends, rate)
+                              previous_word_times, previous_word_ends, rate, previous_source)
             if self.track != song and playback == "Playing":
                 self.player_command("Pause")
+
+    def enable_turn_mix(self):
+        self.turn_mix_strength = self.vocal_effect.strength
+        self.effect_toggle.set_active(True)
+        if self.vocal_effect.active:
+            return True
+        self.finish_turn(pause=True, error="Impossible de mélanger les deux pistes du morceau.")
+        return False
 
     def advance_turn(self, now):
         player = self.party.active
@@ -1085,11 +1290,20 @@ class LyricsWindow(Gtk.ApplicationWindow):
         game = self.game_score
         if self.turn_phase == "preparing":
             if game.ready:
-                self.begin_playback(player)
+                if game.network_socket is not None:
+                    self.turn_phase = "awaiting-mic"
+                    self.turn_deadline = now + 75.
+                else:
+                    self.begin_playback(player)
             elif game.process is None or now >= self.turn_deadline:
                 self.finish_turn(error=game.message or "Le micro ne s’est pas préparé.")
         elif self.turn_phase == "opening" and now >= self.turn_deadline:
             self.finish_turn(error="Strawberry n’a pas démarré la chanson sélectionnée.")
+        elif self.turn_phase == "awaiting-mic":
+            if self.room_audio.receiving():
+                self.begin_playback(player)
+            elif now >= self.turn_deadline or self.turn_scored and game.process is None:
+                self.finish_turn(error="Le microphone du joueur n’a pas démarré.")
         elif self.turn_phase == "playing" and game.requested and game.process is None:
             self.finish_turn(pause=True, error=game.message or "Le moteur de score s’est arrêté.")
         elif self.turn_phase == "finishing":
@@ -1102,30 +1316,66 @@ class LyricsWindow(Gtk.ApplicationWindow):
         player = self.party.active
         if player is None:
             return
+        self.acoustic.update()
         if pause and self.track == player.song.path and self.rate > 0:
             self.player_command("Pause")
-        if self.turn_phase in ("playing", "finishing"):
-            player.score = self.game_score.score or 0
+        played = self.turn_phase in ("playing", "finishing")
+        if played:
+            player.score = self.game_score.score if self.turn_scored else None
+            result = self.game_score.breakdown if self.turn_scored else None
+            if result:
+                player.result = {"summary": result, "lines": dict(self.game_score.line_results)}
+                if not error:
+                    score = ("Score indisponible" if result["score"] is None
+                             else f"Score {result['score']} %")
+                    error = f"{score} · {result['coverage']} % des mots évalués."
+            elif not error:
+                error = "Tour chanté sans note."
             player.done = True
         else:
-            player.score, player.done = self.previous_result
+            player.score, player.done, player.result = self.previous_result
+        self.blackbox.emit("party", "turn-end", turn=self.bb_turn, player=player.name, song=player.song.title,
+                           played=played, detail=error, summary=(player.result or {}).get("summary") if played else None)
+        self.remote_party.turn_completed(player, error, played=played)
+        self.game_score.diagnostic_turn = {}
+        self.bb_turn = None
         if self.record_turn:
             self.game_score.record_turn()
             self.record_turn = False
+        self.room_audio.close_turn()
+        if self.game_score.network_socket is not None:
+            self.game_score.network_socket.close()
+            self.game_score.network_socket = None
         self.party.active = None
+        self.vocal_effect.output_override = None
+        if self.turn_mix_strength is not None:
+            self.effect_toggle.set_active(False)
+            self.effect_strength.set_selected(self.turn_mix_strength)
+            self.turn_mix_strength = None
+        self.vocal_effect.clear_turn_mix()
+        if self.turn_music_restore is not None:
+            self.write_music_volume(self.turn_music_restore)
+            self.turn_music_restore = None
+        self.update_vocal_effect()
         if player.mobile_id in self.mobile_leaving:
             self.mobile_leaving.discard(player.mobile_id)
+            self.room_audio.forget_player(player.mobile_id)
             self.party.players = [p for p in self.party.players if p is not player]
             self.mobile_players.pop(player.mobile_id, None)
             self.party_ready = False
         self.turn_phase = ""
+        self.turn_scored = True
+        self.game_toggle.set_sensitive(True)
         self.turn_tail = None
         self.game_score.set_round()
+        self.apply_timing()
         self.game_toggle.set_active(False)
         self.refresh_game()
         if self.players_window is not None:
             self.players_window.message.set_text(error)
             self.players_window.refresh()
+        if played and self.remote_party.phase == "lobby" and self.party_ready and not self.party.next_player():
+            self.stop_blackbox("party-end")
 
     def toggle_game(self, button):
         if button.get_active():
@@ -1133,50 +1383,64 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if not button.get_active():
             self.finish_turn()
             self.game_score.stop()
+        if self.track:
+            self.load_lines()
+        self.apply_timing()
         self.sync_game()
 
     def sync_game(self):
-        playing = self.track is not None and self.times and self.rate > 0
-        if self.party.active is not None:
-            playing = (self.turn_phase in ("preparing", "opening", "finishing")
-                       or (self.turn_phase == "playing" and playing and self.track == self.party.active.song.path))
-        if self.game_toggle.get_active() and playing and not self.validating:
-            if self.turn_phase in ("", "playing") and self.game_score.vocabulary.lines != tuple(self.lyrics):
-                self.game_score.configure_voice(self.lyrics)
+        if os.environ.get("KARA_SILENT") == "1":
+            return
+        if self.party.active is None:
+            source = self.active_reference
+            can_score = bool(source and self.track and self.scoring_source())
+        else:
+            source = self.game_score.reference
+            can_score = self.turn_scored and bool(source) and (
+                self.turn_phase in ("preparing", "awaiting-mic", "opening", "finishing")
+                or (self.turn_phase == "playing" and self.track == self.party.active.song.path))
+        if self.game_toggle.get_active() and can_score and not self.validating:
+            if self.game_score.reference is not source:
+                self.game_score.pause()
+                self.game_score.set_round([line["text"] for line in source["lines"]], reference=source)
             self.game_score.start()
         else:
             self.game_score.pause()
-            self.start_alignment()
         self.refresh_game()
 
     def refresh_game(self):
         game = self.game_score
-        if not self.game_toggle.get_active():
-            self.game_status = ""
-            self.score_label.set_text("")
+        if not self.game_toggle.get_active() or (self.party.active is not None and not self.turn_scored):
+            self.game_status = "Chant sans note" if self.party.active is not None and not self.turn_scored else ""
+            self.score_label.set_text(self.game_status)
             return
         player = self.party.active
+        breakdown = game.breakdown
+        new_score = breakdown["score"] if breakdown is not None else game.score
         if player is not None:
-            new_score = game.score or 0
             if player.score != new_score:
                 player.score = new_score
                 if self.players_window is not None:
                     self.players_window.refresh_scores()
-        score = f"Score {game.score} %" if game.score is not None else "Score —"
+        score = f"Score {new_score} %" if new_score is not None else "Score —"
         if self.turn_phase == "opening":
             status = "Ouverture dans Strawberry…"
         elif self.turn_phase == "finishing":
             status = "Calcul du score final…"
         elif game.message:
             status = game.message
-        elif not self.times:
-            status = "Paroles minutées nécessaires"
+        elif not self.active_reference:
+            status = "Préparation Turbo nécessaire"
+        elif self.rate > 0 and not self.scoring_source():
+            status = "Instrumental requis pour noter la voix"
         elif not self.rate:
             status = "En pause"
         elif game.feedback:
             status = game.feedback
         else:
             status = "Micro filtré" if game.echo else "Micro actif"
+        if breakdown is not None:
+            status += f" · {breakdown['coverage']} % des mots évalués"
         if game.ready and game.model == "Turbo":
             status += " · Turbo"
         if game.recording:
@@ -1188,13 +1452,18 @@ class LyricsWindow(Gtk.ApplicationWindow):
             name = GLib.markup_escape_text(player.name)
             detail = GLib.markup_escape_text(status)
             self.score_label.set_markup(
-                f'{name} · <span foreground="{score_color(player.score)}">{player.score} %</span> · {detail}'
+                f'{name} · <span foreground="{score_color(player.score)}">{score}</span> · {detail}'
             )
 
     def mobile_event(self, action, member):
         """Mise à jour du jeu UNIQUEMENT depuis la boucle GTK principale."""
         if self.closed or self.receiver is None:
             return GLib.SOURCE_REMOVE
+        if action in ('join', 'reconnect'):
+            self.receiver.resume_tv_display()
+            if action == 'reconnect':
+                # A heartbeat can reopen the TV without changing the party plan.
+                return GLib.SOURCE_REMOVE
         token = member.get('token')
         player = self.mobile_players.get(token)
         if action == 'join':
@@ -1207,32 +1476,29 @@ class LyricsWindow(Gtk.ApplicationWindow):
             if player is not None and self.party.active is None and not self.validating:
                 song = self.receiver.room.song_for(member.get('song'))
                 if song is not None:
-                    try:
-                        self.prepare_song(song)
-                    except (OSError, ValueError) as error:
-                        if self.players_window is not None:
-                            self.players_window.message.set_text(
-                                f'{member["name"]} · chanson non exploitable : {error}')
-                    else:
-                        player.song = song
-                        player.score = 0
-                        player.done = False
-                        self.party_ready = False
+                    player.song = song
+                    player.score = None
+                    player.done = False
+                    player.result = None
+                    self.party_ready = False
         elif action == 'clear':
             if player is not None and self.party.active is None and not self.validating:
                 player.song = None
-                player.score = 0
+                player.score = None
                 player.done = False
+                player.result = None
                 self.party_ready = False
         elif action == 'leave':
             if player is self.party.active:
                 self.mobile_leaving.add(token)
             elif player is not None:
+                self.room_audio.forget_player(token)
                 self.party.players = [p for p in self.party.players if p is not player]
                 self.mobile_players.pop(token, None)
                 self.party_ready = False
         if self.players_window is not None:
             self.players_window.refresh()
+        self.remote_party.changed_selection()
         self.next_tv_update = 0.0
         return GLib.SOURCE_REMOVE
 
@@ -1281,7 +1547,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         try:
             self.receiver = start_receiver(
                 on_mobile=self.mobile_event,
-                reserved_names=(p.name for p in self.party.players if p.mobile_id is None))
+                reserved_names=(p.name for p in self.party.players if p.mobile_id is None),
+                diagnostics=self.blackbox, commands=self.remote_party.dispatch,
+                imports=self.mobile_imports, audio=self.room_audio)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.tv_address.set_text(str(error))
             self.tv_copy.set_visible(False)
@@ -1339,21 +1607,29 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         self.next_tv_update = now + 0.12
         self.receiver.room.set_mode(
-            locked=(self.validating or self.party.active is not None or self.game_score.requested),
+            locked=(self.validating or self.party.active is not None or self.game_score.requested
+                    or self.remote_party.locked),
             game_mode=self.game_toggle.get_active() or self.party_ready,
             current=(self.party.active.name if self.party.active is not None else self.title.get_label()))
         connected = self.receiver.room.public_roster()
+        self.remote_party.publish()
         if self.validating and not self.preparation_only:
             self.receiver.update({
                 "title": "Chargement de la partie", "artist": "", "score": None,
                 "lines": ["", "", "", ""], "progress": self.align_fraction, "notice": " ",
                 "status": self.align_status, "players": self.party.board(),
-                "connected": connected,
+                "connected": connected, "recording": self.blackbox.status()["active"],
+                "party_phase": self.remote_party.phase,
             })
             return
         active = bisect_right(self.times, position) - 1
         lines = [self.lyrics[i] if 0 <= i < len(self.lyrics) else "" for i in range(active - 1, active + 3)]
         fraction = self.display_progress(position, active, utf16=True) if active >= 0 else 0.0
+        if (self.track, active, self.playback_state) != self.bb_line:
+            self.bb_line = self.track, active, self.playback_state
+            self.tv_line_revision += 1
+            self.blackbox.emit("lyrics", "tv-line", turn=self.bb_turn, position=position,
+                               revision=self.tv_line_revision, line=active, lines=lines, playback=self.playback_state)
         if self.title.get_label():
             notice = "Paroles minutées indisponibles" if not self.times else " "
         else:
@@ -1363,9 +1639,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
             "score": self.game_score.score, "lines": lines, "progress": fraction, "notice": notice,
             "status": self.game_status or ("Partie prête" if self.party_ready and self.party.next_player() else ""),
             "players": self.party.board(), "connected": connected,
+            "recording": self.blackbox.status()["active"],
+            "party_phase": self.remote_party.phase, "turn": self.bb_turn,
+            "line_revision": self.tv_line_revision,
+            "ranking": self.remote_party.ranking() if self.remote_party.phase == "finished" else [],
         })
 
     def close_window(self, _window):
+        if self.party.active is not None:
+            self.finish_turn(pause=True)
         self.vocal_effect.disable()
         self.game_toggle.set_active(False)
         self.tv_toggle.set_active(False)
@@ -1373,15 +1655,17 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.set_visible(False)
             return True
         self.album_import.cancel_search()
+        self.music_sync.close()
+        self.stop_blackbox("window-close", wait=True)
         self.closed = True
         if self.align_job is not None:
-            self.align_job[1].send_signal(signal.SIGTERM)
+            self.align_job.send_signal(signal.SIGTERM)
         if self.stem_job is not None:
             self.stem_job[1].send_signal(signal.SIGTERM)
         for timer in self.timers:
             GLib.source_remove(timer)
+        self.bus.signal_unsubscribe(self.seek_signal)
         self.tag_reader.shutdown(wait=False, cancel_futures=True)
-        self.vocal_analyzer.shutdown(wait=False, cancel_futures=True)
         return False
 
     def clear_player(self):
@@ -1399,6 +1683,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if track == self.track:
             return
         self.track = track
+        self.active_reference = None
         self.vocal_effect.set_song(track)
         self.update_vocal_effect()
         self.file_token = None
@@ -1434,8 +1719,12 @@ class LyricsWindow(Gtk.ApplicationWindow):
         now = time.monotonic()
         previous_track, previous_duration, previous_times = self.track, self.duration, self.times
         previous_word_times, previous_word_ends, previous_rate = self.word_times, self.word_ends, self.rate
+        previous_source = self.scoring_source()
         previous_position = self.base_position + (now - self.updated) * self.rate
         metadata = properties.get("Metadata", {})
+        volume = properties.get("Volume")
+        if self.turn_music_restore is None and type(volume) in (int, float) and isfinite(volume) and volume >= 0:
+            self.music_volume = volume
         title = metadata.get("xesam:title", "")
         self.title.set_label(title)
         self.artist.set_label(" · ".join(metadata.get("xesam:artist", [])))
@@ -1458,7 +1747,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             position = self.base_position + (time.monotonic() - self.updated) * self.rate
             self.vocal_effect.sync(self.track, position, self.rate > 0)
         self.observe_turn(playback, previous_track, previous_position, previous_duration, previous_times,
-                          previous_word_times, previous_word_ends, previous_rate, now)
+                          previous_word_times, previous_word_ends, previous_rate, previous_source, now)
         self.sync_game()
 
     def load_lines(self):
@@ -1467,36 +1756,42 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         path = self.track.with_suffix(".lrc")
         try:
-            entry = path.lstat()
-        except FileNotFoundError:
-            self.file_token = None
-            if self.rows:
-                self.set_lines([])
-            if self.fetching == self.track:
-                notice = "Recherche des paroles minutées…"
-            else:
-                notice = self.fetch_message or "Les paroles minutées de ce morceau sont absentes."
-            self.show_fallback(notice)
+            source_token = lrc_token(path)
+            audio_token = file_token(self.track)
+            try:
+                cache_token = (file_token(self.references.folder(self.track) / "prepared.json"),
+                               file_token(self.references.model))
+            except FileNotFoundError:
+                cache_token = None
+        except (OSError, ValueError):
+            self.show_lrc_error("Le morceau ou son fichier LRC est illisible.")
             return
-        except OSError:
-            self.show_lrc_error("Le fichier .lrc de ce morceau est illisible.")
-            return
-        if not stat.S_ISREG(entry.st_mode):
-            self.show_lrc_error("Le fichier .lrc doit être un fichier ordinaire.")
-            return
-        token = (path, entry.st_dev, entry.st_ino, entry.st_mtime_ns, entry.st_size)
+        show_original = (self.original_timing.get_active() and self.party.active is None
+                         and not self.game_toggle.get_active())
+        token = (source_token, audio_token, cache_token, show_original, self.party.active is not None)
         if token != self.file_token:
             self.file_token = token
-            try:
-                lines = read_lrc(path)
-            except (OSError, ValueError):
-                lines = []
-            self.set_lines(lines if any(text for _, text in lines) else [])
+            self.active_reference = self.references.cached(self.track, verify=False) if cache_token else None
+            if self.active_reference:
+                lines = (parse_lrc(self.active_reference["source_lrc"]) if show_original else
+                         [(line["source_start"], line["text"]) for line in self.active_reference["lines"]])
+                self.set_lines(lines)
+            elif source_token is not None:
+                try:
+                    lines = read_lrc(path)
+                except (OSError, ValueError):
+                    lines = []
+                self.set_lines(lines if any(text for _, text in lines) else [])
+            else:
+                self.set_lines([])
         if not self.rows:
-            self.show_fallback("Le fichier .lrc de ce morceau est illisible.", fetch=False)
+            notice = ("Recherche des paroles minutées…" if self.fetching == self.track else
+                      self.fetch_message or "Les paroles minutées de ce morceau sont absentes.")
+            self.show_fallback(notice, fetch=source_token is None)
 
     def show_lrc_error(self, message):
         self.file_token = None
+        self.active_reference = None
         if self.rows:
             self.set_lines([])
         self.show_fallback(message, fetch=False)
@@ -1552,7 +1847,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         try:
             process = Gio.Subprocess.new(
-                [str(Path.home() / ".local/bin/paroles-musique"), "--synchro", str(track)],
+                [str(BIN / "paroles-musique"), "--bibliotheque", str(LIBRARY), "--synchro", "--", str(track)],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE,
             )
         except GLib.Error:
@@ -1617,6 +1912,30 @@ class LyricsWindow(Gtk.ApplicationWindow):
                     classes.append(LYRIC_FADES[min(distance - 2, len(LYRIC_FADES) - 1)])
             row.set_css_classes(classes)
 
+    def log_playback_reference(self, original):
+        session = self.blackbox.status()["session"]
+        if not session or not self.blackbox.active():
+            return
+        context = dict(self.game_score.diagnostic_turn)
+        scoring = self.scoring_source()
+        backing = Path(scoring[0]) if scoring else None
+
+        def identify():
+            try:
+                files = {"original": {"library_path": str(original.relative_to(LIBRARY.resolve())),
+                                      "sha256": digest(original)}}
+                if backing is not None:
+                    files["instrumental"] = {"cache_generation": backing.parent.name, "sha256": digest(backing)}
+                    guide = backing.with_name("vocals.flac")
+                    files["original_voice"] = {"cache_generation": guide.parent.name, "sha256": digest(guide)}
+            except (OSError, ValueError):
+                self.blackbox.emit("audio", "error", **context, recording_session=session,
+                                   operation="reference-identification")
+            else:
+                self.blackbox.emit("audio", "reference", **context, recording_session=session, files=files)
+
+        self.tag_reader.submit(identify)
+
     def animate(self):
         now = time.monotonic()
         position = self.base_position + (now - self.updated) * self.rate
@@ -1627,9 +1946,23 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 return f'{whole//60}:{whole%60:02d}'
             self.media_clock.set_text(f'{clock(position)} / {clock(self.duration)}')
         self.advance_turn(now)
+        self.remote_party.tick(now)
+        player = self.party.active
+        context = self.game_score.diagnostic_turn
+        if (os.environ.get("KARA_SILENT") != "1" and self.turn_phase == "playing"
+                and player and self.track == player.song.path and self.rate > 0 and context):
+            sink = self.room_audio.selected_sink()
+            self.acoustic.update(context, sink)
+            if now >= self.next_capture_clock and self.blackbox.active():
+                self.next_capture_clock = now + 1.
+                self.blackbox.emit("audio", "music-clock", **context, position=self.base_position,
+                                   strawberry_monotonic_ns=round(self.updated * 1_000_000_000),
+                                   playback_rate=self.rate)
+        else:
+            self.acoustic.update()
         if self.game_toggle.get_active() and self.turn_phase in ("", "playing"):
             self.game_score.tick(self.times, self.duration, position, self.rate, now,
-                                 self.word_times, self.word_ends)
+                                 self.word_times, self.word_ends, source=self.scoring_source())
         self.update_tv(position, now)
         if not self.rows:
             return GLib.SOURCE_CONTINUE

@@ -5,6 +5,7 @@ Un seul morceau à la fois, fichiers originaux intacts, publication atomique.
 Le cache est réutilisé uniquement si le fichier source est inchangé.
 """
 import hashlib
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -15,10 +16,12 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
+from _kara_paths import CACHE, kara_data
+
 MODEL = "htdemucs"
-ROOT = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "paroles-strawberry" / "stems"
-PYTHON = Path.home() / ".local/share/kara/demucs-venv/bin/python"
-CHECKPOINT = Path.home() / ".cache/torch/hub/checkpoints/955717e8-8726e21a.th"
+ROOT = CACHE / "paroles-strawberry/stems"
+PYTHON = kara_data("demucs-venv/bin/python")
+CHECKPOINT = Path(os.environ.get("TORCH_HOME") or CACHE / "torch") / "hub/checkpoints/955717e8-8726e21a.th"
 FILES = ("instrumental.flac", "vocals.flac")
 
 
@@ -46,9 +49,40 @@ def cached_stems(song):
         files = tuple(directory / name for name in FILES)
         if not all(p.is_file() and p.stat().st_size > 4096 for p in files):
             return None
+        if not aligned_pair(files):
+            return None
         return files
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, KeyError, IndexError, subprocess.SubprocessError):
         return None
+
+
+@lru_cache(maxsize=128)
+def stem_layout(path, size, mtime_ns):
+    # Cache by file identity metadata. Old Demucs caches pass the same
+    # admission check as new generations without rewriting their metadata.
+    result = subprocess.run(("ffprobe", "-v", "error", "-select_streams", "a:0",
+                             "-show_entries", "stream=sample_rate,channels,start_pts,duration_ts,time_base",
+                             "-of", "json", str(path)), check=True, capture_output=True, timeout=4)
+    stream = json.loads(result.stdout)["streams"][0]
+    rate = int(stream["sample_rate"])
+    frames = int(stream["duration_ts"])
+    if (stream["start_pts"], stream["time_base"], stream["channels"]) != (0, f"1/{rate}", 2):
+        raise ValueError("Les pistes Demucs ne partagent pas une origine PCM stéréo")
+    if frames <= 0 or rate <= 0:
+        raise ValueError("Durée PCM de piste Demucs invalide")
+    # The FLAC header alone cannot detect a damaged frame mid-song.
+    subprocess.run(("ffmpeg", "-v", "error", "-xerror", "-nostdin", "-i", str(path),
+                    "-map", "0:a:0", "-f", "null", "-"),
+                   check=True, capture_output=True, timeout=15)
+    return rate, frames
+
+
+def aligned_pair(files):
+    layouts = []
+    for path in files:
+        info = path.stat()
+        layouts.append(stem_layout(path, info.st_size, info.st_mtime_ns))
+    return layouts[0] == layouts[1]
 
 
 def emit(event, **fields):
@@ -116,7 +150,7 @@ def separate(song):
             raise RuntimeError("Les deux pistes n'ont pas été produites")
         emit("progress", percent=95, status="Vérification de la synchronisation")
         timings = [duration(path) for path in (original, *files)]
-        if max(timings) - min(timings) > .35:
+        if not aligned_pair(files) or max(timings) - min(timings) > .35:
             raise RuntimeError("Les pistes ne sont pas synchronisées avec l'original")
         ready = draft / "ready"
         ready.mkdir(mode=0o700)

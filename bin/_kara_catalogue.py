@@ -7,18 +7,19 @@ from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from requests import Session
-from ytmusicapi import YTMusic
-
-from _musique_oz import canonical_album_artist, INBOX, audio_files, component, probe
+from _musique_oz import canonical_album_artist, INBOX, audio_files, component, probe, source_video
 
 CHANNEL = re.compile(r"UC[A-Za-z0-9_-]{22}")
 ALBUM = re.compile(r"MPRE[A-Za-z0-9_-]+")
 PLAYLIST = re.compile(r"OLAK5uy_[A-Za-z0-9_-]+")
 VIDEO = re.compile(r"[A-Za-z0-9_-]{11}")
+YOUTUBE_COVER_HOSTS = {"lh3.googleusercontent.com", "yt3.googleusercontent.com"}
 
 
 def client():
+    from requests import Session
+    from ytmusicapi import YTMusic
+
     session = Session()
     session.request = partial(session.request, timeout=(5, 12))
     return YTMusic(language="fr", location="FR", requests_session=session)
@@ -51,18 +52,65 @@ def releases(yt, identifier):
     for album in albums:
         identifier = album.get("browseId") or ""
         if ALBUM.fullmatch(identifier) and album.get("title"):
-            result[identifier] = {"title": album["title"], "year": album.get("year") or "",
+            result[identifier] = {"id": identifier, "title": album["title"], "year": album.get("year") or "",
                                   "url": f"https://music.youtube.com/browse/{identifier}"}
     return {"name": artist.get("name") or "", "albums": list(result.values())}
 
 
-def source_video(url):
-    parsed = urlsplit(url or "")
-    if parsed.hostname == "youtu.be":
-        return parsed.path.strip("/")
-    if parsed.hostname in {"youtube.com", "www.youtube.com", "music.youtube.com"}:
-        return parse_qs(parsed.query).get("v", [""])[0]
-    return ""
+def names(row):
+    return [entry["name"] for entry in (row.get("artists") or []) if entry.get("name")]
+
+
+def is_youtube_cover_url(url):
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    # The catalogue and its authenticated image proxy share the same exact
+    # origins. Matching the full authority excludes credentials and ports.
+    return parsed.scheme == "https" and parsed.netloc in YOUTUBE_COVER_HOSTS
+
+
+def album_edition(yt, identifier, edition="édition du catalogue"):
+    """Use one verified catalogue edition for preview and eventual import."""
+    if not ALBUM.fullmatch(identifier):
+        raise ValueError("Identifiant d’album invalide.")
+    album = yt.get_album(identifier)
+    tracks = album.get("tracks") or []
+    total = album.get("trackCount")
+    if not album.get("title") or not tracks or len(tracks) > 150 or (type(total) is int and total != len(tracks)):
+        return None
+    artists = names(album)
+    details = [{"title": row.get("title") or "", "disc": row.get("discNumber"),
+                "track": row.get("trackNumber") or index, "artists": names(row) or artists}
+               for index, row in enumerate(tracks, 1)]
+    cover = next((pic["url"] for pic in (album.get("thumbnails") or [])
+                  if is_youtube_cover_url(pic.get("url"))), None)
+    return {"id": identifier, "title": album["title"], "artists": artists, "edition": album.get("type") or edition,
+            "year": album.get("year"), "tracks": details, "cover": cover}
+
+
+def track_albums(yt, title, artist):
+    """Only return editions whose album track list actually contains this title."""
+    identifiers = {}
+    for row in yt.search(f"{title} {artist}", filter="songs", limit=12):
+        identifier = (row.get("album") or {}).get("id") or ""
+        if key(row.get("title")) == key(title) and key(artist) in {key(name) for name in names(row)}:
+            if ALBUM.fullmatch(identifier):
+                identifiers[identifier] = "album de la piste"
+    for row in yt.search(f"{title} {artist}", filter="albums", limit=8):
+        identifier = row.get("browseId") or ""
+        if ALBUM.fullmatch(identifier):
+            identifiers.setdefault(identifier, row.get("type") or "édition du catalogue")
+    results = []
+    for identifier, edition in list(identifiers.items())[:6]:
+        album = album_edition(yt, identifier, edition)
+        if album and any(key(row["title"]) == key(title) and key(artist) in {key(name) for name in row["artists"]}
+                         for row in album["tracks"]):
+            results.append({**album, "requested_title": title, "requested_artist": artist})
+    return results
 
 
 def track_number(value):
@@ -83,8 +131,8 @@ def collection_tracks(root, album):
 
     expected = [(t.get("videoId") or "", t.get("trackNumber") or index, key(t["title"]))
                 for index, t in enumerate(tracks, 1)]
-    videos = set()
-    local = set()
+    videos = {}
+    local = {}
     for artist in root.iterdir():
         if artist.name in {INBOX, "YouTube"} or artist.name.startswith(".") or artist.is_symlink() or not artist.is_dir():
             continue
@@ -99,33 +147,40 @@ def collection_tracks(root, album):
                 except (OSError, ValueError, subprocess.SubprocessError):
                     continue
                 if VIDEO.fullmatch(video):
-                    videos.add(video)
+                    videos.setdefault(video, str(audio))
                 if same_artist and key(tags.get("album")) == title:
-                    local.add((track_number(tags.get("track") or tags.get("tracknumber")), key(tags.get("title"))))
+                    number = track_number(tags.get("track") or tags.get("tracknumber"))
+                    local.setdefault((number, key(tags.get("title"))), str(audio))
     return [
-        {"id": video, "title": track["title"], "present": video in videos or (number, name) in local}
+        {"id": video, "title": track["title"], "path": videos.get(video) or local.get((number, name))}
         for track, (video, number, name) in zip(tracks, expected, strict=True)
     ]
 
 
 def prepare_album(yt, url, root):
     parsed = urlsplit(url)
+    requested_playlist = parse_qs(parsed.query).get("list", [""])[0]
     if parsed.path.startswith("/browse/"):
         identifier = parsed.path.removeprefix("/browse/").strip("/")
     else:
-        playlist = parse_qs(parsed.query).get("list", [""])[0]
-        identifier = yt.get_album_browse_id(playlist) if PLAYLIST.fullmatch(playlist) else ""
+        identifier = yt.get_album_browse_id(requested_playlist) if PLAYLIST.fullmatch(requested_playlist) else ""
     if not identifier or not ALBUM.fullmatch(identifier):
-        raise ValueError("Impossible d’identifier cet album dans le catalogue YouTube Music.")
+        # A supplied playlist remains resolvable by yt-dlp without a browse ID.
+        if not parsed.path.startswith("/browse/") and PLAYLIST.fullmatch(requested_playlist):
+            return None
+        raise PlaylistUnavailable("Impossible d’identifier cet album dans le catalogue YouTube Music.")
     album = yt.get_album(identifier)
     playlist = album.get("audioPlaylistId") or ""
+    if not parsed.path.startswith("/browse/") and playlist != requested_playlist:
+        # Use the explicitly supplied edition when the catalogue points elsewhere.
+        return None
     if not PLAYLIST.fullmatch(playlist):
-        raise ValueError("La playlist audio de cet album est indisponible.")
+        raise PlaylistUnavailable("La playlist audio de cet album est indisponible.")
     tracks = collection_tracks(root, album)
     title = album.get("title") or ""
     artists = [artist["name"] for artist in (album.get("artists") or []) if artist.get("name")]
     credit = canonical_album_artist(", ".join(artists), title)
-    return {"title": title, "artist": credit, "present": bool(tracks) and all(track["present"] for track in tracks),
+    return {"title": title, "artist": credit, "present": bool(tracks) and all(track["path"] for track in tracks),
             "tracks": tracks, "url": f"https://music.youtube.com/playlist?list={playlist}"}
 
 
@@ -173,7 +228,13 @@ def cover_artwork(yt, title, artist, count, sources):
     return choices.pop() if len(choices) == 1 else None
 
 
+class PlaylistUnavailable(ValueError):
+    pass
+
+
 def main(argv):
+    from urllib.error import URLError
+
     try:
         action, value, *rest = argv
         yt = client()
@@ -181,6 +242,10 @@ def main(argv):
             data = artist_search(yt, value)
         elif action == "albums":
             data = releases(yt, value)
+        elif action == "edition" and not rest:
+            data = album_edition(yt, value)
+        elif action == "morceau" and len(rest) == 1:
+            data = track_albums(yt, value, rest[0])
         elif action == "preparer" and len(rest) == 1:
             data = prepare_album(yt, value, Path(rest[0]))
         elif action == "pochette" and len(rest) >= 2:
@@ -190,11 +255,16 @@ def main(argv):
             raise ValueError("Recherche de catalogue inconnue.")
         print(json.dumps({"data": data}, ensure_ascii=False))
         return 0
-    except ValueError as error:
-        print(json.dumps({"error": str(error)}, ensure_ascii=False))
-        return 1
-    except Exception:
-        print(json.dumps({"error": "Le catalogue YouTube Music est momentanément indisponible."}, ensure_ascii=False))
+    except Exception as error:
+        if isinstance(error, ModuleNotFoundError):
+            category = "dependency"
+        elif isinstance(error, PlaylistUnavailable):
+            category = "playlist"
+        elif isinstance(error, (ConnectionError, TimeoutError, URLError)) or type(error).__module__.startswith("requests."):
+            category = "network"
+        else:
+            category = "processing"
+        print(json.dumps({"category": category, "error": f"{type(error).__name__}: {error}"}, ensure_ascii=False))
         return 1
 
 

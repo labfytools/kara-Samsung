@@ -8,11 +8,12 @@ import subprocess
 import sys
 
 from _kara_voice_session import interrupted, without_dictation
+from _kara_paths import kara_data
 
 
 CONTAINER = "kara-tizen-tv"
 IMAGE = "localhost/kara-tizen-tv:ubuntu24"
-WORKSPACE = Path.home() / ".local/share/kara/tizen-runtime"
+WORKSPACE = kara_data("tizen-runtime")
 
 
 def notify(message):

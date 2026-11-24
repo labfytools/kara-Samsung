@@ -2,156 +2,106 @@
 <html lang="fr">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#1e1e2e">
-<title>Paroles · Rejoindre la salle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#181825">
+<title>Kara · La soirée</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#1e1e2e;color:#cdd6f4}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 30% 0%,#363453 0%,#1e1e2e 48%);padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
-main{max-width:690px;margin:0 auto;padding:22px 16px 64px}header{display:flex;gap:11px;align-items:center;padding-bottom:17px;border-bottom:1px solid #45475a}
-.logo{width:42px;height:42px;background:#45475a;border-radius:13px;display:grid;place-items:center;font-size:23px}
-h1{font-size:22px;margin:0}h2{font-size:18px;margin:0 0 10px}.sub{font-size:12px;color:#a6adc8;margin-top:3px}section{background:#252538;border:1px solid #45475a;border-radius:17px;padding:18px;margin-top:15px}
-label{display:block;font-size:13px;color:#a6adc8;margin-bottom:9px}
-input{width:100%;font:inherit;background:#181825;border:1px solid #585b70;color:#fff;border-radius:10px;padding:13px;outline:none;min-height:47px}
-input:focus{border-color:#b4befe;box-shadow:0 0 0 2px #b4befe33}
-button{font:inherit;color:#cdd6f4;background:#45475a;border:1px solid #585b70;border-radius:10px;padding:11px 14px;cursor:pointer;min-height:43px}
-button:active{transform:scale(.99)}button:focus-visible{outline:2px solid #b4befe;outline-offset:2px}
-button.primary{background:#b4befe;color:#181825;font-weight:750;border-color:#b4befe}button:disabled{opacity:.45}
-.inline{display:flex;align-items:center;gap:9px}.inline>*{min-width:0}.inline input{flex:1}.pill{font-size:12px;border:1px solid #585b70;border-radius:20px;padding:6px 10px;color:#a6adc8;white-space:nowrap}
-#notice{min-height:23px;margin:14px 1px;color:#f9e2af;font-size:13px}#me{font-size:20px;font-weight:750}#choice{padding:13px;background:#313244;border-radius:11px;margin-top:12px;font-size:14px}
-#results{margin:10px 0 0;padding:0;list-style:none;max-height:55vh;overflow:auto}.result{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #45475a}
-.result .song{flex:1;min-width:0}.result strong{font-size:14px;display:block;overflow-wrap:anywhere}.result small{font-size:12px;color:#a6adc8;display:block;margin-top:3px}
-.result button{font-size:13px;white-space:nowrap}.status{font-size:12px;color:#a6adc8;margin:6px 0 0}
-#players{padding-left:0;list-style:none;margin:0}#players li{display:flex;gap:8px;align-items:center;border-bottom:1px solid #45475a;padding:9px 0;font-size:14px}
-#players li:last-child{border:0}.dot{width:8px;height:8px;background:#a6e3a1;border-radius:50%;flex:none}.dot.off{background:#6c7086}
-#players .pinfo{flex:1}.psong{color:#a6adc8;display:block;font-size:12px;margin-top:3px}
-#choice-actions{display:none;gap:9px;flex-wrap:wrap;margin-top:10px}#choice-actions button{flex:1;min-width:120px}#room{display:none}#leave{background:none;color:#a6adc8;border:0;font-size:13px;padding:8px 4px}.muted{color:#a6adc8;font-size:13px;line-height:1.5}
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#181825;color:#cdd6f4;--panel:#252538;--line:#45475a;--accent:#b4befe;--muted:#a6adc8}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:radial-gradient(ellipse at 55% 0,#383553,transparent 480px);min-height:100dvh}
+main{width:min(100%,740px);margin:auto;padding:clamp(16px,5vw,36px) 16px calc(108px + env(safe-area-inset-bottom))}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:22px}h1,h2,h3,p{margin-top:0}h1{font-size:1.65rem;margin-bottom:3px}h2{font-size:1.28rem;margin-bottom:14px}h3{font-size:1.04rem;margin-bottom:8px}p{line-height:1.45}small,.muted{color:var(--muted)}strong,.track-title{overflow-wrap:anywhere}
+.card{padding:clamp(14px,4vw,24px);border:1px solid var(--line);background:var(--panel);border-radius:20px;margin-bottom:14px}.hero{background:linear-gradient(155deg,#34334d,#252538 68%);padding:22px}
+label{display:block;color:var(--muted);margin:8px 0}input,button,select{font:inherit;border:1px solid #585b70;border-radius:11px;min-height:44px;color:inherit}input:not([type=checkbox]),select{background:#181825;padding:9px 11px;width:100%}input[type=checkbox]{min-height:0;margin:0 6px 0 0}
+button{cursor:pointer;background:#393950;padding:8px 12px;font-weight:650}button.primary{background:var(--accent);color:#181825;border-color:var(--accent)}button.danger{color:#f38ba8}button:disabled{opacity:.52;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.row.between{justify-content:space-between}.actions{display:flex;flex-wrap:wrap;gap:8px}.stack{display:grid;gap:9px}.track{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #41415a}.track:last-child{border:0}.track-info{flex:1;min-width:0}.track small{display:block}.cover{width:46px;height:46px;object-fit:cover;border-radius:8px;background:#45475a;flex:none}.tag{display:inline-block;padding:5px 8px;border-radius:999px;background:#313147;font-size:.8rem;font-weight:600}.online{color:#a6e3a1}.warning,.error{color:#f9e2af}.recording{color:#f38ba8}.state-msg{position:sticky;top:0;z-index:3;background:#302945;padding:10px;border-radius:9px}
+nav{position:fixed;bottom:0;left:0;right:0;z-index:4;background:#181825;border-top:1px solid var(--line);padding:7px max(4px,calc((100% - 740px)/2)) calc(7px + env(safe-area-inset-bottom));display:flex;overflow:auto}nav button{flex:1;white-space:nowrap;padding:6px 8px;font-size:.79rem;background:transparent;border-color:transparent}nav button[aria-current=true]{color:var(--accent);background:#313147}
+progress,meter{display:block;width:100%;height:13px;accent-color:var(--accent);margin:8px 0}summary{cursor:pointer;padding:8px 0}details{margin:6px 0}.mic-button{width:100%;min-height:70px;font-size:1.2rem}.micro-active{background:#592839;color:#f5c2e7}#notices:empty{display:none}
+.mix-slider output{color:var(--accent);font-variant-numeric:tabular-nums}
+.mix-slider input[type=range]{accent-color:var(--accent);background:transparent;border:0;padding:0}
+@media(max-width:440px){.track{flex-wrap:wrap}.track .actions button{padding:6px 9px}.cover{width:38px;height:38px}nav button{font-size:.73rem;padding-inline:7px}}
 </style>
 </head>
 <body><main>
-<header><div class="logo">🎤</div><div><h1>Paroles · Karaoké</h1><div class="sub">Salle privée sur le réseau local</div></div></header>
-<p id="notice" role="status" aria-live="polite"></p>
-<section id="join"><h2>Rejoindre la soirée</h2><p class="muted">Choisis ton pseudo. Tu apparaîtras sur la télévision même hors mode jeu.</p>
-<form id="joinform"><label for="nickname">Ton pseudo</label><div class="inline"><input id="nickname" autocomplete="nickname" maxlength="35" required placeholder="Ex. Alex"><button class="primary">Rejoindre</button></div></form></section>
-<div id="room">
-<section><div class="inline"><div style="flex:1"><div class="sub">Connecté en tant que</div><div id="me"></div></div><span class="pill" id="mode">Salle libre</span><button id="leave">Quitter</button></div>
-<div id="choice">Choisis une chanson dans la bibliothèque.</div><div id="choice-actions"><button id="change-choice" type="button" class="primary">Changer de chanson</button><button id="clear-choice" type="button">Retirer mon choix</button></div><p id="lock-info" class="status" style="display:none">Le tour est en cours : les choix sont verrouillés.</p><p class="muted">Un seul titre en attente par joueur. Un nouveau choix remplace le précédent. Le PC garde le contrôle de la partie.</p></section>
-<section><h2>Choisir ma chanson</h2><label for="search">Bibliothèque Strawberry · titres avec paroles minutées</label>
-<input id="search" type="search" placeholder="Rechercher un artiste, titre ou album…" autocomplete="off" aria-label="Rechercher une chanson">
-<p id="found" class="status">Chargement des chansons…</p><ul id="results"></ul><button id="more" style="display:none;width:100%;margin-top:12px">Afficher 30 titres de plus</button></section>
-<section><h2>Joueurs connectés</h2><ul id="players"></ul></section>
-<section><p class="muted" id="awake-info" role="status">L’écran restera allumé quand le navigateur l’autorise.</p><p class="muted">🎙️ La transmission du micro du téléphone sera disponible dans une prochaine version. Pour le moment, utilise le micro du PC ou celui de l'enceinte pour chanter.</p></section>
+<header><div><h1>Kara</h1><small id="identity">La soirée</small></div><div class="row"><span class="tag recording" id="recording" hidden>● BlackBox</span><span class="tag" id="connection">Connexion…</span></div></header>
+<p id="notices" class="state-msg warning" role="status"></p>
+<section class="card hero" id="join">
+  <h2>Rejoindre la soirée</h2>
+  <form id="join-form" class="stack"><label for="nickname">Ton prénom ou ton pseudo</label>
+  <input id="nickname" maxlength="35" required autocomplete="nickname" placeholder="Alex">
+  <button class="primary">Rejoindre</button></form>
+</section>
+<div id="room" hidden>
+  <section id="view-party" class="card hero">
+    <div class="row between"><h2>La partie</h2><span id="tv" class="tag">TV en attente</span></div>
+    <p id="now-playing"></p><p id="next-playing" class="muted"></p><progress id="preparing" max="1" hidden></progress>
+    <div id="players"></div><p id="my-queue" class="muted" hidden></p><p id="my-turn" class="warning" hidden></p>
+    <div class="actions"><button id="mark" hidden>Signaler un problème</button><button id="leave">Quitter</button></div>
+  </section>
+  <section id="view-library" class="card" hidden>
+    <h2>Bibliothèque</h2><div class="stack"><label for="mode">Rechercher par</label>
+    <select id="mode"><option value="all">Tous les champs</option><option value="title">Titre</option><option value="artist">Artiste</option><option value="album">Album</option></select>
+    <input id="search" type="search" placeholder="Un titre, un artiste…" aria-label="Rechercher des chansons"></div>
+    <p id="found" class="muted"></p><div id="tracks"></div><button id="more" hidden>Afficher plus</button>
+    <button id="missing" hidden>Rechercher l’album sur YouTube</button>
+  </section>
+  <section id="view-selection" class="card" hidden>
+    <h2>Mes chansons</h2><div id="selection"></div><button id="ready" class="primary">Je suis prêt</button>
+    <details id="my-mix"><summary>Mes réglages audio</summary><div id="my-mix-controls"></div></details>
+  </section>
+  <section id="view-imports" class="card" hidden>
+    <h2>Importations</h2><div id="import-jobs"></div>
+    <details id="external" hidden><summary>Rechercher sur YouTube Music</summary>
+    <form id="external-form" class="stack"><label for="external-artist">Artiste</label>
+    <input id="external-artist" type="search" placeholder="Premières lettres du nom" autocomplete="off" required minlength="2" maxlength="150">
+    <button>Chercher l’artiste</button></form>
+    <p id="external-status" class="muted" role="status"></p><div id="external-results"></div>
+    </details>
+  </section>
+  <section id="view-mic" class="card hero" hidden>
+    <h2>Mixage du tour</h2><p id="micro-status" class="muted">Le micro apparaît quand c’est ton tour.</p>
+    <button id="micro" class="primary mic-button" disabled>Activer le micro</button>
+    <meter id="micro-level" min="0" max="1" value="0" aria-label="Niveau vocal"></meter>
+    <div id="return-volume" hidden>
+      <label for="live-music">Musique <output id="live-music-value"></output></label>
+      <input type="range" id="live-music" min="0" max="100" value="100">
+      <label for="live-original">Chanteur original <output id="live-original-value"></output></label>
+      <input type="range" id="live-original" min="0" max="100" value="0">
+      <small id="live-guide-note" hidden>La notation signale les passages où l’attribution des paroles est incertaine.</small>
+      <label for="voice">Ma voix <output id="voice-applied"></output></label>
+      <input type="range" id="voice" min="0" max="100" step="1" value="60">
+      <div class="actions"><button id="voice-minus" aria-label="Moins de retour vocal">−</button><button id="voice-plus" aria-label="Plus de retour vocal">+</button><button id="voice-reset">Réinitialiser</button></div>
+    </div>
+  </section>
+  <section id="view-results" class="card" hidden>
+    <h2>Résultats</h2><div id="scores"></div><h3>Classement</h3><div id="ranking"></div>
+  </section>
+  <section id="view-admin" class="card" hidden>
+    <h2>Administration</h2>
+    <form id="admin-form" class="stack"><label for="admin-code">Code organisateur affiché dans Parole</label>
+      <input id="admin-code" type="password" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{4}" minlength="4" maxlength="4" required><button class="primary">Activer les commandes</button></form>
+    <div id="admin-main" hidden>
+      <div class="actions" id="commands"></div><p id="admin-status" class="warning"></p>
+      <div id="admin-players"></div>
+      <details><summary>Réglages audio</summary><label for="music-volume">Volume musical par défaut</label>
+        <input type="range" id="music-volume" min="0" max="100" step="5" value="100">
+        <div id="sound-settings" hidden><label for="audio-profile">Profil de retour</label>
+        <select id="audio-profile"><option value="device">Réglage de la sortie</option><option value="stable">Stable</option><option value="balanced">Équilibré</option><option value="low-latency">Faible latence</option></select>
+        <label for="audio-output">Sortie du retour vocal</label>
+        <select id="audio-output"><option value="default">Sortie PipeWire par défaut</option><option value="analog">Sortie analogique</option></select>
+        <label for="global-voice">Plafond du retour vocal</label>
+        <input type="range" id="global-voice" min="0" max="100" step="5" value="100">
+        <div class="actions"><button id="micro-cut" class="danger">Couper le micro du tour</button></div></div>
+      </details>
+      <details open><summary>BlackBox</summary><p id="bb-status" class="muted"></p>
+        <label id="bb-voice-choice"><input type="checkbox" id="bb-voice">Enregistrer les voix, le monitor de sortie et le micro témoin pendant les tours, avec l’accord de chaque participant (environ 4 à 5 Go par heure de jeu)</label>
+        <button id="bb-control">Activer BlackBox</button></details>
+    </div>
+  </section>
 </div>
-</main><script>
-(function(){
-'use strict';
-const $=id=>document.getElementById(id);
-const root=location.pathname.replace(/\/jouer\/?$/,'');
-const key='paroles.room.'+root;
-let token=localStorage.getItem(key)||'';
-let currentSearch='',offset=0,searchTimer=0,stateTimer=0,latest=0;
-const msg=(value)=>{$('notice').textContent=value||''};
-// Keep the smartphone awake while the karaoke room stays visible.
-// Android browsers require HTTPS (or localhost) for Screen Wake Lock.
-let awakeWanted=true, wakeSentinel=null;
-async function keepScreenAwake(){
-  if(!awakeWanted || document.visibilityState!=='visible' || wakeSentinel)return;
-  if(!('wakeLock' in navigator) || !window.isSecureContext){
-    $('awake-info').textContent='Écran actif : HTTPS nécessaire pour bloquer la veille.';
-    return;
-  }
-  try{
-    const sentinel=await navigator.wakeLock.request('screen');
-    if(!awakeWanted || document.visibilityState!=='visible'){
-      await sentinel.release(); return;
-    }
-    wakeSentinel=sentinel;
-    $('awake-info').textContent='Écran maintenu allumé pendant la soirée.';
-    sentinel.addEventListener('release',()=>{
-      if(wakeSentinel===sentinel)wakeSentinel=null;
-      if(awakeWanted && document.visibilityState==='visible')
-        $('awake-info').textContent='Verrou d’écran perdu : touche la page pour réactiver.';
-    });
-  }catch(e){
-    $('awake-info').textContent='Veille non bloquée : vérifie les autorisations du navigateur.';
-  }
-}
-function stopScreenAwake(){
-  awakeWanted=false;
-  if(wakeSentinel){const sentinel=wakeSentinel;wakeSentinel=null;sentinel.release().catch(()=>{});}
-}
-document.addEventListener('visibilitychange',()=>{
-  if(document.visibilityState==='visible')keepScreenAwake();
-});
-document.addEventListener('pointerdown',()=>{if(awakeWanted)keepScreenAwake();},{passive:true});
-window.addEventListener('pageshow',()=>{awakeWanted=true;keepScreenAwake();});
-window.addEventListener('pagehide',stopScreenAwake);
-async function api(method,action,payload,authenticated=true){
-  const headers={'Content-Type':'application/json'};
-  if(authenticated && token)headers.Authorization='Bearer '+token;
-  const response=await fetch(root+'/api/'+action,{method,headers,body:method==='POST'?JSON.stringify(payload||{}):undefined,cache:'no-store'});
-  let data={};try{data=await response.json()}catch(e){}
-  if(!response.ok)throw new Error(data.error||'Connexion au PC indisponible');
-  return data;
-}
-async function get(action,params=''){
-  const response=await fetch(root+'/api/'+action+params,{headers:{Authorization:'Bearer '+token},cache:'no-store'});
-  const data=await response.json();if(!response.ok)throw new Error(data.error||'Erreur réseau');return data;
-}
-function connected(name){$('join').style.display='none';$('room').style.display='block';$('me').textContent=name;msg('');awakeWanted=true;keepScreenAwake();refresh();search(true);}
-$('joinform').onsubmit=async ev=>{ev.preventDefault();try{
- const value=$('nickname').value.trim();const info=await api('POST','inscription',{name:value},false);
- token=info.token;localStorage.setItem(key,token);connected(info.name);
-}catch(e){msg(e.message)}};
-$('leave').onclick=async()=>{try{await api('POST','quitter',{})}catch(e){}
- token='';localStorage.removeItem(key);$('room').style.display='none';$('join').style.display='block';clearTimeout(stateTimer);msg('Tu as quitté la salle.');};
-async function refresh(){if(!token)return;try{
- const data=await get('etat');$('mode').textContent=data.game_mode?'Mode jeu':'Salle libre';
- $('mode').style.color=data.locked?'#f9e2af':'';
- window.karaLocked=Boolean(data.locked);
- $('choice').textContent=data.me.song?'🎵 Mon choix : '+data.me.song+' — '+data.me.artist:'Choisis une chanson dans la bibliothèque.';
- $('choice-actions').style.display=data.me.song?'flex':'none';
- $('change-choice').disabled=Boolean(data.locked);
- $('clear-choice').disabled=Boolean(data.locked);
- $('lock-info').style.display=data.locked?'block':'none';
- for(const button of $('results').querySelectorAll('button'))button.disabled=Boolean(data.locked);
- const list=$('players');list.replaceChildren();
- for(const person of data.participants){
-  const li=document.createElement('li');const dot=document.createElement('span');dot.className='dot'+(person.online?'':' off');li.append(dot);
-  const block=document.createElement('span');block.className='pinfo';block.textContent=person.name;
-  if(person.song){const song=document.createElement('small');song.className='psong';song.textContent=person.song;block.append(song)}li.append(block);list.append(li);
- }
- if(!data.catalogue_ready){$('found').textContent='Chargement de la bibliothèque…'}
-}catch(e){if(e.message.includes('Rejoins')||e.message.includes('expirée')){
- token='';localStorage.removeItem(key);$('room').style.display='none';$('join').style.display='block';msg('Reconnecte-toi pour rejoindre la salle.');return;
- }msg('Connexion interrompue. Nouvelle tentative…')}
- stateTimer=setTimeout(refresh,2800);
-}
-async function search(reset=false){if(!token)return;const q=$('search').value.trim();
- if(reset){offset=0;$('results').replaceChildren();currentSearch=q}const generation=++latest;
- try{const params='?q='+encodeURIComponent(q)+'&offset='+offset;const data=await get('recherche',params);
- if(generation!==latest || currentSearch!==q)return;
- $('found').textContent=data.ready?data.total+' chanson(s) trouvée(s) · '+(offset+data.results.length)+' affichée(s)':'Chargement de la bibliothèque…';
- for(const song of data.results){const li=document.createElement('li');li.className='result';
-  const detail=document.createElement('div');detail.className='song';const title=document.createElement('strong');title.textContent=song.title;detail.append(title);
-  const meta=document.createElement('small');meta.textContent=[song.artist,song.album].filter(Boolean).join(' · ');detail.append(meta);li.append(detail);
-  const pick=document.createElement('button');pick.textContent='Choisir';pick.disabled=Boolean(window.karaLocked);pick.onclick=async()=>{pick.disabled=true;try{
-   await api('POST','choix',{song_id:song.id});msg('Chanson enregistrée : '+song.title);refresh();
-  }catch(e){msg(e.message)}finally{pick.disabled=false}};li.append(pick);$('results').append(li);
- }
- offset+=data.results.length;$('more').style.display=offset<data.total?'block':'none';
- }catch(e){if(generation===latest)msg(e.message)}
-}
-$('search').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>search(true),230)});
-$('change-choice').onclick=()=>{if($('change-choice').disabled)return;
- $('search').scrollIntoView({behavior:'smooth',block:'center'});$('search').focus();$('search').select();};
-$('clear-choice').onclick=async()=>{const button=$('clear-choice');button.disabled=true;try{
- await api('POST','retirer-choix',{});msg('Ton choix a été retiré. Tu peux sélectionner une autre chanson.');await refresh();
- }catch(e){msg(e.message)}finally{button.disabled=false}};
-$('more').onclick=()=>search(false);
-keepScreenAwake();
-if(token){api('POST','inscription',{token},false).then(info=>connected(info.name)).catch(()=>{
- localStorage.removeItem(key);token='';msg('La session précédente a expiré. Rejoins la salle.');});}
-}());
-</script></body>
+<nav id="nav" aria-label="Navigation" hidden>
+  <button data-view="party">Partie</button><button data-view="library">Bibliothèque</button>
+  <button data-view="selection">Chansons</button><button data-view="imports">Imports</button>
+  <button data-view="mic">Micro</button><button data-view="results">Résultats</button><button data-view="admin">Admin</button>
+</nav>
+</main><script src="mobile.js" defer></script></body>
 </html>

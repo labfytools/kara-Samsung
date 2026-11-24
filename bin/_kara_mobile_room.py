@@ -5,7 +5,7 @@ changements arrivent au contrôleur par GLib.idle_add. Aucune voix ni donnée
 personnelle n'est conservée sur disque par la salle.
 """
 from hashlib import sha256
-from secrets import token_hex
+from secrets import compare_digest, randbelow, token_hex
 from threading import RLock
 import time
 
@@ -14,6 +14,9 @@ from _kara_party import search_key
 
 MAX_PLAYERS = 20
 HEARTBEAT_SECONDS = 35
+MAX_SONGS = 12
+ORGANIZER_CODE_SECONDS = 5 * 60
+ORGANIZER_ATTEMPTS = 5
 
 
 class RoomError(ValueError):
@@ -23,30 +26,51 @@ class RoomError(ValueError):
 
 
 class MobileRoom:
-    def __init__(self, on_event, reserved_names=()):
+    def __init__(self, on_event, reserved_names=(), *, diagnostics=None, admin_code=None):
         self.on_event = on_event
         self._lock = RLock()
         self._members = {}
         self._catalogue = []
         self._songs = {}
+        self._covers = {}
+        self._prepared = set()
         self._salt = token_hex(16)
         self._reserved = {search_key(name) for name in reserved_names}
         self._locked = False
         self._game_mode = False
         self._current = ''
         self._catalogue_ready = False
+        self.diagnostics = diagnostics
+        self.admin_code = admin_code
+        self._admin_expires = time.monotonic() + ORGANIZER_CODE_SECONDS if admin_code else 0
+        self._attempts = 0
+        self._party = {}
+
+    def emit(self, event, member=None, **data):
+        if self.diagnostics is not None:
+            self.diagnostics.emit("mobile", event, player=member["name"] if member else None, **data)
+
+    def publish(self, state):
+        with self._lock:
+            self._party = state
 
     def update_catalogue(self, rows):
-        catalogue, songs = [], {}
+        catalogue, songs, covers = [], {}, {}
+        album_art = {}
         for song, normalized in rows:
-            if not song.path.with_suffix('.lrc').is_file():
-                continue  # Le score exige les paroles. Autres titres disponibles dans la bibliothèque PC.
             key = sha256((self._salt + '\x00' + str(song.path)).encode()).hexdigest()[:20]
-            catalogue.append((key, song, normalized))
+            catalogue.append((key, song, normalized, song.path.with_suffix('.lrc').is_file()))
             songs[key] = song
+            folder = song.path.parent
+            if folder not in album_art:
+                cover = folder / "cover.jpg"
+                album_art[folder] = cover if cover.is_file() and not cover.is_symlink() else None
+            if album_art[folder]:
+                covers[key] = album_art[folder]
         with self._lock:
             self._catalogue = catalogue
             self._songs = songs
+            self._covers = covers
             self._catalogue_ready = True
 
     def set_mode(self, *, locked, game_mode, current):
@@ -66,16 +90,17 @@ class MobileRoom:
             member = self._members.get(token)
             if member is None:
                 raise RoomError('Session expirée. Rejoins la salle.', 401)
+            if time.monotonic() - member['last_seen'] >= HEARTBEAT_SECONDS:
+                self.emit("reconnect", member)
+                self._emit("reconnect", member)
             member['last_seen'] = time.monotonic()
+            member['online'] = True
             return member
 
     def join(self, name, token=None):
         if token:
-            with self._lock:
-                member = self._members.get(token)
-                if member:
-                    member['last_seen'] = time.monotonic()
-                    return {'token': token, 'name': member['name']}
+            member = self._require(token)
+            return {'token': token, 'name': member['name']}
         if not isinstance(name, str):
             raise RoomError('Saisis un pseudo.')
         name = ' '.join(name.strip().split())
@@ -88,22 +113,27 @@ class MobileRoom:
             if normalized in self._reserved or any(search_key(m['name']) == normalized for m in self._members.values()):
                 raise RoomError('Ce pseudo est déjà utilisé. Choisis-en un autre.', 409)
             secret = token_hex(24)
-            member = {'token': secret, 'name': name, 'song': None, 'last_seen': time.monotonic()}
+            member = {'token': secret, 'name': name, 'song': None, 'songs': [], 'ready': False,
+                      'organizer': False, 'online': True, 'last_seen': time.monotonic()}
             self._members[secret] = member
+            self.emit("join", member)
         self._emit('join', member)
         return {'token': secret, 'name': name}
 
     def check(self, token):
-        member = self._require(token)
         with self._lock:
+            member = self._require(token)
             participants = [{'name': m['name'], 'song':
                              self._songs[m['song']].title if m['song'] in self._songs else '',
+                             'ready': m['ready'], 'count': len(m['songs']),
                              'online': time.monotonic() - m['last_seen'] < HEARTBEAT_SECONDS}
                             for m in self._members.values()]
             selection = member['song']
             selected = self._songs.get(selection)
             return {
-                'me': {'name': member['name'],
+                'me': {'name': member['name'], 'organizer': member['organizer'], 'ready': member['ready'],
+                       'mix': self._party.get('mix', {}).get(member['name'], {}),
+                       'songs': [self.describe(key, self._songs[key]) for key in member['songs'] if key in self._songs],
                        'song': selected.title if selected else '',
                        'artist': selected.artist if selected else ''},
                 'participants': participants,
@@ -111,58 +141,172 @@ class MobileRoom:
                 'locked': self._locked,
                 'current': self._current,
                 'catalogue_ready': self._catalogue_ready,
+                'party': {**self._party.get("public", {}),
+                          **(self._party.get("admin", {}) if member["organizer"] else {}),
+                          "results": self._party.get("results", {}).get(member["name"], [])},
             }
 
-    def search(self, token, query, offset=0):
-        self._require(token)
+    def issue_admin_code(self):
+        """Open a short enrollment window from Parole. Existing admins keep their session."""
+        with self._lock:
+            self.admin_code = f"{randbelow(10_000):04d}"
+            self._admin_expires = time.monotonic() + ORGANIZER_CODE_SECONDS
+            self._attempts = 0
+            return self.admin_code
+
+    def authorize(self, token, code=None, *, enroll=False):
+        with self._lock:
+            member = self._require(token)
+            if member["organizer"]:
+                return member["name"]
+            if enroll:
+                if time.monotonic() >= self._admin_expires:
+                    raise RoomError("Affiche un nouveau code organisateur dans Parole.", 403)
+                # The budget belongs to the short code, across all browser sessions.
+                if self._attempts >= ORGANIZER_ATTEMPTS:
+                    raise RoomError("Trop de tentatives. Affiche un nouveau code dans Parole.", 429)
+                if (self.admin_code and isinstance(code, str) and code.isascii()
+                        and compare_digest(code.upper(), self.admin_code)):
+                    member["organizer"] = True
+                    self.emit("organizer", member)
+                    return member["name"]
+                self._attempts += 1
+            self.emit("error", member, operation="organizer-access")
+            raise RoomError("Accès organisateur refusé.", 403)
+
+    def describe(self, key, song, lyrics=None):
+        return {'id': key, 'title': song.title, 'artist': song.artist, 'album': song.album,
+                'duration': song.duration, 'lyrics': lyrics, 'cover': key in self._covers,
+                'preparation': 'Prêt Turbo' if song.path in self._prepared else None}
+
+    def set_prepared(self, paths):
+        with self._lock:
+            self._prepared = set(paths)
+
+    def cover(self, token, key):
+        with self._lock:
+            self._require(token)
+            return self._covers.get(key)
+
+    def player_token(self, name):
+        with self._lock:
+            return next((token for token, member in self._members.items() if member["name"] == name), None)
+
+    def search(self, token, query, offset=0, *, mode="all", artist="", album=""):
+        member = self._require(token)
         if not isinstance(query, str) or len(query) > 120:
             raise RoomError('Recherche invalide.')
         if not isinstance(offset, int) or offset < 0 or offset > 20000:
             raise RoomError('Pagination invalide.')
+        if mode not in ("all", "title", "artist", "album") or max(len(artist), len(album)) > 180:
+            raise RoomError('Filtre musical invalide.')
         terms = search_key(query).split()
         with self._lock:
-            matches = [entry for entry in self._catalogue if all(t in entry[2] for t in terms)]
+            matches = []
+            for entry in self._catalogue:
+                _, song, normalized, _ = entry
+                if (artist and song.artist != artist) or (album and song.album != album):
+                    continue
+                field = normalized if mode == "all" else search_key(getattr(song, mode))
+                if all(term in field for term in terms):
+                    matches.append(entry)
             page = matches[offset:offset+30]
+            if offset == 0:
+                self.emit("search", member, found=len(matches), mode=mode, query_length=len(query))
             return {'total': len(matches), 'offset': offset, 'results': [
-                {'id': sid, 'title': song.title, 'artist': song.artist, 'album': song.album}
-                for sid, song, _ in page], 'ready': self._catalogue_ready}
+                self.describe(sid, song, lyrics)
+                for sid, song, _, lyrics in page], 'ready': self._catalogue_ready}
 
     def choose(self, token, song_id):
-        member = self._require(token)
         if not isinstance(song_id, str):
             raise RoomError('Choix de chanson invalide.')
         with self._lock:
+            member = self._require(token)
             if self._locked:
                 raise RoomError('Le tour est en cours. Attends avant de modifier ta chanson.', 409)
             song = self._songs.get(song_id)
-            if song is None or not song.path.is_file() or not song.path.with_suffix('.lrc').is_file():
-                raise RoomError('Cette chanson n’est plus disponible avec paroles.', 404)
-            member['song'] = song_id
+            if song is None or not song.path.is_file():
+                raise RoomError('Cette chanson n’est plus disponible.', 404)
+            if song_id in member['songs']:
+                return {'name': member['name'], 'song': song.title, 'artist': song.artist}
+            if len(member['songs']) >= MAX_SONGS:
+                raise RoomError('Ta sélection est pleine.', 409)
+            member['songs'] = [*member['songs'], song_id]
+            member['song'] = member['songs'][0]
+            member['ready'] = False
             result = {'name': member['name'], 'song': song.title, 'artist': song.artist}
-        self._emit('choose', member)
+            self.emit("selection", member, song=song_id, action="add")
+            self._emit('choose', member)
         return result
 
-    def clear_choice(self, token):
-        member = self._require(token)
+    def clear_choice(self, token, song_id=None):
         with self._lock:
+            member = self._require(token)
             if self._locked:
                 raise RoomError('Le tour est en cours. Attends avant de modifier ta chanson.', 409)
             if member['song'] is None:
                 return {'ok': True}
-            member['song'] = None
-        self._emit('clear', member)
+            if song_id is not None and song_id not in member['songs']:
+                return {'ok': True}
+            member['songs'] = [sid for sid in member['songs'] if song_id is not None and sid != song_id]
+            member['song'] = next(iter(member['songs']), None)
+            member['ready'] = False
+            self.emit("selection", member, song=song_id, action="remove")
+            self._emit('choose' if member['song'] is not None else 'clear', member)
         return {'ok': True}
+
+    def reorder(self, token, ids):
+        with self._lock:
+            member = self._require(token)
+            if self._locked:
+                raise RoomError("La sélection est verrouillée.", 409)
+            if (not isinstance(ids, list) or len(ids) != len(member["songs"])
+                    or any(not isinstance(sid, str) for sid in ids) or set(ids) != set(member["songs"])):
+                raise RoomError("Ordre des chansons invalide.")
+            member.update(songs=ids, song=next(iter(ids), None), ready=False)
+            self._emit('choose' if ids else 'clear', member)
+        return {'ok': True}
+
+    def ready(self, token, ready):
+        with self._lock:
+            member = self._require(token)
+            if self._locked or type(ready) is not bool or (ready and not member["songs"] and not member["organizer"]):
+                raise RoomError("Choisis une chanson avant de te déclarer prêt.", 409)
+            member["ready"] = ready
+            self.emit("readiness", member, ready=ready)
+        return {"ok": True}
+
+    def selections(self):
+        with self._lock:
+            return {token: (member["ready"], member["organizer"],
+                            [self._songs.get(sid) for sid in member["songs"]])
+                    for token, member in self._members.items()}
+
+    def reset_ready(self):
+        with self._lock:
+            for member in self._members.values():
+                member["ready"] = False
+
+    def identity(self, token):
+        return self._require(token)["name"]
 
     def song_for(self, song_id):
         with self._lock:
             return self._songs.get(song_id)
 
-    def leave(self, token):
-        self._require(token)
+    def match_song_paths(self, paths, title, artist):
         with self._lock:
+            return [sid for sid, song in self._songs.items() if song.path in paths
+                    and search_key(song.title).strip() == search_key(title).strip()
+                    and search_key(song.artist).strip() == search_key(artist).strip()]
+
+    def leave(self, token):
+        with self._lock:
+            self._require(token)
             member = self._members.pop(token, None)
-        if member:
-            self._emit('leave', member)
+            if member:
+                self.emit("leave", member)
+                self._emit('leave', member)
         return {'ok': True}
 
     def kick(self, token):
@@ -174,6 +318,12 @@ class MobileRoom:
     def public_roster(self):
         now = time.monotonic()
         with self._lock:
+            # Keep a disconnected player's slot and selection. The LAN
+            # heartbeat contributes one diagnostic edge per loss, not per poll.
+            for member in self._members.values():
+                if member["online"] and now - member['last_seen'] >= HEARTBEAT_SECONDS:
+                    member["online"] = False
+                    self.emit("disconnect", member, cause="heartbeat")
             return [{'name': m['name'], 'song':
                      self._songs[m['song']].title if m['song'] in self._songs else '',
                      'online': now - m['last_seen'] < HEARTBEAT_SECONDS}

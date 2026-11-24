@@ -82,6 +82,26 @@ def words(text):
     return result
 
 
+def word_boundaries(text):
+    """Return normalized tokens and their original character spans."""
+    folded, indices = [], []
+    stripped = list(text)
+    for bracket in re.finditer(r"\[[^\]]*\]", text):
+        stripped[bracket.start():bracket.end()] = " " * len(bracket.group())
+    for i, char in enumerate(stripped):
+        for part in normalize("NFKD", char.casefold()):
+            if not combining(part):
+                folded.append(part)
+                indices.append(i)
+    spans = []
+    for match in re.finditer(r"[^\W_]+", "".join(folded)):
+        # A lexical expansion such as « chuis » shares one acoustic span.
+        # Its component words must not be assigned invented subword times.
+        span = indices[match.start()], indices[match.end() - 1] + 1
+        spans.extend([span] * len(CONTRACTIONS.get(match.group(), (match.group(),))))
+    return [(word, *span) for word, span in zip(words(text), spans, strict=True)]
+
+
 IGNORED_HINTS = FRENCH | frozenset("""
     le la de du et un en ne se sa son sur est ait ses cet ces elle ils y
     the and that this with for from you your have was were will are not

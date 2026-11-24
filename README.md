@@ -48,6 +48,8 @@ Le service TV (port **8765**) et le prototype de micro (port **8766**) sont dist
 
 L'interface de calibration n'envoie jamais le micro en direct à l'enceinte, afin d'éviter les boucles d'écho. Les artefacts Tizen et les environnements présents sur ArchASP ne sont pas des dépendances portables incluses dans Git.
 
+La [calibration audio expérimentale](docs/audio-calibration.md) lance en un clic un amorçage puis six chirps et six séquences PN alternés, sans compensation. Les tests synthétiques sont disponibles et le protocole physique S21FE, analogique puis EDENWOOD choisie manuellement, reste à réaliser.
+
 ## ✦ Repository
 
 ```text
@@ -84,12 +86,18 @@ Autres points d'entrée existants : `~/.local/bin/paroles-strawberry` (interface
 
 ## ✦ Documentation
 
+Le [guide Kara V1](docs/kara-v1.md) décrit la salle HTTPS, les commandes mobiles, le format BlackBox et le replay local.
+
 | Ressource | Contenu |
 | --- | --- |
+| [Calibration audio](docs/audio-calibration.md) | Contrats, algorithmes, limites de mesure, tests et protocole S21FE à réaliser |
+| [Qualification du chant](docs/kara-qualification-chant.md) | Banc PCM, score, résultats comparatifs et protocole ADB |
 | [Source Tizen](tizen/app/README.md) | Application TV |
 | [Code micro](bin/_kara_micro_test.py) | Serveur HTTPS WebSocket |
 | [Page micro](bin/_kara_micro_test.html) | Interface mobile et calibration |
 | [AudioWorklet](bin/_kara_micro_worklet.js) | Capture audio et paquets PCM |
+| [Moteur de calibration](bin/_kara_audio_calibration.js) | DSP local et synthèse des essais |
+| [Sondes de calibration](bin/_kara_audio_calibration.py) | Références déterministes et émission PipeWire bornée |
 | [Source C](native/src/_kara_dtw.c) | Alignement natif DTW |
 
 ## ✦ Mirrors
@@ -106,6 +114,7 @@ Forgejo est le dépôt principal (`origin`), avec GitHub comme miroir. Les deux 
 | Branche | Usage |
 | --- | --- |
 | `main` | Développement du prototype |
+| `feat/audio-calibration-engine` | Calibration expérimentale, validation synthétique et protocole physique à réaliser |
 
 Aucune version stable n'est annoncée. Les essais de mesure audio ne valent pas certification de latence ni de compatibilité matérielle.
 

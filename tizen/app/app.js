@@ -17,6 +17,8 @@
     var seenClose = null;
     var tvIsClosed = false;
     var lastRoomURL = "";
+    var lastRendered = null;
+    var lastDisconnected = false;
 
     function playerColor(name) {
         if (!Object.prototype.hasOwnProperty.call(playerColors, name)) {
@@ -93,7 +95,7 @@
             // le chanteur déjà en cours de tour (sa partie doit rester visible).
             return !player.mobile || player.active || online.indexOf(player.name) >= 0;
         }).map(function (player) {
-            return {name: player.name, song: player.song || "", score: player.score,
+            return {name: player.name, song: player.song || "", score: player.score, coverage: player.coverage,
                     done: !!player.done, active: !!player.active, connected: false};
         });
         connected.forEach(function (mobile) {
@@ -125,10 +127,13 @@
             var card = playerRows[index];
             var active = !!player.active;
             var score = Math.max(0, Math.min(100, Number(player.score) || 0));
-            var displayScore = active || player.done;
+            var displayScore = (active || player.done) && player.score != null;
             var color = playerColor(player.name);
             if (card.title.textContent !== (player.song || "")) card.title.textContent = player.song || "";
-            card.points.textContent = displayScore ? score + " %" : (player.connected ? "●" : "");
+            card.points.textContent = displayScore ? score + " %" : (player.done ? "—" : (player.connected ? "●" : ""));
+            if (player.done && player.coverage != null) {
+                card.points.textContent += " · " + player.coverage + " % évalués";
+            }
             card.points.style.color = color;
             card.fill.style.backgroundColor = color;
             card.fill.style.width = displayScore ? score + "%" : "0%";
@@ -177,7 +182,12 @@
         }
         show("next", lines[2] || "");
         show("following", lines[3] || "");
-        show("status", data.status || "");
+        var ranking = data.ranking || [];
+        var standings = ranking.map(function (item) {
+            return item.name + " · " + (item.score == null ? "sans note" : item.score + " %");
+        }).join("   |   ");
+        show("status", (data.recording ? "● BlackBox   " : "") +
+            (data.party_phase === "finished" ? "Classement · " + standings : data.status || ""));
         element("fill").style.width = (100 * progress) + "%";
     }
     var form = element("pair");
@@ -188,12 +198,23 @@
     var endpoint = "";
     var connection = 0;
 
-    function showRoomQRCode() {
+    function showRoomQRCode(state) {
         var base = endpoint.replace(/\/etat$/, "");
-        if (!base || base === lastRoomURL) return;
-        lastRoomURL = base;
-        element("room-qr").src = base + "/qr";
-        element("room-url").textContent = base + "/jouer";
+        var joinUrl = state.join_url || base + "/jouer";
+        if (!base || joinUrl === lastRoomURL) return;
+        lastRoomURL = joinUrl;
+        var qr = element("room-qr");
+        qr.removeAttribute("data-inline-qr");
+        qr.src = base + "/qr";
+        element("room-url").textContent = joinUrl;
+    }
+
+    function diagnostic(kind, suffix) {
+        if (!endpoint) return;
+        var request = new XMLHttpRequest();
+        request.open("GET", endpoint.replace(/\/etat$/, "/tv-diagnostic") + "?event=" + kind + (suffix || ""), true);
+        request.timeout = 1200;
+        try { request.send(); } catch (error) {}
     }
 
     function destination(value) {
@@ -217,6 +238,7 @@
         connection += 1;
         endpoint = "";
         lastRoomURL = "";
+        lastRendered = null;
         form.hidden = false;
         panel.hidden = true;
         hint.textContent = "";
@@ -226,7 +248,8 @@
     function poll(id) {
         if (id !== connection || !endpoint) return;
         var xhr = new XMLHttpRequest();
-        xhr.open("GET", endpoint, true);
+        var began = performance.now();
+        xhr.open("GET", endpoint + (element("room-qr").getAttribute("data-inline-qr") ? "?qr=0" : "?qr=1"), true);
         xhr.timeout = 1900;
         xhr.onloadend = function () {
             if (id !== connection) return;
@@ -236,9 +259,17 @@
                     if (!form.hidden) remember();
                     form.hidden = true;
                     panel.hidden = false;
-                    showRoomQRCode();
+                    showRoomQRCode(state);
                     render(state);
+                    if (state.recording && state.line_revision !== undefined && state.line_revision !== lastRendered) {
+                        lastRendered = state.line_revision;
+                        var painted = performance.now();
+                        diagnostic("rendered", "&revision=" + state.line_revision +
+                            "&browser_ms=" + painted.toFixed(1) + "&rtt_ms=" + (painted - began).toFixed(1));
+                    }
+                    lastDisconnected = false;
                 } catch (error) {
+                    diagnostic("render-error");
                     hint.textContent = "Réponse du PC illisible.";
                 }
             } else if (xhr.status === 404) {
@@ -246,6 +277,10 @@
                 hint.textContent = "Vérifie le code affiché dans Paroles Strawberry.";
                 return;
             } else {
+                if (!lastDisconnected) {
+                    diagnostic("display-disconnect");
+                    lastDisconnected = true;
+                }
                 var message = "En attente du mode TV sur le PC…";
                 hint.textContent = message;
                 if (!panel.hidden) show("status", message);
@@ -269,12 +304,12 @@
         poll(connection);
     };
 
-    element("reopen-tv").onclick = function () { window.location.reload(); };
+    element("reopen-tv").onclick = function () { diagnostic("remote-reopen"); window.location.reload(); };
 
     document.addEventListener("keydown", function (event) {
         if (event.keyCode === 10009 || event.keyCode === 27) {
             event.preventDefault();
-            if (endpoint) disconnect();
+            if (endpoint) { diagnostic("remote-back"); disconnect(); }
             else if (typeof tizen !== "undefined") tizen.application.getCurrentApplication().exit();
             return;
         }

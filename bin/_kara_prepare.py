@@ -1,0 +1,604 @@
+"""Préparation persistante des chansons, utilisable par GTK et en mode silencieux."""
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from fcntl import LOCK_EX, LOCK_NB, flock
+from hashlib import sha256
+import json
+from math import isfinite
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
+from time import monotonic, sleep
+from urllib.error import URLError
+
+from _kara_paths import BIN, STATE, music_library
+from _kara_reference import (METHOD, MIN_LINE_COVERAGE, MIN_TOKEN_CONFIDENCE, MIN_TRANSCRIPT_AGREEMENT,
+                             MIN_WORD_COVERAGE, VERSION, alignment, lrc_text)
+from _kara_refine import MAX_DISAGREEMENT, MIN_LOCAL_CONFIDENCE, VERSION as REFINEMENT_VERSION, refine
+from _kara_stems import MODEL as STEM_MODEL, cached_stems
+from _kara_turbo import MODEL, OVERLAP, RATE, STRIDE, TurboDecoder, build_decoder, digest, transcribe_file
+from _kara_words import LyricVocabulary, word_boundaries
+from _paroles_lrc import MAX_LRC_BYTES, source_orders
+
+CACHE_ROOT = STATE / "kara/prepared"
+MAX_MANIFEST = 16_000_000
+
+
+def file_token(path):
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Un fichier ordinaire est requis.")
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def lrc_token(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Le fichier LRC doit être un fichier ordinaire.")
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def read_source(path):
+    with path.open("rb") as source:
+        raw = source.read(MAX_LRC_BYTES + 1)
+    if len(raw) > MAX_LRC_BYTES:
+        raise ValueError("Fichier LRC trop volumineux.")
+    return raw
+
+
+def fingerprint(raw):
+    return sha256(raw).hexdigest()
+
+
+def path_id(song):
+    return fingerprint(os.fsencode(song))
+
+
+def atomic(path, data):
+    # Rename is the publication point. Flush both data and directory so a
+    # process or machine interruption cannot publish a partial generation.
+    draft = None
+    try:
+        with NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            draft = Path(stream.name)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(draft, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if draft is not None:
+            draft.unlink(missing_ok=True)
+
+
+def number(value, low, high):
+    return type(value) in (int, float) and isfinite(value) and low <= value <= high
+
+
+def validate(manifest):
+    if manifest["version"] != VERSION or manifest["method"] != METHOD or manifest["state"] != "ready":
+        return False
+    duration = manifest["duration"]
+    report = manifest["report"]
+    if (not number(duration, 1, 3600)
+            or not number(report["word_coverage"], MIN_WORD_COVERAGE, 1)
+            or not number(report["line_coverage"], MIN_LINE_COVERAGE, 1)
+            or not number(report["transcript_agreement"], MIN_TRANSCRIPT_AGREEMENT, 1)):
+        return False
+    source = source_orders(manifest["source_lrc"])[manifest.get("source_order", "timestamps")]
+    lines = manifest["lines"]
+    if not lines or len(source) != len(lines):
+        return False
+    previous = last_word = -1
+    supported_lines = supported_words = total_words = total_lines = 0
+    for index, (line, (stamp, text)) in enumerate(zip(lines, source)):
+        display = line["display_start"]
+        if (line["id"] != index or (line["source_start"], line["text"]) != (stamp, text)
+                or not number(display, 0, duration) or not previous < display < duration):
+            return False
+        previous = display
+        if line["start"] is not None and (not number(line["start"], 0, duration)
+                                         or not line["words"] or line["start"] != line["words"][0]["start"]):
+            return False
+        if line["end"] is not None and (line["start"] is None or
+                                       not number(line["end"], line["start"], duration)):
+            return False
+        tokens = word_boundaries(text)
+        total_lines += bool(tokens)
+        supported_lines += line["start"] is not None
+        total_words += len(tokens)
+        if len(line["words"]) != len(tokens):
+            return False
+        for j, (word, (token, left, right)) in enumerate(zip(line["words"], tokens)):
+            a, b = word["characters"]
+            start, end, confidence = word["start"], word["end"], word["confidence"]
+            if (word["id"] != j or word["normalized"] != token or (a, b) != (left, right)
+                    or word["text"] != text[a:b]
+                    or (confidence is not None and not number(confidence, 0, 1))):
+                return False
+            if start is None:
+                if end is not None or word["origin"] != "uncertain":
+                    return False
+            elif (not number(start, max(0, last_word), duration)
+                  or not number(confidence, MIN_TOKEN_CONFIDENCE, 1)
+                  or (end is not None and not number(end, start, duration))
+                  or not valid_origin(word, duration)):
+                return False
+            else:
+                last_word = start
+                supported_words += 1
+    return (bool(total_words and total_lines)
+            and supported_words / total_words >= MIN_WORD_COVERAGE
+            and supported_lines / total_lines >= MIN_LINE_COVERAGE)
+
+
+def valid_origin(word, duration):
+    if word["origin"] == "whisper_dtw":
+        return True
+    if word["origin"] not in {"whisper_local_mix", "whisper_local_vocals"}:
+        return False
+    alternate = word["evidence"]["alternate_start"]
+    return (word["confidence"] >= MIN_LOCAL_CONFIDENCE and number(alternate, 0, duration)
+            and abs(alternate - word["start"]) <= MAX_DISAGREEMENT)
+
+
+def matching_settings(manifest, requested):
+    saved = manifest["settings"]
+    if requested is None or saved == requested:
+        return True
+    # The previous decoder frame is exactly the new greedy frame with a
+    # zero option bit. Allow its validated anchors to migrate once, while
+    # retaining the original build identity separately from local retries.
+    differences = {"build", "local_decoding"}
+    return (manifest["state"] == "ready" and not manifest.get("refinement")
+            and "local_decoding" not in saved and "local_decoding" in requested
+            and {key: value for key, value in saved.items() if key not in differences}
+            == {key: value for key, value in requested.items() if key not in differences})
+
+
+class PreparedCache:
+    def __init__(self, root=CACHE_ROOT, model=MODEL):
+        self.root = Path(root)
+        self.model = Path(model)
+        self.model_identity = None
+
+    def folder(self, song):
+        return self.root / path_id(song)
+
+    def model_info(self):
+        token = file_token(self.model)
+        if self.model_identity is None or self.model_identity["file"] != token:
+            # GGML model type is reported by whisper.cpp on startup. The hash
+            # distinguishes actual weights even when the filename stays equal.
+            identity = digest(self.model)
+            if file_token(self.model) != token:
+                raise ValueError("Le modèle a changé pendant la lecture.")
+            self.model_identity = {"name": "large-v3-turbo", "sha256": identity, "file": token}
+        return self.model_identity
+
+    @contextmanager
+    def locked(self, song):
+        folder = self.folder(song)
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (folder / "lock").open("a") as lock:
+            try:
+                flock(lock, LOCK_EX | LOCK_NB)
+            except BlockingIOError as error:
+                raise ValueError("Un autre processus prépare déjà ce morceau.") from error
+            yield folder
+
+    def cached(self, song, *, verify=True, settings=None, rebind=None, insufficient=False):
+        folder = self.folder(song)
+        try:
+            with (folder / "prepared.json").open("rb") as stream:
+                raw = stream.read(MAX_MANIFEST + 1)
+            if len(raw) > MAX_MANIFEST:
+                return None
+            item = json.loads(raw)
+            if insufficient:
+                # A negative receipt has no playable/scorable reference and
+                # cannot be mistaken for a published preparation.
+                valid = (item["state"] == "insufficient" and item["version"] == VERSION
+                         and item["method"] == METHOD and item["refinement"]["version"] == REFINEMENT_VERSION
+                         and number(item["duration"], 1, 3600)
+                         and number(item["report"]["word_coverage"], 0, 1)
+                         and number(item["report"]["line_coverage"], 0, 1))
+            else:
+                valid = validate(item)
+            if item["song_id"] != path_id(song) or not valid or not matching_settings(item, settings):
+                return None
+            source_path = song.with_suffix(".lrc")
+            source = lrc_token(source_path)
+            audio = file_token(song)
+            model = file_token(self.model)
+            if item["source"]["kind"] != ("local" if source is not None else "retrieved"):
+                return None
+            if verify:
+                raw_source = read_source(source_path) if source is not None else None
+                if (item["model"]["sha256"] != self.model_info()["sha256"]
+                        or item["audio"]["sha256"] != digest(song)
+                        or (raw_source is not None and (item["source"]["sha256"] != fingerprint(raw_source)
+                            or item["source_lrc"] != raw_source.decode("utf-8-sig")))
+                        or (source is None and item["source"]["sha256"] !=
+                            fingerprint(item["source_lrc"].encode("utf-8")))
+                        or (audio, model, source) != (file_token(song), file_token(self.model), lrc_token(source_path))):
+                    return None
+            elif (item["model"]["file"] != model or item["audio"]["file"] != audio
+                  or item["source"]["file"] != source):
+                return None
+            if insufficient:
+                return item
+            corrected = lrc_text(item["lines"]).encode()
+            key = fingerprint(corrected)
+            with (folder / (key + ".lrc")).open("rb") as stream:
+                rendered = stream.read(len(corrected) + 1)
+            if item["lrc_sha256"] != key or rendered != corrected:
+                return None
+            if verify and rebind is not None and any(
+                    item[key]["file"] != token for key, token in
+                    zip(("audio", "source", "model"), (audio, source, model))):
+                for key, token in zip(("audio", "source", "model"), (audio, source, model)):
+                    item[key]["file"] = token
+                self.publish(rebind, item)
+            return item
+        except (OSError, KeyError, ValueError, TypeError, OverflowError, RecursionError):
+            return None
+
+    def publish(self, folder, item):
+        if not validate(item):
+            raise ValueError("Référence incohérente : publication refusée.")
+        corrected = lrc_text(item["lines"]).encode()
+        key = fingerprint(corrected)
+        item["lrc_sha256"] = key
+        raw = json.dumps(item, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+        if len(raw) > MAX_MANIFEST:
+            raise ValueError("Référence trop volumineuse.")
+        output = folder / (key + ".lrc")
+        # The LRC is immutable within its generation. The manifest references
+        # the complete LRC only after its write has been committed.
+        atomic(output, corrected)
+        atomic(folder / "prepared.json", raw)
+        for old in folder.glob("*.lrc"):
+            if old != output:
+                old.unlink(missing_ok=True)
+
+
+def retrieve(song):
+    result = subprocess.run([str(BIN / "paroles-musique"), "--bibliotheque", str(music_library()),
+                             "--lrc-stdout", "--", str(song)],
+                            capture_output=True, timeout=120, check=False)
+    if result.returncode:
+        raise ValueError(result.stderr.decode(errors="replace").strip()[-350:] or
+                         "Aucune source de paroles minutées disponible.")
+    data = json.loads(result.stdout)
+    raw = data["lyrics"].encode()
+    if len(raw) > MAX_LRC_BYTES:
+        raise ValueError("Paroles récupérées trop volumineuses.")
+    return raw, data["provider"]
+
+
+def choose_alignment(orders, heard, duration, progress):
+    results = [(order, *alignment(rows, heard, duration, progress if i == 0 else lambda *_: None))
+               for i, (order, rows) in enumerate(orders.items())]
+    return max(results, key=lambda result: (result[3], result[2]["word_coverage"], result[2]["line_coverage"]))
+
+
+class Preparer:
+    def __init__(self, cache, *, device="gpu", threads=None, logs=False, reader=retrieve,
+                 separate_if_needed=False, trace=None):
+        self.cache = cache
+        self.device = device
+        self.threads = threads if threads is not None else (4 if device == "gpu" else 8)
+        self.logs = logs
+        self.reader = reader
+        self.separate_if_needed = separate_if_needed
+        self.trace = trace
+        self.decoder = None
+        self.binary = None
+        self.model_lock = None
+
+    def close(self):
+        if self.decoder is not None:
+            self.decoder.close()
+            self.decoder = None
+        if self.model_lock is not None:
+            self.model_lock.close()
+            self.model_lock = None
+
+    def reserve_model(self):
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if not runtime:
+            return
+        # Share the existing Kara model slot with live inference. Preparation
+        # does not enter the voice session or change the dictation service.
+        lock = (Path(runtime) / "kara-model.lock").open("a")
+        try:
+            limit = monotonic() + 30
+            while True:
+                try:
+                    flock(lock, LOCK_EX | LOCK_NB)
+                    self.model_lock = lock
+                    return
+                except BlockingIOError:
+                    if monotonic() >= limit:
+                        raise TimeoutError("Le moteur local est déjà utilisé par une autre session Kara.")
+                    sleep(.2)
+        except BaseException:
+            lock.close()
+            raise
+
+    def settings(self):
+        if self.binary is None:
+            self.binary = build_decoder()
+        return {"backend": "whisper.cpp-dtw", "build": self.binary.name, "device": self.device,
+                "threads": self.threads, "rate": RATE, "window_stride": STRIDE, "window_overlap": OVERLAP,
+                "temperature": 0, "no_context": True, "no_speech_threshold": .65, "prompt": "",
+                "fallback": "near-threshold-dtwturbo-" + STEM_MODEL,
+                "local_decoding": "beam3-with-greedy-onset-audit"}
+
+    def vocal_stem(self, song, progress):
+        stems = cached_stems(song)
+        if stems is None and self.separate_if_needed:
+            progress("separation", 94)
+            # The existing Demucs CLI terminates its child on SIGTERM. Release
+            # the model before a full separation to avoid concurrent memory peaks.
+            self.close()
+            with subprocess.Popen([sys.executable, "-B", str(BIN / "_kara_stems.py"), str(song)],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL) as separation:
+                try:
+                    separation.wait(timeout=900)
+                except (KeyboardInterrupt, subprocess.TimeoutExpired) as error:
+                    separation.terminate()
+                    try:
+                        separation.wait(timeout=12)
+                    except subprocess.TimeoutExpired:
+                        separation.kill()
+                    if isinstance(error, KeyboardInterrupt):
+                        raise
+            stems = cached_stems(song)
+        return stems[1] if stems else None
+
+    def load_decoder(self):
+        if self.decoder is None:
+            self.reserve_model()
+            self.decoder = TurboDecoder(self.binary, self.cache.model, self.device, self.threads, logs=self.logs)
+        return self.decoder
+
+    def transcribe(self, song, language, progress):
+        load_seconds = 0.
+        if self.decoder is None:
+            start = monotonic()
+            progress("model", 12)
+            self.load_decoder()
+            load_seconds = monotonic() - start
+        progress("transcription", 20)
+        start = monotonic()
+        result = transcribe_file(song, self.decoder, language, lambda f: progress("transcription", 20 + int(55 * f)))
+        return *result, load_seconds, monotonic() - start
+
+    def trace_text(self, song, kind, text, **data):
+        if self.trace:
+            for offset in range(0, len(text), 6000):
+                self.trace(song, kind, offset=offset, text=text[offset:offset + 6000], **data)
+
+    def first_pass(self, song, lrc, settings, progress):
+        audio_file = file_token(song)
+        audio_hash = digest(song)
+        source_file = lrc_token(lrc)
+        progress("lyrics", 8)
+        source, provider = (read_source(lrc), "library") if source_file is not None else self.reader(song)
+        if len(source) > MAX_LRC_BYTES:
+            raise ValueError("Fichier LRC trop volumineux.")
+        text = source.decode("utf-8-sig")
+        if self.trace:
+            self.trace_text(song, "source-lrc", text, provider=provider, sha256=fingerprint(source))
+        orders = source_orders(text)
+        vocabulary = LyricVocabulary(t for _, t in orders["timestamps"])
+        if not any(vocabulary.tokens):
+            raise ValueError("Paroles minutées introuvables.")
+        model = self.cache.model_info()
+        duration, language, heard, segments, model_seconds, analysis_seconds = self.transcribe(
+            song, vocabulary.language, progress)
+        if self.trace:
+            for index, segment in enumerate(segments):
+                self.trace(song, "original-transcription", index=index, segment=segment, language=language)
+        source_order, lines, report, _ = choose_alignment(orders, heard, duration, progress)
+        report.update(input="original", duration=round(duration, 3), model_seconds=round(model_seconds, 3),
+                      analysis_seconds=round(analysis_seconds, 3), real_time_factor=round(analysis_seconds / duration, 4))
+        if self.decoder is not None:
+            report["native_peak_rss_kib"] = self.decoder.peak_rss_kib()
+        return {"version": VERSION, "method": METHOD, "song_id": path_id(song),
+                "title": song.stem, "language": language, "model": model, "settings": settings,
+                "audio": {"sha256": audio_hash, "file": audio_file},
+                "source": {"kind": "local" if source_file is not None else "retrieved",
+                           "file": source_file, "provider": provider,
+                           "sha256": fingerprint(source if source_file is not None else text.encode())},
+                "source_lrc": text, "source_order": source_order, "duration": duration, "lines": lines,
+                "segments": segments, "observation": {"input": "original"}, "report": report}
+
+    def deepen(self, song, item, progress):
+        base = item["report"]
+        # Keep the original first-pass summary when the user retries local
+        # work on an already consolidated generation.
+        initial = base.get("baseline") or {key: base.get(key) for key in (
+            "word_coverage", "line_coverage", "uncertain_words", "uncertain_lines", "max_delta",
+            "analysis_seconds", "native_peak_rss_kib")}
+        stem_seconds = 0.
+        stem_id = None
+        stem_identity = None
+
+        def choose_stem():
+            nonlocal stem_seconds, stem_id, stem_identity
+            began = monotonic()
+            stems = cached_stems(song)
+            # A costly new separation is opt-in and limited to an originally
+            # near-threshold result. Existing stems may be compared directly.
+            if stems:
+                stem = stems[1]
+            elif (self.separate_if_needed and base["line_coverage"] < MIN_LINE_COVERAGE
+                  and base["word_coverage"] >= .62 and base["transcript_agreement"] >= .55):
+                stem = self.vocal_stem(song, progress)
+            else:
+                stem = None
+            if stem is not None:
+                stem_identity = (stem, file_token(stem))
+                stem_id = digest(stem)
+            stem_seconds += monotonic() - began
+            return stem
+
+        began = monotonic()
+        previous = item.get("refinement", {})
+        audit_only = bool(previous and any(word["start"] is None and word.get("rejected")
+                                          for line in item["lines"] for word in line["words"]))
+        lines, report, ready, stats = refine(song, item["lines"], base, item["duration"], item["language"],
+                                            self.load_decoder, vocal_stem=choose_stem, audit_only=audit_only,
+                                            progress=progress)
+        if stats["recovered_stem"]:
+            stem, token = stem_identity
+            if file_token(stem) != token:
+                raise ValueError("La piste vocale a changé pendant la vérification.")
+            stats["vocal_source"] = {"model": STEM_MODEL, "sha256": stem_id}
+        stats.update(seconds=round(monotonic() - began, 3), separation_seconds=round(stem_seconds, 3))
+        if self.decoder is not None and stats["decodes"]:
+            stats["native_peak_rss_kib"] = self.decoder.peak_rss_kib()
+        if previous:
+            stats["previous_work"] = {key: previous.get(key) for key in
+                                      ("windows", "stem_windows", "decodes", "seconds", "recovered_mix",
+                                       "recovered_stem", "quarantined", "native_peak_rss_kib")}
+        report.update(baseline=initial, refinement=stats)
+        item.update(lines=lines, report=report, refinement=stats)
+        return ready
+
+    def prepare(self, song, *, force=False, progress=lambda *_: None):
+        song = Path(song).resolve(strict=True)
+        start = monotonic()
+        lrc = song.with_suffix(".lrc")
+        with self.cache.locked(song) as folder:
+            progress("cache", 2)
+            settings = self.settings()
+            item = self.cache.cached(song, settings=settings, rebind=folder)
+            from_reference = item is not None
+            if item and self.trace:
+                self.trace(song, "cache-revision", id=item["song_id"], lrc_sha256=item["lrc_sha256"],
+                           audio_sha256=item["audio"]["sha256"], revision=item["prepared_at"])
+            if not force:
+                if item and item.get("refinement", {}).get("version") == REFINEMENT_VERSION:
+                    if self.trace:
+                        self.trace_text(song, "source-lrc", item["source_lrc"],
+                                        provider=item["source"].get("provider"), sha256=item["source"]["sha256"])
+                        self.trace_text(song, "corrected-lrc", lrc_text(item["lines"]), sha256=item["lrc_sha256"])
+                        for index, entry in enumerate(item["lines"]):
+                            self.trace(song, "reference-line", index=index, line=entry)
+                    progress("cached", 100)
+                    return True, item["report"], monotonic() - start, item["duration"]
+                if item is None:
+                    attempt = self.cache.cached(song, settings=settings, insufficient=True)
+                    if attempt:
+                        progress("cached_insufficient", 100)
+                        return False, attempt["report"], monotonic() - start, attempt["duration"]
+            if item is None:
+                item = self.first_pass(song, lrc, settings, progress)
+            elif item["settings"] != settings:
+                item["baseline_settings"] = item["settings"]
+                item["settings"] = settings
+            ready = self.deepen(song, item, progress)
+            if ((file_token(song), lrc_token(lrc), file_token(self.cache.model))
+                    != tuple(item[key]["file"] for key in ("audio", "source", "model"))):
+                raise ValueError("Le morceau, le modèle ou le LRC a changé pendant la préparation.")
+            report = item["report"]
+            report["refinement"]["reused_reference"] = from_reference
+            duration = item["duration"]
+            if self.trace:
+                self.trace(song, "reference-validation", id=item["song_id"], ready=ready, report=report,
+                           audio_sha256=item["audio"]["sha256"], source_sha256=item["source"]["sha256"],
+                           settings=item["settings"], model_sha256=item["model"].get("sha256"))
+                for index, entry in enumerate(item["lines"]):
+                    self.trace(song, "reference-line", index=index, line=entry)
+            if not ready:
+                report["message"] = "Référence temporelle insuffisante pour noter le morceau."
+                receipt = {k: v for k, v in item.items() if k not in ("lines", "segments", "lrc_sha256")}
+                receipt["state"] = "insufficient"
+                # The same publication pointer revokes an old generation in
+                # one rename. A restart can never see both readiness states.
+                atomic(folder / "prepared.json", json.dumps(receipt, ensure_ascii=False, allow_nan=False).encode())
+                return False, report, monotonic() - start, duration
+            progress("saving", 97)
+            stats = report["refinement"]
+            item["state"] = "ready"
+            if not from_reference or stats["recovered_mix"] or stats["recovered_stem"] or stats["quarantined"]:
+                item["prepared_at"] = datetime.now(timezone.utc).isoformat()
+            self.cache.publish(folder, item)
+            if self.trace:
+                self.trace_text(song, "corrected-lrc", lrc_text(item["lines"]), sha256=item["lrc_sha256"])
+            progress("ready", 100)
+            return True, report, monotonic() - start, duration
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("songs", nargs="+", type=Path)
+    parser.add_argument("--cache", type=Path, default=CACHE_ROOT)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force-path", type=Path, action="append", default=[])
+    parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--device", choices=("cpu", "gpu"), default=os.environ.get("KARA_TURBO_DEVICE", "gpu"))
+    parser.add_argument("--threads", type=int, choices=range(1, 33))
+    parser.add_argument("--backend-logs", action="store_true")
+    parser.add_argument("--separate-if-needed", action="store_true")
+    args = parser.parse_args()
+
+    def cancel(_signal, _frame):
+        raise KeyboardInterrupt
+
+    def send(event, path, **data):
+        print(json.dumps({"event": event, "path": str(path), **data}, ensure_ascii=False), flush=True)
+
+    signal.signal(signal.SIGTERM, cancel)
+    preparer = Preparer(PreparedCache(args.cache), device=args.device, threads=args.threads, logs=args.backend_logs,
+                        separate_if_needed=args.separate_if_needed,
+                        trace=(lambda song, kind, **payload: send("evidence", song, kind=kind, evidence=payload))
+                        if args.trace else None)
+    failed = False
+    force_paths = {path.resolve() for path in args.force_path}
+    try:
+        for song in dict.fromkeys(path.resolve() for path in args.songs):
+            phase = ""
+
+            def progress(stage, percent):
+                nonlocal phase
+                phase = stage
+                send("progress", song, phase=stage, percent=percent)
+
+            try:
+                ready, report, elapsed, duration = preparer.prepare(
+                    song, force=args.force or song in force_paths, progress=progress)
+            except (EOFError, OSError, ValueError, RuntimeError, KeyError, URLError, subprocess.SubprocessError) as error:
+                preparer.close()
+                send("error", song, message=str(error))
+                failed = True
+            else:
+                send("result", song, ready=ready, cached=phase in ("cached", "cached_insufficient"), report=report,
+                     seconds=round(elapsed, 3), duration=round(duration, 3))
+                failed |= not ready
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        preparer.close()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

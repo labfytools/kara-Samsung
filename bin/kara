@@ -1,14 +1,16 @@
 #!/usr/bin/python3 -B
 """Prépare un album YouTube Music ou complète la bibliothèque partagée."""
 import argparse
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fcntl import LOCK_EX, LOCK_NB, flock
 import json
 import os
 from pathlib import Path
 import re
+from shutil import which
 import signal
 import subprocess
 import sys
@@ -18,53 +20,76 @@ import time
 from unicodedata import normalize
 from urllib.parse import parse_qs, urlsplit
 
-from _musique_oz import INBOX, SHARED_LIBRARY, audio_files
+from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_category, retry_albums
+from _kara_paths import BIN, DATA, catalogue_command
+from _musique_oz import INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, source_video
 
-BIN = Path(__file__).resolve().parent
-CATALOGUE_PYTHON = Path.home() / ".local/share/kara/catalogue/bin/python"
-CATALOGUE = BIN / "_kara_catalogue.py"
 DOWNLOAD_WORKERS = 20
-YT_COMMAND = ("yt-dlp", "--cookies-from-browser", "firefox", "--yes-playlist")
+# Both Parole and the CLI use this engine. A Kara-local update can fix the
+# extractor independently of the system package and other yt-dlp callers.
+KARA_DOWNLOADER = DATA / "kara" / "tools" / "yt-dlp"
+YT_EXECUTABLE = str(KARA_DOWNLOADER) if KARA_DOWNLOADER.is_file() else "yt-dlp"
+YT_COMMAND = (YT_EXECUTABLE, "--cookies-from-browser", "firefox", "--color", "never", "--socket-timeout", "15")
+YOUTUBE_HOSTS = {"music.youtube.com", "www.youtube.com", "youtube.com", "youtu.be"}
+PLAYLIST_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 
 
 YT_PROGRESS = (
-    "--no-simulate", "--newline", "--progress", "--progress-delta", "0.35", "--color", "never",
-    "--print", "before_dl:KARA_ITEM %(playlist_index,playlist_autonumber|1)d %(playlist_count,n_entries|0)d %(title)j",
+    "--no-simulate", "--newline", "--progress", "--progress-delta", "0.35",
+    "--print", "before_dl:KARA_ITEM %(kara_index|1)d %(title)j",
     "--progress-template",
-    "download:KARA_BYTES %(info.playlist_index,info.playlist_autonumber|1)d "
-    "%(info.playlist_count,info.n_entries|0)d %(progress.downloaded_bytes|0)d "
+    "download:KARA_BYTES %(info.kara_index|1)d %(progress.downloaded_bytes|0)d "
     "%(progress.total_bytes,progress.total_bytes_estimate|0)d %(progress.status|unknown)s",
     "--progress-template",
-    "postprocess:KARA_CONVERT %(info.playlist_index,info.playlist_autonumber|1)d %(progress.status|unknown)s",
-    "--print", "after_move:KARA_DONE %(playlist_index,playlist_autonumber|1)d",
+    "postprocess:KARA_CONVERT %(info.kara_index|1)d %(progress.status|unknown)s",
+    "--print", "after_move:KARA_DONE %(kara_index|1)d",
 )
 
 
 class ImportProgress:
-    def __init__(self, report=None):
+    def __init__(self, report=None, *, journal=None, json_output=True, url=None):
         self.report = report
+        self.journal = journal
+        self.json_output = json_output
+        self.url = url
         self.total = 0
         self.titles = {}
         self.download_fraction = 0.0
         self.track_progress = {}
         self.selected = None
-        self.workers = 1
-        self.transferring = set()
+        self.finished_positions = set()
         self.download_lock = Lock()
         self.slot_notice = False
-        self.imported = 0
-        self.skipped = ""
         self.failures = []
         self.lyrics_added = 0
         self.lyrics_synced = 0
         self.cover_counts = (0, 0)
 
-    def emit(self, message, fraction=None, *, event="progress"):
+    def emit(self, message, fraction=None, *, event="progress", **fields):
         if self.report is not None:
             self.report(message, fraction)
             return
-        print(json.dumps({"event": event, "message": message, "fraction": fraction},
-                         ensure_ascii=False), flush=True)
+        payload = {"event": event, "message": message, "fraction": fraction, **fields}
+        if self.journal and event != "progress":
+            self.journal.write(payload)
+        if self.json_output:
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        elif event != "album":
+            print(message, flush=True)
+            if fields.get("detail"):
+                print(fields["detail"], file=sys.stderr, flush=True)
+
+    def log(self, stage, output, *, command=None):
+        if self.journal:
+            self.journal.write({"event": "output", "url": self.url, "stage": stage,
+                                "command": command, "output": output})
+
+    def issue(self, stage, category, detail):
+        diagnostic = {"stage": stage, "category": category, "detail": detail}
+        with self.download_lock:
+            self.failures.append(diagnostic)
+        return diagnostic
 
     def track_status(self, verb, index, finished=0.0):
         label = f"{verb} · piste {index}"
@@ -72,8 +97,6 @@ class ImportProgress:
             label += f"/{self.total}"
         if index in self.titles:
             label += f" — {self.titles[index]}"
-        if self.workers > 1:
-            label = f"{len(self.transferring)}/{self.workers} transferts actifs · {label}"
         if self.selected:
             self.track_progress[index] = max(self.track_progress.get(index, 0.0), finished)
             measured = sum(self.track_progress.get(position, 0.0) for position in self.selected)
@@ -87,23 +110,19 @@ class ImportProgress:
         marker, _, payload = line.partition(" ")
         try:
             if marker == "KARA_ITEM":
-                index, total, title = payload.split(maxsplit=2)
+                index, title = payload.split(maxsplit=1)
                 index = max(1, int(index))
-                self.total = max(self.total, int(total))
                 title = " ".join(str(json.loads(title) or "").split())[:160]
                 if title:
                     self.titles[index] = title
                 self.track_status("Téléchargement", index)
             elif marker == "KARA_BYTES":
-                index, total, downloaded, size, status = payload.split()
+                index, downloaded, size, status = payload.split()
                 index = max(1, int(index))
-                self.total = max(self.total, int(total))
                 estimate = max(0.0, min(1.0, int(downloaded) / int(size))) if int(size) > 0 else 0.0
                 if status == "finished":
-                    self.transferring.discard(index)
                     self.track_status("Préparation de l’audio", index, 0.94)
                 elif status == "downloading":
-                    self.transferring.add(index)
                     self.track_status("Téléchargement", index, estimate * 0.92)
             elif marker == "KARA_CONVERT":
                 index, status = payload.split()
@@ -111,26 +130,13 @@ class ImportProgress:
                     self.track_status("Préparation de l’audio", int(index), 0.95)
             elif marker == "KARA_DONE":
                 index = int(payload)
-                self.transferring.discard(index)
+                self.finished_positions.add(index)
                 self.track_status("Piste enregistrée", index, 1.0)
         except (ValueError, IndexError):
             return
 
-    def finish(self, code, reason=""):
-        if not code and self.skipped:
-            self.emit(self.skipped, 1.0, event="skip")
-            return
-        if not code:
-            message = f"Import terminé · {self.imported} piste(s) ajoutée(s)."
-        elif self.imported:
-            detail = reason or ", ".join(label for label, _ in self.failures)
-            message = f"{self.imported} piste(s) importée(s) · enrichissement ou import incomplet."
-            if detail:
-                message += f" {detail}"
-        else:
-            detail = reason or next((error for _, error in self.failures if error), "")
-            message = f"Import impossible · {detail}" if detail else "Aucune piste complète à importer."
-        self.emit(message, 1.0 if not code else None, event="success" if not code else "failure")
+    def finish_issue(self, issue):
+        self.emit(CATEGORIES[issue.category], event="failure", category=issue.category, detail=str(issue))
 
 
 def run(label, command, *, progress=None, fraction=None, download=False, announce=True,
@@ -143,7 +149,8 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
     env = None if download else {**os.environ, "KARA_SHARED_WAIT": "suivi" if progress else "texte"}
     if progress is None:
         return subprocess.run(command, env=env).returncode
-    error = ""
+    errors = []
+    tail = deque(maxlen=32)
     processed = 0
     active = None
 
@@ -151,19 +158,26 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
         activity = f"{active[0]}/{active[1]} en cours · " if active is not None else ""
         progress.emit(f"{label} · {activity}{processed}/{total} {unit}", fraction + span * processed / total)
 
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          encoding="utf-8", errors="replace", env=env) as process:
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   encoding="utf-8", errors="replace", env=env, cwd=BIN)
+    except OSError as error:
+        category = "dependency" if isinstance(error, FileNotFoundError) else "path"
+        progress.issue(label, category, f"{command[0]} : {error}")
+        return 1
+    with process:
         for raw in process.stdout:
-            line = raw.strip()
+            line = raw.rstrip("\r\n")
             if line == "KARA_ATTENTE_BIBLIOTHEQUE":
                 progress.emit(f"En attente de la bibliothèque · {label}", fraction)
                 continue
             if line == "KARA_BIBLIOTHEQUE_DISPONIBLE":
                 progress.emit(label, fraction)
                 continue
-            if download:
+            if download and line.startswith(("KARA_ITEM ", "KARA_BYTES ", "KARA_CONVERT ", "KARA_DONE ")):
                 with progress.download_lock:
                     progress.yt_line(line)
+                continue
             if line.startswith("KARA_TOTAL "):
                 count = line.removeprefix("KARA_TOTAL ").strip()
                 if count.isdecimal():
@@ -174,7 +188,7 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
             if line.startswith("KARA_POCHETTES "):
                 counts = line.split()[1:]
                 if len(counts) == 2 and all(value.isdecimal() for value in counts):
-                    progress.cover_counts = (int(counts[0]), int(counts[1]))
+                    progress.cover_counts = tuple(map(int, counts))
                 continue
             if total and line.startswith("KARA_ACTIVITE "):
                 parts = line.split()
@@ -184,6 +198,9 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
                         active = amount, capacity
                         report_activity()
                 continue
+            progress.log(label, line, command=command[0])
+            if not progress.json_output and line:
+                print(line, flush=True)
             if total and " · " in line:
                 processed = min(total, processed + 1)
                 report_activity()
@@ -191,14 +208,14 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
                 progress.lyrics_added += 1
             if label == "Paroles synchronisées pour le karaoké" and " · paroles synchronisées · fichier .lrc · " in line:
                 progress.lyrics_synced += 1
-            if line.startswith("ERROR:"):
-                error = line.removeprefix("ERROR:").strip()
-            elif " · erreur :" in line:
-                error = line.partition(" · erreur :")[2].strip()
+            if line:
+                tail.append(line)
+            if line.startswith(("ERROR:", "WARNING:", "Erreur pour ")) or " · erreur :" in line:
+                errors.append(line)
         result = process.wait()
     if result:
-        with progress.download_lock:
-            progress.failures.append((label, error[:220]))
+        detail = "\n".join(errors or tail) or f"{command[0]} a retourné le code {result}."
+        progress.issue(label, failure_category(detail, "download" if download else "processing"), detail)
     return result
 
 
@@ -229,30 +246,28 @@ def fetch_lyrics(lyric_args, progress, *, start, synced_start):
 
 def find_missing_lyrics(progress=None):
     if not SHARED_LIBRARY.is_dir():
-        raise ValueError(f"Bibliothèque partagée introuvable : {SHARED_LIBRARY}")
+        raise ImportIssue("path", f"Bibliothèque introuvable : {SHARED_LIBRARY}")
     code = fetch_lyrics(["--tout"], progress, start=0.0, synced_start=0.5)
     if progress:
         message = (f"Recherche terminée · {progress.lyrics_added} piste(s) enrichie(s) · "
                    f"{progress.lyrics_synced} fichier(s) .lrc ajouté(s).")
         if code:
-            detail = next((error for _, error in progress.failures if error), "")
-            message += f" Erreur pendant la recherche{f' · {detail}' if detail else '.'}"
-        progress.emit(message, 1.0, event="failure" if code else "success")
+            message += " Erreur pendant la recherche."
+        progress.emit(message, 1.0, event="failure" if code else "success", diagnostics=progress.failures)
     return code
 
 
 def find_missing_covers(progress=None):
     if not SHARED_LIBRARY.is_dir():
-        raise ValueError(f"Bibliothèque partagée introuvable : {SHARED_LIBRARY}")
+        raise ImportIssue("path", f"Bibliothèque introuvable : {SHARED_LIBRARY}")
     code = fetch_covers(["--manquantes"], progress, start=0.0, span=1.0)
     if progress:
         added, unresolved = progress.cover_counts
         message = (f"Recherche terminée · {added} pochette(s) ajoutée(s) · "
                    f"{unresolved} album(s) encore sans pochette.")
         if code:
-            detail = next((error for _, error in progress.failures if error), "")
-            message += f" Erreur pendant la recherche{f' · {detail}' if detail else '.'}"
-        progress.emit(message, 1.0, event="failure" if code else "success")
+            message += " Erreur pendant la recherche."
+        progress.emit(message, 1.0, event="failure" if code else "success", diagnostics=progress.failures)
     return code
 
 
@@ -263,102 +278,171 @@ def revise():
     return enrich([], ["--tout"])
 
 
-def album_preflight(url, root):
+def require_commands(*commands):
+    for command in commands:
+        if which(str(command)) is None:
+            raise ImportIssue("dependency", f"Commande introuvable ou non exécutable : {command}")
+
+
+def album_preflight(url, root, progress):
     parsed = urlsplit(url)
     playlist = parse_qs(parsed.query).get("list", [""])[0]
     if not parsed.path.startswith("/browse/MPRE") and not playlist.startswith("OLAK5uy_"):
         return None
-    if not CATALOGUE_PYTHON.is_file() or not CATALOGUE.is_file():
-        raise ValueError("La recherche d’albums de kara est indisponible.")
     try:
-        result = subprocess.run(
-            [str(CATALOGUE_PYTHON), "-B", str(CATALOGUE), "preparer", url, str(root)],
-            capture_output=True, encoding="utf-8", timeout=70,
-        )
+        command = catalogue_command("preparer", url, str(root))
+        require_commands(command[0])
+        if not Path(command[2]).is_file():
+            raise ImportIssue("dependency", f"Catalogue introuvable : {command[2]}")
+        result = subprocess.run(command, cwd=BIN, capture_output=True, encoding="utf-8", errors="replace", timeout=70)
+    except subprocess.TimeoutExpired as error:
+        raise ImportIssue("network", f"Délai dépassé pendant la recherche de cet album : {url}") from error
+    if result.stderr:
+        progress.log("Catalogue YouTube Music", result.stderr)
+    try:
         report = json.loads(result.stdout)
-    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        raise ValueError("Impossible de vérifier l’album dans la collection.") from error
-    if result.returncode:
-        raise ValueError(report.get("error") or "Impossible de vérifier l’album dans la collection.")
-    return report["data"]
+        if not isinstance(report, dict):
+            raise ValueError("Réponse du catalogue invalide.")
+    except ValueError as error:
+        detail = result.stderr or result.stdout or str(error)
+        raise ImportIssue(failure_category(detail, "processing"), detail) from error
+    if result.returncode or "data" not in report:
+        category = report.get("category")
+        detail = report.get("error") or result.stderr or f"Réponse du catalogue invalide : {url}"
+        raise ImportIssue(category if category in CATEGORIES else "processing", detail)
+    album = report["data"]
+    if album is not None and (not isinstance(album, dict) or not isinstance(album.get("title"), str)
+                              or not isinstance(album.get("url"), str) or not isinstance(album.get("tracks"), list)
+                              or any(not isinstance(track, dict) or not isinstance(track.get("id"), str)
+                                     or not isinstance(track.get("title"), str) for track in album["tracks"])):
+        progress.log("Catalogue YouTube Music", result.stdout)
+        raise ImportIssue("processing", "Données d’album invalides dans la réponse du catalogue.")
+    return album
 
 
-def playlist_positions(url, album):
-    if "list" not in parse_qs(urlsplit(url).query):
-        return None
+@dataclass(frozen=True)
+class SourceTrack:
+    url: str
+    position: int
+    album: str = ""
+
+
+def playlist_entries(playlist, progress):
+    # Resolve a playlist once. Each transfer later uses the exact watch ID from
+    # this snapshot, even if YouTube responds differently to a second tab request.
+    url = f"https://www.youtube.com/playlist?list={playlist}"
     try:
         result = subprocess.run(
-            [*YT_COMMAND, "--flat-playlist", "--skip-download", "--color", "never",
-             "--print", "%(playlist_index)j %(id)j %(title)j", "--", url],
-            capture_output=True, encoding="utf-8", timeout=25,
+            [*YT_COMMAND, "--yes-playlist", "--flat-playlist", "--skip-download",
+             "--print", "%(.{playlist_index,id,title,playlist_title,playlist_count})j", "--", url],
+            cwd=BIN, capture_output=True, encoding="utf-8", errors="replace", timeout=45,
         )
-        if result.returncode:
-            return None
-        entries = {}
-        decoder = json.JSONDecoder()
+    except subprocess.TimeoutExpired as error:
+        stderr = (error.stderr or b"").decode("utf-8", errors="replace")
+        if stderr:
+            progress.log("Résolution de la playlist", stderr)
+        raise ImportIssue("network", f"Délai dépassé : {url}\n{stderr}".strip()) from error
+    if result.stderr:
+        progress.log("Résolution de la playlist", result.stderr)
+    if result.returncode:
+        detail = result.stderr or result.stdout or f"yt-dlp a retourné le code {result.returncode}."
+        raise ImportIssue(failure_category(detail, "playlist"), f"{url}\n{detail.rstrip()}")
+    entries = {}
+    try:
         for line in result.stdout.splitlines():
-            position, _, rest = line.partition(" ")
-            if not position.isdecimal():
-                return None
-            video, end = decoder.raw_decode(rest)
-            title = json.loads(rest[end:].lstrip())
-            if not isinstance(video, str) or not isinstance(title, str) or int(position) in entries:
-                return None
-            entries[int(position)] = (video, title)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+            entry = json.loads(line)
+            index = entry["playlist_index"]
+            if type(index) is not int or index < 1 or index in entries:
+                raise ValueError("position de piste invalide ou dupliquée")
+            if any(entry.get(key) is not None and not isinstance(entry[key], str)
+                   for key in ("id", "title", "playlist_title")):
+                raise ValueError("métadonnées de piste invalides")
+            entries[index] = entry
+    except (KeyError, TypeError, ValueError) as error:
+        progress.log("Résolution de la playlist", result.stdout)
+        raise ImportIssue("processing", f"Réponse de playlist invalide : {url}\n{error}") from error
     if not entries:
-        return None
+        raise ImportIssue("playlist", f"La playlist ne renvoie aucune piste : {url}\n{result.stderr}".strip())
+    return entries
 
-    tracks = (album or {}).get("tracks") or []
-    if not tracks or not any(track["present"] for track in tracks):
-        return sorted(entries)
 
-    def title_key(value):
-        folded = " ".join(normalize("NFKC", value).casefold().replace("’", "'").split())
-        # YouTube Music peut ajouter les crédits d’invités après le titre du morceau.
-        return re.sub(r"\s*[\[(](?:avec|feat\.?|ft\.?|featuring|with)\s+[^)\]]+[\])]$", "", folded)
+def title_key(value):
+    folded = " ".join(normalize("NFKC", value or "").casefold().replace("’", "'").split())
+    # YouTube Music can add featured credits to catalogue titles only.
+    return re.sub(r"\s*[\[(](?:avec|feat\.?|ft\.?|featuring|with)\s+[^)\]]+[\])]$", "", folded)
 
-    same_order = sorted(entries) == list(range(1, len(tracks) + 1)) and all(
-        track["id"] == entries[index][0] or title_key(track["title"]) == title_key(entries[index][1])
-        for index, track in enumerate(tracks, 1)
+
+def available_tracks(paths, root):
+    valid = []
+    for value in paths:
+        if not isinstance(value, str):
+            continue
+        path = Path(value)
+        if (path.is_absolute() and path.is_relative_to(root) and len(path.relative_to(root).parts) >= 3
+                and path.relative_to(root).parts[0] not in {INBOX, "YouTube"}
+                and path.resolve() == path and audio_file(path)):
+            valid.append(str(path))
+    return sorted(set(valid))
+
+
+def known_video_ids(paths):
+    videos = set()
+    for path in paths:
+        try:
+            tags, _ = probe(path)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if video := source_video(tags.get("purl")):
+            videos.add(video)
+    return videos
+
+
+def missing_sources(item, playlist, album):
+    entries = playlist_entries(playlist, item.progress)
+    advertised = [entry.get("playlist_count") for entry in entries.values()]
+    expected = max(max(entries), max((count for count in advertised if type(count) is int), default=0))
+    if len(entries) < expected:
+        item.progress.issue("Résolution de la playlist", "playlist",
+                            f"YouTube a renvoyé {len(entries)} piste(s) pour {expected} positions annoncées.")
+    catalogue = (album or {}).get("tracks", [])
+    aligned = sorted(entries) == list(range(1, len(catalogue) + 1)) and all(
+        track["id"] == entries[index].get("id")
+        or title_key(track["title"]) == title_key(entries[index].get("title"))
+        for index, track in enumerate(catalogue, 1)
     )
-    if same_order:
-        return [index for index, track in enumerate(tracks, 1) if not track["present"]]
+    published = known_video_ids(item.tracks)
+    if not aligned:
+        published.update(track["id"] for track in catalogue if track.get("path"))
+    videos = [entry.get("id") for entry in entries.values()]
+    repeated = {video for video, count in Counter(videos).items() if count > 1}
+    for index, entry in sorted(entries.items()):
+        video = entry.get("id")
+        if (aligned and catalogue[index - 1].get("path")) or (video in published and video not in repeated):
+            continue
+        if not isinstance(video, str) or not VIDEO_ID.fullmatch(video):
+            item.progress.issue("Résolution de la playlist", "playlist",
+                                f"Piste {index} sans identifiant vidéo utilisable : {entry.get('title') or playlist}")
+            continue
+        playlist_title = entry.get("playlist_title")
+        fallback = re.sub(r"^Album\s*-\s*", "", playlist_title) if isinstance(playlist_title, str) else ""
+        album_title = (album or {}).get("title") or fallback
+        if not album and album_title:
+            item.title = album_title
+        item.sources.append(SourceTrack(f"https://www.youtube.com/watch?v={video}", index, album_title))
+    return expected
 
-    # Si les ordres divergent, seuls les identifiants présents sont certains.
-    known_ids = {track["id"] for track in tracks if track["present"] and track["id"]}
-    return [index for index in sorted(entries) if entries[index][0] not in known_ids]
 
-
-def download_audio(url, album, batch, progress):
-    positions = playlist_positions(url, album)
-    if positions == []:
-        if progress:
-            progress.skipped = f"Les pistes de cette playlist sont déjà dans la collection · {album['title']}."
-        else:
-            print(f"Les pistes de cette playlist sont déjà dans la collection · {album['title']}.", flush=True)
-        return None
-    worker_count = min(DOWNLOAD_WORKERS, len(positions)) if positions else 1
-    if progress:
-        progress.selected = tuple(positions) if positions else None
-        progress.workers = worker_count
-    if worker_count > 1:
-        label = f"Téléchargement via Firefox · {worker_count} pistes en parallèle"
-        if progress:
-            progress.emit(label)
-        else:
-            print(f"\n{label}", flush=True)
-    def group(indices):
-        return download_group(url, batch, indices, progress, announce=worker_count == 1,
-                              parallel=worker_count > 1)
-
-    groups = download_groups(positions)
-    if worker_count == 1:
-        return group(groups[0])
-    with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        codes = list(pool.map(group, groups))
-    return next((code for code in codes if code), 0)
+def checked_link(url):
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme == "https" and parsed.hostname in YOUTUBE_HOSTS
+                and parsed.username is None and parsed.port in {None, 443}):
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if "list" not in query or (len(query["list"]) == 1 and PLAYLIST_ID.fullmatch(query["list"][0])):
+                return parsed, query.get("list", [""])[0]
+    except ValueError:
+        pass
+    raise ImportIssue("path", f"Lien HTTPS YouTube Music ou YouTube invalide : {url}")
 
 
 @contextmanager
@@ -374,66 +458,39 @@ def transfer_slot(inbox, progress):
                     continue
                 yield
                 return
-        if progress:
-            with progress.download_lock:
-                if not progress.slot_notice:
-                    progress.slot_notice = True
-                    progress.emit("En attente d’une place de téléchargement…")
+        with progress.download_lock:
+            if not progress.slot_notice:
+                progress.slot_notice = True
+                progress.emit("En attente d’une place de téléchargement…")
         time.sleep(0.15)
 
 
-def download_group(url, batch, indices, progress, *, announce, parallel):
-    label = "Téléchargement via Firefox"
-    options = [
-        *YT_COMMAND, "--abort-on-error",
-        "-f", "bestaudio", "-x", "--audio-format", "best", "--embed-metadata",
-        "--parse-metadata", "%(album,playlist_title)s:%(meta_album)s",
-        "--parse-metadata", "%(track_number,playlist_index)s:%(meta_track)s",
-        "-P", str(batch), "-o", "%(playlist_index)02d - %(title).150B [%(id)s].%(ext)s",
-        *(YT_PROGRESS if progress else ("--newline",) if parallel else ()),
+def literal_metadata(value, field):
+    # Keep catalogue text literal in yt-dlp's FROM:TO template. Delimiters
+    # force single-word titles to be interpreted as text, rather than a field.
+    value = " ".join(value.split()).replace("%", "%%").replace(":", r"\:")
+    return f"={value}!:=%({field})s!"
+
+
+def download_track(source, folder, progress):
+    position = source.position
+    label = f"Téléchargement · piste {position}"
+    metadata = ["--parse-metadata", f"{position}:%(kara_index)s",
+                "--parse-metadata", "%(track_number,kara_index)s:%(meta_track)s"]
+    if source.album:
+        metadata += ["--parse-metadata", literal_metadata(source.album, "kara_album"),
+                     "--parse-metadata", "%(album,kara_album)s:%(meta_album)s"]
+    # yt-dlp moves a file to the visible batch only after post-processing. The
+    # sorter ignores its private work directory and never publishes its drafts.
+    command = [
+        *YT_COMMAND, "--no-playlist", "--abort-on-error", "--retries", "3", "--extractor-retries", "2",
+        "-f", "bestaudio", "-x", "--audio-format", "best", "--embed-metadata", *metadata,
+        "-P", str(folder), "-P", f"temp:{folder / '.download'}",
+        "-o", f"{position:02d} - %(title).150B [%(id)s].%(ext)s",
+        *YT_PROGRESS, "--", source.url,
     ]
-    selection = ["--playlist-items", ",".join(map(str, indices))] if indices else []
-    try:
-        with transfer_slot(batch.parent, progress):
-            return run(label, [*options, *selection, "--", url], progress=progress, download=True,
-                       announce=announce)
-    finally:
-        if progress and indices:
-            with progress.download_lock:
-                progress.transferring.difference_update(indices)
-
-
-def download_groups(positions):
-    if not positions:
-        return [None]
-    count = min(DOWNLOAD_WORKERS, len(positions))
-    return [positions[offset::count] for offset in range(count)]
-
-def prepare(url, progress=None):
-    root = SHARED_LIBRARY
-    inbox = root / INBOX
-    if not inbox.is_dir():
-        raise SystemExit(f"Dossier de réception introuvable : {inbox}")
-    if progress:
-        progress.emit("Vérification de l’album dans la collection…")
-    album = album_preflight(url, root)
-    if album:
-        if album["present"]:
-            message = f"Déjà dans la collection · {album['title']}."
-            if progress:
-                progress.skipped = message
-            else:
-                print(message, flush=True)
-            return 0
-        url = album["url"]
-    batch = new_batch(inbox)
-    try:
-        download = download_audio(url, album, batch, progress)
-        if download is None:
-            return 0
-        return import_audio(batch, download, progress, (album or {}).get("artist"))
-    finally:
-        close_batch(batch, progress)
+    with transfer_slot(folder.parent, progress):
+        return run(label, command, progress=progress, download=True, announce=False)
 
 
 def new_batch(inbox):
@@ -442,92 +499,129 @@ def new_batch(inbox):
     return batch
 
 
-def sort_audio(batch, download, progress, album_artist=None):
-    root = SHARED_LIBRARY
+def sort_audio(batch, progress, album_artist):
     if not any(audio_files(batch)):
-        if progress is None:
-            print("Aucune piste complète à importer.", flush=True)
-        return download or 1, []
+        return 0, []
     with TemporaryDirectory(prefix="kara-rapport-") as temporary:
         report = Path(temporary) / "pistes.json"
         credit = ["--artiste-album", album_artist] if album_artist else []
-        sort = run("Tri dans l’audiothèque partagée",
-                   [str(BIN / "musique-tri"), "--rapport", str(report), *credit, str(batch)],
+        code = run("Tri dans l’audiothèque",
+                   [str(BIN / "musique-tri"), "--bibliotheque", str(SHARED_LIBRARY),
+                    "--rapport", str(report), "--rapport-detaille", *credit, "--", str(batch)],
                    progress=progress, fraction=0.76)
-        tracks = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else []
-    if progress:
-        progress.imported = len(tracks)
-    return int(any((download, sort, not tracks))), tracks
+        if not report.is_file():
+            if not code:
+                progress.issue("Tri dans l’audiothèque", "processing", "Rapport du tri absent.")
+            return 0, []
+        data = json.loads(report.read_text(encoding="utf-8"))
+        tracks = available_tracks(data["tracks"], SHARED_LIBRARY)
+        if len(tracks) != len(data["tracks"]):
+            progress.issue("Tri dans l’audiothèque", "path", "Une destination publiée est inaccessible.")
+    return data["added"], tracks
 
 
 def enrich_tracks(tracks, progress):
     albums = sorted({str(Path(track).parent) for track in tracks})
-    result = enrich(["--", *albums], ["--", *tracks], progress)
-    if progress is None:
-        print(f"\n{len(tracks)} piste(s) dans {', '.join(str(Path(album).relative_to(SHARED_LIBRARY)) for album in albums)}.",
-              flush=True)
-    return result
+    return enrich(["--", *albums], ["--", *tracks], progress)
 
 
-def import_audio(batch, download, progress, album_artist=None):
-    code, tracks = sort_audio(batch, download, progress, album_artist)
-    enrichment = enrich_tracks(tracks, progress) if tracks else 0
-    return int(any((code, enrichment)))
-
-
-def close_batch(batch, progress):
+def close_batch(batch):
+    work = batch / ".download"
+    if work.is_dir() and not any(work.iterdir()):
+        work.rmdir()
     if any(batch.iterdir()):
         visible = batch.with_name(batch.name.removeprefix("."))
         batch.rename(visible)
-        if progress is None:
-            print(f"Fichiers restants dans {visible}.", flush=True)
-    else:
-        batch.rmdir()
+        return visible
+    batch.rmdir()
+    return None
 
 
 @dataclass
 class BatchAlbum:
     url: str
     title: str
-    positions: list[int] | None = None
+    progress: ImportProgress
+    identity: str = ""
+    sources: list[SourceTrack] = field(default_factory=list)
+    tracks: list[str] = field(default_factory=list)
     artist: str | None = None
     folder: Path | None = None
-    progress: ImportProgress | None = None
     fraction: float = 0.0
+    added: int = 0
+    audio_complete: bool = False
     status: str = ""
-    error: str = ""
-    download_code: int = 0
 
 
-def plan_album(item, root, stop):
+def record_error(progress, stage, error, default="processing"):
+    if isinstance(error, ImportIssue):
+        category = error.category
+    elif isinstance(error, OSError):
+        category = "path"
+    else:
+        category = default
+    progress.issue(stage, category, str(error))
+
+
+def album_diagnostics(item):
+    return sorted(item.progress.failures, key=lambda entry: (entry["stage"], entry["detail"]))
+
+
+def plan_album(item, root, previous, stop):
     if stop.is_set():
         return
     try:
-        album = album_preflight(item.url, root)
+        parsed, playlist = checked_link(item.url)
+        old_tracks = previous.get("tracks")
+        if not isinstance(old_tracks, list):
+            old_tracks = []
+        item.tracks = available_tracks(old_tracks, root)
+        if previous.get("title"):
+            item.title = previous["title"]
+        if previous.get("audio_complete") and item.tracks and len(item.tracks) == len(old_tracks):
+            item.audio_complete = True
+            return
+        require_commands(YT_EXECUTABLE)
+        album = album_preflight(item.url, root, item.progress)
         if album:
             item.title = album["title"] or item.title
             item.artist = album.get("artist")
-            item.url = album["url"]
+            item.tracks = sorted(set(item.tracks).union(
+                available_tracks([track.get("path") for track in album["tracks"]], root)))
             if album["present"]:
-                item.status = "present"
+                item.audio_complete = True
                 return
-        item.positions = playlist_positions(item.url, album)
-        if item.positions == []:
-            item.status = "present"
-    except (OSError, ValueError) as error:
-        item.status = "failure"
-        item.error = str(error)
+            _, playlist = checked_link(album["url"])
+        if playlist:
+            item.identity = f"playlist:{playlist}"
+            item.progress.total = missing_sources(item, playlist, album)
+        else:
+            video = source_video(item.url)
+            if not video and parsed.path.startswith(("/shorts/", "/live/")):
+                video = parsed.path.split("/")[2]
+            if not VIDEO_ID.fullmatch(video):
+                raise ImportIssue("path", f"Lien sans playlist ou vidéo YouTube utilisable : {item.url}")
+            item.identity = f"video:{video}"
+            if video not in known_video_ids(item.tracks):
+                item.sources.append(SourceTrack(f"https://www.youtube.com/watch?v={video}", 1))
+            item.progress.total = 1
+        if not item.sources and not item.progress.failures:
+            item.audio_complete = True
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        record_error(item.progress, "Préparation de l’album", error)
 
 
-def prepare_batch(urls, progress, stop):
+def prepare_batch(urls, progress, stop, previous):
     root = SHARED_LIBRARY
     inbox = root / INBOX
-    if not inbox.is_dir():
-        raise ValueError(f"Dossier de réception introuvable : {inbox}")
-    items = [BatchAlbum(url, f"Album {index}") for index, url in enumerate(dict.fromkeys(urls), 1)]
+    if not root.is_dir() or not inbox.is_dir() or inbox.is_symlink():
+        raise ImportIssue("path", f"Bibliothèque ou dossier de réception absent ou symbolique : {inbox}")
+    require_commands("ffmpeg", "ffprobe", BIN / "musique-tri")
     lock = RLock()
     downloading = False
-    enrichment_failed = False
+    items = []
+    tasks = []
+    attempted = 0
 
     def report(item, message, fraction=None):
         with lock:
@@ -535,114 +629,143 @@ def prepare_batch(urls, progress, stop):
                 item.fraction = max(item.fraction, fraction)
             total = sum(album.fraction for album in items) / len(items)
             if downloading:
-                active = sum(len(album.progress.transferring) for album in items if album.progress)
-                message = f"{active}/{DOWNLOAD_WORKERS} transferts actifs · {item.title} · {message}"
-            else:
-                message = f"{item.title} · {message}"
-            progress.emit(message, total)
+                message = f"{attempted}/{len(tasks)} pistes traitées · {message}"
+            progress.emit(f"{item.title} · {message}", total)
+
+    for index, url in enumerate(dict.fromkeys(urls), 1):
+        child = ImportProgress(journal=progress.journal, json_output=progress.json_output, url=url)
+        item = BatchAlbum(url, f"Album {index}", child)
+        child.report = lambda message, fraction, album=item: report(album, message, fraction)
+        child.download_lock = lock
+        items.append(item)
 
     def transfer(job):
-        item, indices = job
+        nonlocal attempted
+        item, source = job
+        started = False
         try:
             with lock:
+                if item.folder is None and stop.is_set():
+                    return
+                started = True
                 if item.folder is None:
-                    if stop.is_set():
-                        return
                     item.folder = new_batch(inbox)
-            code = download_group(item.url, item.folder, indices, item.progress, announce=False, parallel=True)
-        except OSError as error:
+            code = download_track(source, item.folder, item.progress)
             with lock:
-                item.error = str(error)
-            code = 1
+                published = source.position in item.progress.finished_positions
+            if not code and not published:
+                raise ImportIssue("download", "Le téléchargeur n’a publié aucun fichier pour cette piste.")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            record_error(item.progress, f"Téléchargement · piste {source.position}", error, "download")
         finally:
-            if not indices and item.progress:
-                with lock:
-                    item.progress.transferring.clear()
-        if code:
             with lock:
-                item.download_code = code
+                # A failed extraction has no byte progress. Count attempts
+                # once on completion, without counting albums stopped before work.
+                if started:
+                    attempted += 1
+                    report(item, f"Piste {source.position} traitée")
 
     try:
-        progress.emit(f"Vérification des {len(items)} albums dans la collection…", 0.0)
+        progress.emit(f"Vérification de {len(items)} album(s) dans la collection…", 0.0)
         with ThreadPoolExecutor(max_workers=3) as pool:
-            list(pool.map(lambda item: plan_album(item, root, stop), items))
+            list(pool.map(lambda item: plan_album(item, root, previous.get(item.url, {}), stop), items))
 
-        tasks = []
         seen = set()
         for item in items:
-            if item.status in {"present", "failure"}:
-                item.fraction = 1.0
-                continue
-            if item.url in seen:
-                item.status = "duplicate"
-                item.fraction = 1.0
-                continue
-            seen.add(item.url)
-            item.progress = ImportProgress(lambda message, fraction, album=item: report(album, message, fraction))
-            item.progress.download_lock = lock
-            item.progress.selected = tuple(item.positions) if item.positions else None
-            tasks.extend((item, indices) for indices in download_groups(item.positions))
-
-        if not stop.is_set() and tasks:
+            if item.identity and item.sources:
+                if item.identity in seen:
+                    item.status = "duplicate"
+                    continue
+                seen.add(item.identity)
+            item.progress.selected = tuple(source.position for source in item.sources)
+            tasks.extend((item, source) for source in item.sources)
+        if tasks and not stop.is_set():
             downloading = True
-            progress.emit(f"Préparation du téléchargement · jusqu’à {DOWNLOAD_WORKERS} transferts simultanés")
-            with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            report(tasks[0][0], "Recherche des formats audio")
+            with ThreadPoolExecutor(max_workers=min(DOWNLOAD_WORKERS, len(tasks))) as pool:
                 list(pool.map(transfer, tasks))
             downloading = False
 
-        received = []
-        tracks = set()
         for item in items:
-            if item.folder is None:
+            if item.status == "duplicate":
                 continue
-            report(item, "Pistes reçues, préparation de l’import", 0.74)
-            try:
-                code, imported = sort_audio(item.folder, item.download_code, item.progress, item.artist)
-            except (OSError, ValueError) as error:
-                item.error = str(error)
-                code, imported = 1, []
-            item.status = "failure" if code else "imported"
-            if imported:
-                received.append(item)
-                tracks.update(imported)
-            report(item, "Pistes classées" if not code else "Import incomplet ou en échec", 0.81 if imported else 1.0)
-
-        if tracks:
-            def enrichment_progress(message, fraction):
-                if fraction is not None:
-                    for item in received:
-                        item.fraction = max(item.fraction, fraction)
-                progress.emit(message, sum(item.fraction for item in items) / len(items))
-
-            enrichment_failed = bool(enrich_tracks(sorted(tracks), ImportProgress(enrichment_progress)))
-            for item in received:
-                item.fraction = 1.0
+            retry_enrichment = bool(item.tracks and item.url in previous)
+            if item.folder is not None:
+                report(item, "Pistes reçues, préparation du tri", 0.74)
+                try:
+                    item.added, sorted_tracks = sort_audio(item.folder, item.progress, item.artist)
+                    if not sorted_tracks and not item.progress.failures:
+                        raise ImportIssue("download", "Aucune piste complète n’a été reçue.")
+                    item.tracks = sorted(set(item.tracks).union(sorted_tracks))
+                    item.audio_complete = not item.progress.failures
+                except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                    record_error(item.progress, "Tri dans l’audiothèque", error)
+            else:
+                sorted_tracks = []
+            targets = item.tracks if retry_enrichment else sorted_tracks
+            if targets:
+                try:
+                    enrich_tracks(targets, item.progress)
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    record_error(item.progress, "Pochettes et paroles", error)
     finally:
         for item in items:
+            remaining = None
             if item.folder is not None:
-                close_batch(item.folder, item.progress)
+                try:
+                    remaining = close_batch(item.folder)
+                except OSError as error:
+                    record_error(item.progress, "Dossier de réception", error)
+                    remaining = item.folder
+            if item.status != "duplicate":
+                if item.progress.failures:
+                    item.status = "partial" if item.tracks else "failure"
+                elif item.audio_complete:
+                    item.status = "success" if item.added or item.url in previous else "present"
+                else:
+                    item.status = "pending"
 
-    added = sum(item.status == "imported" for item in items)
-    present = sum(item.status == "present" for item in items)
-    duplicates = sum(item.status == "duplicate" for item in items)
-    failures = [item for item in items if item.status == "failure"]
-    pending = sum(not item.status for item in items)
-    summary = [f"{added} album(s) importé(s)", f"{present} déjà en collection"]
-    if duplicates:
-        summary.append(f"{duplicates} lien(s) en double")
-    if pending:
-        summary.append(f"{pending} arrêté(s) avant téléchargement")
-    if failures:
-        first = failures[0]
-        detail = first.error
-        if not detail and first.progress:
-            detail = next((error for _, error in first.progress.failures if error), "")
-        summary += [f"{len(failures)} échec(s)", f"{first.title} · {detail}" if detail else first.title]
-    if enrichment_failed:
-        summary.append("pochettes ou paroles incomplètes après import")
-    fraction = sum(item.fraction for item in items) / len(items)
-    failed = bool(failures) or enrichment_failed
-    progress.emit(" · ".join(summary), fraction, event="failure" if failed else "success")
+            diagnostics = album_diagnostics(item)
+            category = ("partial" if item.status == "partial" else diagnostics[0]["category"] if diagnostics
+                        else "present" if item.status == "present" else None)
+            message = CATEGORIES.get(category) or {
+                "success": "Import terminé", "duplicate": "Lien en double", "pending": "Arrêté avant téléchargement",
+            }[item.status]
+            progress.emit(message, 1.0, event="album", url=item.url, title=item.title, status=item.status,
+                          category=category, diagnostics=diagnostics, added=item.added, tracks=item.tracks,
+                          audio_complete=item.audio_complete, remaining=str(remaining) if remaining else None)
+
+    counts = Counter(item.status for item in items)
+    added = sum(item.added for item in items)
+    failed = bool(counts["failure"] or counts["partial"])
+    if len(items) == 1:
+        item = items[0]
+        if item.status == "failure":
+            category = album_diagnostics(item)[0]["category"]
+            message = f"{CATEGORIES[category]} · {item.title}"
+        elif item.status == "partial":
+            message = f"Importation partielle · {item.title} · {added} piste(s) ajoutée(s)."
+        elif item.status == "present":
+            message = f"Album déjà présent · {item.title}."
+        elif item.status == "pending":
+            message = "Import arrêté avant téléchargement."
+        else:
+            message = f"Import terminé · {added} piste(s) ajoutée(s)."
+    else:
+        summary = [f"{counts['success']} album(s) importé(s)", f"{counts['present']} déjà en collection"]
+        for status, label in (("partial", "importation(s) partielle(s)"), ("failure", "échec(s)"),
+                              ("duplicate", "lien(s) en double"), ("pending", "arrêté(s) avant téléchargement")):
+            if counts[status]:
+                summary.append(f"{counts[status]} {label}")
+        message = " · ".join(summary)
+    event = "failure" if failed else "skip" if not counts["success"] and counts["present"] else "success"
+    fields = {}
+    if not progress.json_output and failed:
+        fields["detail"] = "\n\n".join(
+            f"{item.title} · {diagnostic['stage']}\n{diagnostic['detail']}"
+            for item in items for diagnostic in album_diagnostics(item)
+        )
+    progress.emit(message, 1.0, event=event, **fields)
     return int(failed)
 
 
@@ -658,55 +781,58 @@ def main():
     mode.add_argument("--pochettes-manquantes", action="store_true",
                       help="cherche uniquement les pochettes absentes de la bibliothèque")
     parser.add_argument("--suivi-json", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--reprendre", metavar="JOURNAL", help="relance les liens en échec depuis ce journal")
     args = parser.parse_args()
+    maintenance = (find_missing_lyrics if args.paroles_manquantes else
+                   find_missing_covers if args.pochettes_manquantes else revise if args.revision else None)
+    if args.reprendre and maintenance:
+        parser.error("--reprendre demande un ou plusieurs liens d’album")
     if args.suivi_json and args.revision:
-        parser.error("--suivi-json demande un lien d’album")
+        parser.error("--suivi-json ne prend pas en charge --revision")
     if args.lot and not args.suivi_json:
         parser.error("--lot demande --suivi-json")
-    progress = ImportProgress() if args.suivi_json else None
-    for url in args.lot or ([args.url] if args.url is not None else []):
-        try:
-            parsed = urlsplit(url)
-            valid = parsed.scheme == "https" and parsed.hostname in {
-                "music.youtube.com", "www.youtube.com", "youtube.com", "youtu.be",
-            }
-        except ValueError:
-            valid = False
-        if not valid:
-            message = "Lien HTTPS YouTube Music ou YouTube attendu."
-            if progress:
-                progress.finish(2, message)
-                return 2
-            parser.error(message)
     os.umask(0o007)
-    maintenance = (find_missing_lyrics if args.paroles_manquantes else
-                   find_missing_covers if args.pochettes_manquantes else None)
-    if progress:
-        try:
-            if maintenance:
-                return maintenance(progress)
-            if args.lot:
-                stop = Event()
-                signal.signal(signal.SIGUSR1, lambda *_: stop.set())
-                return prepare_batch(args.lot, progress, stop)
-            result = prepare(args.url, progress)
-        except (SystemExit, OSError, ValueError) as error:
-            progress.finish(1, str(error))
-            return 1
-        except KeyboardInterrupt:
-            progress.finish(130, "Import interrompu.")
-            return 130
-        progress.finish(result)
-        return result
+    progress = ImportProgress(json_output=args.suivi_json)
+    urls = args.lot or ([args.url] if args.url is not None else [])
+    stop = Event()
+    if args.lot:
+        signal.signal(signal.SIGUSR1, lambda *_: stop.set())
     try:
-        if maintenance:
-            return maintenance()
-        return revise() if args.revision else prepare(args.url)
-    except ValueError as error:
-        print(error, file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
+        with ImportLog() as journal:
+            progress.journal = journal
+            journal.write({"event": "header", "version": 1, "library": str(SHARED_LIBRARY), "urls": urls})
+            progress.emit(f"Journal : {journal.path}", event="journal", path=str(journal.path))
+            try:
+                if args.revision:
+                    return revise()
+                if maintenance:
+                    return maintenance(progress)
+                previous = {}
+                if args.reprendre:
+                    original, outcomes = retry_albums(args.reprendre, SHARED_LIBRARY)
+                    if not set(urls) <= original:
+                        raise ImportIssue("path", "Les liens à reprendre doivent provenir du journal sélectionné.")
+                    previous = {url: item for url, item in outcomes.items() if item["status"] in {"failure", "partial"}}
+                    # Allow unfinished links after a fatal error, but never run an
+                    # already successful, skipped or deliberately stopped album.
+                    urls = [url for url in urls if url not in outcomes or url in previous]
+                    if not urls:
+                        progress.emit("Aucun import en échec dans cette sélection.", 1.0, event="skip")
+                        return 0
+                return prepare_batch(urls, progress, stop, previous)
+            except ImportIssue as error:
+                progress.finish_issue(error)
+            except KeyboardInterrupt:
+                progress.finish_issue(ImportIssue("processing", "Import interrompu."))
+                return 130
+            except OSError as error:
+                progress.finish_issue(ImportIssue("path", str(error)))
+            except (ValueError, subprocess.SubprocessError) as error:
+                progress.finish_issue(ImportIssue("processing", str(error)))
+    except OSError as error:
+        progress.journal = None
+        progress.finish_issue(ImportIssue("path", f"Journal d’import inaccessible : {error}"))
+    return 1
 
 
 if __name__ == "__main__":

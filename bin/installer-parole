@@ -1,0 +1,41 @@
+#!/usr/bin/python3 -B
+"""Installe le raccourci Paroles Strawberry dans les applications XDG."""
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+from _kara_paths import BIN, DATA
+
+
+def main():
+    application = BIN / "paroles-strawberry"
+    executable = str(application)
+    if any(character in executable for character in "\n\r\t"):
+        raise SystemExit("Le chemin de Parole contient un caractère de contrôle.")
+    # Exec has a quoting layer of its own, inside the desktop-file value.
+    escaped = "".join("\\" + c if c in '\\"$`' else "%%" if c == "%" else c for c in executable)
+    quoted = '"' + escaped.replace("\\", "\\\\") + '"'
+    directory = DATA / "applications"
+    directory.mkdir(parents=True, exist_ok=True)
+    desktop = directory / "fr.labfy.ParolesStrawberry.desktop"
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, prefix=".parole-", delete=False) as draft:
+        temporary = Path(draft.name)
+        try:
+            draft.write(f"""[Desktop Entry]
+Type=Application
+Name=Paroles Strawberry
+Comment=Paroles synchronisées avec le morceau en cours
+Exec=/usr/bin/python3 -B {quoted}
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true
+""")
+            draft.flush()
+            temporary.replace(desktop)
+        finally:
+            temporary.unlink(missing_ok=True)
+    print(desktop)
+
+
+if __name__ == "__main__":
+    main()
