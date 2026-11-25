@@ -22,6 +22,7 @@ DEFAULT_DOWNLOADS = 10
 MAX_DOWNLOADS = 20
 MEMORY_PRESSURE_SLOTS = 3
 YOUTUBE_DEFAULT_SLOTS = 3
+YOUTUBE_INTERVAL = .5
 
 
 def youtube_audio_slots(value):
@@ -299,8 +300,9 @@ def memory_download_limit():
         pressure = float(Path("/proc/pressure/memory").read_text().splitlines()[0].split()[1].split("=")[1])
     except (OSError, ValueError, StopIteration, IndexError):
         return MEMORY_PRESSURE_SLOTS, "Mesure de la mémoire indisponible"
-    # Leave memory for Strawberry, desktop and video. Each admitted track
-    # may own a downloader and its conversion subprocess at the same time.
+    # Leave memory for Strawberry, the desktop and video. The allowance
+    # covers track workers and buffers. YouTube separately bounds its live
+    # processes, including the ones waiting to acquire a conversion slot.
     limit = max(1, min(MAX_DOWNLOADS, (available - 1280) // 192))
     if pressure >= 1:
         limit = min(limit, MEMORY_PRESSURE_SLOTS)
@@ -343,10 +345,12 @@ def pending_downloads(directory):
 
 
 @contextmanager
-def audio_slot(directory, service, interval=0., notice=None):
+def audio_slot(directory, service, interval=0., notice=None, *, provider_fd=None):
     # Acquisition across competing processes is serialized. The leases
     # themselves outlive admission and are inherited by an external worker.
     # A capped or cooling provider cannot hold a global transfer slot.
+    # A resolver may already own the provider lease. Its ticket must then
+    # compete for the global slot without trying to acquire a second lease.
     profile, max_wait = AUDIO_PROVIDERS[service]
     provider_slots = directory / service
     waiting = directory / "waiting"
@@ -355,10 +359,11 @@ def audio_slot(directory, service, interval=0., notice=None):
     settings = _downloads.get() or (lambda: (DEFAULT_DOWNLOADS, True))
     _, manual = settings()
     prefix = f"{0 if manual else 1}_{time.monotonic_ns():020d}-"
+    suffix = "_" + service + ("+reserved" if provider_fd is not None else "")
     with ExitStack() as transferred:
         with lease(mutex, poll_interval=.01):
             ticket = transferred.enter_context(NamedTemporaryFile(
-                dir=waiting, prefix=prefix, suffix="_" + service, delete=False))
+                dir=waiting, prefix=prefix, suffix=suffix, delete=False))
             flock(ticket.fileno(), LOCK_EX)
         path = Path(ticket.name)
         try:
@@ -385,17 +390,19 @@ def audio_slot(directory, service, interval=0., notice=None):
                             check_space(directory, extra=WORKING_RESERVE)
                     if active < effective and active < min(memory, free):
                         available = {}
-                        for waiter, host in pending_downloads(directory):
+                        for waiter, kind in pending_downloads(directory):
+                            host, _, reserved = kind.partition("+")
                             if host not in AUDIO_PROVIDERS:
                                 continue
-                            if host not in available:
+                            if kind not in available:
                                 cap, _ = AUDIO_PROVIDERS[host]
-                                available[host] = (service_delay(host) <= 0
-                                                   and slot_count(directory / host, cap) < cap)
-                            if not available[host]:
+                                available[kind] = (service_delay(host) <= 0 and
+                                                   (reserved == "reserved" or slot_count(directory / host, cap) < cap))
+                            if not available[kind]:
                                 continue
                             if waiter == path and reserve_service(service, interval):
-                                provider_fd = claim.enter_context(resource_slot(provider_slots, profile))
+                                if provider_fd is None:
+                                    provider_fd = claim.enter_context(resource_slot(provider_slots, profile))
                                 global_fd = claim.enter_context(resource_slot(directory, MAX_DOWNLOADS))
                                 transferred.enter_context(claim.pop_all())
                             break
@@ -417,7 +424,7 @@ def download_limitations(directory):
     if not directory.is_dir():
         return []
     with lease(directory / "admission.lock", wait=False) as fd:
-        hosts = {host for _, host in pending_downloads(directory)} if fd is not None else set()
+        hosts = {kind.partition("+")[0] for _, kind in pending_downloads(directory)} if fd is not None else set()
     result = []
     for service, (cap, _) in AUDIO_PROVIDERS.items():
         # A provider pool can be full before any worker has a waiting ticket.

@@ -1,5 +1,5 @@
 """Durable Parole queue, scoped to the canonical music library."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -24,6 +24,14 @@ HISTORY_DAYS = (0, 7, 30, 90)
 # history entry stays hidden, and pending catalogue acknowledgements survive.
 VISIBLE = "(NOT EXISTS (SELECT 1 FROM import_history WHERE job=jobs.id AND removed=1) OR state IN ('queued','running'))"
 CURRENT = f"(state NOT IN ('done','cancelled') OR refresh>0) AND {VISIBLE}"
+
+
+def read_transfer_settings(database, identity):
+    # Downloader subprocesses reuse the owner's settings without running
+    # initialization or holding a write connection while waiting for admission.
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+        return tuple(db.execute("""SELECT effective,coalesce((SELECT manual FROM jobs WHERE id=?),1)
+                                   FROM download_settings WHERE id=1""", (identity,)).fetchone())
 
 
 def import_key(url):
@@ -294,9 +302,7 @@ class ImportQueue:
             return [self.decode(row) for row in rows]
 
     def transfer_settings(self, identity):
-        with self.connect() as db:
-            return tuple(db.execute("""SELECT effective,coalesce((SELECT manual FROM jobs WHERE id=?),1)
-                                       FROM download_settings WHERE id=1""", (identity,)).fetchone())
+        return read_transfer_settings(self.database, identity)
 
     def history(self, before=None, limit=25):
         with self.connect() as db:

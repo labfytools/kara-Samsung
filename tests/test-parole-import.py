@@ -285,6 +285,7 @@ class AlbumImportTests(unittest.TestCase):
         subprocess.run([TOOLS["ffmpeg"], "-nostdin", "-v", "error", "-f", "lavfi",
                         "-i", "sine=frequency=440:duration=4", "-c:a", "libopus", str(media / "signal.opus")],
                        check=True)
+        cls.signal = (media / "signal.opus").read_bytes()
         from PIL import Image
         cls.cover = media / "cover.jpg"
         Image.new("RGB", (200, 200), "#526c9c").save(cls.cover)
@@ -329,6 +330,30 @@ class AlbumImportTests(unittest.TestCase):
 
     def update_config(self):
         self.manifest.write_text(json.dumps(self.config), encoding="utf-8")
+
+    def hold_media_bodies(self):
+        # Keep real response bodies open while observing leases. Delaying
+        # extractor startup would exercise the resolution phase instead.
+        audio, release = self.signal, Event()
+
+        class HeldAudio(QuietHTTP):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(audio)))
+                self.end_headers()
+                try:
+                    self.wfile.write(audio[:8192])
+                    release.wait(18)
+                    self.wfile.write(audio[8192:])
+                except OSError:
+                    pass
+
+        server = self.enterContext(ThreadingHTTPServer(("127.0.0.1", 0), HeldAudio))
+        Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(release.set)
+        self.config["media"] = f"http://127.0.0.1:{server.server_port}/audio.opus"
+        return release
 
     def run_import(self, *urls, expected=0, cwd=None, previous=None, env=None, command=None):
         command = [str(command or BIN / "kara"), "--suivi-json"]
@@ -1115,6 +1140,47 @@ os.execv(os.environ['REAL_FFMPEG'], [os.environ['REAL_FFMPEG'], *args])
         self.assertIn(content, [track.read_bytes() for track in tracks])
         self.assertEqual(len(list((self.library / self.config["artist"]).rglob("*.flac"))), 3)
 
+    def test_youtube_releases_audio_slots_before_ffmpeg_and_resumes(self):
+        # Hold the actual FFmpeg metadata postprocessor. yt-dlp must keep
+        # its completed draft and a processing lease, with both audio
+        # leases free for a different track.
+        tools = self.temp / "slow-youtube"
+        tools.mkdir()
+        marker = self.temp / "conversion-pid"
+        wrapper = tools / "ffmpeg"
+        wrapper.write_text('''#!/usr/bin/python3 -B
+import os, sys, time
+from pathlib import Path
+if '-metadata' in sys.argv and any('.download' in value for value in sys.argv):
+    Path(os.environ['KARA_TEST_CONVERSION']).write_text(str(os.getpid()))
+    time.sleep(20)
+os.execv(os.environ['REAL_FFMPEG'], [os.environ['REAL_FFMPEG'], *sys.argv[1:]])
+''')
+        wrapper.chmod(0o700)
+        original_path = self.env["PATH"]
+        self.env.update(PATH=str(tools) + os.pathsep + original_path, REAL_FFMPEG=TOOLS["ffmpeg"],
+                        KARA_TEST_CONVERSION=str(marker))
+        queue = ImportQueue(self.temp / "state", self.library)
+        url = playlist("PLENRICH")
+        identity = queue.enqueue([("Enrich", url)])
+        worker = self.launch_managed(queue, identity)
+        self.until(lambda: marker.exists() and bool(marker.read_text()))
+        pid = int(marker.read_text())
+        self.assertEqual(slot_count(self.inbox / ".kara-traitements", PROCESSING), 1)
+        self.assertEqual(slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS), 0)
+        self.assertEqual(slot_count(self.inbox / ".kara-transferts/youtube", MAX_DOWNLOADS), 0)
+        self.await_pause(queue, worker)
+        self.assertFalse(Path(f"/proc/{pid}").exists())
+        draft, = self.inbox.glob(".kara-reprise-*/.download/*.opus")
+        self.assertGreater(draft.stat().st_size, 1024)
+        self.env["PATH"] = original_path
+        queue.configure(paused=False)
+        worker = self.launch_managed(queue, identity)
+        stdout, stderr = worker.communicate(timeout=25)
+        self.assertEqual(worker.returncode, 0, (stdout, stderr))
+        self.assertEqual(queue.outcomes(identity)[url]["status"], "success")
+        self.check_tracks("Enrich", 1, enriched=False)
+
     def test_pause_during_import_lyrics_releases_maintenance_and_resumes(self):
         from _parole_import_enrichment import schedule
 
@@ -1213,9 +1279,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         self.assertEqual(Counter(self.requests.read_text().splitlines()), {"soundPART01": 1, "soundPART02": 1})
 
     def test_one_lot_downloads_tracks_from_several_albums(self):
-        # Leave room for the real catalogue request cadence and yt-dlp
-        # startup variance while the three independent transfers overlap.
-        self.config["transfer_delay"] = 6
+        release = self.hold_media_bodies()
         targets = []
         for number in range(YOUTUBE_DEFAULT_SLOTS):
             key = f"PLPARALLEL{number}"
@@ -1227,6 +1291,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         identity = queue.enqueue(targets)
         worker = self.launch_managed(queue, identity)
         self.until(lambda: slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS) == YOUTUBE_DEFAULT_SLOTS)
+        release.set()
         stdout, stderr = worker.communicate(timeout=35)
         self.assertEqual(worker.returncode, 0, (stdout, stderr))
         self.assertEqual(queue.totals(), (YOUTUBE_DEFAULT_SLOTS,) * 4)
@@ -1234,7 +1299,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
                          {f"parallel{number:03d}": 1 for number in range(YOUTUBE_DEFAULT_SLOTS)})
 
     def test_single_cli_album_uses_configured_track_profile(self):
-        self.config["transfer_delay"] = 6
+        release = self.hold_media_bodies()
         name = "PLCLISLOTS"
         self.config["playlists"][name] = {"title": "Album CLI", "tracks": [
             {"id": f"cli{number:08d}", "title": f"Piste {number}"} for number in range(5)]}
@@ -1244,13 +1309,14 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.stop_worker, worker)
         self.until(lambda: slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS) == 5)
+        release.set()
         stdout, stderr = worker.communicate(timeout=35)
         self.assertEqual(worker.returncode, 0, (stdout, stderr))
         album, = (row for row in map(json.loads, stdout.splitlines()) if row["event"] == "album")
         self.assertEqual(album["added"], 5)
 
     def test_four_lots_share_download_slots_and_finish_after_client_exit(self):
-        self.config["transfer_delay"] = 2
+        release = self.hold_media_bodies()
         targets = []
         for number in range(4):
             title = f"Album {number}"
@@ -1274,6 +1340,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         for worker in workers:
             worker.stdout.close()
             worker.stdout = None
+        release.set()
         for worker, identity in zip(workers, ids):
             self.assertEqual(worker.wait(timeout=45), 0, queue.outcomes(identity))
         restarted = ImportQueue(self.temp / "state", self.library)

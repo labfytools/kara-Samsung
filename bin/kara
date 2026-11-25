@@ -30,9 +30,9 @@ from _kara_import_local import LOCAL, local_entries, local_selection, local_url,
 from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_category, retry_albums
 from _kara_import_queue import COMPLETE, ImportQueue, digest
 from _kara_import_resources import (AUDIO_PROVIDERS, CATALOGUE, MAX_DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE,
-                                   ImportPause, ImportSuspended, audio_slot, check_space, checkpoint as pause_checkpoint,
-                                   current_pause, defer_service, download_scope, lease, resource_slot, terminate_group,
-                                   track_results, wait_service, watch_download)
+                                   YOUTUBE_INTERVAL, ImportPause, ImportSuspended, check_space, checkpoint as pause_checkpoint,
+                                   current_pause, defer_service, download_event, download_scope, lease, resource_slot, terminate_group,
+                                   memory_download_limit, track_results, wait_service, watch_download)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
                          shared_mutation, source_video)
@@ -100,6 +100,7 @@ class ImportProgress:
         self.audio_event = lambda *_args, **_fields: None
         self.artist_route = None
         self.track_pools = {}
+        self.download_context = {}
 
     def emit(self, message, fraction=None, *, event="progress", **fields):
         if self.report is not None:
@@ -206,13 +207,16 @@ class ImportProgress:
 
 
 def run(label, command, *, progress=None, fraction=None, download=False, announce=True,
-        total=0, unit="pistes traitées", span=0.0, resource=None, disk=None, cooperative=False):
+        total=0, unit="pistes traitées", span=0.0, resource=None, disk=None, cooperative=False,
+        download_context=None, phase_changed=None):
     if announce:
         if progress is None:
             print(f"\n{label}", flush=True)
         else:
             progress.emit(label, fraction)
     env = {**os.environ, "KARA_SHARED_WAIT": "suivi" if progress else "texte"}
+    if download_context:
+        env.update(download_context)
     if progress is None:
         return subprocess.run(command, env=env).returncode
     pause_checkpoint()
@@ -279,9 +283,14 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
     watchdog = Thread(target=watch, daemon=True)
     watchdog.start()
     locked_at = None
+    phase = None
     with process:
         for raw in iter(lambda: process.stdout.readline(65536), ""):
             line = raw.rstrip("\r\n")
+            if phase_changed and line.startswith("KARA_PHASE "):
+                phase = line.removeprefix("KARA_PHASE ")
+                phase_changed(phase)
+                continue
             if line == "KARA_ATTENTE_BIBLIOTHEQUE":
                 locked_at = monotonic()
                 progress.emit(f"En attente de la bibliothèque · {label}", fraction)
@@ -342,10 +351,10 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
         if abort:
             category, reason = abort[0]
             detail = f"{reason}\n{detail}"
-        if download and category == "network":
+        if download and phase in {"resolution", "transfer"} and category == "network":
             rate_limited = "429" in detail
             defer_service("youtube", 60 if rate_limited else 12)
-            progress.audio_event("audio-error", network=not rate_limited)
+            progress.audio_event("audio-error", network=phase == "transfer" and not rate_limited)
         progress.issue(label, category, detail, returncode=result, tool=command[0])
     return result
 
@@ -462,7 +471,7 @@ def youtube_metadata(command, progress, timeout):
     directory = SHARED_LIBRARY / INBOX / ".kara-catalogue"
     with resource_slot(directory, CATALOGUE) as slot:
         if command[0] == YT_EXECUTABLE:
-            wait_service("youtube", 0.5)
+            wait_service("youtube", YOUTUBE_INTERVAL)
         try:
             result = bounded_metadata(command, progress.guard + (slot,), timeout)
         except subprocess.TimeoutExpired:
@@ -670,6 +679,9 @@ def download_track(source, folder, progress):
     command = [
         *YT_COMMAND, "--no-playlist", "--continue", "--abort-on-error", "--retries", "2", "--extractor-retries", "1",
         "--retry-sleep", "http:exp=2:15", "--retry-sleep", "extractor:exp=2:15",
+        "--plugin-dirs", str(BIN / "yt-dlp-plugins"),
+        "--use-postprocessor", "KaraAdmission:when=before_dl;phase=transfer",
+        "--use-postprocessor", "KaraAdmission:when=post_process;phase=conversion",
         # Each admitted track owns one media stream. The fragment option
         # enforces that budget even with a user yt-dlp configuration.
         "--concurrent-fragments", "1",
@@ -679,38 +691,57 @@ def download_track(source, folder, progress):
         "-o", f"{position:02d} - %(title).150B [%(id)s].%(ext)s",
         *YT_PROGRESS, "--", source.url,
     ]
-    directory = folder.parent / ".kara-transferts"
-    waiting = monotonic()
-    with audio_slot(directory, "youtube", .5, lambda: progress.emit("En attente d’un téléchargement…")) as slots:
-        progress.measured(label, "download_queue", monotonic() - waiting)
-        check_space(folder, extra=WORKING_RESERVE)
-        # yt-dlp's counters include a previously saved prefix. The stage is
-        # owned by this album, and only this position/video can use its draft.
-        prefix, token = f"{position:02d} - ", f"[{source_video(source.url)}]."
-        partial = folder / ".download"
-        drafts = partial.iterdir() if partial.is_dir() and not partial.is_symlink() else ()
-        offset = max((path.stat().st_size for path in drafts if path.name.startswith(prefix) and
-                      token in path.name and path.name.endswith(".part") and path.is_file() and
-                      not path.is_symlink()), default=0)
+    check_space(folder, extra=WORKING_RESERVE)
+    # yt-dlp's counters include a previously saved prefix. The stage is
+    # owned by this album, and only this position/video can use its draft.
+    prefix, token = f"{position:02d} - ", f"[{source_video(source.url)}]."
+    partial = folder / ".download"
+    drafts = partial.iterdir() if partial.is_dir() and not partial.is_symlink() else ()
+    offset = max((path.stat().st_size for path in drafts if path.name.startswith(prefix) and
+                  token in path.name and path.name.endswith(".part") and path.is_file() and
+                  not path.is_symlink()), default=0)
+    with progress.download_lock:
+        progress.transfer_offsets[position] = offset
+        transfer = progress.transfers[position] = Transfer(
+            monotonic(), lambda event, **fields: progress.audio_event(event, track=position, **fields))
+    last_phase, last_phase_at = None, monotonic()
+
+    def phase_changed(phase):
+        nonlocal last_phase, last_phase_at
+        now = monotonic()
+        if last_phase is not None:
+            progress.measured(label, "youtube_" + last_phase, now - last_phase_at)
+        last_phase, last_phase_at = phase, now
+        if phase == "transfer":
+            transfer.started = transfer.reported_at = now
+            download_event("audio-started", track=position)
+        elif phase == "conversion-wait":
+            transfer.end()
+        progress.audio_event("audio-phase", track=position, phase=phase)
+
+    try:
+        # Bound the number of yt-dlp processes across all lots, including
+        # those awaiting CPU admission. The child inherits this lifetime
+        # lease so a parent exit cannot admit another process prematurely.
+        workers = min(AUDIO_PROVIDERS["youtube"][0], memory_download_limit()[0]) + PROCESSING
+        with resource_slot(folder.parent / ".kara-youtube-travailleurs", workers) as worker:
+            result = run(label, command, progress=progress, download=True, announce=False, disk=folder,
+                         resource=(worker,), download_context=progress.download_context, phase_changed=phase_changed)
+    finally:
         with progress.download_lock:
-            progress.transfer_offsets[position] = offset
-            transfer = progress.transfers[position] = Transfer(
-                monotonic(), lambda event, **fields: progress.audio_event(event, track=position, **fields))
-        try:
-            result = run(label, command, progress=progress, download=True, announce=False, resource=slots, disk=folder)
-        finally:
-            with progress.download_lock:
-                transfer.end()
-                progress.transfers.pop(position, None)
-                progress.transfer_offsets.pop(position, None)
-        if not result and position in progress.finished_positions:
-            progress.audio_event("audio-complete")
-        if transfer.first is not None:
-            progress.measured(label, "first_byte", transfer.first - transfer.started)
-            progress.measured(label, "transfer", transfer.last - transfer.first, bytes=transfer.bytes)
-        if not result and progress.measure_index is not None:
-            observe(progress.measure_index, YOUTUBE, transfer.measurements())
-        return result
+            transfer.end()
+            progress.transfers.pop(position, None)
+            progress.transfer_offsets.pop(position, None)
+        if last_phase:
+            phase_changed("done")
+    if not result and position in progress.finished_positions:
+        progress.audio_event("audio-complete")
+    if transfer.first is not None:
+        progress.measured(label, "first_byte", transfer.first - transfer.started)
+        progress.measured(label, "transfer", transfer.last - transfer.first, bytes=transfer.bytes)
+    if not result and progress.measure_index is not None:
+        observe(progress.measure_index, YOUTUBE, transfer.measurements())
+    return result
 
 
 def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, folder_hint=None, filing_artist=None,
@@ -1654,6 +1685,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
         child.download_lock = RLock()
         child.measure_index = metrics
         child.track_pools = progress.track_pools
+        child.download_context = progress.download_context
         child.announce_provider = lambda source, label: progress.emit(label, event="provider", provider=source)
         if progress.managed:
             child.audio_event = lambda event, **fields: progress.emit(
@@ -1801,7 +1833,10 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
     with ExitStack() as workers:
         # Batch and CLI share the same track admission. Separate dispatch
         # pools prevent one provider's cooldown from starving another.
-        progress.track_pools = {service: workers.enter_context(ThreadPoolExecutor(max_workers=capacity))
+        # The subprocesses waiting for a provider slot or CPU stay bounded
+        # independently of the number of albums in the lot.
+        progress.track_pools = {service: workers.enter_context(ThreadPoolExecutor(
+                                    max_workers=capacity + PROCESSING if service == "youtube" else capacity))
                                 for service, (capacity, _) in AUDIO_PROVIDERS.items()}
         results = album_results()
         workers.callback(results.close)
@@ -1959,6 +1994,9 @@ def main():
                         return 0
                 configuration = queue or ImportQueue()
                 resources.enter_context(download_scope(lambda: configuration.transfer_settings(args.import_file)))
+                progress.download_context = {"KARA_YTDLP_INBOX": str(SHARED_LIBRARY / INBOX),
+                                             "KARA_YTDLP_QUEUE": str(configuration.database),
+                                             "KARA_YTDLP_JOB": args.import_file or ""}
                 return prepare_batch(urls, progress, stop, previous, titles=titles,
                                      routes=queue.routes(job["id"]) if job else None,
                                      on_album=(lambda outcome: queue.album(job["id"], outcome)) if job else None)

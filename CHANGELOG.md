@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Libérer le créneau global pendant la résolution YouTube et transférer la conversion yt-dlp à la file de traitement, en conservant le profil réseau du fournisseur et les fichiers de reprise.
+
 - Figer les compteurs au début de chaque mesure pour permettre au régulateur de monter après une réduction en production. Consigner les essais sur des originaux CC0 d’Internet Archive.
 
 - Supprimer le plafond local de 512 Kio/s, partager les travailleurs audio entre les parcours CLI et Parole et permettre au régulateur de remonter avant la fin de publication d’un album.
