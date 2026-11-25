@@ -234,6 +234,20 @@ class SourceTests(Fixture):
         with self.assertRaises(PermissionError):
             authenticate(self.base, lambda: False, self.base / "auth.json")
 
+    def test_disabled_musicbrainz_cannot_issue_catalogue_requests(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from _parole_work import main
+
+        seed(self.index)
+        controls(self.index, "MusicBrainz", "disabled")
+        output = StringIO()
+        with patch("_parole_work.Index", return_value=self.index), patch(
+                "_parole_work.edition", side_effect=AssertionError("fournisseur désactivé")), patch.object(
+                sys, "argv", ["_parole_work.py", "album", "fixture"]), redirect_stdout(output):
+            main()
+        self.assertEqual(json.loads(output.getvalue())["state"], "temporary")
+
     def test_validated_endpoint_is_reused_and_can_be_disabled(self):
         seed(self.index)
         source = self.source()

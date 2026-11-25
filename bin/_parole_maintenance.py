@@ -631,7 +631,8 @@ class Maintenance:
         self.revision += 1
 
     def authorized_imports(self, settings):
-        if self.import_queue is None or not (settings["import_tracks"] or settings["import_albums"]):
+        if (self.import_queue is None or not (settings["import_tracks"] or settings["import_albums"])
+                or not self.index.source_enabled("YouTube Music")):
             return
         with self.index.db() as db:
             rows = db.execute("""SELECT * FROM import_permissions WHERE job IS NULL ORDER BY decided LIMIT 5""").fetchall()

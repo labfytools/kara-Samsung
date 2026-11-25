@@ -228,6 +228,10 @@ class Index:
             db.execute(f"UPDATE songs SET {','.join(name+'=?' for name in fields)} WHERE id=?",
                        (*fields.values(), identity))
 
+    def source_enabled(self, identity):
+        with self.db() as db:
+            return bool(db.execute("SELECT 1 FROM sources WHERE id=? AND state='active'", (identity,)).fetchone())
+
     def review(self, kind, subject, state, value):
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",

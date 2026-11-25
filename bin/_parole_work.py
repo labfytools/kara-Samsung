@@ -132,8 +132,7 @@ def cover(index, subject):
         row = db.execute("SELECT path FROM songs WHERE edition=? LIMIT 1", (subject,)).fetchone()
         if not row:
             return "excluded"
-        builtin = db.execute("SELECT 1 FROM sources WHERE id='YouTube Music' AND state='active'").fetchone()
-    if not builtin:
+    if not index.source_enabled("YouTube Music"):
         return "temporary"
     folder = Path(row["path"]).parent
     if folder.resolve(strict=True) != folder or len(folder.relative_to(index.root).parts) != 2:
@@ -183,6 +182,8 @@ def main():
         validate_endpoint(index, subject, LyricsEndpoint(payload["host"], payload["path"]),
                           payload["terms"], payload["fixtures"], lyrics_engine().best_transcript)
         result = {"state": "complete"}
+    elif not index.source_enabled("MusicBrainz"):
+        result = {"state": "temporary"}
     else:
         began = monotonic()
         try:
