@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from gi.repository import Gio, GLib, Gtk, Pango
 
 from _kara_import_local import LOCAL, local_target, local_url
-from _kara_import_queue import COMPLETE, ImportQueue, MAX_BATCHES, import_key
+from _kara_import_queue import COMPLETE, HISTORY_DAYS, ImportQueue, MAX_BATCHES, import_key
 from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space, lease, slot_count
 from _kara_import_result import CATEGORIES, ImportIssue
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY
@@ -98,6 +98,9 @@ class AlbumImport(Gtk.Revealer):
         self.by_id = {}
         self.imports_snapshot = ([], {})
         self.next_poll = 0
+        self.next_history_prune = 0
+        self.history_window = None
+        self.refresh_history = None
         self.closing = False
         self.refreshing = {}
         self.queue_error = ""
@@ -205,39 +208,123 @@ class AlbumImport(Gtk.Revealer):
         GLib.idle_add(self.launch_next)
 
     def show_history(self, button):
+        if self.history_window is not None:
+            self.history_window.present()
+            return
+        try:
+            days, _ = self.queue.history_policy()
+        except (OSError, sqlite3.Error) as error:
+            self.message(f"Historique indisponible · {error}", failed=True)
+            return
         window = Gtk.Window(title="Historique des importations", transient_for=button.get_root(),
-                            destroy_with_parent=True, default_width=640, default_height=420)
-        scroll = Gtk.ScrolledWindow()
-        rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12,
-                       margin_bottom=12, margin_start=12, margin_end=12)
+                            destroy_with_parent=True, default_width=740, default_height=460)
+        self.history_window = window
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["panel-content", "import-history"])
+        actions = Gtk.Box(spacing=6)
+        remove = Gtk.Button(label="Supprimer la sélection", sensitive=False)
+        successful = Gtk.Button(label="Effacer les importations réussies")
+        clear = Gtk.Button(label="Effacer tout l’historique", css_classes=["destructive-action"])
+        for action in (remove, successful, clear):
+            actions.append(action)
+        content.append(actions)
+        retention_row = Gtk.Box(spacing=6)
+        retention_label = Gtk.Label(label="Nettoyage automatique")
+        retention = Gtk.DropDown.new_from_strings(["Conserver indéfiniment", "Après 7 jours", "Après 30 jours", "Après 90 jours"])
+        retention_label.set_mnemonic_widget(retention)
+        retention_row.append(retention_label)
+        retention_row.append(retention)
+        content.append(retention_row)
+        message = Gtk.Label(xalign=0, wrap=True, css_classes=["muted"])
+        content.append(message)
+        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.MULTIPLE)
         scroll.set_child(rows)
-        window.set_child(scroll)
+        content.append(scroll)
         more = Gtk.Button(label="Imports précédents")
+        content.append(more)
+        window.set_child(content)
         cursor = None
 
-        def append_page(_button):
+        def append_page(_button=None):
             nonlocal cursor
             try:
                 page = self.queue.history(cursor, limit=26)
-                if more.get_parent() is rows:
-                    rows.remove(more)
                 for row in page[:25]:
                     job = ImportJob(row["targets"], None, identity=row["id"], option=row["option"],
                                     journal=row["journal"])
                     job.outcomes = self.queue.outcomes(row["id"])
                     job.finish_import("success" if row["state"] == "done" else "cancelled",
                                       row["message"], 1., "", notify=False, history=True)
-                    rows.append(job)
+                    selection = Gtk.ListBoxRow(child=job, activatable=False)
+                    rows.append(selection)
                     cursor = row["seq"]
-                if len(page) > 25:
-                    rows.append(more)
-                elif cursor is None:
-                    rows.append(Gtk.Label(label="Aucune importation terminée."))
+                more.set_visible(len(page) > 25)
+                successful.set_sensitive(cursor is not None)
+                clear.set_sensitive(cursor is not None)
             except (OSError, sqlite3.Error) as error:
-                rows.append(Gtk.Label(label=f"Historique indisponible · {error}"))
+                message.set_text(f"Historique indisponible · {error}")
 
+        def reload_history():
+            nonlocal cursor
+            cursor = None
+            while row := rows.get_first_child():
+                rows.remove(row)
+            append_page()
+
+        def apply(change, *, retention_change=False):
+            try:
+                removed = change()
+            except (OSError, sqlite3.Error, ValueError) as error:
+                message.set_text(f"Nettoyage impossible · {error}")
+                return
+            self.launch_next(force=True)
+            message.set_text(f"{removed} entrée(s) retirée(s) de l’historique." if removed else
+                             "Conservation mise à jour." if retention_change else "Aucune entrée à effacer.")
+
+        def configure_history(widget, _property):
+            selected = widget.get_selected()
+            if selected < len(HISTORY_DAYS):
+                apply(lambda: self.queue.configure_history(HISTORY_DAYS[selected]), retention_change=True)
+
+        def confirm_clear(_button):
+            confirm = Gtk.AlertDialog(message="Effacer tout l’historique des importations ?",
+                                      detail="Les entrées disparaîtront aussi sur le mobile.",
+                                      buttons=["Annuler", "Effacer"], cancel_button=0, default_button=0)
+
+            def confirmed(dialog, result):
+                try:
+                    approved = dialog.choose_finish(result) == 1
+                except GLib.Error:
+                    return
+                if approved:
+                    apply(self.queue.delete_history)
+
+            confirm.choose(window, None, confirmed)
+
+        def closed(_window):
+            if self.history_window is window:
+                self.history_window = self.refresh_history = None
+
+        def close_requested(widget):
+            closed(widget)
+            return False
+
+        def remove_selected(_button):
+            identities = [row.get_child().identity for row in rows.get_selected_rows()]
+            apply(lambda: self.queue.delete_history(identities))
+
+        rows.set_placeholder(Gtk.Label(label="Aucune importation terminée.", css_classes=["muted"]))
+        rows.connect("selected-rows-changed", lambda box: remove.set_sensitive(bool(box.get_selected_rows())))
+        remove.connect("clicked", remove_selected)
+        successful.connect("clicked", lambda _: apply(lambda: self.queue.delete_history(successful=True)))
+        clear.connect("clicked", confirm_clear)
+        retention.set_selected(HISTORY_DAYS.index(days))
+        retention.connect("notify::selected", configure_history)
+        window.connect("close-request", close_requested)
+        window.connect("destroy", closed)
+        self.refresh_history = reload_history
         more.connect("clicked", append_page)
-        append_page(more)
+        append_page()
         window.present()
 
     @property
@@ -771,6 +858,9 @@ class AlbumImport(Gtk.Revealer):
             return GLib.SOURCE_REMOVE
         self.next_poll = now + 0.75
         try:
+            if now >= self.next_history_prune:
+                self.queue.prune_history()
+                self.next_history_prune = now + 60
             self.sync_queue()
         except (OSError, sqlite3.Error) as error:
             self.queue_status.set_text(f"File indisponible · {error}")
@@ -852,6 +942,9 @@ class AlbumImport(Gtk.Revealer):
 
     def update_queue_summary(self, capacity, inbox, limitation):
         pause_state = self.queue.pause_state()
+        _, history_revision = self.queue.history_policy()
+        if self.refresh_history and history_revision != self.imports_snapshot[1].get("history_revision"):
+            self.refresh_history()
         self.pause.set_label({"running": "Mettre la file en pause", "suspending": "Suspension en cours…",
                               "paused": "Reprendre la file"}[pause_state])
         self.pause.set_sensitive(pause_state != "suspending")
@@ -874,6 +967,7 @@ class AlbumImport(Gtk.Revealer):
                                                   audio_bytes_per_second=sum(rates) if rates else None,
                                                   progress=progress, paused=pause_state != "running",
                                                   pause_state=pause_state, batches=capacity,
+                                                  history_revision=history_revision,
                                                   limitation=CATEGORIES["space"] if limitation else "",
                                                   max_batches=MAX_BATCHES))
         summary = (f"{active} lot(s) actif(s) · {waiting} en attente · {albums} album(s) audio complet(s) · "

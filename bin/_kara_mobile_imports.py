@@ -1,5 +1,6 @@
 """Requests and catalogue editions for the shared Parole import queue."""
 from collections import OrderedDict
+from contextlib import nullcontext
 import json
 import sqlite3
 from pathlib import Path
@@ -261,7 +262,9 @@ class MobileImports:
         result = []
         requesters = {}
         seeking = history and before is not None
-        with self.lock:
+        with self.lock, (self.queue.connect() if history and self.queue else nullcontext()) as db:
+            if db is not None:
+                db.execute("BEGIN")
             for job in reversed(self.jobs.values()):
                 if not organizer and member not in job["requests"]:
                     continue
@@ -269,6 +272,8 @@ class MobileImports:
                     continue
                 if seeking:
                     seeking = job["id"] != before
+                    continue
+                if db is not None and job.get("task_id") and self.queue.history_removed(job["task_id"], db):
                     continue
                 key = f"queue:{job.get('task_id')}"
                 task = by_id.get(key, {})

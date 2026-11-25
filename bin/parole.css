@@ -112,6 +112,9 @@ headerbar button.sync-ready image { color: @teal; }
     color: @text;
 }
 row:selected { background-color: @surface; color: @lavender; }
+.import-history row { padding: 8px; }
+.import-history row + row { border-top: 1px solid @border; }
+.import-history button.destructive-action:not(:disabled) { color: @red; }
 .library-tree row { min-height: 27px; }
 columnview header button {
     background-color: @surface; color: @muted; border-radius: 0; border-width: 0 0 1px;

@@ -425,25 +425,37 @@
     setImport(null); externalOpen = false; editing = !!state?.me.songs.length; render(); search(true);
   };
   $("import-concurrency").onchange = event => command("import-concurrency", {batches: Number(event.target.value)}).catch(error => notice(error.message));
-  let historyCursor;
+  let historyCursor, historyRevision, historyRequest = 0;
   async function loadHistory(reset) {
     if (!token) return;
+    const request = ++historyRequest;
     const list = $("history-jobs");
+    if (reset) {
+      historyCursor = undefined;
+      $("history-more").hidden = true;
+    }
     try {
       const params = !reset && historyCursor ? new URLSearchParams({before: historyCursor}) : undefined;
       const jobs = await api("historique-imports", undefined, params);
+      if (request !== historyRequest) return;
       if (reset) list.replaceChildren();
       for (const job of jobs) list.append(element("p", job.title + " · " + job.message));
       if (!jobs.length && reset) list.textContent = "Aucun import terminé.";
       if (jobs.length) historyCursor = jobs[jobs.length - 1].cursor || jobs[jobs.length - 1].id;
       $("history-more").hidden = jobs.length < 25;
-    } catch (error) { list.textContent = error.message; }
+    } catch (error) {
+      if (request === historyRequest) list.textContent = error.message;
+    }
   }
   $("history-more").onclick = () => run($("history-more"), () => loadHistory(false));
   $("import-history").ontoggle = () => { if ($("import-history").open) loadHistory(true); };
   function displayImports(party) {
     const queue = party.import_queue;
     if (queue?.batches) {
+      if (queue.history_revision !== historyRevision) {
+        historyRevision = queue.history_revision;
+        if ($("import-history").open) loadHistory(true);
+      }
       $("import-summary").textContent = [
         `${queue.active} lot(s) actif(s)`, `${queue.waiting} en attente`,
         `${queue.albums} album(s) terminé(s)`, `${queue.tracks} piste(s) traitée(s)`,

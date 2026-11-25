@@ -126,6 +126,113 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(historical[0]["journal"], "journal-local")
             self.assertEqual(set(relaunched.outcomes(identity)), {good, missing})
 
+    def test_history_cleanup_keeps_queue_receipts_and_updates_mobile(self):
+        root = Path(self.enterContext(TemporaryDirectory(prefix="parole-history-")))
+        queue = ImportQueue(root / "state", root)
+        mobile = MobileImports(SimpleNamespace(album_import=SimpleNamespace(imports_snapshot=([], {}))))
+
+        def add(number, event=None, *, acknowledge=True, linked=False):
+            url = playlist(f"HISTORY{number}")
+            request = None
+            if linked:
+                request = dict(id=f"{number:032x}", title="Mobile", targets=[("Album", url)], tracks=1,
+                               state="done", message="Intégré", progress=1., requests={digest("member"): []},
+                               notes={}, results={})
+            job = queue.enqueue_maintenance("automatic-receipt", "Album", url) if number == 1 else queue.enqueue(
+                [("Album", url)], request=request)
+            if event is not None:
+                self.assertTrue(queue.claim(job))
+                if event != "cancelled":
+                    queue.album(job, dict(url=url, status="partial" if event == "failure" else "success",
+                                          tracks=[f"piste-{number}"]))
+                queue.finish(job, event, event)
+                if acknowledge:
+                    queue.refreshed([(job, queue.job(job)["refresh"])])
+            return job, url
+
+        success, url = add(1, "success")
+        linked, _ = add(2, "success", linked=True)
+        cancelled, _ = add(3, "cancelled")
+        previous_cancellation, _ = add(4, "cancelled")
+        partial, pending_url = add(5, "failure")
+        integrating, _ = add(6, "success", acknowledge=False)
+        waiting, _ = add(7)
+        mobile.bind_queue(queue)
+        self.assertEqual(len(mobile.snapshot(organizer=True, history=True)), 4)
+        self.assertEqual(len(mobile.snapshot(token="member", history=True)), 1)
+        self.assertEqual(queue.totals(), (1, 2, 2, 3))
+
+        self.assertEqual(queue.delete_history((linked, cancelled, waiting, partial, integrating)), 2)
+        self.assertEqual(queue.history_policy(), (0, 1))
+        self.assertEqual(mobile.snapshot(token="member", history=True), [])
+        self.assertEqual(queue.delete_history(successful=True), 1)
+        self.assertEqual([row["id"] for row in queue.history()], [previous_cancellation])
+        self.assertEqual(queue.delete_history(), 1)
+        self.assertEqual(queue.delete_history(), 0)
+
+        restarted = ImportQueue(root / "state", root)
+        mobile.bind_queue(restarted)
+        self.assertEqual(mobile.snapshot(organizer=True, history=True), [])
+        self.assertEqual(mobile.snapshot(token="member", history=True), [])
+        self.assertEqual(restarted.history_policy(), (0, 3))
+        self.assertEqual(restarted.enqueue_maintenance("automatic-receipt", "Album", url), success)
+        self.assertEqual(restarted.outcomes(success)[url]["tracks"], ["piste-1"])
+        self.assertEqual(restarted.outcomes(partial)[pending_url]["tracks"], ["piste-5"])
+        self.assertTrue(restarted.transition(partial, "partial", "queued", "Reprendre"))
+        self.assertTrue(restarted.claim(partial))
+        self.assertEqual(restarted.enqueue([("Déjà en cours", pending_url)]), partial)
+        self.assertEqual(restarted.job(waiting)["state"], "queued")
+        restarted.refreshed([(integrating, restarted.job(integrating)["refresh"])])
+        self.assertEqual([row["id"] for row in restarted.history()], [integrating])
+        self.assertEqual(restarted.totals(), (0, 1, 0, 2))
+
+    def test_history_retention_uses_closure_date_and_persists(self):
+        for days in (7, 30, 90):
+            with self.subTest(days=days), TemporaryDirectory(prefix="parole-history-") as temporary:
+                root = Path(temporary)
+                queue = ImportQueue(root / "state", root)
+                now = time.time()
+                closed = []
+                for age in (days + 1, days - 1):
+                    identity = queue.enqueue([("Album", playlist(f"RETENTION{age}"))])
+                    self.assertTrue(queue.transition(identity, "queued", "cancelled", "Clôturé"))
+                    with queue.connect(write=True) as db:
+                        db.execute("UPDATE import_history SET closed_at=? WHERE job=?", (now - age * 86400, identity))
+                    closed.append(identity)
+                self.assertEqual(queue.prune_history(), 0)
+                self.assertEqual(queue.configure_history(days), 1)
+                restarted = ImportQueue(root / "state", root)
+                self.assertEqual(restarted.history_policy(), (days, 1))
+                self.assertEqual([row["id"] for row in restarted.history()], [closed[1]])
+                with restarted.connect(write=True) as db:
+                    db.execute("UPDATE import_history SET closed_at=? WHERE job=?", (now - (days + 1) * 86400, closed[1]))
+                self.assertEqual(restarted.prune_history(), 1)
+                self.assertEqual(restarted.configure_history(0), 0)
+                self.assertEqual(restarted.history_policy(), (0, 2))
+                self.assertEqual(restarted.history(), [])
+
+    def test_history_migrates_legacy_closed_lots_without_touching_imports(self):
+        root = Path(self.enterContext(TemporaryDirectory(prefix="parole-history-")))
+        queue = ImportQueue(root / "state", root)
+        identity = queue.enqueue([("Album", playlist("LEGACY"))])
+        self.assertTrue(queue.transition(identity, "queued", "cancelled", "Clôturé"))
+        active = queue.enqueue([("En cours", playlist("ONGOING"))])
+        self.assertTrue(queue.claim(active))
+        before = queue.job(active)
+        date = time.time() - 45 * 86400
+        # Reconstruct the previous schema with an existing settlement receipt.
+        with queue.connect(write=True) as db:
+            db.execute("DROP TRIGGER import_history_closed")
+            db.execute("DROP TABLE import_history")
+            db.execute("DROP TABLE history_policy")
+            db.execute("""INSERT INTO import_recovery_history(job,attempt,stamp,signature,phase,message)
+                          VALUES (?,0,?,'','cancelled','Clôturé')""", (identity, date))
+        migrated = ImportQueue(root / "state", root)
+        self.assertEqual([row["id"] for row in migrated.history()], [identity])
+        self.assertEqual(migrated.job(active), before)
+        self.assertEqual(migrated.configure_history(30), 1)
+        self.assertEqual(migrated.history(), [])
+
     def test_persistent_large_queue_and_shared_admission(self):
         with TemporaryDirectory(prefix="parole-queue-") as temporary:
             root = Path(temporary)
@@ -327,6 +434,10 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual(cached["requests"], 0)
         self.assertGreaterEqual(cached["cache_hits"], 2)
         self.assertTrue(published.with_suffix(".lrc").is_file())
+        queue.refreshed([(identity, queue.job(identity)["refresh"])])
+        self.assertEqual(queue.delete_history(successful=True), 1)
+        self.assertEqual(ImportQueue(self.temp / "state", self.library).history(), [])
+        self.assertEqual(queue.outcomes(identity)[url]["provenance"], complete["provenance"])
         _, items, _ = self.run_import(url)
         self.assertEqual((items[0]["status"], items[0]["processed"]), ("present", 0))
         self.assertEqual(self.requests.read_text(), "")
@@ -1316,11 +1427,84 @@ with ThreadPoolExecutor(max_workers=1) as pool:
     assert len(catalogues[0]) == 2
     assert mobile.jobs[request["job"]]["state"] == "done"
     assert panel.queue.job(desktop.identity)["refresh"] == 0
-    assert panel.imports_snapshot[1]["tracks"] == 2
+    panel.launch_next(force=True)
+    assert panel.imports_snapshot[1]["tracks"] == 0
+    assert panel.imports_snapshot[1]["progress"] == 0
 panel.closing = True
 ''', encoding="utf-8")
         subprocess.run(["dbus-run-session", "--", sys.executable, "-B", script, BIN], cwd=self.temp,
                        env=dict(self.env, GTK_A11Y="none"), timeout=35, check=True)
+
+    @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK"), "set PAROLE_TEST_GTK=1 in a GTK session")
+    def test_history_window_multiselect_success_filter_and_confirmation(self):
+        validation = """
+import gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import GLib, Gtk
+from _kara_import import AlbumImport
+from _kara_import_queue import ImportQueue
+
+panel = AlbumImport()
+owner = Gtk.Window(child=panel)
+queue = panel.queue
+assert panel.configure(paused=True)
+
+def archive(index, state):
+    job = queue.enqueue([(f'Clôture {index}', f'https://www.youtube.com/watch?v=history{index:04}')])
+    assert queue.transition(job, 'queued', state, 'Clôturé')
+    return job
+
+success = archive(0, 'done')
+selection = [archive(i, 'cancelled') for i in (1, 2)]
+last = archive(3, 'cancelled')
+panel.show_history(panel.history_button)
+history = panel.history_window
+
+def traverse(widget):
+    yield widget
+    child = widget.get_first_child()
+    while child is not None:
+        yield from traverse(child)
+        child = child.get_next_sibling()
+
+def button(widget, label):
+    return next(item for item in traverse(widget) if isinstance(item, Gtk.Button) and item.get_label() == label)
+
+rows = next(item for item in traverse(history) if isinstance(item, Gtk.ListBox))
+for row in traverse(rows):
+    if isinstance(row, Gtk.ListBoxRow) and row.get_child().identity in selection:
+        rows.select_row(row)
+assert len(rows.get_selected_rows()) == 2
+button(history, 'Supprimer la sélection').emit('clicked')
+assert {row['id'] for row in queue.history()} == {success, last}
+button(history, 'Effacer les importations réussies').emit('clicked')
+assert [row['id'] for row in queue.history()] == [last]
+
+def respond(label):
+    button(history, 'Effacer tout l’historique').emit('clicked')
+    context = GLib.MainContext.default()
+    while context.pending():
+        context.iteration(False)
+    dialog = next(win for win in Gtk.Window.list_toplevels() if win.get_transient_for() == history)
+    button(dialog, label).emit('clicked')
+    while context.pending():
+        context.iteration(False)
+
+respond('Annuler')
+assert len(queue.history()) == 1
+respond('Effacer')
+assert queue.history() == []
+assert rows.get_row_at_index(0) is None
+retention = next(item for item in traverse(history) if isinstance(item, Gtk.DropDown))
+retention.set_selected(2)
+assert ImportQueue().history_policy() == (30, 3)
+assert panel.imports_snapshot[1]['history_revision'] == 3
+history.close()
+assert panel.history_window is None
+owner.destroy()
+"""
+        subprocess.run(["dbus-run-session", "--", sys.executable, "-B", "-c", validation], cwd=self.temp,
+                       env=dict(self.env, PYTHONPATH=str(BIN), GTK_A11Y="none"), timeout=20, check=True)
 
 
 if __name__ == "__main__":

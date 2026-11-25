@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Nettoyer l’historique des imports par sélection, résultat ou durée, avec une visibilité partagée entre Parole et la salle et des compteurs centrés sur la file.
 - Suspendre les téléchargements et enrichissements actifs de la file d’import, conserver leurs reçus de reprise et partager l’état confirmé entre Parole et le mobile.
 - Publier l’audio des imports gérés avant les recherches de paroles et de pochettes. Confier l’enrichissement à la file de maintenance persistante.
 - Mutualiser les recherches de texte et de LRC, limiter les requêtes par fournisseur et conserver les résultats vérifiés et les absences confirmées.

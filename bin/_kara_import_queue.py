@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+from time import time
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ DEFAULT_BATCHES = 4
 MAX_BATCHES = 8
 COMPLETE = {"success", "present", "duplicate"}
 BUSY = ("queued", "running")
+HISTORY_DAYS = (0, 7, 30, 90)
 
 
 def import_key(url):
@@ -68,6 +70,8 @@ class ImportQueue:
                     refresh INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, seq);
+                CREATE INDEX IF NOT EXISTS jobs_current ON jobs(seq)
+                    WHERE state NOT IN ('done','cancelled') OR refresh>0;
                 CREATE TABLE IF NOT EXISTS outcomes (
                     job TEXT NOT NULL, url TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY (job, url), FOREIGN KEY (job) REFERENCES jobs(id)
@@ -97,8 +101,30 @@ class ImportQueue:
                     artist TEXT NOT NULL, artist_id TEXT NOT NULL, album_id TEXT NOT NULL,
                     PRIMARY KEY(job,url)
                 );
+                CREATE TABLE IF NOT EXISTS history_policy (
+                    id INTEGER PRIMARY KEY CHECK (id=1),
+                    days INTEGER NOT NULL CHECK (days IN (0,7,30,90)), revision INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS import_history (
+                    job TEXT PRIMARY KEY REFERENCES jobs(id),
+                    closed_at REAL NOT NULL,
+                    removed INTEGER NOT NULL DEFAULT 0 CHECK (removed IN (0,1))
+                );
+                CREATE INDEX IF NOT EXISTS history_expiry ON import_history(removed,closed_at);
+                CREATE TRIGGER IF NOT EXISTS import_history_closed AFTER UPDATE OF state,refresh ON jobs
+                    WHEN NEW.state IN ('done','cancelled') AND NEW.refresh=0
+                    BEGIN
+                        INSERT OR IGNORE INTO import_history(job,closed_at) VALUES(NEW.id,unixepoch('subsec'));
+                    END;
             """)
             db.execute("INSERT OR IGNORE INTO settings VALUES (1, 0, ?)", (DEFAULT_BATCHES,))
+            if db.execute("INSERT OR IGNORE INTO history_policy(id,days) VALUES(1,0)").rowcount:
+                # Old lots have no close timestamp. Use the recorded
+                # settlement if available, or begin retention at migration.
+                db.execute("""INSERT OR IGNORE INTO import_history(job,closed_at)
+                              SELECT id,coalesce((SELECT max(stamp) FROM import_recovery_history
+                                            WHERE job=jobs.id AND phase IN ('done','cancelled')),?)
+                              FROM jobs WHERE state IN ('done','cancelled') AND refresh=0""", (time(),))
 
     @contextmanager
     def connect(self, write=False):
@@ -232,10 +258,58 @@ class ImportQueue:
     def history(self, before=None, limit=25):
         with self.connect() as db:
             rows = db.execute("""
-                SELECT * FROM jobs WHERE state IN ('done', 'cancelled') AND refresh=0
+                SELECT jobs.* FROM jobs JOIN import_history ON job=id
+                WHERE state IN ('done', 'cancelled') AND refresh=0 AND removed=0
                     AND (? IS NULL OR seq < ?) ORDER BY seq DESC LIMIT ?
             """, (before, before, limit))
             return [self.decode(row) for row in rows]
+
+    def history_policy(self):
+        with self.connect() as db:
+            row = db.execute("SELECT days,revision FROM history_policy WHERE id=1").fetchone()
+            return row["days"], row["revision"]
+
+    def history_removed(self, identity, db):
+        return db.execute("SELECT 1 FROM import_history WHERE job=? AND removed=1", (identity,)).fetchone() is not None
+
+    def configure_history(self, days):
+        if type(days) is not int or days not in HISTORY_DAYS:
+            raise ValueError("Durée de conservation invalide.")
+        with self.connect(write=True) as db:
+            db.execute("UPDATE history_policy SET days=? WHERE id=1", (days,))
+            return self.expire_history(db, days)
+
+    def prune_history(self):
+        if self.history_policy()[0] == 0:
+            return 0
+        with self.connect(write=True) as db:
+            days = db.execute("SELECT days FROM history_policy WHERE id=1").fetchone()[0]
+            return self.expire_history(db, days)
+
+    def expire_history(self, db, days):
+        if not days:
+            return 0
+        return self.remove_history(db, cutoff=time() - days * 86400)
+
+    def delete_history(self, identities=None, *, successful=False):
+        with self.connect(write=True) as db:
+            return self.remove_history(db, identities=identities, successful=successful)
+
+    @staticmethod
+    def remove_history(db, *, identities=None, successful=False, cutoff=None):
+        # Visibility is durable and independent of the lot and publication
+        # receipts. The state predicate protects work still in the queue,
+        # even if a client sends a stale selection.
+        selection = None if identities is None else json.dumps(list(identities))
+        count = db.execute("""UPDATE import_history SET removed=1
+                              WHERE removed=0 AND (? IS NULL OR closed_at<=?)
+                              AND (? IS NULL OR job IN (SELECT value FROM json_each(?)))
+                              AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id=import_history.job AND refresh=0
+                                          AND state IN ('done','cancelled') AND (NOT ? OR state='done'))""",
+                           (cutoff, cutoff, selection, selection, successful)).rowcount
+        if count:
+            db.execute("UPDATE history_policy SET revision=revision+1 WHERE id=1")
+        return count
 
     def count(self):
         with self.connect() as db:
@@ -293,10 +367,14 @@ class ImportQueue:
 
     def totals(self):
         with self.connect() as db:
+            db.execute("BEGIN")
             albums, tracks = set(), set()
             settled = 0
+            # Drive the join from current lots, using the partial index, so
+            # polling the panel does not scan archived album payloads.
             for url, payload, state in db.execute(
-                    "SELECT url,payload,state FROM outcomes JOIN jobs ON jobs.id=outcomes.job"):
+                    """SELECT url,payload,state FROM jobs CROSS JOIN outcomes
+                       WHERE (state NOT IN ('done','cancelled') OR refresh>0) AND outcomes.job=jobs.id"""):
                 outcome = json.loads(payload)
                 status = outcome["status"]
                 if state != "cancelled" and (status in COMPLETE or
@@ -307,7 +385,8 @@ class ImportQueue:
                 tracks.update(outcome.get("tracks", ()))
             planned = db.execute("""
                 SELECT coalesce(sum(json_array_length(targets)),0)
-                FROM jobs WHERE option IS NULL AND state != 'cancelled'
+                FROM jobs WHERE (state NOT IN ('done','cancelled') OR refresh>0)
+                    AND option IS NULL AND state!='cancelled'
             """).fetchone()[0]
         return len(albums), len(tracks), settled, planned
 
