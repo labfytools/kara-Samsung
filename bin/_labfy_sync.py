@@ -67,6 +67,19 @@ class MusicSync:
     def technical_dirs():
         return tuple(directory.resolve() for directory in (CACHE / "paroles-strawberry", STATE / "kara", DATA / "kara"))
 
+    def album_moves(self):
+        maintenance = self.parent.maintenance
+        if maintenance is None:
+            return {}
+        database = maintenance.index.path
+        moves = {}
+        for source in group_locations(database, index_revision(database)):
+            original = self.library / source
+            destination = grouped_path(self.library, original, database=database)
+            if destination != original and destination.is_dir():
+                moves[source.as_posix()] = destination.relative_to(self.library).as_posix()
+        return moves
+
     def poll(self):
         if self.probe is not None or self.closed or (self.dialog is not None and self.dialog.process is not None):
             return GLib.SOURCE_CONTINUE
@@ -436,6 +449,12 @@ class SyncWindow(Gtk.Window):
         self.conflict_box.set_visible(False)
         self.deletions.set_visible(False)
         self.deletions.set_active(False)
+        layout = None
+        if args[1] == "session" and self.controller.connection.get("pc_layout") and (moves := self.controller.album_moves()):
+            # The receipt supplies names only. Labfy still proves file
+            # identity and checks both sides before its exclusive rename.
+            args.append("--pc-layout")
+            layout = {"action": "pc-layout", "moves": moves}
         try:
             self.process = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDIN_PIPE |
                                               Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
@@ -449,6 +468,8 @@ class SyncWindow(Gtk.Window):
             self.transferring = args[1] == "resume"
             stream = Gio.DataInputStream.new(self.process.get_stdout_pipe())
             stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_line)
+            if layout is not None:
+                self.send_request(layout)
         self.refresh_controls()
 
     def on_line(self, stream, result):
@@ -551,7 +572,9 @@ class SyncWindow(Gtk.Window):
             pending = data.get("media_pending", 0)
             # The engine just closed the journal. Invalidate a previous probe
             # immediately so reopening the dialog cannot offer a stale resume.
-            self.controller.connection.update(recover=False, resume=None, media_repair=bool(pending), media_pending=pending)
+            if not data.get("repair"):
+                self.controller.connection.update(recover=False, resume=None)
+            self.controller.connection.update(media_repair=bool(pending), media_pending=pending)
             if data.get("abandoned"):
                 message = "Plan abandonné. Les fichiers déjà publiés sont conservés."
             elif data.get("repair"):
@@ -836,18 +859,21 @@ class SyncWindow(Gtk.Window):
         self.rescan_on_finish = True
         self.refresh_controls()
         self.controller.log("Plan de synchronisation confirmé.")
-        data = json.dumps({"action": "apply", "conflicts": self.decisions, "delete": allow_delete}).encode() + b"\n"
-        stream = self.process.get_stdin_pipe()
-        stream.write_all_async(data, GLib.PRIORITY_DEFAULT, None, self.approval_sent)
+        self.send_request({"action": "apply", "conflicts": self.decisions, "delete": allow_delete})
 
-    def approval_sent(self, stream, result):
+    def send_request(self, request):
+        data = json.dumps(request, separators=(",", ":")).encode() + b"\n"
+        stream = self.process.get_stdin_pipe()
+        stream.write_all_async(data, GLib.PRIORITY_DEFAULT, None, self.request_sent)
+
+    def request_sent(self, stream, result):
         try:
             stream.write_all_finish(result)
         except GLib.Error as error:
             if not self.closed:
                 self.summary.set_text(error.message)
             self.controller.log(error.message, "ERROR")
-            if self.process:
+            if self.process and stream == self.process.get_stdin_pipe():
                 self.process.send_signal(signal.SIGTERM)
 
     def cancel(self, _button):

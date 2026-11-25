@@ -181,6 +181,23 @@ class SyncTests(unittest.TestCase):
             self.assertEqual((phone / updated).read_bytes(), (pc / updated).read_bytes())
             dialog.close()
 
+            # The album's former layout is only known to the canonical Parole
+            # registry. Android's copy never appeared in a USB baseline.
+            prior_track = Path("Nouveau crédit/Édition/Piste.opus")
+            for library in (pc, phone):
+                (library / prior_track).parent.mkdir(parents=True)
+                (library / prior_track).write_bytes(b"same complete audio and tags")
+            apply(index, preview(pc, "Conservé", ["Nouveau crédit"]), state=base / "state")
+            upload_log = device / "upload-stage.log"
+            previous_uploads = upload_log.stat().st_size
+            dialog = open_preview()
+            self.assertEqual(len(dialog.sections["Renommages"]), 1)
+            confirm(dialog)
+            self.assertFalse((phone / prior_track).exists())
+            self.assertEqual((phone / "Conservé/Édition/Piste.opus").read_bytes(), b"same complete audio and tags")
+            self.assertEqual(upload_log.stat().st_size, previous_uploads)
+            dialog.close()
+
             # A stale Android directory that has no counterpart in the USB
             # baseline must not recreate the album under the former artist.
             (phone / track).parent.mkdir(parents=True)

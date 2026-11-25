@@ -15,6 +15,7 @@
 - Rétablir le bouton de synchronisation USB Labfy dans l’en-tête de Parole, avec aperçu, suivi des opérations vérifiées et bilan dans la catégorie `SYNC`.
 - Exclure les imports en attente et les répertoires techniques de Kara dès l’inventaire USB.
 - Afficher l’espace Android, les compteurs incrémentaux et les mesures USB. Ajouter la suspension avec reprise et l’abandon explicite d’un plan interrompu.
+- Transmettre les déplacements d’albums du registre Parole pour éviter les recopies USB lorsqu’une ancienne version Android est identique.
 
 - Documenter dans `AGENTS.md` les périmètres de commit, les contrôles avant chaque commit et la séparation entre développement et agent de recherche Parole.
 - Conserver le parcours Kara V2 avec salle mobile, démarrage TV autonome, BlackBox, mixage et file d’import persistante commune au bureau et au mobile. Voir `docs/kara-v2.md` et `docs/parole-imports.md`.
