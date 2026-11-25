@@ -128,6 +128,14 @@ class InventoryTests(Fixture):
 
 
 class QueueTests(Fixture):
+    def test_automatic_codex_is_opt_in_and_manual_claims_remain_available(self):
+        self.assertFalse(self.index.settings()["codex_auto"])
+        self.index.enqueue("codex", "automatic", "rev", priority=10, now=5)
+        self.index.enqueue("codex", "manual", "rev", priority=15, now=5, payload={"manual": True})
+        self.assertEqual(self.index.claim(("codex",), 10, codex_auto=False)["subject"], "manual")
+        self.assertIsNone(self.index.claim(("codex",), 10, codex_auto=False))
+        self.assertEqual(self.index.claim(("codex",), 10, codex_auto=True)["subject"], "automatic")
+
     def test_resume_dedupe_cancel_and_budget(self):
         self.index.enqueue("lyrics", "song", "v1", now=100.)
         self.index.enqueue("lyrics", "song", "v1", now=101.)

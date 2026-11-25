@@ -34,7 +34,7 @@ class Tests(unittest.TestCase):
         self.addCleanup(self.journal.close)
         self.controller = SimpleNamespace(index=self.index, journal=self.journal, revision=0, output=self.web_catalogue)
         self.recovery = ImportDiagnostics(self.controller, self.queue, versions=lambda: VERSIONS)
-        self.settings = {**self.index.settings(), "codex": True}
+        self.settings = {**self.index.settings(), "codex": True, "codex_auto": True}
 
     def web_catalogue(self, command, timeout):
         self.assertIn(ALIAS, command)

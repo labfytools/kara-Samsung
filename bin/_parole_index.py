@@ -22,7 +22,7 @@ from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 DEFAULTS = {
     "startup": True, "paused": False, "lyrics": True, "lrc": True, "generate": True,
     "albums": True, "discography": True, "cover": True, "metadata": True, "autoprepare": True, "import_tracks": False, "import_albums": False,
-    "codex": False, "codex_auto": True, "codex_daily": 2, "codex_timeout": 120,
+    "codex": False, "codex_auto": False, "codex_daily": 2, "codex_timeout": 120,
     "codex_model": "", "codex_effort": "low",
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
@@ -178,7 +178,7 @@ class Index:
         with self.db() as db:
             db.execute("UPDATE tasks SET state='suspended' WHERE state='running'")
 
-    def claim(self, kinds, now, *, bucket=None, limit=0, high=False):
+    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
@@ -193,9 +193,11 @@ class Index:
                 UPDATE tasks SET state='running', updated=?, attempts=attempts+1
                 WHERE rowid=(SELECT rowid FROM tasks WHERE kind IN ({placeholders})
                     AND state IN ('queued','suspended','temporary') AND due<=? AND (NOT ? OR priority<=15)
+                    AND (? OR kind!='codex' OR json_extract(payload,'$.manual')=1
+                         OR json_extract(payload,'$.kind') IN ('adapter','import_patch'))
                     ORDER BY max(10,priority-cast((?-due)/86400 AS INTEGER)),due,subject LIMIT 1)
                 RETURNING *
-            """, (now, *kinds, now, high, now)).fetchone()
+            """, (now, *kinds, now, high, codex_auto, now)).fetchone()
             if bucket and task is not None:
                 db.execute("""INSERT INTO daily_usage VALUES(?,?,1) ON CONFLICT(bucket,day)
                               DO UPDATE SET used=used+1""", (bucket, day))

@@ -294,7 +294,8 @@ class ImportDiagnostics:
                 else:
                     delay = max(failure.retry_after, 60 * 4**row["classic"], self.cooldown(row, signature, now))
                     self.decide(row, signature, "retry_wait", f"{LABELS[failure.cause]} · relance différée", now + delay)
-            elif failure.cause == "rate" or not settings["codex"] or "import_failure" not in settings["codex_categories"]:
+            elif (failure.cause == "rate" or not (settings["codex"] and settings["codex_auto"])
+                  or "import_failure" not in settings["codex_categories"]):
                 self.decide(row, signature, "review", f"À vérifier · {LABELS[failure.cause]}")
             else:
                 task, result = self.status(signature)

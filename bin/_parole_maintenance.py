@@ -325,9 +325,11 @@ class Maintenance:
         settings = self.index.settings()
         if not settings["codex"] or kind not in settings["codex_categories"] or not (manual or settings["codex_auto"]):
             return False
+        if manual:
+            query["manual"] = True
         query.update(failure=failure, providers=self.active_sources(kind))
         identity = query["research_id"]
-        if self.index.enqueue("codex", identity, identity, 15 if manual else 48, query):
+        if self.index.enqueue("codex", identity, identity, 15 if manual else 48, query, force=manual):
             self.journal.emit("CODEX", f"Recherche mise en file · {query['artist']} {query['title'] or query['album']}")
             self.wake.set()
         return True
@@ -845,9 +847,10 @@ class Maintenance:
             return
         flags = {"album": "albums", "source": None, "source_probe": None}
         kinds = [kind for kind in NETWORK if flags.get(kind, kind) is None or settings[flags.get(kind, kind)]]
-        if now < settings.get("codex_suspended_until", 0) and "codex" in kinds:
+        if (not settings["codex"] or now < settings.get("codex_suspended_until", 0)) and "codex" in kinds:
             kinds.remove("codex")
-        manual = self.index.claim(kinds, now, bucket="network", limit=settings["network_daily"], high=True)
+        manual = self.index.claim(kinds, now, bucket="network", limit=settings["network_daily"], high=True,
+                                  codex_auto=settings["codex_auto"])
         if manual is not None:
             self.next_network = now + settings["network_interval"]
             self.execute(manual)
@@ -861,7 +864,7 @@ class Maintenance:
             if kind not in kinds:
                 continue
             task = self.index.claim((kind,), now, bucket="network" if kind != "codex" else None,
-                                    limit=settings["network_daily"])
+                                    limit=settings["network_daily"], codex_auto=settings["codex_auto"])
             if task is not None:
                 self.next_network = now + settings["network_interval"]
                 self.execute(task)
