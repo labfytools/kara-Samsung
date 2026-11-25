@@ -23,7 +23,7 @@ from _kara_reference import (METHOD, MIN_LINE_COVERAGE, MIN_TOKEN_CONFIDENCE, MI
                              MIN_WORD_COVERAGE, VERSION, alignment, lrc_text)
 from _kara_refine import MAX_DISAGREEMENT, MIN_LOCAL_CONFIDENCE, VERSION as REFINEMENT_VERSION, refine
 from _kara_stems import MODEL as STEM_MODEL, cached_stems
-from _kara_turbo import MODEL, OVERLAP, RATE, STRIDE, TurboDecoder, build_decoder, digest, transcribe_file
+from _kara_turbo import MODEL, OVERLAP, RATE, STRIDE, ObservedWord, TurboDecoder, build_decoder, digest, transcribe_file
 from _kara_words import LyricVocabulary, word_boundaries
 from _paroles_lrc import MAX_LRC_BYTES, source_orders
 
@@ -170,6 +170,44 @@ def matching_settings(manifest, requested):
             and "local_decoding" not in saved and "local_decoding" in requested
             and {key: value for key, value in saved.items() if key not in differences}
             == {key: value for key, value in requested.items() if key not in differences})
+
+
+def failed_first_pass(receipt, audio_hash, model, settings, requested_language):
+    """Read bounded mix observations from an insufficient Vulkan receipt."""
+    if receipt is None:
+        return None
+    try:
+        draft = receipt["first_pass"]
+        duration, language = receipt["duration"], receipt["language"]
+        # A new lyric candidate can change the alignment, but it must not
+        # silently reuse observations made with another input or decoder.
+        if (receipt["audio"]["sha256"] != audio_hash or receipt["model"] != model
+                or receipt["settings"] != settings or receipt["observation"] != {
+                    "input": "original", "acceleration": "vulkan"}
+                or draft["language_request"] != requested_language
+                or not isinstance(draft["words"], list)
+                or not number(duration, 1, 3600) or not re.fullmatch("[a-z]{2,8}", language)):
+            return None
+        heard = []
+        previous = -1.
+        for text, start, end, confidence, origin in draft["words"]:
+            if (not isinstance(text, str) or not number(start, 0, duration) or start < previous
+                    or not number(confidence, 0, 1)
+                    or end is not None and not number(end, start, duration + .01)
+                    or origin not in (None, "next_token", "segment_end")):
+                return None
+            heard.append(ObservedWord(text, start, end, confidence, origin))
+            previous = start
+        segments = draft["segments"]
+        if not isinstance(segments, list) or any(
+                not (number(segment["start"], 0, duration)
+                     and number(segment["end"], segment["start"], duration)
+                     and number(segment["no_speech"], 0, 1) and isinstance(segment["text"], str))
+                for segment in segments):
+            return None
+        return duration, language, heard, segments
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 class PreparedCache:
@@ -424,7 +462,7 @@ class Preparer:
                 self.trace(song, kind, offset=offset, text=text[offset:offset + 6000], **data)
 
     def first_pass(self, song, lrc, settings, progress, plain=None, timed=None,
-                   provider="Strawberry", rejected=None):
+                   provider="Strawberry", rejected=None, previous_attempt=None):
         audio_file = file_token(song)
         audio_hash = digest(song)
         source_file = lrc_token(lrc)
@@ -456,14 +494,22 @@ class Preparer:
         if not any(vocabulary.tokens):
             raise ValueError("Paroles minutées introuvables.")
         model = self.cache.model_info()
-        duration, language, heard, segments, model_seconds, analysis_seconds = self.transcribe(
-            song, vocabulary.language, progress)
+        saved = failed_first_pass(previous_attempt, audio_hash, model, settings, vocabulary.language)
+        if saved is None:
+            duration, language, heard, segments, model_seconds, analysis_seconds = self.transcribe(
+                song, vocabulary.language, progress)
+        else:
+            progress("cached_transcription", 75)
+            duration, language, heard, segments = saved
+            model_seconds = analysis_seconds = 0.
         if self.trace:
             for index, segment in enumerate(segments):
                 self.trace(song, "original-transcription", index=index, segment=segment, language=language)
         source_order, lines, report, _ = choose_alignment(orders, heard, duration, progress)
         report.update(input="original", duration=round(duration, 3), model_seconds=round(model_seconds, 3),
                       analysis_seconds=round(analysis_seconds, 3), real_time_factor=round(analysis_seconds / duration, 4))
+        if saved is not None:
+            report["reused_first_pass"] = True
         if self.decoder is not None:
             report["native_peak_rss_kib"] = self.decoder.peak_rss_kib()
         audio = {"sha256": audio_hash, "file": audio_file}
@@ -482,7 +528,7 @@ class Preparer:
                 "source_lrc": text, "source_order": source_order, "duration": duration, "lines": lines,
                 "segments": segments, "observation": {
                     "input": "original", **({"acceleration": "vulkan"} if self.require_vulkan else {})},
-                "report": report}
+                "report": report, **({"first_pass": (vocabulary.language, heard)} if self.require_vulkan else {})}
 
     def deepen(self, song, item, progress):
         base = item["report"]
@@ -569,8 +615,11 @@ class Preparer:
                         progress("cached_insufficient", 100)
                         return False, attempt["report"], monotonic() - start, attempt["duration"]
             if item is None:
+                previous_attempt = None
+                if self.require_vulkan and not force and (plain is not None or timed is not None):
+                    previous_attempt = self.cache.cached(song, settings=settings, insufficient=True, verify=False)
                 item = self.first_pass(song, lrc, settings, progress, plain=plain, timed=timed,
-                                       provider=provider, rejected=rejected)
+                                       provider=provider, rejected=rejected, previous_attempt=previous_attempt)
             elif item["settings"] != settings:
                 item["baseline_settings"] = item["settings"]
                 item["settings"] = settings
@@ -582,6 +631,7 @@ class Preparer:
                     and lrc_token(song.with_suffix(".txt")) != item["source"]["plain_file"]):
                 raise ValueError("Le texte de référence a changé pendant la préparation.")
             report = item["report"]
+            first_pass = item.pop("first_pass", None)
             if observed_corrections and report.get("display_only_changes"):
                 # Interactive playback permits display-only interpolation.
                 # Automatic correction may keep inherited timestamps, but a
@@ -599,9 +649,21 @@ class Preparer:
                 report["message"] = "Référence temporelle insuffisante pour noter le morceau."
                 receipt = {k: v for k, v in item.items() if k not in ("lines", "segments", "lrc_sha256")}
                 receipt["state"] = "insufficient"
+                if first_pass is not None and not from_reference:
+                    language_request, heard = first_pass
+                    receipt["first_pass"] = {
+                        "language_request": language_request,
+                        "words": [[w.text, w.start, w.end, w.confidence, w.end_origin] for w in heard],
+                        "segments": item["segments"],
+                    }
                 # The same publication pointer revokes an old generation in
-                # one rename. A restart can never see both readiness states.
-                atomic(folder / "prepared.json", json.dumps(receipt, ensure_ascii=False, allow_nan=False).encode())
+                # one rename. Observations for a retry remain insufficient,
+                # and an oversized optional receipt falls back to redecoding.
+                raw = json.dumps(receipt, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+                if "first_pass" in receipt and len(raw) > MAX_MANIFEST:
+                    receipt.pop("first_pass")
+                    raw = json.dumps(receipt, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+                atomic(folder / "prepared.json", raw)
                 return False, report, monotonic() - start, duration
             progress("saving", 97)
             stats = report["refinement"]

@@ -22,3 +22,4 @@
 - Ajouter un banc silencieux de préparation sur dix morceaux complets et un comparateur de repères sur annotations indépendantes.
 - Distinguer références temporelles et préparations complètes, et afficher les temps moyens observés et les blocs mutualisés dans le bilan nocturne.
 - Continuer la recherche locale des débuts de ligne manquants lorsque la transcription d’un texte sans minutage couvre déjà au moins 95 % des mots.
+- Réutiliser la première transcription Vulkan lors d’une nouvelle tentative sur le même audio et dans la même langue, puis rejouer l’alignement et les reprises locales.

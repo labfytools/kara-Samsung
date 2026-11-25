@@ -208,6 +208,39 @@ class PlainReferenceTests(unittest.TestCase):
             self.assertTrue(all(len(call.args[0]) < 7 * 16_000 * 2 for call in decoder.decode.call_args_list))
             self.assertEqual(parse_lrc(audio.with_suffix(".lrc").read_text()), rows)
 
+    def test_failed_vulkan_first_pass_can_be_reused_with_a_new_text(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio, model = root / "titre.opus", root / "model"
+            audio.write_bytes(b"audio de test")
+            model.write_bytes(b"poids de test")
+            cache = prepare.PreparedCache(root / "prepared", model)
+            worker = prepare.Preparer(cache, require_vulkan=True)
+            one_word = [ObservedWord("musique", 2., None, .92)]
+            plain = "Musique dans la nuit\nLa lumière disparaît".encode()
+            # A single reportable onset is insufficient even after local
+            # evaluation. Negative receipts can seed a new text, never a score.
+            with (patch.object(worker, "settings", return_value={}),
+                  patch.object(worker, "transcribe", return_value=(9., "fr", one_word, [], 0., 1.)) as transcribe,
+                  patch.object(prepare, "pcm_digest", return_value="fixture")):
+                self.assertFalse(worker.prepare(audio, plain=plain)[0])
+                self.assertIsNone(cache.cached(audio, verify=False))
+                ready, report, *_ = worker.prepare(audio, plain=plain + b"!")
+                self.assertFalse(ready)
+                self.assertTrue(report["reused_first_pass"])
+                transcribe.assert_called_once()
+                path = cache.folder(audio) / "prepared.json"
+                damaged = json.loads(path.read_text())
+                damaged["first_pass"]["words"][0][1] = -1
+                path.write_text(json.dumps(damaged))
+                self.assertNotIn("reused_first_pass", worker.prepare(audio, plain=plain)[1])
+                self.assertEqual(transcribe.call_count, 2)
+                worker.prepare(audio, plain=plain, force=True)
+                self.assertEqual(transcribe.call_count, 3)
+                model.write_bytes(b"poids remplaces")
+                self.assertNotIn("reused_first_pass", worker.prepare(audio, plain=plain)[1])
+                self.assertEqual(transcribe.call_count, 4)
+
     def test_refrain_publication_and_move_reuse_the_observed_reference(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -163,3 +163,13 @@ Le profil Équilibré a été essayé sur le même titre de Joe Dassin, capot ou
 ### Cas de génération depuis un texte
 
 Une fixture passe par la publication LRC de Kara avec 24 mots observés sur 25 et quatre débuts de ligne sur cinq. Avant la correction, le seuil de couverture des mots déclenchait l’arrêt avant le premier essai local, alors que la publication exigeait encore le cinquième début. Après la correction, la même fixture publie les cinq lignes. Elle exécute une seule passe globale simulée, puis deux décodages simulés sur des fenêtres de moins de sept secondes. Le PCM encadrant ces fenêtres est décodé par FFmpeg. Aucun seuil acoustique ou de publication ne change. Le test mesure la décision et le travail demandé au décodeur. Le résultat sur les chansons complètes reste à qualifier.
+
+La réutilisation d’une première transcription après refus a été mesurée séparément en Vulkan F16. Les deux passages de chaque cas reçoivent le même audio et le même texte sans minutage. Le second réemploie uniquement les observations du mix. L’alignement et les reprises locales sont rejoués. Dans les trois cas, la trace acoustique ligne par ligne est exactement identique et la référence conserve son état insuffisant.
+
+| Cas en Vulkan F16, sur le mix | Première préparation | Reprise avec transcription réutilisée | Temps évité |
+| --- | ---: | ---: | ---: |
+| Extrait anglais | 31,51 s | 15,85 s | 15,66 s |
+| Extrait français | 56,04 s | 41,83 s | 14,22 s |
+| `en-chant-studio`, 2 min 35, texte Strawberry | 144,57 s | 94,85 s | 49,73 s |
+
+Le reçu temporairement insuffisant ajoute environ 7,0 Kio sur le morceau entier et 2,9 à 3,6 Kio sur les extraits. Les empreintes et les observations brutes sont limitées au même fichier de cache. La préparation initiale et la cadence de la référence sur dix titres ne bénéficient pas de cette réutilisation.

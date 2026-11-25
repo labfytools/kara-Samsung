@@ -37,6 +37,7 @@ HOUR = 3600
 DAY = 24 * HOUR
 PHASES = {"cache": "Vérification du cache", "lyrics": "Paroles de référence",
           "model": "Chargement du modèle", "transcription": "Transcription acoustique",
+          "cached_transcription": "Première transcription réutilisée",
           "comparison": "Comparaison des mots", "correction": "Vérification des repères",
           "words": "Repères mot par mot", "refinement": "Reprises localisées",
           "vocal_refinement": "Vérification sur la voix séparée", "saving": "Enregistrement",
@@ -651,7 +652,7 @@ class Maintenance:
                         measurements = {}
                         if refinement.get("decodes"):
                             measurements["reprises"] = refinement.get("seconds")
-                        if not refinement.get("reused_reference"):
+                        if not refinement.get("reused_reference") and not report.get("reused_first_pass"):
                             measurements["turbo"] = report.get("analysis_seconds")
                         self.night_measures.update((name, seconds) for name, seconds in measurements.items()
                                                    if type(seconds) in (int, float) and isfinite(seconds)
