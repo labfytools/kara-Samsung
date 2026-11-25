@@ -72,17 +72,40 @@ def snapshot(index, *, now=None):
 class Transfer:
     """Measure startup and throughput from observed bytes, keeping their clocks distinct."""
 
-    def __init__(self, started):
+    def __init__(self, started, notify=None):
         self.started = started
         self.first = self.last = None
         self.initial_bytes = self.bytes = 0
+        self.notify = notify
+        self.reported_at = started
+        self.reported_bytes = 0
 
     def received(self, size, instant):
         if size <= self.bytes or instant < (self.last if self.last is not None else self.started):
             return
         if self.first is None:
             self.first, self.initial_bytes = instant, size
+            if self.notify:
+                self.notify("audio-first-byte")
         self.last, self.bytes = instant, size
+        if self.notify and instant - self.reported_at >= .35:
+            self.report_bytes()
+
+    def report_bytes(self):
+        if self.bytes > self.reported_bytes:
+            self.notify("audio-bytes", size=self.bytes - self.reported_bytes)
+            self.reported_bytes = self.bytes
+            self.reported_at = self.last
+
+    def end(self):
+        # End the body interval before checksum, conversion or publication.
+        # Emit once on EOF, failure or suspension, including a short body
+        # whose bytes never reached the reporting interval.
+        if self.notify:
+            if self.first is not None:
+                self.report_bytes()
+                self.notify("audio-transfer-ended")
+            self.notify = None
 
     def measurements(self):
         if self.first is None:

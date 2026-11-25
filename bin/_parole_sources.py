@@ -232,9 +232,7 @@ class AudioDownload:
         self.deadline = deadline
         self.length = length
         self.offset = offset
-        self.transfer = Transfer(started)
-        self.reported_at = started
-        self.reported_bytes = 0
+        self.transfer = Transfer(started, download_event)
         self.finished = False
 
     def read(self, size):
@@ -247,17 +245,11 @@ class AudioDownload:
             checkpoint()
             raise ImportIssue("network", "Transfert audio interrompu.") from error
         checkpoint()
-        now = monotonic()
         if block:
-            self.transfer.received(self.transfer.bytes + len(block), now)
+            self.transfer.received(self.transfer.bytes + len(block), monotonic())
         else:
             self.finished = True
-        if self.finished or now - self.reported_at >= .35:
-            delta = self.transfer.bytes - self.reported_bytes
-            if delta:
-                download_event("audio-bytes", size=delta)
-                self.reported_bytes = self.transfer.bytes
-                self.reported_at = now
+            self.transfer.end()
         return block
 
 
@@ -312,7 +304,10 @@ def open_audio(url, *, registry, provider, service, hosts, expected_size=None, i
             if media and not (media.startswith("audio/") or media in {"application/octet-stream", "application/ogg"}):
                 raise ImportIssue("processing", f"La réponse {provider} n’est pas un fichier audio.")
             stream = AudioDownload(response, started, deadline, length, offset)
-            yield stream
+            try:
+                yield stream
+            finally:
+                stream.transfer.end()
             if stream.finished:
                 observe(registry, provider, stream.transfer.measurements())
             return

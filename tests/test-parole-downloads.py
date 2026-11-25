@@ -326,6 +326,16 @@ class FullEngineTests(unittest.TestCase):
                     self.assertEqual(server.peak, cap)
                     self.assertEqual(sum(event["size"] for event in events if event["event"] == "audio-bytes"),
                                      server.received)
+                    receiving, started, peak = set(), set(), 0
+                    for event in events:
+                        if event["event"] == "audio-first-byte":
+                            self.assertNotIn(event["track"], started)
+                            started.add(event["track"])
+                            receiving.add(event["track"])
+                            peak = max(peak, len(receiving))
+                        elif event["event"] == "audio-transfer-ended":
+                            receiving.remove(event["track"])
+                    self.assertEqual((len(started), receiving, peak), (36, set(), cap))
                     self.assertTrue(outcome["enrichment"]["import_lyrics"])
                     index = Index(case[1], case[0]/"state")
                     with index.db() as db:

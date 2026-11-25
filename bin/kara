@@ -97,6 +97,7 @@ class ImportProgress:
         self.measure_index = None
         self.announce_provider = lambda *_: None
         self.transfers = {}
+        self.transfer_offsets = {}
         self.audio_event = lambda *_args, **_fields: None
         self.artist_route = None
         self.track_pools = {}
@@ -176,10 +177,13 @@ class ImportProgress:
                 transfer = self.transfers.get(index)
                 if transfer is not None:
                     now, size_now = monotonic(), int(downloaded)
-                    previous_bytes = transfer.bytes
-                    transfer.received(size_now, now)
-                    if transfer.bytes > previous_bytes:
-                        self.audio_event("audio-bytes", size=transfer.bytes - previous_bytes)
+                    offset = self.transfer_offsets.get(index, 0)
+                    if transfer.first is None and status == "downloading" and size_now < offset:
+                        # The server restarted the body instead of accepting the range.
+                        self.transfer_offsets[index] = offset = 0
+                    transfer.received(max(0, size_now - offset), now)
+                    if status == "finished":
+                        transfer.end()
                 estimate = max(0.0, min(1.0, int(downloaded) / int(size))) if int(size) > 0 else 0.0
                 if status == "finished":
                     self.track_status("Préparation de l’audio", index, 0.94)
@@ -187,6 +191,8 @@ class ImportProgress:
                     self.track_status("Téléchargement", index, estimate * 0.92)
             elif marker == "KARA_CONVERT":
                 index, status = payload.split()
+                if transfer := self.transfers.get(int(index)):
+                    transfer.end()
                 if status != "finished":
                     self.track_status("Préparation de l’audio", int(index), 0.95)
             elif marker == "KARA_DONE":
@@ -676,9 +682,25 @@ def download_track(source, folder, progress):
                     admitted=lambda: progress.audio_event("audio-started")) as slots:
         progress.measured(label, "download_queue", monotonic() - waiting)
         check_space(folder, extra=WORKING_RESERVE)
+        # yt-dlp's counters include a previously saved prefix. The stage is
+        # owned by this album, and only this position/video can use its draft.
+        prefix, token = f"{position:02d} - ", f"[{source_video(source.url)}]."
+        partial = folder / ".download"
+        drafts = partial.iterdir() if partial.is_dir() and not partial.is_symlink() else ()
+        offset = max((path.stat().st_size for path in drafts if path.name.startswith(prefix) and
+                      token in path.name and path.name.endswith(".part") and path.is_file() and
+                      not path.is_symlink()), default=0)
         with progress.download_lock:
-            transfer = progress.transfers[position] = Transfer(monotonic())
-        result = run(label, command, progress=progress, download=True, announce=False, resource=slots, disk=folder)
+            progress.transfer_offsets[position] = offset
+            transfer = progress.transfers[position] = Transfer(
+                monotonic(), lambda event, **fields: progress.audio_event(event, track=position, **fields))
+        try:
+            result = run(label, command, progress=progress, download=True, announce=False, resource=slots, disk=folder)
+        finally:
+            with progress.download_lock:
+                transfer.end()
+                progress.transfers.pop(position, None)
+                progress.transfer_offsets.pop(position, None)
         if not result and position in progress.finished_positions:
             progress.audio_event("audio-complete")
         elif result:
@@ -1117,7 +1139,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                     def observed(event, **fields):
                         nonlocal started
                         started = started or event == "audio-started"
-                        progress.audio_event(event, **fields)
+                        progress.audio_event(event, track=number, **fields)
 
                     try:
                         if stop.is_set():

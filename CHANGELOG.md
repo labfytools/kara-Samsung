@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Distinguer les pistes qui reçoivent des octets des créneaux occupés par une connexion ou une conversion.
+
 - Appliquer l’accent Lavender aux barres d’import avec un thème GTK local qui impose une autre couleur.
 
 - Préserver l’exécution de la maintenance quand une recherche est préparée à partir d’une édition ou d’une piste manquante.

@@ -29,7 +29,9 @@ from _parole_offer import create_plan, offers_are_equivalent, valid_offer
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
-AUDIO_EVENTS = ("audio-queued", "audio-started", "audio-bytes", "audio-complete", "audio-error", "audio-dropped")
+AUDIO_EVENTS = ("audio-queued", "audio-started", "audio-first-byte", "audio-bytes",
+                "audio-transfer-ended", "audio-complete", "audio-error", "audio-dropped")
+NETWORK_FRESHNESS = 3.
 MEASURED_AUDIO = {"audio-bytes": 0, "audio-complete": 1, "album": 2, "audio-error": 3}
 
 
@@ -990,10 +992,11 @@ class AlbumImport(Gtk.Revealer):
         active, waiting = counts.get("running", 0), counts.get("queued", 0)
         errors = counts.get("failed", 0) + counts.get("partial", 0) + counts.get("review", 0)
         transfers = inbox / ".kara-transferts"
-        downloads = slot_count(transfers, MAX_DOWNLOADS)
+        reserved = slot_count(transfers, MAX_DOWNLOADS)
         processing = slot_count(inbox / ".kara-traitements", PROCESSING)
         running = [job for job in self.imports if job.process is not None]
         now = monotonic()
+        downloads = sum(now - stamp <= NETWORK_FRESHNESS for job in running for stamp in job.network_transfers.values())
         while self.audio_samples and now - self.audio_samples[0][0] > 60.:
             self.audio_samples.popleft()
         rate = sum(amount for stamp, index, amount in self.audio_samples if index == 0 and now - stamp <= 5.) / 5.
@@ -1010,7 +1013,7 @@ class AlbumImport(Gtk.Revealer):
         storage = storage_download_limit(inbox) if inbox.is_dir() else MAX_DOWNLOADS
         if pause_state == "running":
             proposed = self.download_controller.update(
-                now, ceiling, effective, max(1, min(memory, storage)), downloads, waiting_tracks, self.audio_counters,
+                now, ceiling, effective, max(1, min(memory, storage)), reserved, waiting_tracks, self.audio_counters,
                 resource_reason=memory_reason if memory <= storage else "Réserve disque")
             if proposed != effective:
                 self.queue.set_download_limit(proposed)
@@ -1030,7 +1033,8 @@ class AlbumImport(Gtk.Revealer):
         progress = min(1., (settled + progressed) / planned) if planned else 0.
         owner_rows = [job.snapshot() for job in reversed(self.imports)]
         self.imports_snapshot = (owner_rows, dict(active=active, waiting=waiting, albums=albums, tracks=tracks,
-                                                  errors=errors, downloads=downloads, processing=processing,
+                                                  errors=errors, downloads=downloads, download_slots=reserved,
+                                                  processing=processing,
                                                   download_ceiling=ceiling, download_limit=effective,
                                                   waiting_tracks=waiting_tracks, active_albums=active_albums,
                                                   downloaded_per_minute=downloaded, integrated_per_minute=integrated,
@@ -1041,7 +1045,7 @@ class AlbumImport(Gtk.Revealer):
                                                   history_revision=history_revision,
                                                   limitation=" · ".join(reasons),
                                                   max_batches=MAX_BATCHES))
-        summary = (f"{downloads}/{ceiling} téléchargements · {active} lots actifs · "
+        summary = (f"{downloads} pistes en réception · {reserved}/{ceiling} créneaux occupés · {active} lots actifs · "
                    f"{rate / 1024**2:.2f} Mio/s · {waiting_tracks} pistes prêtes en attente\n"
                    f"{downloaded} pistes reçues/min · {integrated} intégrées/min · "
                    f"{active_albums} albums en cours · {albums} audio complets · {waiting} lots en attente\n"
@@ -1146,6 +1150,7 @@ class ImportJob(Gtk.Box):
         self.result = None
         self.outcomes = {}
         self.waiting_transfers = Counter()
+        self.network_transfers = {}
         self.active_albums = set()
         self.unstructured = deque(maxlen=32)
         self.failed_jobs = []
@@ -1293,6 +1298,13 @@ class ImportJob(Gtk.Box):
                     self.waiting_transfers[url] += amount
             elif event in ("audio-started", "audio-dropped") and self.waiting_transfers[url] > 0:
                 self.waiting_transfers[url] -= 1
+            track = payload.get("track")
+            if isinstance(url, str) and type(track) is int and track > 0:
+                key = url, track
+                if event == "audio-transfer-ended":
+                    self.network_transfers.pop(key, None)
+                elif event in ("audio-first-byte", "audio-bytes"):
+                    self.network_transfers[key] = monotonic()
             self.on_update(self, event, payload)
             return
         if event == "album-started":
@@ -1343,6 +1355,7 @@ class ImportJob(Gtk.Box):
             self.stopping = self.stop_ready = False
             self.stop.set_sensitive(False)
             self.waiting_transfers.clear()
+            self.network_transfers.clear()
             self.active_albums.clear()
             self.album_fraction = 0.
             self.message(text)
@@ -1359,6 +1372,7 @@ class ImportJob(Gtk.Box):
 
     def finish_import(self, event, text, fraction, detail, *, notify=True, history=False):
         self.process = None
+        self.network_transfers.clear()
         if self.timer is not None:
             GLib.source_remove(self.timer)
             self.timer = None

@@ -55,6 +55,21 @@ class Measurements(unittest.TestCase):
         clock.received(4, 13.)
         self.assertEqual(clock.measurements(), {STARTUP: 2., THROUGHPUT: 4 * 1024**2})
 
+    def test_audio_body_events_exclude_setup_and_finish_once(self):
+        events = []
+        notify = lambda event, **fields: events.append((event, fields))
+        transfer = Transfer(10., notify)
+        transfer.received(0, 11.)
+        self.assertEqual(events, [])
+        transfer.received(8192, 11.)
+        transfer.received(16384, 11.2)
+        transfer.end()
+        transfer.end()
+        self.assertEqual(events, [("audio-first-byte", {}), ("audio-bytes", {"size": 8192}),
+                                  ("audio-bytes", {"size": 8192}), ("audio-transfer-ended", {})])
+        Transfer(12., notify).end()
+        self.assertEqual(len(events), 4)
+
     def test_lyrics_profiles_use_observed_context_and_form(self):
         tags = contexts({"language": "fr-FR", "genre": "Rap"})
         self.assertEqual(contexts({}), ())

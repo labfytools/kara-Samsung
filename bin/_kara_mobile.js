@@ -459,7 +459,8 @@
       $("import-summary").textContent = [
         `${queue.active} lot(s) actif(s)`, `${queue.waiting} en attente`,
         `${queue.albums} album(s) terminé(s)`, `${queue.tracks} piste(s) traitée(s)`,
-        `${queue.downloads}/${queue.download_ceiling} téléchargement(s)`, `${queue.processing} traitement(s)`,
+        `${queue.downloads} piste(s) en réception`,
+        `${queue.download_slots}/${queue.download_ceiling} créneau(x) occupé(s)`, `${queue.processing} traitement(s)`,
         `${queue.errors} erreur(s)`, queue.limitation
       ].filter(Boolean).join(" · ");
       $("import-controls").hidden = !state.me.organizer;

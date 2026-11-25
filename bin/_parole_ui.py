@@ -203,7 +203,8 @@ class Console:
             except (OSError, sqlite3.Error, ValueError):
                 pass
         lyrics, lrc = self.maintenance.import_activity
-        line = (f"{summary.get('downloads', 0)}/{summary.get('download_ceiling', 0)} téléchargement(s) · "
+        line = (f"{summary.get('downloads', 0)} piste(s) en réception · "
+                f"{summary.get('download_slots', 0)}/{summary.get('download_ceiling', 0)} créneau(x) occupé(s) · "
                 f"{lyrics} recherche(s) de texte · "
                 f"{lrc} recherche(s) LRC · {summary.get('albums', 0)} album(s) audio complet(s)")
         if summary.get("pause_state") in {"suspending", "paused"}:
