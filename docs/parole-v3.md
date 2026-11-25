@@ -95,6 +95,8 @@ La qualification ne fixe pas la précision de 500 ms. Elle demande un corpus don
 
 ### Essais nocturnes sur ArchASP
 
+Le [banc de performances](parole-performances.md) décrit la campagne élargie, la mesure par étape et le témoin temporel indépendant.
+
 Deux morceaux complets ont été traités sur des copies privées, capot ouvert, avec Demucs CPU à deux fils et Turbo Vulkan. Les mesures utilisent temporairement le profil Économie de TLP. Le profil Performance a fait dépasser 85 °C au CPU pendant l’essai initial. En Économie, les essais terminés ont mesuré au plus 74,9 °C au CPU et 61 °C au GPU. Le décodeur strict a confirmé `Vulkan0`. Lorsque le pilote a été masqué pour le seul processus de test, il a quitté avec le code 4 avant d’annoncer sa disponibilité.
 
 | Morceau entier | Demucs | Turbo avec LRC | Couverture mots / lignes | Repères corrigés | Cache alloué |

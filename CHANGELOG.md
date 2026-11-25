@@ -19,3 +19,4 @@
 - Afficher dans Parole le bilan persistant de la dernière session nocturne, avec la cadence et le stockage mesurés.
 - Exiger un backend Vulkan initialisé pour les analyses nocturnes et conserver le profil système sur les versions de TLP dont les demandes survivent au client.
 - Documenter les essais nocturnes ArchASP sur deux morceaux complets et la validation sur secteur, écran éteint.
+- Ajouter un banc silencieux de préparation sur dix morceaux complets et un comparateur de repères sur annotations indépendantes.
