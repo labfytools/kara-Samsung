@@ -56,6 +56,16 @@ FADE_HEIGHT = 56
 LYRIC_FOCUS = 0.33
 LYRIC_FADES = ("fade-near", "fade-far", "fade-distant")
 CSS = (BIN / "parole.css").read_bytes()
+IMPORT_ACCENT = b"""
+@define-color import_lavender #B4BEFE;
+.album-import progressbar > trough > progress {
+    background: @import_lavender;
+    border-color: @import_lavender;
+}
+.album-import entry:focus-within, .album-import spinbutton:focus-within, .album-import button:focus-visible {
+    outline-color: @import_lavender;
+}
+"""
 
 
 def local_track(url):
@@ -412,6 +422,11 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def open_import(self, _button=None):
         if self.import_window is None:
+            # The desktop stylesheet can override GTK's accent at user
+            # priority. Keep the requested palette local to the import panel.
+            accent = Gtk.CssProvider()
+            accent.load_from_data(IMPORT_ACCENT)
+            Gtk.StyleContext.add_provider_for_display(self.get_display(), accent, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
             self.import_window = Gtk.Window(title="Importer des albums", transient_for=self,
                                             destroy_with_parent=True, hide_on_close=True,
                                             default_width=980, default_height=630)

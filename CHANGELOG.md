@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Appliquer l’accent Lavender aux barres d’import avec un thème GTK local qui impose une autre couleur.
+
 - Préserver l’exécution de la maintenance quand une recherche est préparée à partir d’une édition ou d’une piste manquante.
 
 - Régler le plafond global des téléchargements audio entre 1 et 20, avec priorité manuelle, adaptation à la cadence et aux ressources, et statistiques de transfert mesurées.
