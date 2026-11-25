@@ -1,6 +1,7 @@
 """Requests and catalogue editions for the shared Parole import queue."""
 from collections import OrderedDict
 import json
+import sqlite3
 from pathlib import Path
 from subprocess import DEVNULL, run, SubprocessError
 from tempfile import TemporaryFile
@@ -10,7 +11,9 @@ from urllib.request import HTTPRedirectHandler, build_opener
 from uuid import uuid4
 
 from _kara_catalogue import ALBUM, CHANNEL, is_youtube_cover_url
-from _kara_import_result import CATEGORIES
+from _kara_import_queue import digest, import_key
+from _kara_import_resources import check_space
+from _kara_import_result import CATEGORIES, ImportIssue
 from _kara_mobile_room import RoomError
 from _kara_party import search_key
 from _kara_paths import catalogue_command
@@ -40,6 +43,27 @@ class MobileImports:
         self.editions = OrderedDict()
         self.discographies = OrderedDict()
         self.jobs = OrderedDict()
+        self.tokens = {}
+        self.queue = None
+
+    def bind_queue(self, queue):
+        self.queue = queue
+        if queue is None:
+            return
+        for request in queue.requests():
+            request["urls"] = frozenset(url for _, url in request["targets"])
+            self.jobs[request["id"]] = request
+
+    def copy_for_storage(self, job):
+        return {key: value for key, value in job.items() if key != "urls"}
+
+    def persist(self, job):
+        if self.queue is None:
+            raise RoomError("La file Parole est indisponible.", 503)
+        try:
+            self.queue.save_request(self.copy_for_storage(job))
+        except (OSError, sqlite3.Error) as error:
+            raise RoomError("Impossible d’enregistrer la demande dans Parole.", 503) from error
 
     def lookup(self, title, artist):
         if not all(isinstance(value, str) and 1 <= len(value.strip()) <= 120 for value in (title, artist)):
@@ -162,140 +186,188 @@ class MobileImports:
                 track_count = len(album["tracks"])
                 requested = (name, album, data["add"])
             targets = tuple((album["title"], f"https://music.youtube.com/browse/{album['id']}") for album in albums)
+            direct = data.get("direct") is True and data.get("all") is not True and data.get("add") is False
             urls = frozenset(url for _, url in targets)
+            if self.queue is None:
+                raise RoomError("La file Parole est indisponible.", 503)
+            try:
+                check_space(self.queue.directory, state=True)
+            except (OSError, ImportIssue) as error:
+                raise RoomError("Espace disque insuffisant pour enregistrer la demande.", 507) from error
+            # Keep room credentials in memory. Stored approvals carry only the
+            # reference used to find a member while that room is still alive.
+            member = digest(token)
+            self.tokens[member] = token
+            if requested[1] is not None:
+                selected = requested[1]
+                requested = (name, {field: selected.get(field) for field in
+                                    ("requested_title", "requested_artist")}, requested[2])
             for existing in self.jobs.values():
-                if existing["state"] in FINISHED or not urls & existing["urls"]:
-                    continue
-                if urls == existing["urls"]:
-                    existing["requests"][token] = requested
+                if existing["state"] not in FINISHED and urls == existing["urls"]:
+                    revised = {**existing, "requests": {**existing["requests"], member: requested}}
+                    if direct and existing["state"] == "approval":
+                        self.enqueue(revised)
+                    else:
+                        self.persist(revised)
+                    existing.update(revised)
                     return {"job": existing["id"], "state": existing["state"]}
-                raise RoomError("Une autre demande en cours contient déjà certains de ces albums.", 409)
-            if len(self.jobs) >= 32:
-                finished = next((job for job in self.jobs.values() if job["state"] in FINISHED), None)
-                if finished:
-                    self.jobs.pop(finished["id"])
-                else:
-                    raise RoomError("La file des demandes est pleine.", 409)
             identity = uuid4().hex
-            self.jobs[identity] = {"id": identity, "title": title, "targets": targets, "urls": urls,
-                                   "tracks": track_count, "state": "approval", "progress": 0.,
-                                   "message": "En attente de l’organisateur",
-                                   "requests": {token: requested}, "notes": {}, "results": {}}
+            job = {"id": identity, "title": title, "targets": targets, "urls": urls,
+                   "tracks": track_count, "state": "approval", "progress": 0.,
+                   "message": "En attente de l’organisateur",
+                   "requests": {member: requested}, "notes": {}, "results": {}}
+            if direct:
+                self.enqueue(job)
+            else:
+                self.persist(job)
+            self.jobs[identity] = job
         self.control.blackbox.emit("imports", "requested", player=name, job=identity, album=title, albums=len(targets))
-        return {"job": identity, "state": "approval"}
+        return {"job": identity, "state": job["state"]}
+
+    def enqueue(self, job):
+        # The shared scheduler picks up the committed request on its next
+        # poll. Commit the receipt and lot together before replying to mobile.
+        revised = {**job, "state": "queued", "message": "Dans la file Parole"}
+        try:
+            task_id = self.queue.enqueue(job["targets"], request=self.copy_for_storage(revised))
+        except (OSError, sqlite3.Error) as error:
+            raise RoomError("Impossible d’enregistrer ce lot dans Parole.", 503) from error
+        job.update(revised, task_id=task_id)
 
     def pending(self):
         with self.lock:
             return any(job["state"] in ("approval", "queued", "running", "stopping", "integrating")
                        for job in self.jobs.values())
 
-    def snapshot(self, *, organizer=False, token=None):
-        with self.lock:
-            return [{"id": job["id"], "title": job["title"], "tracks": job["tracks"], "albums": len(job["targets"]),
-                     "state": job["state"], "progress": job["progress"], "message": job["message"],
-                     "note": job["notes"].get(token, ""),
-                     **({"requesters": [entry[0] for entry in job["requests"].values()]} if organizer else {})}
-                    for job in reversed(self.jobs.values()) if organizer or token in job["requests"]]
+    def queue_status(self):
+        return self.control.album_import.imports_snapshot[1]
 
-    def action(self, identity, command):
+    def snapshot(self, *, organizer=False, token=None, history=False, before=None):
+        if organizer and history and self.queue:
+            return [dict(id=f"queue:{row['id']}", title=row["targets"][0][0] or "Import par lien",
+                         albums=len(row["targets"]), state=row["state"], message=row["message"],
+                         cursor=str(row["seq"])) for row in self.queue.history(before)]
+        queue_rows, _ = self.control.album_import.imports_snapshot
+        member = digest(token) if token else None
+        by_id = {row["id"]: row for row in queue_rows}
+        result = []
+        requesters = {}
+        seeking = history and before is not None
+        with self.lock:
+            for job in reversed(self.jobs.values()):
+                if not organizer and member not in job["requests"]:
+                    continue
+                if (job["state"] in ("done", "cancelled")) != history:
+                    continue
+                if seeking:
+                    seeking = job["id"] != before
+                    continue
+                key = f"queue:{job.get('task_id')}"
+                task = by_id.get(key, {})
+                if organizer and task and not history:
+                    requesters.setdefault(key, set()).update(request[0] for request in job["requests"].values())
+                    continue
+                state = job["state"]
+                message = job["message"]
+                if task and (state in ("queued", "running") or state != "done" and
+                             task["state"] in ("queued", "running")):
+                    state, message = task["state"], task["message"]
+                result.append(dict(id=job["id"], title=job["title"], tracks=job["tracks"],
+                                   albums=len(job["targets"]), state=state, message=message,
+                                   progress=task.get("progress", job["progress"]),
+                                   completed=task.get("completed", sum(imported(outcome) for outcome in job["results"].values())),
+                                   processed=task.get("processed", len({path for outcome in job["results"].values()
+                                                                        for path in outcome.get("tracks", [])})),
+                                   errors=task.get("errors", 0), note=job["notes"].get(member, ""),
+                                   remaining=task.get("remaining", []),
+                                   players=[request[0] for request in job["requests"].values()] if organizer else []))
+                if history and len(result) == 25:
+                    break
+        if not organizer or history:
+            return result
+        return result + [{**row, "players": sorted(requesters.get(row["id"], ()))}
+                         for row in queue_rows]
+
+    def action(self, identity, command, *, owner=None):
+        panel = self.control.album_import
         if not isinstance(identity, str):
             raise RoomError("Demande inconnue.", 404)
+        if identity.startswith("queue:"):
+            if owner is not None:
+                raise RoomError("Demande inconnue.", 404)
+            apply = {"cancel": panel.cancel_job, "retry": panel.retry_job}.get(command)
+            if apply and apply(identity.removeprefix("queue:")):
+                return
+            raise RoomError("Cette action est indisponible pour ce lot.", 409)
         with self.lock:
             job = self.jobs.get(identity)
-            if job is None:
+            if job is None or owner is not None and (command != "retry" or owner not in job["requests"]):
                 raise RoomError("Demande inconnue.", 404)
             state = job["state"]
             if command == "cancel" and state == "approval":
-                job.update(state="cancelled", message="Demande annulée")
+                revised = {**job, "state": "cancelled", "message": "Demande annulée"}
+                self.persist(revised)
+                job.update(revised)
                 return
-            if command == "cancel" and state in ("queued", "running"):
-                task = job.get("task")
-                if task is None or task.done or task.process is not None and not task.stop_ready:
-                    raise RoomError("Attends le prochain point d’arrêt de l’import.", 409)
-                job.update(state="stopping", message="Arrêt demandé")
-            else:
-                task = None
-            if task is not None:
-                if len(task.jobs) > 1 and len(job["targets"]) == 1:
-                    job.update(state=state)
-                    raise RoomError("L’album appartient à un lot lancé dans Parole.", 409)
-            elif ((command, state) not in (("approve", "approval"), ("retry", "failed"), ("retry", "partial"))
-                  or self.control.remote_party.locked):
+            task_id = job.get("task_id")
+            if command == "approve" and self.control.remote_party.locked:
                 raise RoomError("La demande ne peut pas être lancée maintenant.", 409)
-            if task is None:
-                targets = job["targets"]
-                journal = job.get("journal") if command == "retry" else None
-                if journal:
-                    targets = tuple((title, url) for title, url in targets
-                                    if not imported(job["results"].get(url, {}))
-                                    and job["results"].get(url, {}).get("status") != "pending")
-                    if not targets:
-                        raise RoomError("Aucun album en échec à relancer.", 409)
-                job.update(state="queued", message="Dans la file Parole", progress=0.)
-        if task is not None:
-            if task.process is None:
-                task.finish_import("cancelled", "Demande annulée", None, "")
-            else:
-                task.stop_batch(None)
-            return
-        from _kara_import import import_key
-        keys = {import_key(url) for _, url in targets}
-        occupied = next((item for item in self.control.album_import.imports
-                         if not item.done and keys.intersection(item.keys)), None)
-        if occupied is not None and len(job["targets"]) > 1:
+            if command == "approve" and state == "approval":
+                revised = {**job, "state": "queued", "message": "Dans la file Parole"}
+                try:
+                    if self.queue is None:
+                        raise OSError("File indisponible")
+                    check_space(self.queue.directory, state=True)
+                    task_id = self.queue.enqueue(job["targets"], request=self.copy_for_storage(revised))
+                except (OSError, ImportIssue, sqlite3.Error) as error:
+                    raise RoomError("Impossible d’enregistrer ce lot dans Parole.", 503) from error
+                job.update(revised, task_id=task_id)
+            elif command not in ("retry", "cancel") or not task_id:
+                raise RoomError("La demande ne peut pas être lancée maintenant.", 409)
+        if command == "approve":
+            panel.launch_next(force=True)
+        elif command == "retry" and panel.retry_job(task_id):
             with self.lock:
-                job.update(state=state, message="Des albums du lot sont déjà en cours dans Parole")
-            raise RoomError(job["message"], 409)
-        task = occupied or self.control.album_import.enqueue(targets, journal=journal)
-        with self.lock:
-            if task is None:
-                job.update(state=state, message="La file Parole est pleine")
-                raise RoomError(job["message"], 409)
-            job["task"] = task
-            if task.process is not None:
-                job.update(state="running", message="Import en cours")
-        if task.done:
-            self.update(task, "finished", {"event": "failure"})
+                job.update(state="queued", message="Relance en attente…", progress=0.)
+                self.persist(job)
+        elif command == "cancel":
+            task = panel.by_id.get(task_id)
+            if task and task.keys == {import_key(url) for _, url in job["targets"]} and panel.cancel_job(task_id):
+                return
+            raise RoomError("Ce lot ne peut pas être annulé depuis cette demande.", 409)
+        else:
+            raise RoomError("Aucun album en échec à relancer.", 409)
 
     def update(self, task, kind, payload):
-        # The original import journal remains the full local diagnostic. Public
-        # snapshots only expose sanitized stage/summary fields, never subprocess text.
+        if kind not in ("settled", "recovered"):
+            return
+        integrating = []
+        # Only sanitized states reach the room. The journal and audio paths
+        # remain local for diagnostics and catalogue integration.
+        outcomes_by_key = {import_key(url): outcome for url, outcome in task.outcomes.items()}
         with self.lock:
-            jobs = [job for job in self.jobs.values() if job.get("task") is task]
-            for job in jobs:
-                if kind == "running":
-                    job.update(state="running", message="Import en cours")
-                if kind == "progress":
-                    fraction = payload.get("fraction")
-                    if type(fraction) in (int, float) and 0 <= fraction <= 1:
-                        job["progress"] = max(job["progress"], fraction)
-                    message = payload.get("message", "")
-                    if any(word in message.casefold() for word in ("collection", "piste", "paroles", "tri", "pochette")):
-                        job["message"] = message[:200]
-                if kind == "finished":
-                    # A retry only reports the albums it ran. Retain the
-                    # successful releases so the whole request can integrate.
-                    job["results"].update((url, outcome) for url, outcome in task.outcomes.items()
-                                          if url in job["urls"])
-                    outcomes = [job["results"].get(url, {}) for _, url in job["targets"]]
-                    statuses = [outcome.get("status") for outcome in outcomes]
-                    complete = sum(imported(outcome) for outcome in outcomes)
-                    job["journal"] = task.journal
-                    if complete == len(outcomes):
-                        job.update(state="integrating", message="Actualisation de la bibliothèque")
-                    elif all(status == "pending" for status in statuses) or payload.get("event") == "cancelled":
-                        job.update(state="cancelled", message="Demande annulée")
-                    elif complete or "partial" in statuses:
-                        job.update(state="partial", message="Import partiel")
-                    else:
-                        audio_unavailable = all(outcome.get("category") == "audio_unavailable" for outcome in outcomes)
-                        job.update(state="failed", message=CATEGORIES["audio_unavailable"] if audio_unavailable
-                                   else "Échec de l’import")
-        self.control.blackbox.emit("imports", "error" if kind == "finished" and payload.get("event") == "failure"
-                                   else kind or "progress", progress=payload.get("fraction"),
-                                   status=payload.get("status"), category=payload.get("category"))
-        if kind == "finished":
-            self.control.refresh_after_import(task, [job for job in jobs if job["state"] == "integrating"])
+            for job in self.jobs.values():
+                if job.get("task_id") != task.identity or job["state"] == "done":
+                    continue
+                results = {url: outcomes_by_key[import_key(url)] for _, url in job["targets"]
+                           if import_key(url) in outcomes_by_key}
+                outcomes = [results.get(url, {}) for _, url in job["targets"]]
+                complete = sum(imported(outcome) for outcome in outcomes)
+                if complete == len(outcomes):
+                    state, message = "integrating", "Actualisation de la bibliothèque"
+                    integrating.append(job)
+                elif task.final_event == "cancelled":
+                    state, message = "cancelled", "Demande annulée"
+                elif complete or any(outcome.get("status") == "partial" for outcome in outcomes):
+                    state, message = "partial", "Import partiel"
+                else:
+                    unavailable = all(outcome.get("category") == "audio_unavailable" for outcome in outcomes)
+                    state, message = "failed", CATEGORIES["audio_unavailable"] if unavailable else "Échec de l’import"
+                job.update(state=state, message=message, results=results, progress=task.fraction)
+                self.persist(job)
+        self.control.blackbox.emit("imports", "finished", status=task.final_event,
+                                   progress=task.fraction)
+        self.control.refresh_after_import(task, integrating)
 
     def integrated(self, jobs, receiver, visible_paths):
         with self.lock:
@@ -307,17 +379,19 @@ class MobileImports:
                 job.update(state="done" if ready else "partial", progress=1.,
                            message=f"{albums} albums dans la bibliothèque" if ready and albums > 1 else
                            "Album dans la bibliothèque" if ready else "Albums manquants dans l’index local")
-                for token, (_, requested, add) in job["requests"].items():
-                    if not ready or not add or receiver is None:
+                for member, (_, requested, add) in job["requests"].items():
+                    token = self.tokens.get(member)
+                    if not ready or not add or receiver is None or token is None:
                         continue
                     ids = receiver.room.match_song_paths(paths, requested["requested_title"],
                                                          requested["requested_artist"])
                     if len(ids) != 1:
-                        job["notes"][token] = "Le morceau demandé n’a pas été retrouvé de façon certaine."
+                        job["notes"][member] = "Le morceau demandé n’a pas été retrouvé de façon certaine."
                         continue
                     try:
                         receiver.room.choose(token, ids[0])
                     except RoomError:
-                        job["notes"][token] = "Ajoute le morceau depuis la bibliothèque."
+                        job["notes"][member] = "Ajoute le morceau depuis la bibliothèque."
                     else:
-                        job["notes"][token] = "Le morceau a été ajouté à ta sélection."
+                        job["notes"][member] = "Le morceau a été ajouté à ta sélection."
+                self.persist(job)

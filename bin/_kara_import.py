@@ -1,13 +1,18 @@
 """Recherche et import d’albums dans la fenêtre de paroles."""
 from collections import deque
 import json
+import os
 from pathlib import Path
 import signal
-from urllib.parse import parse_qs, urlsplit
+import sqlite3
+from time import monotonic
 
 from gi.repository import Gio, GLib, Gtk, Pango
 
-from _kara_import_result import CATEGORIES
+from _kara_import_queue import COMPLETE, ImportQueue, MAX_BATCHES, import_key
+from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space, lease, slot_count
+from _kara_import_result import CATEGORIES, ImportIssue
+from _musique_oz import INBOX, SHARED_LIBRARY
 from _kara_paths import BIN, catalogue_command
 
 KARA = BIN / "kara"
@@ -72,6 +77,17 @@ class AlbumImport(Gtk.Revealer):
         self.can_launch = lambda: True
         self.on_update = lambda *_: None
         self.albums = []
+        self.by_id = {}
+        self.imports_snapshot = ([], {})
+        self.next_poll = 0
+        self.closing = False
+        self.refreshing = {}
+        self.queue_error = ""
+        try:
+            self.queue = ImportQueue()
+        except (OSError, sqlite3.Error) as error:
+            self.queue = None
+            self.queue_error = str(error)
 
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["album-import"])
         self.set_child(panel)
@@ -116,15 +132,74 @@ class AlbumImport(Gtk.Revealer):
         self.lookup_detail = ""
         status_box.append(self.search_detail)
         panel.append(status_box)
+        controls = Gtk.Box(spacing=8)
+        panel.append(controls)
+        controls.append(Gtk.Label(label="Lots simultanés"))
+        self.concurrency = Gtk.SpinButton.new_with_range(1, MAX_BATCHES, 1)
+        self.concurrency.set_tooltip_text("Nombre maximal de lots actifs")
+        self.concurrency_handler = self.concurrency.connect("value-changed", self.configure_concurrency)
+        controls.append(self.concurrency)
+        self.pause = Gtk.Button(label="Mettre la file en pause")
+        self.pause.set_tooltip_text("Suspend les nouveaux départs. Les lots actifs peuvent se terminer.")
+        self.pause.connect("clicked", lambda _: self.configure(paused=not self.imports_snapshot[1].get("paused", False)))
+        controls.append(self.pause)
+        self.queue_status = Gtk.Label(xalign=0., wrap=True, hexpand=True, css_classes=["lyrics-info"])
+        panel.append(self.queue_status)
+        self.overall = Gtk.ProgressBar(show_text=True)
+        panel.append(self.overall)
+        if self.queue is None:
+            self.pause.set_sensitive(False)
+            self.concurrency.set_sensitive(False)
+            self.queue_status.set_text(f"File indisponible · {self.queue_error}")
         self.import_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.import_view = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
                                               propagate_natural_height=True, max_content_height=185, visible=False)
         self.import_view.set_child(self.import_rows)
         panel.append(self.import_view)
+        self.history_button = Gtk.Button(label="Historique", halign=Gtk.Align.END, sensitive=self.queue is not None)
+        self.history_button.connect("clicked", self.show_history)
+        panel.append(self.history_button)
+        GLib.idle_add(self.launch_next)
+
+    def show_history(self, button):
+        window = Gtk.Window(title="Historique des importations", transient_for=button.get_root(),
+                            destroy_with_parent=True, default_width=640, default_height=420)
+        scroll = Gtk.ScrolledWindow()
+        rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12,
+                       margin_bottom=12, margin_start=12, margin_end=12)
+        scroll.set_child(rows)
+        window.set_child(scroll)
+        more = Gtk.Button(label="Imports précédents")
+        cursor = None
+
+        def append_page(_button):
+            nonlocal cursor
+            try:
+                page = self.queue.history(cursor, limit=26)
+                if more.get_parent() is rows:
+                    rows.remove(more)
+                for row in page[:25]:
+                    job = ImportJob(row["targets"], None, identity=row["id"], option=row["option"],
+                                    journal=row["journal"])
+                    job.outcomes = self.queue.outcomes(row["id"])
+                    job.finish_import("success" if row["state"] == "done" else "cancelled",
+                                      row["message"], 1., "", notify=False, history=True)
+                    rows.append(job)
+                    cursor = row["seq"]
+                if len(page) > 25:
+                    rows.append(more)
+                elif cursor is None:
+                    rows.append(Gtk.Label(label="Aucune importation terminée."))
+            except (OSError, sqlite3.Error) as error:
+                rows.append(Gtk.Label(label=f"Historique indisponible · {error}"))
+
+        more.connect("clicked", append_page)
+        append_page(more)
+        window.present()
 
     @property
     def running(self):
-        return any(not job.done for job in self.imports)
+        return bool(self.imports_snapshot[1].get("active") or self.imports_snapshot[1].get("waiting"))
 
     def toggle(self, button):
         opened = button.get_active()
@@ -329,87 +404,233 @@ class AlbumImport(Gtk.Revealer):
     def start_queue(self, jobs, *, journal=None):
         return self.enqueue(jobs, journal=journal) is not None
 
-    def enqueue(self, jobs, *, journal=None):
-        occupied = {key for job in self.imports if not job.done for key in job.keys}
-        pending = []
-        for title, url in jobs:
-            key = import_key(url)
-            if key not in occupied:
-                pending.append((title, url))
-                occupied.add(key)
-        if not pending:
-            self.message("Cet import est déjà en cours.")
+    def enqueue(self, jobs, *, journal=None, request=None, option=None):
+        try:
+            if self.queue is None:
+                raise OSError(self.queue_error)
+            check_space(self.queue.directory, state=True)
+            identity = self.queue.enqueue(jobs, journal=journal, option=option, request=request)
+        except (ValueError, OSError, sqlite3.Error) as error:
+            self.message("Impossible d’enregistrer l’import.", failed=True, detail=str(error))
             return None
         self.hide_message()
-        return self.add_import(ImportJob(pending, self.import_finished, retry=self.start_queue, journal=journal))
+        self.launch_next(force=True)
+        return self.by_id[identity]
 
     def start_maintenance(self, option, title):
-        if any(job.option == option and not job.done for job in self.imports):
-            self.message(f"{title} · recherche déjà en cours.")
-            return False
-        self.hide_message()
-        return self.add_import(ImportJob([(title, "")], self.import_finished, option=option))
+        return self.enqueue([(title, "")], option=option) is not None
 
-    def add_import(self, job):
-        if sum(not item.done for item in self.imports) >= 16:
-            self.message("La file d’importation est pleine.")
-            return None
+    def configure_concurrency(self, spin):
+        self.configure(batches=spin.get_value_as_int())
+
+    def configure(self, **settings):
+        try:
+            if self.queue is None:
+                raise OSError(self.queue_error)
+            self.queue.configure(**settings)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            self.message(str(error), failed=True)
+            return False
+        self.launch_next(force=True)
+        return True
+
+    def add_import(self, row):
+        job = ImportJob(row["targets"], self.import_finished, identity=row["id"], option=row["option"],
+                        retry=self.retry_job, journal=row["journal"])
+        self.by_id[job.identity] = job
         self.imports.append(job)
-        job.on_update = self.on_update
+        job.update_counts()
+        job.on_update = self.changed
         self.import_rows.prepend(job)
         self.import_view.set_visible(True)
-        job.message("En attente…")
-        self.launch_next()
         return job
 
-    def launch_next(self):
-        if self.can_launch() and not any(job.process is not None for job in self.imports):
-            pending = next((job for job in self.imports if not job.done), None)
-            if pending is not None:
-                pending.launch()
+    def changed(self, job, kind, payload):
+        if kind == "progress":
+            self.on_update(job, kind, payload)
+        elif kind in {"finished", "album", "running"}:
+            self.on_update(job, kind, payload)
+            self.next_poll = 0
 
-    def import_finished(self, _job):
-        completed = [job for job in self.imports if job.done and not job.retry_button.get_visible()]
-        for job in completed[:-6]:
-            self.import_rows.remove(job)
-            self.imports.remove(job)
-        self.launch_next()
+    def launch_next(self, force=False):
+        now = monotonic()
+        if self.queue is None or self.closing or not force and now < self.next_poll:
+            return GLib.SOURCE_REMOVE
+        self.next_poll = now + 0.75
+        try:
+            self.sync_queue()
+        except (OSError, sqlite3.Error) as error:
+            self.queue_status.set_text(f"File indisponible · {error}")
+        return GLib.SOURCE_REMOVE
+
+    def sync_queue(self):
+        rows = self.queue.rows()
+        paused, capacity = self.queue.settings()
+        inbox = SHARED_LIBRARY / INBOX
+        can_start = self.can_launch() and not paused
+        limitation = ""
+        if can_start and any(row["state"] in {"queued", "running"} for row in rows):
+            try:
+                check_space(self.queue.directory, state=True)
+                if inbox.is_dir() and not inbox.is_symlink():
+                    check_space(inbox, extra=WORKING_RESERVE)
+            except ImportIssue as error:
+                can_start, limitation = False, str(error)
+        self.pause.set_label("Reprendre la file" if paused else "Mettre la file en pause")
+        self.concurrency.handler_block(self.concurrency_handler)
+        self.concurrency.set_value(capacity)
+        self.concurrency.handler_unblock(self.concurrency_handler)
+        active = sum(row["state"] == "running" for row in rows)
+        for row in rows:
+            identity, state = row["id"], row["state"]
+            job = self.by_id.get(identity) or self.add_import(row)
+            job.awaiting_refresh = bool(row["refresh"])
+            if job.done:
+                job.update_details()
+            if job.process is not None:
+                continue
+            if state in {"running", "queued"}:
+                if job.done:
+                    self.import_rows.remove(job)
+                    self.imports.remove(job)
+                    job = self.add_import(row)
+                job.store_state = state
+                job.message(row["message"])
+                if state == "running" or can_start and active < capacity:
+                    with lease(self.queue.directory / f"{identity}.lock", wait=False) as fd:
+                        if fd is None:
+                            # An import started by the previous instance still
+                            # owns the lot. Its worker commits the result itself.
+                            if state == "running":
+                                job.message("Import actif · session précédente")
+                            continue
+                        if state == "running":
+                            self.queue.transition(identity, "running", "queued", "Import interrompu · reprise en attente")
+                            job.store_state = "queued"
+                            active -= 1
+                            job.message("Import interrompu · reprise en attente")
+                        if can_start and active < capacity and self.queue.claim(identity):
+                            active += 1
+                            job.outcomes = self.queue.outcomes(identity)
+                            job.launch(fd)
+            elif not job.done or job.final_event != {"done": "success", "cancelled": "cancelled"}.get(state, "failure"):
+                job.journal = row["journal"]
+                job.outcomes = self.queue.outcomes(identity)
+                kind = {"done": "success", "cancelled": "cancelled"}.get(state, "failure")
+                detail = read_final_detail(job.journal) if kind == "failure" else ""
+                job.finish_import(kind, row["message"], 1., detail, notify=False)
+            if row["refresh"] and job.done and self.refreshing.get(identity) != row["refresh"]:
+                self.schedule_refresh(job, row["refresh"])
+        visible = {row["id"] for row in rows}
+        for job in list(self.imports):
+            if job.identity not in visible and job.done:
+                self.import_rows.remove(job)
+                self.imports.remove(job)
+                self.by_id.pop(job.identity)
+        self.import_view.set_visible(bool(self.imports))
+        self.update_queue_summary(paused, capacity, inbox, limitation)
+
+    def update_queue_summary(self, paused, capacity, inbox, limitation):
+        counts = self.queue.count()
+        albums, tracks, settled, planned = self.queue.totals()
+        active, waiting = counts.get("running", 0), counts.get("queued", 0)
+        errors = counts.get("failed", 0) + counts.get("partial", 0)
+        downloads = slot_count(inbox / ".kara-transferts", DOWNLOADS)
+        processing = slot_count(inbox / ".kara-traitements", PROCESSING)
+        running = [job for job in self.imports if job.process is not None]
+        progressed = sum(job.album_fraction for job in running)
+        progress = min(1., (settled + progressed) / planned) if planned else 0.
+        owner_rows = [job.snapshot() for job in reversed(self.imports)]
+        self.imports_snapshot = (owner_rows, dict(active=active, waiting=waiting, albums=albums, tracks=tracks,
+                                                  errors=errors, downloads=downloads, processing=processing,
+                                                  progress=progress, paused=paused, batches=capacity,
+                                                  limitation=CATEGORIES["space"] if limitation else "",
+                                                  max_batches=MAX_BATCHES))
+        summary = (f"{active} lot(s) actif(s) · {waiting} en attente · {albums} album(s) terminé(s) · "
+                   f"{tracks} piste(s) traitée(s) · {errors} erreur(s)\n"
+                   f"{downloads}/{DOWNLOADS} téléchargement(s) · {processing}/{PROCESSING} traitement(s)")
+        self.queue_status.set_text(f"{summary}\n{limitation}" if limitation else summary)
+        self.overall.set_fraction(progress)
+        self.overall.set_text(f"Progression globale · {progress:.0%}")
+
+    def import_finished(self, job):
+        # A normal worker already committed. A failed spawn or an abrupt
+        # worker exit still needs a terminal record and an explicit retry.
+        self.queue.finish(job.identity, job.final_event, job.status.get_text())
+        self.schedule_refresh(job, self.queue.job(job.identity)["refresh"])
+        self.next_poll = 0
+
+    def schedule_refresh(self, job, generation):
+        job.awaiting_refresh = bool(generation)
+        job.refresh_generation = generation
+        self.refreshing[job.identity] = generation
+        self.on_update(job, "settled", {})
+
+    def release_refresh(self, generations):
+        for identity, generation in generations:
+            if self.refreshing.get(identity) == generation:
+                self.refreshing.pop(identity, None)
+
+    def acknowledge_refresh(self, generations):
+        self.queue.refreshed(generations)
+        self.release_refresh(generations)
+
+    def retry_job(self, identity):
+        if self.queue.transition(identity, "failed", "queued", "Relance en attente…") or self.queue.transition(
+                identity, "partial", "queued", "Relance en attente…"):
+            self.launch_next(force=True)
+            return True
+        return False
+
+    def cancel_job(self, identity):
+        if self.queue.transition(identity, "queued", "cancelled", "Demande annulée", refresh=True):
+            self.launch_next(force=True)
+            return True
+        job = self.by_id.get(identity)
+        if job and job.stop_ready:
+            job.stop_batch(None)
+            return True
+        return False
 
 
-def import_key(url):
+def read_final_detail(path):
+    if not path:
+        return ""
     try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return ("url", url)
-    if parsed.hostname not in {"music.youtube.com", "www.youtube.com", "youtube.com", "youtu.be"}:
-        return ("url", url)
-    query = parse_qs(parsed.query)
-    if query.get("list"):
-        return ("playlist", query["list"][0])
-    if parsed.path.startswith("/browse/"):
-        return ("album", parsed.path.rstrip("/").split("/")[-1])
-    if query.get("v"):
-        return ("video", query["v"][0])
-    if parsed.hostname == "youtu.be":
-        return ("video", parsed.path.strip("/"))
-    return ("url", url)
+        details = ""
+        with Path(path).open(encoding="utf-8") as log:
+            for line in log:
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if payload.get("event") == "failure":
+                    details = payload.get("detail", "")
+        return details
+    except OSError:
+        return ""
 
 
 class ImportJob(Gtk.Box):
-    def __init__(self, jobs, on_finished, *, option=None, retry=None, journal=None):
+    def __init__(self, jobs, on_finished, *, identity, option=None, retry=None, journal=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.identity = identity
         self.jobs = jobs
         self.option = option
         self.keys = {import_key(url) for _, url in jobs} if option is None else set()
         self.on_finished = on_finished
         self.retry = retry
-        self.previous_journal = journal
-        self.journal = None
+        self.journal = journal
         self.done = False
         self.process = None
         self.stop_ready = False
         self.stopping = False
         self.fraction = 0.0
+        self.album_fraction = 0.0
+        self.final_event = None
+        self.refresh_generation = 0
+        self.awaiting_refresh = False
+        self.store_state = "queued"
         self.measured = False
         self.result = None
         self.outcomes = {}
@@ -425,6 +646,7 @@ class ImportJob(Gtk.Box):
             title = first_title or "Import par lien"
         else:
             title = f"{len(jobs)} albums · {first_title}" if first_title else f"{len(jobs)} albums"
+        self.title = title
         label = Gtk.Label(label=title, xalign=0.0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         label.set_tooltip_text(first_title or first_url)
         header.append(label)
@@ -440,10 +662,12 @@ class ImportJob(Gtk.Box):
         self.retry_button.connect("clicked", self.retry_failed)
         header.append(self.retry_button)
         self.append(header)
-        self.progress = Gtk.ProgressBar()
+        self.progress = Gtk.ProgressBar(show_text=True)
         self.append(self.progress)
         self.status = Gtk.Label(xalign=0.0, ellipsize=Pango.EllipsizeMode.END, css_classes=["lyrics-info"])
         self.append(self.status)
+        self.counts = Gtk.Label(xalign=0., css_classes=["lyrics-info"])
+        self.append(self.counts)
 
     def message(self, text, *, failed=False):
         self.status.set_text(text)
@@ -453,25 +677,53 @@ class ImportJob(Gtk.Box):
         else:
             self.status.remove_css_class("import-error")
 
-    def launch(self):
-        urls = [url for _, url in self.jobs]
-        if self.option:
-            arguments = [self.option]
-        else:
-            arguments = ["--lot", *urls]
-            if self.previous_journal:
-                arguments = ["--reprendre", self.previous_journal, *arguments]
+    def launch(self, fd):
         self.message("Vérification de la collection…")
-        self.on_update(self, "running", {})
         try:
-            self.process = Gio.Subprocess.new([str(KARA), "--suivi-json", *arguments], PIPE)
+            launcher = Gio.SubprocessLauncher.new(PIPE)
+            # Give the engine the same locked description used to claim the
+            # job. A restarted GTK instance cannot schedule it twice.
+            lease_fd = 9
+            launcher.take_fd(os.dup(fd), lease_fd)
+            # Imports already admitted can finish during a tour at lower CPU
+            # priority than the real-time voice path.
+            self.process = launcher.spawnv(["nice", "-n", "6", str(KARA), "--suivi-json", "--import-file", self.identity,
+                                            "--import-lease", str(lease_fd)])
+            launcher.close()
         except GLib.Error as error:
             self.finish_import("failure", "Impossible de lancer kara.", None, str(error))
             return False
-        self.timer = GLib.timeout_add(110, self.pulse)
+        self.on_update(self, "running", {})
+        self.timer = GLib.timeout_add(150, self.pulse)
         stream = Gio.DataInputStream.new(self.process.get_stdout_pipe())
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_line)
         return True
+
+    def update_counts(self):
+        snapshot = self.snapshot()
+        if self.option is None:
+            self.counts.set_text(f"{snapshot['completed']}/{snapshot['albums']} album(s) terminé(s) · "
+                                 f"{snapshot['processed']} piste(s) traitée(s) · {snapshot['errors']} erreur(s)")
+        self.progress.set_text(f"{self.fraction:.0%}")
+
+    def snapshot(self):
+        status = self.status.get_text()
+        state = ("partial" if any(item.get("tracks") for item in self.outcomes.values()) else "failed"
+                 ) if self.final_event == "failure" else (
+                 "cancelled" if self.final_event == "cancelled" else "done" if self.done else
+                 "running" if self.process else self.store_state)
+        if self.awaiting_refresh and state == "done":
+            state, status = "integrating", "Actualisation de la bibliothèque"
+        return dict(id=f"queue:{self.identity}", title=self.title, albums=len(self.jobs), tracks=None,
+                    state=state, progress=self.fraction if self.measured else None, message=status, note="",
+                    remaining=[{"title": title or (outcome or {}).get("title") or "Import par lien",
+                                "message": (outcome or {}).get("message", "En attente"),
+                                "errors": [CATEGORIES.get(entry.get("category"), "Erreur")
+                                           for entry in (outcome or {}).get("diagnostics", [])]}
+                               for title, _, outcome in self.visible_albums()],
+                    completed=sum(item.get("status") in COMPLETE for item in self.outcomes.values()),
+                    processed=len({path for item in self.outcomes.values() for path in item.get("tracks", [])}),
+                    errors=sum(item.get("status") in {"failure", "partial"} for item in self.outcomes.values()))
 
     def stop_batch(self, _widget):
         if self.process is not None and self.stop_ready and not self.stopping:
@@ -509,7 +761,6 @@ class ImportJob(Gtk.Box):
         text = payload.get("message")
         if not isinstance(text, str):
             return
-        self.on_update(self, event, payload)
         fraction = payload.get("fraction")
         if type(fraction) not in (float, int) or not 0 <= fraction <= 1:
             fraction = None
@@ -517,7 +768,12 @@ class ImportJob(Gtk.Box):
             self.journal = payload.get("path")
         elif event == "album" and isinstance(payload.get("url"), str):
             self.outcomes[payload["url"]] = payload
-        elif event in {"success", "failure", "skip"}:
+            self.album_fraction = 0.
+            if fraction is not None:
+                self.fraction = max(self.fraction, fraction)
+                self.progress.set_fraction(self.fraction)
+            self.update_counts()
+        elif event in {"success", "failure", "skip", "cancelled"}:
             details = self.diagnostics(payload)
             if isinstance(payload.get("detail"), str):
                 details.insert(0, payload["detail"])
@@ -530,7 +786,11 @@ class ImportJob(Gtk.Box):
                 self.measured = True
                 self.fraction = max(self.fraction, fraction)
                 self.progress.set_fraction(self.fraction)
-            self.message(text)
+                self.progress.set_text(f"{self.fraction:.0%}")
+            self.album_fraction = payload.get("album_fraction", 0.)
+            processed = payload.get("processed", 0)
+            self.message(f"{text} · {processed} piste(s) traitée(s)" if processed else text)
+        self.on_update(self, event, payload)
 
     def finished(self, process, result):
         try:
@@ -538,7 +798,7 @@ class ImportJob(Gtk.Box):
         except GLib.Error:
             completed = False
         event, text, fraction, detail = self.result or ("failure", "Kara s’est arrêté avant le bilan.", None, "")
-        if not completed and event != "failure":
+        if not completed and event not in {"failure", "cancelled"}:
             event, text = "failure", "Kara s’est arrêté avec une erreur."
         self.finish_import(event, text, fraction, detail)
 
@@ -547,29 +807,46 @@ class ImportJob(Gtk.Box):
         return [f"{CATEGORIES.get(entry.get('category'), 'Erreur')} · {entry.get('stage')}\n{entry.get('detail')}"
                 for entry in payload.get("diagnostics", [])]
 
-    def finish_import(self, event, text, fraction, detail):
+    def finish_import(self, event, text, fraction, detail, *, notify=True, history=False):
         self.process = None
         if self.timer is not None:
             GLib.source_remove(self.timer)
             self.timer = None
         self.done = True
+        self.final_event = event
+        self.awaiting_refresh = self.awaiting_refresh or notify
         self.stop.set_visible(False)
-        self.progress.set_fraction(max(self.fraction, fraction) if fraction is not None else self.fraction)
+        self.fraction = max(self.fraction, fraction) if fraction is not None else self.fraction
+        self.progress.set_fraction(self.fraction)
+        self.update_counts()
         self.message(text, failed=event == "failure")
-        sections = [text]
-        if detail:
-            sections.append(detail)
+        self.final_detail = detail
+        self.update_details(history=history)
+        if notify:
+            self.on_finished(self)
+
+    def visible_albums(self, history=False):
+        for title, url in self.jobs:
+            outcome = self.outcomes.get(url)
+            if (history or not self.done or self.awaiting_refresh or not outcome or
+                    outcome.get("status") not in COMPLETE):
+                yield title, url, outcome
+
+    def update_details(self, history=False):
+        sections = [self.status.get_text()]
+        if self.final_detail:
+            sections.append(self.final_detail)
         if self.unstructured:
             sections.append("\n".join(self.unstructured))
-        for title, url in self.jobs:
-            result = self.outcomes.get(url)
+        self.failed_jobs = []
+        for title, url, result in self.visible_albums(history):
             if result:
                 heading = f"{title or result['title']} · {result['message']} · {result['added']} piste(s) ajoutée(s)"
                 lines = [heading, url, *self.diagnostics(result)]
                 if result.get("remaining"):
                     lines.append(f"Fichiers conservés dans {result['remaining']}")
                 sections.append("\n".join(lines))
-            if not self.option and event == "failure" and (
+            if not self.option and self.final_event == "failure" and (
                 result is None or result.get("status") in {"failure", "partial"}
             ):
                 self.failed_jobs.append((title, url))
@@ -578,9 +855,7 @@ class ImportJob(Gtk.Box):
         self.detail_text = "\n\n".join(sections)
         self.details_button.set_visible(len(sections) > 1)
         self.retry_button.set_visible(bool(self.failed_jobs and self.retry))
-        self.on_update(self, "finished", {"event": event, "message": text})
-        self.on_finished(self)
 
     def retry_failed(self, _button):
-        if self.failed_jobs and self.retry(self.failed_jobs, journal=self.journal):
+        if self.failed_jobs and self.retry(self.identity):
             self.retry_button.set_visible(False)

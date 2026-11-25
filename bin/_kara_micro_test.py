@@ -602,6 +602,7 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
             if route:
                 settings["applied_percent"] = room_audio.applied(route)
                 settings["requested_percent"] = room_audio.requested(route)
+                settings["return_muted"] = room_audio.muted(route)
             await ws.send_json(settings)
             async for msg in ws:
                 if route and not room_audio.allowed(route, ws):
@@ -787,6 +788,8 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                         if route:
                             levels["applied_percent"] = room_audio.applied(route)
                             levels["requested_percent"] = room_audio.requested(route)
+                            levels["return_muted"] = room_audio.muted(route)
+                            levels["return_started"] = route.return_enabled
                             levels["return_rms"] = audio_stats.get("return_rms", 0.)
                             levels["return_peak"] = audio_stats.get("return_peak", 0.)
                             levels["return_drive"] = route.return_drive

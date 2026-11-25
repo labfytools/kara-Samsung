@@ -7,28 +7,26 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<form id="pair">
-  <h1>Karaoké</h1>
-  <p>Active TV dans Paroles Strawberry et saisis les identifiants affichés.</p>
-  <label for="pc">Adresse du PC</label>
-  <input id="pc" type="text" maxlength="15" autocomplete="off" spellcheck="false">
-  <label for="code">Code</label>
-  <input id="code" type="text" maxlength="8" autocomplete="off" spellcheck="false">
-  <button type="submit" id="join">Se connecter</button>
-  <p id="hint" role="status"></p>
-</form>
+<section id="connect">
+  <img class="logo" src="icon.png" alt="">
+  <h1>Kara</h1>
+  <p id="hint" role="status">Connexion au serveur Kara…</p>
+  <button type="button" id="retry">Réessayer</button>
+</section>
 <div id="screen" hidden>
-<header><h1 id="title">Karaoké</h1><div id="artist"></div><div id="score"></div></header>
+<header><img class="logo" src="icon.png" alt=""><h1 id="title">Kara</h1><div id="artist"></div><div id="score"></div>
+<p id="server-status">Serveur Kara connecté</p></header>
 <div id="stage">
 <section id="performance">
 <main id="lyrics">
 <div id="previous" class="line"></div>
-<div id="current" class="line">En attente de Strawberry…</div>
+<div id="current" class="line">En attente de l’ouverture du salon</div>
 <div id="progress"><div id="fill"></div></div>
 <div id="next" class="line"></div>
 <div id="following" class="line"></div>
 </main>
 <p id="status"></p>
+<ol id="upcoming" aria-label="Prochains tours"></ol>
 </section>
 <aside id="party" aria-labelledby="party-title">
   <h2 id="party-title">Joueurs connectés <span id="player-count">0</span></h2>
@@ -41,6 +39,7 @@
       <small>Android et iPhone</small>
       <span id="room-url"></span>
     </div>
+      <div id="organizer-code" hidden><small>Code organisateur</small><strong id="pin"></strong></div>
   </section>
 </aside>
 </div>
@@ -48,9 +47,10 @@
 <div id="tv-closed" hidden>
   <h2>Affichage TV fermé</h2>
   <p>Les joueurs et la musique restent connectés au PC.</p>
-  <p>Utilise « Actualiser TV » dans Paroles pour rouvrir l’écran.</p>
+  <p>Rouvre l’écran pour retrouver la soirée.</p>
   <button type="button" id="reopen-tv">Rouvrir l’écran</button>
 </div>
+<script src="display-config.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

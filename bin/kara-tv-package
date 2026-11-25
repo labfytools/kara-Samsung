@@ -1,0 +1,39 @@
+#!/usr/bin/python3 -B
+"""Prépare les sources privées du WGT Samsung, pour le profil kara-tv-physique."""
+import argparse
+import json
+import os
+from pathlib import Path
+from secrets import token_hex
+import shutil
+
+from _kara_paths import BIN, CONFIG
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("destination", type=Path, help="Nouveau dossier privé de préparation du WGT")
+    args = parser.parse_args()
+    key_file = CONFIG / "kara/tv-display-key"
+    key_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Keep the same display identity on repackaging. Only the local signer
+    # handles the generated script and the widget carrying that credential.
+    try:
+        with open(key_file, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
+            output.write(token_hex(32) + "\n")
+    except FileExistsError:
+        pass
+    key = key_file.read_text().strip()
+    if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+        parser.error("La clé d’affichage est invalide.")
+    source = BIN.parent / "tizen/app"
+    args.destination.mkdir(mode=0o700)
+    for name in ("app.js", "config.xml", "icon.png", "index.html", "style.css"):
+        shutil.copyfile(source / name, args.destination / name)
+    script = args.destination / "display-config.js"
+    with open(script, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
+        output.write("window.KARA_DISPLAY_KEY = " + json.dumps(key) + ";\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+[Unit]
+Description=Serveur de soirée Kara pour Sway
+PartOf=graphical-session.target
+After=graphical-session-pre.target pipewire.service pipewire-pulse.service app-org.strawberrymusicplayer.strawberry@autostart.service
+Wants=pipewire.service pipewire-pulse.service app-org.strawberrymusicplayer.strawberry@autostart.service
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/paroles-strawberry --service
+Restart=on-failure
+RestartSec=8s
+TimeoutStopSec=60s
+KillMode=mixed
+
+[Install]
+WantedBy=graphical-session.target

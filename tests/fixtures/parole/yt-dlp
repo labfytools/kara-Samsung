@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from tempfile import NamedTemporaryFile
 from urllib.parse import parse_qs, urlsplit
 
@@ -26,6 +27,8 @@ if "--flat-playlist" in arguments:
 video = query["v"][0]
 with Path(config["requests"]).open("a", encoding="utf-8") as handle:
     handle.write(video + "\n")
+if config.get("transfer_delay"):
+    time.sleep(config["transfer_delay"])
 if video in config["transfer_failures"]:
     scratch = next(value.removeprefix("temp:") for value in arguments if value.startswith("temp:"))
     Path(scratch).mkdir(parents=True, exist_ok=True)

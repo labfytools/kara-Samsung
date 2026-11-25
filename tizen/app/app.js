@@ -17,8 +17,8 @@
     var seenClose = null;
     var tvIsClosed = false;
     var lastRoomURL = "";
-    var lastRendered = null;
-    var lastDisconnected = false;
+    var lastUpcoming = "";
+
 
     function playerColor(name) {
         if (!Object.prototype.hasOwnProperty.call(playerColors, name)) {
@@ -153,17 +153,37 @@
 
     function render(data) {
         if (applyRemoteCommands(data)) return;
+        if (data.join_url !== lastRoomURL) {
+            element("room-qr").removeAttribute("data-inline-qr");
+            lastRoomURL = data.join_url;
+        }
+        show("room-url", data.join_url || "");
         if (data.qr_data && !element("room-qr").getAttribute("data-inline-qr")) {
             element("room-qr").setAttribute("data-inline-qr", "1");
             element("room-qr").src = "data:image/png;base64," + data.qr_data;
         }
-        var lines = data.lines || ["", "", "", ""];
-        var progress = Math.max(0, Math.min(1, data.progress || 0));
+        var lobby = !data.party_phase || ["lobby", "preparing", "ready"].indexOf(data.party_phase) >= 0;
+        var recent = data.recent_result;
+        var playing = data.turn_phase === "playing";
+        var lines = playing ? data.lines || [] : [];
+        var notice = data.notice || " ";
+        if (lobby) notice = "En attente de l’ouverture du salon";
+        else if (data.party_phase === "finished") notice = "Partie terminée";
+        else if (data.countdown > 0) notice = String(data.countdown);
+        else if (recent) notice = recent.player + " · " + (recent.summary && recent.summary.score != null ?
+            recent.summary.score + " %" : recent.detail);
+        else if (!playing) notice = data.current_player ? "À toi de chanter, " + data.current_player + " !" : "Salon ouvert";
+        element("mobile-room").hidden = !lobby;
+        element("room-qr").hidden = !element("room-qr").getAttribute("data-inline-qr");
+        element("organizer-code").hidden = !data.organizer_pin;
+        show("pin", data.organizer_pin || "");
+        element("progress").hidden = !playing;
+        var progress = playing ? Math.max(0, Math.min(1, data.progress || 0)) : 0;
         var current = element("current");
-        var text = lines[1] || data.notice || " ";
+        var text = lines[1] || notice;
         var count = Math.floor(progress * text.length);
-        show("title", data.title || "Karaoké");
-        show("artist", data.artist || "");
+        show("title", lobby ? "Kara" : data.current_song || (playing && data.title) || "Kara");
+        show("artist", playing ? data.artist || "" : "");
         var players = Array.isArray(data.players) ? data.players : [];
         var connected = Array.isArray(data.connected) ? data.connected : [];
         renderPlayers(players, connected);
@@ -187,145 +207,98 @@
             return item.name + " · " + (item.score == null ? "sans note" : item.score + " %");
         }).join("   |   ");
         show("status", (data.recording ? "● BlackBox   " : "") +
-            (data.party_phase === "finished" ? "Classement · " + standings : data.status || ""));
+            (data.party_phase === "finished" ? "Classement · " + standings : lobby && data.preparing_count ?
+                data.preparing_count + " morceau(x) en préparation" : playing ? data.status || "" : ""));
+        var upcoming = data.party_phase === "running" && !data.current_player ? data.next_turns || [] : [];
+        var order = JSON.stringify(upcoming);
+        if (lastUpcoming !== order) {
+            lastUpcoming = order;
+            var list = element("upcoming");
+            list.textContent = "";
+            upcoming.forEach(function (turn) {
+                var item = document.createElement("li");
+                item.textContent = turn.player + " · " + turn.song;
+                list.appendChild(item);
+            });
+        }
         element("fill").style.width = (100 * progress) + "%";
     }
-    var form = element("pair");
     var panel = element("screen");
-    var pc = element("pc");
-    var code = element("code");
+    var connect = element("connect");
     var hint = element("hint");
-    var endpoint = "";
-    var connection = 0;
+    var endpoint = "https://kara.labfytools.com:8443/tv/etat";
+    var key = window.KARA_DISPLAY_KEY;
+    var timer, request, retryDelay = 750;
+    var lastRendered;
 
-    function showRoomQRCode(state) {
-        var base = endpoint.replace(/\/etat$/, "");
-        var joinUrl = state.join_url || base + "/jouer";
-        if (!base || joinUrl === lastRoomURL) return;
-        lastRoomURL = joinUrl;
-        var qr = element("room-qr");
-        qr.removeAttribute("data-inline-qr");
-        qr.src = base + "/qr";
-        element("room-url").textContent = joinUrl;
-    }
-
-    function diagnostic(kind, suffix) {
-        if (!endpoint) return;
-        var request = new XMLHttpRequest();
-        request.open("GET", endpoint.replace(/\/etat$/, "/tv-diagnostic") + "?event=" + kind + (suffix || ""), true);
-        request.timeout = 1200;
-        try { request.send(); } catch (error) {}
-    }
-
-    function destination(value) {
-        var match = /^(?:http:\/\/)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value.trim());
-        if (!match) return "";
-        var ip = match.slice(1).map(Number);
-        if (ip.some(function (x) { return x > 255; }) ||
-                !(ip[0] === 10 || ip[0] === 192 && ip[1] === 168 ||
-                  ip[0] === 172 && ip[1] >= 16 && ip[1] <= 31)) return "";
-        return "http://" + ip.join(".") + ":8765";
-    }
-
-    function remember() {
+    function diagnostic(event, details) {
+        if (!key) return;
         try {
-            localStorage.setItem("kara.pc", pc.value);
-            localStorage.setItem("kara.code", code.value);
+            var xhr = new XMLHttpRequest();
+            xhr.open("GET", endpoint.replace(/\/etat$/, "/diagnostic") + "?event=" + event + (details || ""), true);
+            xhr.setRequestHeader("Authorization", "Bearer " + key);
+            xhr.timeout = 1400;
+            xhr.send();
         } catch (error) {}
     }
 
-    function disconnect() {
-        connection += 1;
-        endpoint = "";
-        lastRoomURL = "";
-        lastRendered = null;
-        form.hidden = false;
+    function unavailable() {
+        var moveFocus = connect.hidden;
+        connect.hidden = false;
         panel.hidden = true;
-        hint.textContent = "";
-        pc.focus();
+        show("hint", "Serveur Kara indisponible — nouvelle tentative en cours");
+        if (moveFocus) element("retry").focus();
+        timer = setTimeout(poll, retryDelay);
+        retryDelay = Math.min(12000, retryDelay * 2);
     }
 
-    function poll(id) {
-        if (id !== connection || !endpoint) return;
-        var xhr = new XMLHttpRequest();
+    function poll() {
+        var xhr = request = new XMLHttpRequest();
+        var qr = element("room-qr");
         var began = performance.now();
-        xhr.open("GET", endpoint + (element("room-qr").getAttribute("data-inline-qr") ? "?qr=0" : "?qr=1"), true);
-        xhr.timeout = 1900;
+        xhr.open("GET", endpoint + "?qr=" + (qr.getAttribute("data-inline-qr") ? "0" : "1"), true);
+        xhr.timeout = 2600;
+        if (key) xhr.setRequestHeader("Authorization", "Bearer " + key);
         xhr.onloadend = function () {
-            if (id !== connection) return;
-            if (xhr.status === 200) {
-                try {
-                    var state = JSON.parse(xhr.responseText);
-                    if (!form.hidden) remember();
-                    form.hidden = true;
-                    panel.hidden = false;
-                    showRoomQRCode(state);
-                    render(state);
-                    if (state.recording && state.line_revision !== undefined && state.line_revision !== lastRendered) {
-                        lastRendered = state.line_revision;
-                        var painted = performance.now();
-                        diagnostic("rendered", "&revision=" + state.line_revision +
-                            "&browser_ms=" + painted.toFixed(1) + "&rtt_ms=" + (painted - began).toFixed(1));
-                    }
-                    lastDisconnected = false;
-                } catch (error) {
-                    diagnostic("render-error");
-                    hint.textContent = "Réponse du PC illisible.";
+            if (request !== xhr) return;
+            request = null;
+            if (xhr.status !== 200) { unavailable(); return; }
+            try {
+                var state = JSON.parse(xhr.responseText);
+                if (!state.join_url) { unavailable(); return; }
+                render(state);
+                if (state.recording && state.line_revision !== undefined && state.line_revision !== lastRendered) {
+                    lastRendered = state.line_revision;
+                    var painted = performance.now();
+                    diagnostic("rendered", "&revision=" + state.line_revision + "&browser_ms=" +
+                        painted.toFixed(1) + "&rtt_ms=" + (painted - began).toFixed(1));
                 }
-            } else if (xhr.status === 404) {
-                disconnect();
-                hint.textContent = "Vérifie le code affiché dans Paroles Strawberry.";
-                return;
-            } else {
-                if (!lastDisconnected) {
-                    diagnostic("display-disconnect");
-                    lastDisconnected = true;
-                }
-                var message = "En attente du mode TV sur le PC…";
-                hint.textContent = message;
-                if (!panel.hidden) show("status", message);
-            }
-            setTimeout(function () { poll(id); }, xhr.status === 200 ? 160 : 1150);
+                if (!qr.getAttribute("data-inline-qr")) lastRoomURL = "";
+                panel.hidden = false;
+                connect.hidden = true;
+                retryDelay = 750;
+                timer = setTimeout(poll, 160);
+            } catch (error) { diagnostic("render-error"); unavailable(); }
         };
-        xhr.send();
+        try { xhr.send(); }
+        catch (error) { request = null; unavailable(); }
     }
 
-    form.onsubmit = function (event) {
-        event.preventDefault();
-        var host = destination(pc.value);
-        var token = code.value.trim().toLowerCase();
-        if (!host || !/^[0-9a-f]{8}$/.test(token)) {
-            hint.textContent = "Saisis l’adresse du PC et le code à huit caractères.";
-            return;
-        }
-        hint.textContent = "Connexion au PC…";
-        endpoint = host + "/" + token + "/etat";
-        connection += 1;
-        poll(connection);
-    };
-
-    element("reopen-tv").onclick = function () { diagnostic("remote-reopen"); window.location.reload(); };
-
+    function retry() {
+        clearTimeout(timer);
+        if (request) { var previous = request; request = null; previous.abort(); }
+        retryDelay = 750;
+        show("hint", "Connexion au serveur Kara…");
+        poll();
+    }
+    element("retry").onclick = retry;
+    element("reopen-tv").onclick = function () { window.location.reload(); };
     document.addEventListener("keydown", function (event) {
         if (event.keyCode === 10009 || event.keyCode === 27) {
             event.preventDefault();
-            if (endpoint) { diagnostic("remote-back"); disconnect(); }
-            else if (typeof tizen !== "undefined") tizen.application.getCurrentApplication().exit();
-            return;
-        }
-        if (!form.hidden && (event.keyCode === 38 || event.keyCode === 40)) {
-            var controls = [pc, code, element("join")];
-            var direction = event.keyCode === 40 ? 1 : -1;
-            var index = controls.indexOf(document.activeElement);
-            controls[(index + direction + controls.length) % controls.length].focus();
-            event.preventDefault();
+            if (typeof tizen !== "undefined") tizen.application.getCurrentApplication().exit();
         }
     });
-
-    try {
-        pc.value = localStorage.getItem("kara.pc") || "192.168.1.63";
-        code.value = localStorage.getItem("kara.code") || "";
-    } catch (error) {}
-    if (code.value) form.onsubmit({preventDefault:function () {}});
-    else code.focus();
+    element("retry").focus();
+    retry();
 }());

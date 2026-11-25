@@ -2,6 +2,7 @@
 """Isolated import regressions with real local media, yt-dlp and FFmpeg."""
 from collections import Counter
 from functools import partial
+from fcntl import LOCK_EX, flock
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
@@ -16,6 +18,10 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 FIXTURES = ROOT / "tests/fixtures/parole"
+sys.path.insert(0, str(BIN))
+from _kara_import_queue import ImportQueue
+from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
+
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
 
 
@@ -31,6 +37,74 @@ MISSING = ("WARNING: [youtube:tab] YouTube said: The playlist does not exist.\n"
 class QuietHTTP(SimpleHTTPRequestHandler):
     def log_message(self, *_args):
         pass
+
+
+class QueueTests(unittest.TestCase):
+    def test_only_acknowledged_imports_move_to_history(self):
+        with TemporaryDirectory(prefix="parole-history-") as temporary:
+            root = Path(temporary)
+            queue = ImportQueue(root / "state", root)
+            good, missing = playlist("GOOD"), playlist("MISSING")
+            identity = queue.enqueue([("Réussi", good), ("Incomplet", missing)], journal="journal-local")
+            self.assertTrue(queue.claim(identity))
+            for url in (good, missing):
+                queue.album(identity, dict(url=url, status="success", audio_complete=True, tracks=[url]))
+            queue.finish(identity, "success", "Album téléchargé")
+            row = queue.rows()[0]
+            self.assertTrue(row["refresh"])
+            self.assertEqual(queue.history(), [])
+            queue.integration_failed(identity, row["refresh"], [missing])
+            self.assertEqual(queue.rows()[0]["state"], "partial")
+            self.assertEqual(queue.outcomes(identity)[good]["status"], "success")
+            self.assertEqual(queue.outcomes(identity)[missing]["diagnostics"][0]["stage"], "integration")
+            queue.transition(identity, "partial", "queued", "Relance")
+            self.assertTrue(queue.claim(identity))
+            queue.album(identity, dict(url=missing, status="success", audio_complete=True, tracks=[missing]))
+            queue.finish(identity, "success", "Intégré")
+            queue.refreshed([(identity, queue.job(identity)["refresh"])])
+            relaunched = ImportQueue(root / "state", root)
+            self.assertEqual(relaunched.rows(), [])
+            historical = relaunched.history()
+            self.assertEqual(historical[0]["journal"], "journal-local")
+            self.assertEqual(set(relaunched.outcomes(identity)), {good, missing})
+
+    def test_persistent_large_queue_and_shared_admission(self):
+        with TemporaryDirectory(prefix="parole-queue-") as temporary:
+            root = Path(temporary)
+            queue = ImportQueue(root / "state", root / "collection")
+            queue.configure(paused=True)
+            lots = [queue.enqueue([(f"Artiste {artist}/{number}", playlist(f"AL{artist}_{number}"))
+                                   for number in range(5)]) for artist in range(100)]
+            self.assertEqual(queue.count(), {"queued": 100})
+            self.assertEqual(queue.totals(), (0, 0, 0, 500))
+            self.assertEqual(queue.enqueue([("Double", playlist("AL0_1"))]), lots[0])
+            restarted = ImportQueue(root / "state", root / "collection")
+            self.assertEqual(restarted.settings(), (True, 4))
+            self.assertFalse(restarted.claim(lots[0]))
+            restarted.configure(paused=False)
+            self.assertEqual([restarted.claim(lot) for lot in lots[:5]], [True] * 4 + [False])
+            self.assertEqual(restarted.count(), {"queued": 96, "running": 4})
+            restarted.configure(batches=2)
+            self.assertFalse(queue.claim(lots[5]))
+            self.assertEqual(ImportQueue(root / "state", root / "other-collection").count(), {})
+
+
+    def test_an_old_refresh_cannot_acknowledge_a_new_attempt(self):
+        with TemporaryDirectory(prefix="parole-queue-") as temporary:
+            root = Path(temporary)
+            queue = ImportQueue(root / "state", root / "collection")
+            identity = queue.enqueue([("Album", playlist("PLFIX"))])
+            self.assertTrue(queue.claim(identity))
+            queue.finish(identity, "failure", "Échec")
+            generation = queue.job(identity)["refresh"]
+            self.assertTrue(queue.transition(identity, "failed", "queued", "Relance"))
+            self.assertTrue(queue.claim(identity))
+            queue.finish(identity, "success", "Terminé")
+            queue.refreshed([(identity, generation)])
+            latest = queue.job(identity)["refresh"]
+            self.assertGreater(latest, generation)
+            queue.refreshed([(identity, latest)])
+            self.assertEqual(queue.job(identity)["refresh"], 0)
 
 
 @unittest.skipUnless(all(TOOLS.values()), "yt-dlp, FFmpeg and ffprobe are required")
@@ -63,7 +137,7 @@ class AlbumImportTests(unittest.TestCase):
                         XDG_DATA_HOME=str(self.temp / "data"), XDG_CONFIG_HOME=str(self.temp / "config"),
                         XDG_CACHE_HOME=str(self.temp / "cache"),
                         PATH=str(FIXTURES) + os.pathsep + os.environ["PATH"],
-                        PYTHONPATH=str(FIXTURES), PAROLE_TEST_CONFIG=str(self.manifest))
+                        PYTHONPATH=str(FIXTURES), PAROLE_TEST_CONFIG=str(self.manifest), TMPDIR=str(self.temp))
         self.config = {
             "real_downloader": TOOLS["yt-dlp"], "artist": "Atelier test", "media": self.media,
             "requests": str(self.requests), "cover": str(self.cover), "temp": str(self.temp),
@@ -229,7 +303,7 @@ class AlbumImportTests(unittest.TestCase):
         self.assertIn("yt-dlp", items[0]["diagnostics"][0]["detail"])
         self.assertEqual(list(self.inbox.iterdir()), [])
 
-    def test_direct_playlist_reimport_deduplicates_during_sort(self):
+    def test_direct_playlist_reimport_reuses_published_audio(self):
         url = playlist("PLPART")
         self.config["transfer_failures"].clear()
         self.update_config()
@@ -237,7 +311,7 @@ class AlbumImportTests(unittest.TestCase):
         _, items, _ = self.run_import(url)
         self.assertEqual((items[0]["status"], items[0]["added"]), ("present", 0))
         self.check_tracks("Deux pistes", 2)
-        self.assertEqual(Counter(self.requests.read_text().splitlines()), {"soundPART01": 2, "soundPART02": 2})
+        self.assertEqual(Counter(self.requests.read_text().splitlines()), {"soundPART01": 1, "soundPART02": 1})
 
     def test_concurrent_imports_publish_each_track_once(self):
         self.config["transfer_failures"].clear()
@@ -261,6 +335,111 @@ class AlbumImportTests(unittest.TestCase):
                 if process.poll() is None:
                     process.terminate()
                     process.communicate(timeout=10)
+
+    def managed_worker(self, queue, identity, fd):
+        child = subprocess.Popen([BIN / "kara", "--suivi-json", "--import-file", identity,
+                                  "--import-lease", str(fd)], env=self.env, cwd=self.temp,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, pass_fds=(fd,))
+        self.addCleanup(self.stop_worker, child)
+        return child
+
+    @staticmethod
+    def stop_worker(worker):
+        if worker.poll() is None:
+            worker.kill()
+        worker.communicate(timeout=10)
+
+    def until(self, predicate, seconds=20):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.04)
+        self.fail("La fixture n’a pas atteint l’état attendu")
+
+    def test_lost_worker_after_sort_starts_reuses_publication_receipt(self):
+        self.config["transfer_failures"].clear()
+        self.update_config()
+        queue = ImportQueue(self.temp / "state", self.library)
+        identity = queue.enqueue([("Deux pistes", playlist("PLPART"))])
+        lock = queue.directory / f"{identity}.lock"
+        with (self.library / ".labfy-music.lock").open("a") as library_lock:
+            flock(library_lock, LOCK_EX)
+            self.assertTrue(queue.claim(identity))
+            with lease(lock) as fd:
+                worker = self.managed_worker(queue, identity, fd)
+            # The real sorter is blocked under the library lock. Simulate the
+            # import process disappearing while its admitted child is alive.
+            self.until(lambda: slot_count(self.inbox / ".kara-traitements", PROCESSING) == 1)
+            worker.kill()
+            worker.communicate(timeout=10)
+            self.assertEqual(queue.job(identity)["state"], "running")
+            with lease(lock, wait=False) as fd:
+                self.assertIsNone(fd)
+            self.assertEqual(queue.outcomes(identity), {})
+            self.assertEqual(list(self.library.rglob("*.lrc")), [])
+        self.until(lambda: len(list((self.library / "Atelier test").rglob("*.opus"))) == 2)
+        with lease(lock) as fd:
+            self.assertTrue(queue.transition(identity, "running", "queued", "Interrompu"))
+            self.assertTrue(queue.claim(identity))
+            restarted = self.managed_worker(queue, identity, fd)
+        stdout, stderr = restarted.communicate(timeout=35)
+        self.assertEqual(restarted.returncode, 0, (stdout, stderr))
+        self.assertEqual(queue.job(identity)["state"], "done")
+        self.assertTrue(queue.job(identity)["refresh"])
+        self.check_tracks("Deux pistes", 2)
+        self.assertEqual(Counter(self.requests.read_text().splitlines()), {"soundPART01": 1, "soundPART02": 1})
+
+    def test_four_lots_share_download_slots_and_finish_after_client_exit(self):
+        self.config["transfer_delay"] = 2
+        targets = []
+        for number in range(4):
+            title = f"Album {number}"
+            key = f"PLMASS{number}"
+            self.config["playlists"][key] = {"title": title, "tracks": [
+                {"id": f"mass0000{number}{index}0", "title": f"Titre {index}"} for index in range(2)]}
+            targets.append(playlist(key))
+        self.update_config()
+        queue = ImportQueue(self.temp / "state", self.library)
+        workers, ids = [], []
+        for url in targets:
+            identity = queue.enqueue([("", url)])
+            ids.append(identity)
+            self.assertTrue(queue.claim(identity))
+            with lease(queue.directory / f"{identity}.lock") as fd:
+                workers.append(self.managed_worker(queue, identity, fd))
+        self.until(lambda: slot_count(self.inbox / ".kara-transferts", DOWNLOADS) == DOWNLOADS)
+        self.assertEqual(queue.count(), {"running": 4})
+        # Closing the progress pipes models GTK going away without stopping
+        # the workers. Journals and SQLite results remain available on restart.
+        for worker in workers:
+            worker.stdout.close()
+            worker.stdout = None
+        for worker in workers:
+            self.assertEqual(worker.wait(timeout=45), 0)
+        restarted = ImportQueue(self.temp / "state", self.library)
+        self.assertEqual(restarted.count(), {"done": 4})
+        self.assertEqual(restarted.totals(), (4, 8, 4, 4))
+        self.assertTrue(all(restarted.job(identity)["refresh"] for identity in ids))
+        self.assertEqual(len(self.requests.read_text().splitlines()), 8)
+
+    def test_low_disk_blocks_transfers(self):
+        wrapper = self.temp / "low_disk.py"
+        wrapper.write_text(
+            "import runpy, shutil, sys\n"
+            "from pathlib import Path\n"
+            "real = shutil.disk_usage\n"
+            "shutil.disk_usage = lambda path: real(path)._replace(free=0) if 'A_trier' in str(path) else real(path)\n"
+            "kara = sys.argv.pop(1)\n"
+            "sys.path.insert(0, str(Path(kara).parent))\n"
+            "runpy.run_path(kara, run_name='__main__')\n")
+        result = subprocess.run([sys.executable, wrapper, BIN / "kara", "--suivi-json", "--", playlist("PLPART")],
+                                cwd=self.temp, env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        album = next(row for row in map(json.loads, result.stdout.splitlines()) if row["event"] == "album")
+        self.assertEqual(album["category"], "space")
+        self.assertEqual(self.requests.read_text(), "")
+        self.assertEqual(list(self.inbox.iterdir()), [])
 
     def test_shortcut_uses_moved_checkout_from_foreign_cwd(self):
         checkout = self.temp / "copie déplacée $ 100%" / "bin"
@@ -340,7 +519,7 @@ path.write_text(json.dumps(config))
 first.retry_button.emit("clicked")
 assert not first.retry_button.get_visible()
 retry_job = panel.imports[-1]
-assert retry_job is not first and len(retry_job.jobs) == 1
+assert retry_job is not first and retry_job.identity == first.identity
 wait_for(lambda: retry_job.done)
 assert retry_job.outcomes[sys.argv[3]]["status"] == "success"
 window.close()
@@ -351,6 +530,96 @@ window.close()
                        cwd=self.temp, env=env, timeout=55, check=True)
         self.assertEqual(Counter(self.requests.read_text().splitlines()),
                          {"soundGOOD01": 1, "soundGOOD02": 1, "soundDOWN01": 1})
+
+
+    @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK"), "set PAROLE_TEST_GTK=1 in a GTK session")
+    def test_mobile_queue_pause_low_disk_and_library_refresh(self):
+        script = self.temp / "gtk_shared.py"
+        script.write_text('''
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib
+from concurrent.futures import ThreadPoolExecutor
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+from types import MethodType, SimpleNamespace
+from unittest.mock import patch
+import sys
+import time
+
+sys.path.insert(0, sys.argv[1])
+from _kara_import import AlbumImport
+from _kara_import_result import ImportIssue
+from _kara_mobile_imports import MobileImports
+
+loader = SourceFileLoader("parole_window_fixture", str(Path(sys.argv[1]) / "paroles-strawberry"))
+spec = spec_from_loader(loader.name, loader)
+module = module_from_spec(spec)
+loader.exec_module(module)
+window = module.LyricsWindow
+catalogues = []
+room = SimpleNamespace(update_catalogue=catalogues.append)
+control = SimpleNamespace(receiver=SimpleNamespace(room=room), closed=False, music_window=None,
+                          blackbox=SimpleNamespace(emit=lambda *args, **kwargs: None),
+                          remote_party=SimpleNamespace(locked=False), import_refresh_tasks={},
+                          import_refresh_timer=None, import_refresh_active=False)
+for name in ("refresh_after_import", "reload_after_import"):
+    setattr(control, name, MethodType(getattr(window, name), control))
+
+panel = AlbumImport()
+assert panel.configure(paused=True)
+mobile = MobileImports(control)
+control.album_import, control.mobile_imports = panel, mobile
+mobile.bind_queue(panel.queue)
+panel.on_update = mobile.update
+album_id = "MPREb_FIXTURE"
+url = f"https://music.youtube.com/browse/{album_id}"
+desktop = panel.enqueue([("Édition fixture", url)])
+for number in range(40):
+    mobile.discographies["fixture"] = {"name": f"Artiste {number}", "albums": [
+        {"id": f"MPREb_{number}", "title": f"Album {number}"}]}
+    mobile.request("token", "participant", {"handle": "fixture", "all": True, "rights": True})
+mobile.discographies["fixture"] = {"name": "Artiste fixture", "albums": [{"id": album_id, "title": "Édition fixture"}]}
+request = mobile.request("token", "participant", {"handle": "fixture", "all": True, "rights": True})
+mobile.action(request["job"], "approve")
+assert panel.queue.count() == {"queued": 1}
+assert mobile.jobs[request["job"]]["task_id"] == desktop.identity
+
+# Recreate both frontends with the same queue and the same scoped state.
+panel.closing = True
+panel = AlbumImport()
+mobile = MobileImports(control)
+control.album_import, control.mobile_imports = panel, mobile
+mobile.bind_queue(panel.queue)
+panel.on_update = mobile.update
+assert len(mobile.snapshot(organizer=True)) >= 40
+assert panel.queue.settings() == (True, 4)
+with patch("_kara_import.check_space", side_effect=ImportIssue("space", "Fixture disque plein")):
+    assert panel.configure(paused=False)
+    assert panel.queue.count() == {"queued": 1}
+    assert "Fixture disque plein" in panel.queue_status.get_text()
+with ThreadPoolExecutor(max_workers=1) as pool:
+    control.tag_reader = pool
+    panel.launch_next(force=True)
+    deadline = time.monotonic() + 25
+    context = GLib.MainContext.default()
+    while time.monotonic() < deadline:
+        while context.pending():
+            context.iteration(False)
+        panel.launch_next()
+        if catalogues:
+            break
+        time.sleep(.02)
+    assert len(catalogues) == 1
+    assert len(catalogues[0]) == 2
+    assert mobile.jobs[request["job"]]["state"] == "done"
+    assert panel.queue.job(desktop.identity)["refresh"] == 0
+    assert panel.imports_snapshot[1]["tracks"] == 2
+panel.closing = True
+''', encoding="utf-8")
+        subprocess.run(["dbus-run-session", "--", sys.executable, "-B", script, BIN], cwd=self.temp,
+                       env=dict(self.env, GTK_A11Y="none"), timeout=35, check=True)
 
 
 if __name__ == "__main__":

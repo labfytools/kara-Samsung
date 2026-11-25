@@ -6,8 +6,9 @@ import json
 import os
 import re
 import ssl
+import sys
 from pathlib import Path
-from secrets import token_hex
+from secrets import compare_digest, token_hex
 import subprocess
 from tempfile import NamedTemporaryFile
 from threading import BoundedSemaphore, RLock, Thread
@@ -19,6 +20,8 @@ from _kara_paths import BIN, CONFIG, STATE
 
 
 LAN_RANGES = ("10.", "192.168.", "172.")
+DISPLAY_ROUTE = "/tv/etat"
+DISPLAY_DIAGNOSTIC = "/tv/diagnostic"
 
 
 def lan_interface():
@@ -103,6 +106,11 @@ class RoomListener(ThreadingHTTPServer):
         sock.settimeout(3)
         return sock, address
 
+    def handle_error(self, request, address):
+        # A released TV or browser socket can vanish during request parsing.
+        if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            super().handle_error(request, address)
+
     def start(self):
         Thread(target=self.serve_forever, kwargs={"poll_interval": 0.10}, daemon=True).start()
 
@@ -186,7 +194,8 @@ class Receiver(RoomListener):
 
     def __init__(self, address, html, *, port=0, code=None, on_mobile=None,
                  reserved_names=(), mobile_html=b'', network=None, https=None,
-                 diagnostics=None, commands=None, admin_code=None, imports=None, audio=None):
+                 diagnostics=None, commands=None, admin_code=None, imports=None, audio=None,
+                 display_key=None):
         super().__init__(address, port, network=network)
         self.receiver = self
         self.https_listener = None
@@ -202,6 +211,8 @@ class Receiver(RoomListener):
         # the previous room. The first player can clear it without SDB.
         self._tv_needs_open = True
         self.tv_seen = 0.
+        self.secure_tv_seen = 0.
+        self.display_key = display_key
         self.tv_diagnostic_seen = 0.
         self.diagnostics = diagnostics
         self.commands = commands
@@ -299,14 +310,25 @@ class Receiver(RoomListener):
         self.shutdown()
         self.server_close()
 
-    def tv_request(self, client=False, *, include_qr=True):
+    def tv_request(self, client=False, *, include_qr=True, secure_display=False):
         if client:
             with self._state_lock:
                 clock = time.monotonic()
                 if clock - self.tv_seen > 4 and self.diagnostics:
                     self.diagnostics.emit("television", "reconnect" if self.tv_seen else "connect")
                 self.tv_seen = clock
-        return self.state if include_qr else self.state_no_qr
+                if secure_display:
+                    self.secure_tv_seen = clock
+        raw = self.state if include_qr else self.state_no_qr
+        if not secure_display:
+            return raw
+        state = json.loads(raw)
+        state["join_url"] = self.join_url
+        if include_qr:
+            state["qr_data"] = self.qr_data
+        if state.get("party_phase", "lobby") in ("lobby", "preparing", "ready"):
+            state["organizer_pin"] = self.room.current_admin_code()
+        return state
 
     def tv_report(self, params):
         event = params.get("event", [""])[0]
@@ -342,6 +364,10 @@ class Page(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
+        if self.server.tls and self.path.partition("?")[0] in (DISPLAY_ROUTE, DISPLAY_DIAGNOSTIC):
+            # A packaged Tizen widget can have an opaque origin. Only the
+            # bearer-authenticated, read-only display route accepts it.
+            self.send_header("Access-Control-Allow-Origin", "*")
         audio = self.server.receiver.audio
         allowed_audio = ' ' + audio.url.removesuffix('/audio') if audio and audio.url else ''
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'" + allowed_audio + "; object-src 'none'; base-uri 'none'")
@@ -361,7 +387,7 @@ class Page(BaseHTTPRequestHandler):
         except ValueError as error:
             raise RoomError("Adresse de salle invalide.") from error
         base = self.server.receiver.path
-        if not request.path.startswith(base + '/') and request.path != base:
+        if not request.path.startswith(base + '/') and request.path not in (base, DISPLAY_ROUTE, DISPLAY_DIAGNOSTIC):
             raise RoomError('Salle introuvable.', 404)
         return request
 
@@ -382,6 +408,17 @@ class Page(BaseHTTPRequestHandler):
             path = request.path
             receiver = self.server.receiver
             base = receiver.path
+            if path in (DISPLAY_ROUTE, DISPLAY_DIAGNOSTIC):
+                key = self.headers.get("Authorization", "")
+                if (not self.server.tls or not receiver.display_key or not key.isascii()
+                        or not compare_digest(key, "Bearer " + receiver.display_key)):
+                    raise RoomError("Écran Kara non autorisé.", 403)
+                params = parse_qs(request.query)
+                if path == DISPLAY_DIAGNOSTIC:
+                    receiver.tv_report(params)
+                    return self._send(200, {"ok": True})
+                include_qr = params.get("qr", ["1"])[0] != "0"
+                return self._send(200, receiver.tv_request(client=True, include_qr=include_qr, secure_display=True))
             if path == base:
                 return self._send(200, receiver.html, 'text/html')
             if path == base + '/etat':
@@ -400,6 +437,8 @@ class Page(BaseHTTPRequestHandler):
                 return self._send(200, receiver.mobile_html, 'text/html')
             if path == base + '/mobile.js' and receiver.mobile_script:
                 return self._send(200, receiver.mobile_script, 'text/javascript')
+            if path == base + '/logo.png':
+                return self._send(200, (BIN.parent / "tizen/app/icon.png").read_bytes(), 'image/png')
             if path == base + '/micro-worklet.js' and self.server.tls and receiver.audio:
                 return self._send(200, (BIN / "_kara_micro_worklet.js").read_bytes(), 'text/javascript')
             if path == base + '/qr':
@@ -414,7 +453,21 @@ class Page(BaseHTTPRequestHandler):
                 if receiver.imports:
                     state["party"]["imports"] = receiver.imports.snapshot(
                         organizer=state["me"]["organizer"], token=token)
+                    state["party"]["import_queue"] = receiver.imports.queue_status()
                 return self._send(200, state)
+            if path == base + '/api/historique-imports' and receiver.imports:
+                self._private_transport()
+                token = self._authorized_token()
+                state = receiver.room.check(token)
+                params = parse_qs(request.query)
+                organizer = state["me"]["organizer"] and params.get("mine") != ["1"]
+                before = params.get("before", [None])[0]
+                if before is not None:
+                    if not re.fullmatch(r"[0-9]{1,18}" if organizer else r"[a-f0-9]{32}", before):
+                        raise RoomError("Page d’historique invalide.")
+                    before = int(before) if organizer else before
+                return self._send(200, receiver.imports.snapshot(
+                    organizer=organizer, token=token, history=True, before=before))
             if path == base + '/api/recherche':
                 params = parse_qs(request.query, keep_blank_values=True)
                 query = params.get('q', [''])[0]
@@ -422,12 +475,17 @@ class Page(BaseHTTPRequestHandler):
                     offset = int(params.get('offset', ['0'])[0])
                 except (ValueError, TypeError):
                     raise RoomError('Pagination invalide.')
+                if not self.headers.get("Authorization"):
+                    self._private_transport()
                 return self._send(200, receiver.room.search(
-                    self._authorized_token(), query, offset, mode=params.get('mode', ['all'])[0],
+                    self._authorized_token() if self.headers.get("Authorization") else None,
+                    query, offset, mode=params.get('mode', ['all'])[0],
                     artist=params.get('artist', [''])[0], album=params.get('album', [''])[0]))
             if path.startswith(base + '/api/pochette/'):
                 key = path.rsplit('/', 1)[-1]
-                cover = receiver.room.cover(self._authorized_token(), key)
+                if not self.headers.get("Authorization"):
+                    self._private_transport()
+                cover = receiver.room.cover(self._authorized_token() if self.headers.get("Authorization") else None, key)
                 if cover and not cover.is_symlink():
                     try:
                         with open(cover, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW)) as stream:
@@ -445,6 +503,17 @@ class Page(BaseHTTPRequestHandler):
             raise RoomError('Page introuvable.', 404)
         except RoomError as error:
             return self._send(error.status, {'error': str(error)})
+
+    def do_OPTIONS(self):
+        if self.server.tls and self.path.partition("?")[0] in (DISPLAY_ROUTE, DISPLAY_DIAGNOSTIC):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.end_headers()
+        else:
+            self.send_error(404)
 
     def do_POST(self):
         try:
@@ -475,10 +544,11 @@ class Page(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise RoomError('Requête invalide.')
             if request.path == base + '/api/inscription':
-                return self._send(200, receiver.room.join(data.get('name'), data.get('token')))
+                return self._send(200, receiver.room.join(data.get('name'), data.get('token'), data.get("registration")))
             token = self._authorized_token()
             if request.path == base + '/api/choix':
-                return self._send(200, receiver.room.choose(token, data.get('song_id')))
+                return self._send(200, receiver.room.choose(token, data.get('song_id'),
+                                  confirm=data.get("confirm") is True, replace=data.get("replace") is True))
             if request.path == base + '/api/retirer-choix':
                 return self._send(200, receiver.room.clear_choice(token, data.get('song_id')))
             if request.path == base + '/api/quitter':
@@ -513,7 +583,23 @@ class Page(BaseHTTPRequestHandler):
             if request.path == base + '/api/micro-ticket' and receiver.audio:
                 self._private_transport()
                 receiver.room.identity(token)
-                return self._send(200, receiver.audio.ticket(token))
+                return self._send(200, receiver.audio.ticket(token, consent=data.get("consent") is True))
+            if receiver.commands is not None and request.path == base + '/api/demarrer':
+                self._private_transport()
+                name = receiver.room.identity(token)
+                return self._send(200, receiver.commands("player-start", name, data))
+            if receiver.commands is not None and request.path == base + '/api/relancer-import' and receiver.imports:
+                self._private_transport()
+                name = receiver.room.identity(token)
+                return self._send(200, receiver.commands("player-retry-import", name, data))
+            if receiver.commands is not None and request.path == base + '/api/relancer-chanson':
+                self._private_transport()
+                name = receiver.room.identity(token)
+                return self._send(200, receiver.commands("player-retry-song", name, data))
+            if receiver.commands is not None and request.path == base + '/api/couper-retour':
+                self._private_transport()
+                name = receiver.room.identity(token)
+                return self._send(200, receiver.commands("audio-return-cut", name, data))
             if receiver.imports is not None and request.path == base + '/api/albums-externes':
                 self._private_transport()
                 receiver.room.identity(token)
@@ -580,7 +666,11 @@ def start_receiver(on_mobile=None, reserved_names=(), *, diagnostics=None, comma
     html = (BIN / '_kara_tv.html').read_bytes()
     mobile_html = (BIN / '_kara_mobile.html').read_bytes()
     address, network = lan_interface()
+    key_path = CONFIG / "kara/tv-display-key"
+    display_key = key_path.read_text().strip() if key_path.is_file() else None
+    if display_key is not None and not re.fullmatch(r"[0-9a-f]{64}", display_key):
+        raise ValueError("La clé de la télévision Kara est invalide.")
     return Receiver(address, html, port=8765, code=pairing_code(), network=network, https=https_settings(),
                     on_mobile=on_mobile, reserved_names=reserved_names,
                     mobile_html=mobile_html, diagnostics=diagnostics, commands=commands, admin_code=admin_code,
-                    imports=imports, audio=audio)
+                    imports=imports, audio=audio, display_key=display_key)

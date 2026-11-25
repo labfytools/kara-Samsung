@@ -1,5 +1,6 @@
 """Résultats d’import partagés par la commande kara et son interface GTK."""
 import json
+import os
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
@@ -13,6 +14,7 @@ CATEGORIES = {
     "path": "Chemin invalide",
     "playlist": "Playlist indisponible",
     "network": "Erreur réseau",
+    "space": "Espace disque insuffisant",
     "audio_unavailable": "Format audio indisponible sur YouTube",
     "download": "Échec de téléchargement",
     "processing": "Échec de traitement",
@@ -32,8 +34,10 @@ def failure_category(detail, default):
     if any(term in text for term in ("modulenotfounderror", "not installed", "ffmpeg not found",
                                      "no supported javascript runtime", "python dependencies")):
         return "dependency"
+    if "no space left on device" in text or "espace disque insuffisant" in text:
+        return "space"
     if any(term in text for term in ("could not find firefox cookies", "no such file or directory",
-                                     "permission denied", "no space left on device", "invalid path")):
+                                     "permission denied", "invalid path")):
         return "path"
     if any(term in text for term in ("playlist does not exist", "playlist is not available",
                                      "playlist is private", "failed to resolve album to playlist",
@@ -65,6 +69,8 @@ class ImportLog:
         with self.lock:
             self.file.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self.file.flush()
+            if payload.get("event") in {"header", "success", "skip", "failure", "cancelled"}:
+                os.fsync(self.file.fileno())
 
 
 def retry_albums(log_path, library):

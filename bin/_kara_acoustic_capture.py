@@ -50,6 +50,8 @@ class AcousticTurn:
 
     def start(self):
         for track in GRAPH_TRACKS:
+            if self.recorder.voice_session(track) != self.session:
+                continue
             self.report(track, "requested")
             thread = Thread(target=self.read, args=(track,), daemon=True, name=f"kara-acoustic-{track}")
             self.threads.append(thread)
@@ -123,7 +125,8 @@ class AcousticCapture:
         self.task = None
 
     def update(self, context=None, sink=None):
-        session = self.recorder.voice_session() if context else None
+        session = next((identity for track in GRAPH_TRACKS
+                        if (identity := self.recorder.voice_session(track))), None) if context else None
         signature = (session, context["turn"], sink) if session else None
         if self.task:
             if self.task.signature == signature and not self.task.stop_flag.is_set():

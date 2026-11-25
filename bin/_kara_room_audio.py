@@ -39,6 +39,11 @@ class Route:
     receiving: bool = False
     failed_blocks: int = 0
     last_sample: float = 0.
+    last_arrival: float = 0.
+    muted: bool = False
+    return_enabled: bool = True
+    recording_consent: bool = True
+    require_consent: bool = False
     next_metrics: float = 0.
     counters: dict = field(default_factory=dict)
     gain: float = 0.
@@ -87,6 +92,7 @@ class RoomAudio:
         # Preferences are scoped to the ephemeral room identity and physical
         # output. They cannot change the PCM consumed by the score engine.
         self.preferences = {}
+        self.default_preferences = {}
         self.preference_device = None
 
     def status(self):
@@ -204,15 +210,19 @@ class RoomAudio:
         settings["echo_guard"] = True
         return sink, device, settings
 
-    def open_turn(self, owner, player, turn, song, *, scoring=True):
+    def open_turn(self, owner, player, turn, song, *, scoring=True, require_consent=False):
         self.close_turn()
         sink, device, settings = self._route_settings()
         sender, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
         sender.setblocking(False)
         with self.lock:
             self.preference_device = device
-            volume = self.preferences.get((owner, device), min(100, settings["volume_percent"]))
+            volume = self.preferences.get((owner, device),
+                                          self.default_preferences.get(owner, min(100, settings["volume_percent"])))
             self.route = Route(owner, player, turn, song, sink, device, settings, volume, sender, scoring=scoring)
+            self.route.recording_consent = not require_consent
+            self.route.require_consent = require_consent
+            self.route.return_enabled = not require_consent
         self.diagnostics.emit("audio", "route", player=player, turn=turn, song=song, output=sink,
                               profile=settings["profile"], guard=True, requested_percent=volume, scoring=scoring,
                               trial=self.mix_trial_name)
@@ -231,15 +241,16 @@ class RoomAudio:
         if ws is not None and self.loop:
             asyncio.run_coroutine_threadsafe(ws.close(code=4000, message=b"Tour termine"), self.loop)
 
-    def receiving(self):
+    def receiving(self, *, recent=False):
         with self.lock:
-            return bool(self.route and self.route.receiving)
+            route = self.route
+            return bool(route and route.receiving and (not recent or time.monotonic() - route.last_arrival < 1.5))
 
     def selected_sink(self):
         with self.lock:
             return self.route.sink if self.route else None
 
-    def ticket(self, owner):
+    def ticket(self, owner, *, consent=False):
         with self.lock:
             route = self.route
             if self.silent or route is None or route.owner != owner or route.closed or not self.runner:
@@ -247,6 +258,7 @@ class RoomAudio:
             if route.claimed is not None or route.claim is None and time.monotonic() < route.armed_until:
                 raise RoomError("Ton microphone est déjà connecté.", 409)
             route.claim = token_urlsafe(24)
+            route.recording_consent = not route.require_consent or consent is True
             route.armed_until = time.monotonic() + 45.
             return {"url": self.url, "ticket": route.claim, "volume": route.volume,
                     "capture": route.settings["mic_gain_percent"], "echo": route.settings["chrome_echo"],
@@ -305,8 +317,12 @@ class RoomAudio:
 
     def return_pcm(self, route, pcm, sequence):
         with self.lock:
-            if route is self.route:
+            if route is self.route and route.recording_consent:
                 self.diagnostics.pcm("return", 48000, 2, pcm, sequence=sequence, **route.context)
+
+    def consented(self):
+        with self.lock:
+            return bool(self.route and self.route.recording_consent)
 
     def allowed(self, route, ws):
         with self.lock:
@@ -317,18 +333,30 @@ class RoomAudio:
         # capture route. Only the playback stream uses this bounded ramp.
         with self.lock:
             exponent = 2 if route.wireless_output and route.return_drive > 1 else 3
-            target = (min(route.volume, self.ceiling) / 100.) ** exponent if route is self.route else 0.
+            target = (min(route.volume, self.ceiling) / 100.) ** exponent if self._return_enabled(route) else 0.
         first = route.gain
         route.gain += (target - first) * min(1., len(samples) / 2400.)
         return samples * np.linspace(first, route.gain, len(samples), dtype=np.float32)
 
     def applied(self, route):
         with self.lock:
-            return min(route.volume, self.ceiling) if route is self.route else 0
+            return min(route.volume, self.ceiling) if self._return_enabled(route) else 0
+
+    def _return_enabled(self, route):
+        return route is self.route and route.return_enabled and not route.muted
+
+    def enable_return(self):
+        with self.lock:
+            if self.route:
+                self.route.return_enabled = True
 
     def requested(self, route):
         with self.lock:
             return route.volume if route is self.route else 0
+
+    def muted(self, route):
+        with self.lock:
+            return route is self.route and route.muted
 
     def volume(self, route, value):
         if value == "reset":
@@ -344,13 +372,14 @@ class RoomAudio:
             if route is not self.route:
                 return
             route.volume = value
+            route.muted = False
             self.preferences[(route.owner, route.device)] = value
             applied = min(value, self.ceiling)
         self.diagnostics.emit("audio", "voice-volume", **route.context, requested=value, applied=applied)
 
     def administrate(self, action, value):
         if action == "audio-cut":
-            self.close_turn()
+            self.mute_return()
         elif action == "audio-ceiling" and type(value) is int and 0 <= value <= 100:
             if self.mix_trial and value > self.mix_trial.ceiling:
                 raise RoomError("Le niveau dépasse le plafond de ce profil de calibration.")
@@ -378,7 +407,10 @@ class RoomAudio:
         if current and current.owner == owner:
             self.volume(current, str(percent))
         else:
-            _, device, _ = self._route_settings()
+            with self.lock:
+                device = self.preference_device
+            if device is None:
+                _, device, _ = self._route_settings()
             with self.lock:
                 self.preference_device = device
                 self.preferences[(owner, device)] = percent
@@ -388,10 +420,29 @@ class RoomAudio:
         with self.lock:
             if self.route and self.route.owner == owner:
                 return self.route.volume
-            return self.preferences.get((owner, self.preference_device))
+            return self.preferences.get((owner, self.preference_device), self.default_preferences.get(owner))
+
+    def mute_return(self):
+        with self.lock:
+            route = self.route
+            if route:
+                route.muted = True
+                self.diagnostics.emit("audio", "return-cut", **route.context)
+
+    def default_player_volume(self, owner, percent):
+        with self.lock:
+            self.default_preferences[owner] = percent
+
+    def reset_player_volume(self, owner):
+        self.forget_player(owner)
+        with self.lock:
+            route = self.route
+        if route and route.owner == owner:
+            self.volume(route, "reset")
 
     def forget_player(self, owner):
         with self.lock:
+            self.default_preferences.pop(owner, None)
             for key in tuple(self.preferences):
                 if key[0] == owner:
                     self.preferences.pop(key)
@@ -426,6 +477,7 @@ class RoomAudio:
             if end <= route.last_sample:
                 return
             route.receiving = True
+            route.last_arrival = received
             if route.scoring:
                 try:
                     route.sender.send(struct.pack("<d", end) + pcm)
@@ -436,8 +488,9 @@ class RoomAudio:
             route.seq = sequence
             route.sent += 1
             timing = {"frame_end": frame_end, "send_ms": send_clock, "received_s": received}
-            self.diagnostics.pcm("wifi", rate, 1, data, capture_end=end, sequence=sequence,
-                                 packet_timing=timing, **route.context)
-            if route.scoring:
-                self.diagnostics.pcm("whisper", 16000, 1, pcm, capture_end=end, sequence=sequence,
+            if route.recording_consent:
+                self.diagnostics.pcm("wifi", rate, 1, data, capture_end=end, sequence=sequence,
                                      packet_timing=timing, **route.context)
+                if route.scoring:
+                    self.diagnostics.pcm("whisper", 16000, 1, pcm, capture_end=end, sequence=sequence,
+                                         packet_timing=timing, **route.context)

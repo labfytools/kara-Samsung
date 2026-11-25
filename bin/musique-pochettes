@@ -22,6 +22,8 @@ from uuid import UUID
 
 from PIL import Image, ImageOps
 from _kara_paths import catalogue_command
+from _kara_import_resources import defer_service, wait_service
+from _kara_import_result import ImportIssue
 from _musique_oz import (INBOX, SHARED_LIBRARY, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file,
                          probe, share_file, shared_mutation, title_pair)
 
@@ -49,35 +51,14 @@ class HttpsOnly(HTTPRedirectHandler):
 class Catalog:
     def __init__(self):
         self.opener = build_opener(HttpsOnly)
-        self.lock = Lock()
-        self.next_request = {}
-        self.paused = set()
-
-    def wait_source(self, host):
-        interval = SOURCE_INTERVALS.get(host, 0.15)
-        while True:
-            with self.lock:
-                if host in self.paused:
-                    raise OSError(f"{host} demande d’attendre avant de reprendre")
-                now = time.monotonic()
-                delay = self.next_request.get(host, 0.0) - now
-                if delay <= 0:
-                    self.next_request[host] = now + interval
-                    return
-            time.sleep(delay)
-
-    def defer_source(self, host, delay):
-        with self.lock:
-            if delay > 30:
-                self.paused.add(host)
-            else:
-                self.next_request[host] = max(self.next_request.get(host, 0.0), time.monotonic() + delay)
-
     def get(self, url, limit):
         host = urlsplit(url).hostname
         request = Request(url, headers={"User-Agent": "MusiquePochettes/1.1"})
         for delay in (2, 5, None):
-            self.wait_source(host)
+            try:
+                wait_service(host, SOURCE_INTERVALS.get(host, 0.15), max_wait=30)
+            except ImportIssue as error:
+                raise OSError(str(error)) from error
             try:
                 with self.opener.open(request, timeout=12) as response:
                     payload = response.read(limit + 1)
@@ -96,7 +77,7 @@ class Catalog:
                         pause = max(pause, requested)
                 except (ValueError, TypeError, OverflowError):
                     pass
-                self.defer_source(host, pause)
+                defer_service(host, pause)
                 if delay is None or pause > 30:
                     raise
                 continue
@@ -431,7 +412,7 @@ def fetch_cover(album, catalog, shared_root=None):
 def process_albums(albums, root, catalog, tracking=False, missing_only=False):
     if tracking:
         print(f"KARA_TOTAL {len(albums)}", flush=True)
-    workers = min(ALBUM_WORKERS, len(albums))
+    workers = min(1 if os.environ.get("KARA_IMPORT_PROCESSING") else ALBUM_WORKERS, len(albums))
     activity_lock = Lock()
     active = 0
 
@@ -445,7 +426,7 @@ def process_albums(albums, root, catalog, tracking=False, missing_only=False):
     def work(album):
         activity(1)
         try:
-            return album, fetch_cover(album, catalog, root if missing_only else None), False
+            return album, fetch_cover(album, catalog, root if missing_only or os.environ.get("KARA_IMPORT_PROCESSING") else None), False
         except (OSError, ValueError) as error:
             return album, f"erreur : {error}", True
         finally:
@@ -499,6 +480,10 @@ def main():
         with shared_mutation(root):
             albums = [album for album in select() if not has_cover(album) and any(map(audio_file, album.iterdir()))]
         return process_albums(albums, root, catalog, args.suivi_activite, missing_only=True)
+    if os.environ.get("KARA_IMPORT_PROCESSING"):
+        with shared_mutation(root):
+            albums = select()
+        return process_albums(albums, root, catalog, args.suivi_activite)
     with shared_mutation(root):
         albums = select()
         if not albums:

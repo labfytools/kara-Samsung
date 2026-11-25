@@ -11,8 +11,8 @@ import sys
 from tempfile import TemporaryDirectory
 import wave
 
-from _kara_blackbox import (FORMAT, GRAPH_TRACKS, ROOT, TRACK_NAME, digest, events, float_header,
-                            private_file, session_folders, wave_layout)
+from _kara_blackbox import (ROOT, TRACK_NAME, digest, events, float_header,
+                            private_file, session_folders, validate_recording, wave_layout)
 from _kara_scoring import score_reference_line
 
 
@@ -35,57 +35,6 @@ def matching(args, folder):
         if args.until is not None and item["monotonic_ns"] > args.until:
             continue
         yield item
-
-
-def validate(folder, manifest):
-    if manifest["format"] != FORMAT or manifest["session"] != folder.name:
-        raise ValueError("Manifeste incompatible.")
-    if manifest["status"] == "recording":
-        raise ValueError("La session est en cours ou doit être récupérée par Parole.")
-    if not {"events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"} <= set(manifest["files"]):
-        raise ValueError("Inventaire de session invalide.")
-    audio = {}
-    for name, entry in manifest["files"].items():
-        path = folder / name
-        if path.is_symlink():
-            raise ValueError("Chemin de capture invalide.")
-        if name not in ("events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"):
-            if not name.startswith("audio/") or not TRACK_NAME.fullmatch(name.removeprefix("audio/")) or path.parent.is_symlink():
-                raise ValueError("Chemin de capture invalide.")
-            audio[name] = wave_layout(path)
-        if path.stat().st_size != entry["bytes"] or digest(path) != entry["sha256"]:
-            raise ValueError(f"Intégrité invalide pour {name}.")
-    previous = 0
-    graph_tail, gaps = {}, 0
-    for item in events(folder / "events.jsonl"):
-        if item["session"] != folder.name or item["id"] <= previous:
-            raise ValueError("Identité ou ordre d’événement invalide.")
-        if item["event"] == "pcm":
-            data = item["data"]
-            rate, channels, frames, width, _ = audio[data["file"]]
-            graph = data["track"] in GRAPH_TRACKS
-            if (data["rate"], data["channels"], width) != (rate, channels, 4 if graph else 2) or not (
-                    0 <= data["sample"] < data["sample"] + data["frames"] <= frames):
-                raise ValueError("Index PCM invalide.")
-            if graph:
-                clock = data["clock"]
-                expected_planes = 6 if data["track"] == "monitor" else 1
-                if (any(type(clock[k]) is not int or clock[k] < 0 for k in
-                        ("driver", "epoch", "frame", "xrun", "monotonic_ns", "quantum", "present"))
-                        or clock["quantum"] != data["frames"]
-                        or clock["present"] & expected_planes != expected_planes):
-                    raise ValueError("Horloge PipeWire invalide.")
-                key = (item["turn"], data["track"], clock["epoch"])
-                last = graph_tail.get(key)
-                if last:
-                    if (clock["driver"] != last["driver"] or clock["xrun"] != last["xrun"]
-                            or clock["monotonic_ns"] <= last["monotonic_ns"]
-                            or clock["frame"] < last["frame"] + last["quantum"]):
-                        raise ValueError("Discontinuité d’horloge PipeWire dans une même fenêtre.")
-                    gaps += clock["frame"] > last["frame"] + last["quantum"]
-                graph_tail[key] = clock
-        previous = item["id"]
-    output({"valid": True, "status": manifest["status"], "session": folder.name, "graph_index_gaps": gaps})
 
 
 def extract_pcm(folder, item, destination, count):
@@ -252,7 +201,7 @@ def main():
         elif args.action == "summary":
             output(read(folder / "summary.json"))
         elif args.action == "validate":
-            validate(folder, read(folder / "manifest.json"))
+            output(validate_recording(folder, read(folder / "manifest.json")))
         elif args.action == "analyze":
             print((folder / "REPORT.md").read_text(), end="")
         elif args.action == "extract-pcm":

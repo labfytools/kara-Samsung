@@ -50,7 +50,26 @@ def same_import_track(source, target, tags):
         return False
 
 
-def move_track(source, target):
+def publish_import(draft, target):
+    # The recovery receipt is recorded before publication. Sync the audio and
+    # directory before removing its staging source so a power loss can replay it.
+    with open(draft, "rb") as media:
+        os.fsync(media.fileno())
+    os.link(draft, target)
+    sync_dir(target.parent)
+    sync_dir(target.parent.parent)
+    sync_dir(target.parent.parent.parent)
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def move_track(source, target, recover=False):
     if not target.is_relative_to(SHARED_LIBRARY):
         try:
             os.link(source, target)
@@ -66,7 +85,7 @@ def move_track(source, target):
             share_file(draft.name, target)
         else:
             shutil.copy2(source, draft.name)
-        os.link(draft.name, target)
+        (publish_import if recover else os.link)(draft.name, target)
     source.unlink()
 
 
@@ -119,7 +138,7 @@ def album_artists(items, root):
     return resolved
 
 
-def write_tags(source, target, tags, updates):
+def write_tags(source, target, tags, updates, recover=False):
     ffmpeg_keys = {"albumartist": "album_artist", "album": "album"}
     metadata = []
     for key, value in updates.items():
@@ -141,7 +160,7 @@ def write_tags(source, target, tags, updates):
         if source == target:
             os.replace(draft, target)
         else:
-            os.link(draft, target)
+            (publish_import if recover else os.link)(draft, target)
             source.unlink()
 
 
@@ -156,7 +175,8 @@ def target_parts(source, tags, artist, album):
             prefix + title, source.suffix.lower())
 
 
-def classify(source, tags, album_artist, album_title, root, preview, reserved, importing, known_sources):
+def classify(source, tags, album_artist, album_title, root, preview, reserved, importing, known_sources,
+             receipt=None):
     artist, album, name, extension = target_parts(source, tags, album_artist, album_title)
     updates = {}
     if album_title != tags.get("album"):
@@ -175,6 +195,17 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
     position = (number(tags.get("disc") or tags.get("discnumber")) or 1,
                 number(tags.get("track") or tags.get("tracknumber")))
     identity = (video, position, None if position[1] else name)
+    def remember(target):
+        if receipt is None:
+            return
+        # Record the exact staged filename and intended destination before
+        # touching either. Recovery verifies the destination against the source.
+        with receipt.open("a+", encoding="utf-8") as journal:
+            journal.write("\n" + json.dumps([source.name, str(target), video, *position]) + "\n")
+            journal.flush()
+            os.fsync(journal.fileno())
+        sync_dir(receipt.parent)
+
     if video:
         # A retry may choose a different codec or have new tags. Reuse the same
         # source at the same album position, under the shared library lock.
@@ -192,6 +223,7 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
                     sources.setdefault((existing_video, (disc, track), None if track else existing.stem), existing)
         existing = known_sources[folder].get(identity)
         if existing is not None and source != existing and audio_file(existing):
+            remember(existing)
             source.unlink()
             print(f"Déjà dans la bibliothèque : {existing.relative_to(root)}")
             return existing, False
@@ -206,6 +238,7 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
             return target, False
         if target in reserved or target.exists() or target.is_symlink():
             if importing and not preview and (same_content(source, target) or same_import_track(source, target, tags)):
+                remember(target)
                 source.unlink()
                 print(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
                 return target, False
@@ -215,10 +248,11 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
             continue
         if not preview:
             try:
+                remember(target)
                 if updates:
-                    write_tags(source, target, tags, updates)
+                    write_tags(source, target, tags, updates, receipt is not None)
                 else:
-                    move_track(source, target)
+                    move_track(source, target, receipt is not None)
             except FileExistsError:
                 continue
         if preview:
@@ -241,6 +275,7 @@ def main():
     parser.add_argument("--nom-album", help="impose le titre de l’album pour les sources sélectionnées")
     parser.add_argument("--rapport", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--rapport-detaille", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--reprise-interne", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     for option, value in (("--artiste-album", args.artiste_album), ("--nom-album", args.nom_album)):
         if value is not None and (not args.sources or not value.strip()):
@@ -280,7 +315,7 @@ def main():
                 if importing and args.artiste_album:
                     artist = canonical_album_artist(artist, album)
                 target, moved = classify(track, tags, artist, album, root, args.apercu, reserved, importing,
-                                         known_sources)
+                                         known_sources, args.reprise_interne if importing else None)
                 if target is not None:
                     destinations.add(str(target))
                 added += moved

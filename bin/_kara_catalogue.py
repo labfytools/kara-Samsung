@@ -3,10 +3,11 @@ import json
 import re
 import subprocess
 import sys
-from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from _kara_import_resources import defer_service, wait_service
+from _kara_import_result import ImportIssue
 from _musique_oz import canonical_album_artist, INBOX, audio_files, component, probe, source_video
 
 CHANNEL = re.compile(r"UC[A-Za-z0-9_-]{22}")
@@ -20,9 +21,34 @@ def client():
     from requests import Session
     from ytmusicapi import YTMusic
 
-    session = Session()
-    session.request = partial(session.request, timeout=(5, 12))
-    return YTMusic(language="fr", location="FR", requests_session=session)
+    class CatalogueSession(Session):
+        def request(self, method, url, **options):
+            from email.utils import parsedate_to_datetime
+            from time import time
+            from requests import exceptions
+
+            # Desktop suggestions, mobile lookup, covers and imports share
+            # pacing with yt-dlp. A Retry-After applies to the next callers too.
+            wait_service("youtube", 0.5)
+            options.setdefault("timeout", (5, 12))
+            try:
+                response = super().request(method, url, **options)
+            except (exceptions.Timeout, exceptions.ConnectionError):
+                defer_service("youtube", 12)
+                raise
+            if response.status_code in (429, 500, 502, 503, 504):
+                delay = 60 if response.status_code == 429 else 12
+                header = response.headers.get("Retry-After", "")
+                try:
+                    requested = int(header) if header.isdecimal() else parsedate_to_datetime(header).timestamp() - time()
+                    delay = max(delay, requested)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                defer_service("youtube", delay)
+                response.raise_for_status()
+            return response
+
+    return YTMusic(language="fr", location="FR", requests_session=CatalogueSession())
 
 
 def key(value):
@@ -258,6 +284,8 @@ def main(argv):
     except Exception as error:
         if isinstance(error, ModuleNotFoundError):
             category = "dependency"
+        elif isinstance(error, ImportIssue):
+            category = error.category
         elif isinstance(error, PlaylistUnavailable):
             category = "playlist"
         elif isinstance(error, (ConnectionError, TimeoutError, URLError)) or type(error).__module__.startswith("requests."):

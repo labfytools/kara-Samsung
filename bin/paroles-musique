@@ -3,6 +3,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from email.utils import parsedate_to_datetime
 from fcntl import LOCK_EX, LOCK_NB, flock
 from html import unescape
@@ -26,6 +27,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_artist,
                          probe, share_file, shared_mutation)
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
+from _kara_import_resources import defer_service, wait_service
+from _kara_import_result import ImportIssue
 
 
 LIBRARY = SHARED_LIBRARY
@@ -74,7 +77,13 @@ class RequestGate:
         self.next_request = 0.0
         self.paused = False
 
-    def wait(self):
+    def wait(self, host):
+        if os.environ.get("KARA_IMPORT_PROCESSING"):
+            try:
+                wait_service(host, self.interval, max_wait=30)
+                return True
+            except ImportIssue:
+                return False
         while True:
             with self.lock:
                 if self.paused:
@@ -86,7 +95,10 @@ class RequestGate:
                     return True
             time.sleep(delay)
 
-    def defer(self, delay):
+    def defer(self, host, delay):
+        if os.environ.get("KARA_IMPORT_PROCESSING"):
+            defer_service(host, delay)
+            return
         with self.lock:
             if delay > 30:
                 self.paused = True
@@ -107,7 +119,7 @@ class LrcLib:
         })
         for delay in (2, 5, None):
             last_attempt = delay is None
-            if not self.gate.wait():
+            if not self.gate.wait(urlsplit(request.full_url).hostname):
                 raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer")
             try:
                 with self.opener.open(request, timeout=10) as response:
@@ -126,7 +138,7 @@ class LrcLib:
                 if error.code not in {429, 500, 502, 503, 504}:
                     raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}") from error
                 delay = retry_delay(error.headers.get("Retry-After"), delay or 5)
-                self.gate.defer(delay)
+                self.gate.defer(urlsplit(request.full_url).hostname, delay)
                 if delay > 30:
                     raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer") from error
                 if last_attempt:
@@ -167,7 +179,7 @@ class LyricsOvh:
         request = Request(f"https://api.lyrics.ovh/{path}", headers={
             "Accept": "application/json", "User-Agent": "ParolesMusique/1.1",
         })
-        if not self.gate.wait():
+        if not self.gate.wait(urlsplit(request.full_url).hostname):
             return None
         try:
             with self.opener.open(request, timeout=6) as response:
@@ -177,7 +189,7 @@ class LyricsOvh:
             return json.loads(raw) if len(raw) <= MAX_RESPONSE else None
         except HTTPError as error:
             if error.code == 429:
-                self.gate.defer(retry_delay(error.headers.get("Retry-After"), 2))
+                self.gate.defer(urlsplit(request.full_url).hostname, retry_delay(error.headers.get("Retry-After"), 2))
             return None
         except (OSError, ValueError):
             return None
@@ -230,7 +242,7 @@ class PublicLyrics:
         if referer:
             headers["Referer"] = referer
         request = Request(url, headers=headers)
-        if not self.gate.wait():
+        if not self.gate.wait(urlsplit(request.full_url).hostname):
             return None
         try:
             with self.opener.open(request, timeout=6) as response:
@@ -239,7 +251,7 @@ class PublicLyrics:
                 return raw.decode("utf-8") if html else json.loads(raw)
         except HTTPError as error:
             if error.code == 429:
-                self.gate.defer(retry_delay(error.headers.get("Retry-After"), 2))
+                self.gate.defer(urlsplit(request.full_url).hostname, retry_delay(error.headers.get("Retry-After"), 2))
             return None
         except (OSError, ValueError):
             return None
@@ -743,7 +755,7 @@ def stream_hashes(path):
     )
 
 
-def save_lyrics(path, version, tags, lyrics):
+def save_lyrics(path, version, tags, lyrics, publication_root=None):
     scope = "-metadata:s:a:0" if path.suffix.lower() in STREAM_TAGS else "-metadata"
     key = "lyrics-eng" if path.suffix.lower() == ".mp3" else "LYRICS"
     with TemporaryDirectory(dir=path.parent, prefix=".paroles-") as workspace:
@@ -764,11 +776,12 @@ def save_lyrics(path, version, tags, lyrics):
         original_hashes = stream_hashes(path)
         if not original_hashes or original_hashes != stream_hashes(draft):
             raise ValueError("les flux audio ou image changeraient")
-        if track_version(path) != version:
-            raise ValueError("fichier modifié pendant la recherche")
-        shutil.copymode(path, draft)
-        share_file(draft, path)
-        os.replace(draft, path)
+        with shared_mutation(publication_root) if publication_root else nullcontext():
+            if track_version(path) != version or path.resolve() != path:
+                raise ValueError("fichier modifié pendant la recherche")
+            shutil.copymode(path, draft)
+            share_file(draft, path)
+            os.replace(draft, path)
 
 
 def save_lrc(path, lyrics):
@@ -825,7 +838,7 @@ def retrieve_lyrics(path, client, tags, *, synced):
                        synced=synced, local_text=local_text)
 
 
-def process_track(path, client, preview, synced=False):
+def process_track(path, client, preview, synced=False, publication_root=None):
     sidecar = path.with_suffix(".lrc")
     if synced and (sidecar.exists() or sidecar.is_symlink()):
         return "paroles synchronisées déjà présentes"
@@ -850,17 +863,18 @@ def process_track(path, client, preview, synced=False):
     if not lyrics:
         return "instrumental"
     if synced:
-        if track_version(path) != version:
-            raise ValueError("fichier modifié pendant la recherche")
-        return (f"paroles synchronisées · fichier .lrc · {source}" if save_lrc(sidecar, lyrics)
-                else "paroles synchronisées déjà présentes")
-    save_lyrics(path, version, tags, lyrics)
+        with shared_mutation(publication_root) if publication_root else nullcontext():
+            if track_version(path) != version or path.resolve() != path:
+                raise ValueError("fichier modifié pendant la recherche")
+            return (f"paroles synchronisées · fichier .lrc · {source}" if save_lrc(sidecar, lyrics)
+                    else "paroles synchronisées déjà présentes")
+    save_lyrics(path, version, tags, lyrics, publication_root)
     return f"paroles intégrées · {source}"
 
 
-def run(tracks, root, preview, synced, tracking=False):
+def run(tracks, root, preview, synced, tracking=False, publication_root=None):
     client = None if preview else LyricsSources()
-    workers = 1 if preview else min(TRACK_WORKERS, len(tracks))
+    workers = 1 if preview or publication_root else min(TRACK_WORKERS, len(tracks))
     activity_lock = Lock()
     active = 0
 
@@ -874,7 +888,7 @@ def run(tracks, root, preview, synced, tracking=False):
     def work(track):
         activity(1)
         try:
-            return track, process_track(track, client, preview, synced), False
+            return track, process_track(track, client, preview, synced, publication_root), False
         except ServiceUnavailable as error:
             return track, str(error), True
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
@@ -889,7 +903,7 @@ def run(tracks, root, preview, synced, tracking=False):
             failures += failed
         return int(bool(failures))
 
-    if preview or len(tracks) <= 1:
+    if workers <= 1:
         return publish(map(work, tracks))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(work, track) for track in tracks]
@@ -929,9 +943,10 @@ def main():
             parser.exit(1, "Aucune parole minutée vérifiable.\n")
         print(json.dumps({"lyrics": lyrics, "provider": source}, ensure_ascii=False))
         return 0
-    def process_selection():
+    def process_selection(publication_root=None):
         try:
-            tracks = selected_tracks(args, root)
+            with shared_mutation(publication_root) if publication_root else nullcontext():
+                tracks = selected_tracks(args, root)
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             parser.error(str(error))
         if args.suivi_activite:
@@ -939,11 +954,15 @@ def main():
         if not tracks:
             print("Aucune piste audio à traiter.")
             return 0
-        return run(tracks, root, args.apercu, args.synchro, args.suivi_activite)
+        return run(tracks, root, args.apercu, args.synchro, args.suivi_activite, publication_root)
 
     if args.apercu:
         return process_selection()
     if root == SHARED_LIBRARY:
+        if os.environ.get("KARA_IMPORT_PROCESSING"):
+            # Network, decoding and tag preparation can overlap other albums.
+            # Only the version-checked publication holds the library lock.
+            return process_selection(root)
         with shared_mutation(root):
             return process_selection()
 

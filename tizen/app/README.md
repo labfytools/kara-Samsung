@@ -1,17 +1,24 @@
-# Karaoké Strawberry sur Samsung
+# Kara sur Samsung
 
-Active TV dans Paroles Strawberry et saisis l'adresse du PC et le code dans
-l'application. La touche Retour de la télécommande revient à la connexion.
+Ouvre **Kara** depuis **Applications** sur la télévision. Le client 2.0.0
+attend le serveur HTTPS d’ArchASP puis affiche le QR de jeu et le PIN de
+l’organisateur. **Réessayer** relance immédiatement la connexion.
 
-## Installation
+## Construire une mise à jour
 
-1. Installe Tizen Studio et les extensions Samsung TV et Samsung Certificate.
-2. Ouvre Apps sur la télé, saisis 12345 et active Developer Mode.
-3. Saisis l'adresse du PC puis redémarre la TV.
-4. Ajoute la TV dans Device Manager et crée un profil de certificat Samsung TV
-   avec le DUID du téléviseur.
-5. Importe ce dossier comme application Web tv-samsung, signe le WGT avec le
-   profil et déploie-le sur la TV.
+1. Prépare un nouveau dossier privé avec `bin/kara-tv-package CHEMIN`.
+   Ce dossier contient les sources à signer et la configuration locale de
+   l’écran. Le paquet signé doit rester dans un espace privé.
+2. Signe le dossier avec Tizen Studio et le profil Samsung TV
+   `kara-tv-physique`, qui utilise le certificat auteur d’origine et le
+   certificat de distribution associé au téléviseur.
+3. Vérifie que le WGT porte la version attendue et l’identifiant
+   `LabfyKara0.Karaoke`. Installe la mise à jour via SDB sur la télévision
+   en Developer Mode. L’adresse du PC côté Developer Mode doit correspondre
+   à l’adresse LAN actuelle d’ArchASP.
+4. Pour vérifier l’autonomie, ouvre Kara avec la télécommande depuis le menu
+   **Applications**. Vérifie l’accueil, le QR HTTPS et le PIN, puis relance
+   l’application pendant une partie pour vérifier qu’elle retrouve son état.
 
-[Connexion à la TV](https://developer.samsung.com/smarttv/develop/tools/additional-tools/vscode/connecting-to-tv-device.html)
-[Certificats](https://developer.samsung.com/smarttv/develop/getting-started/setting-up-sdk/creating-certificates.html)
+[Connexion Samsung TV](https://developer.samsung.com/smarttv/develop/tools/additional-tools/vscode/connecting-to-tv-device.html) ·
+[Certificats Samsung TV](https://developer.samsung.com/smarttv/develop/getting-started/setting-up-sdk/creating-certificates.html)

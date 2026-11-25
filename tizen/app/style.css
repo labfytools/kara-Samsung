@@ -51,9 +51,15 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 #reopen-tv{padding:1.3vh 2.3vw;border-radius:10px;font-size:2vw;color:#181825;background:#b4befe;border:0}
 #reopen-tv:focus{outline:3px solid #f9e2af}
 [hidden]{display:none!important}
-#pair{max-width:48vw;margin:5vh auto;padding:4vh 4vw;border:1px solid #45475a;border-radius:20px;background:#242437}
-#pair p,#pair label{display:block;margin:2vh 0 .8vh;font-size:1.55vw;color:#a6adc8}
-#pair input,#join{width:100%;padding:.7em 1em;font-size:1.8vw;border-radius:8px;border:2px solid #45475a;background:#181825;color:#cdd6f4}
-#pair input:focus,#join:focus{outline:3px solid #b4befe}
-#join{margin-top:2.5vh;background:#b4befe;color:#181825;font-weight:bold}
-#hint{min-height:1.6em}
+#connect{max-width:70vw;margin:8vh auto;text-align:center}
+.logo{width:5vw;height:5vw;border-radius:1vw}
+#connect .logo{width:8vw;height:8vw;margin-bottom:2vh}
+#connect p{font-size:2.5vw}
+#retry{padding:1vh 2vw;border:0;border-radius:10px;background:#b4befe;color:#181825;font-size:2vw}
+#retry:focus{outline:3px solid #f9e2af}
+header .logo{float:left;margin-right:1.5vw}
+#mobile-room{flex-wrap:wrap}#organizer-code{display:flex;flex-direction:column;min-width:100%;gap:.4vh}
+#organizer-code small{color:#a6adc8;font-size:1.25vw}
+#pin{color:#b4befe;font-size:3vw;letter-spacing:.18em;font-variant-numeric:tabular-nums}
+#server-status{color:#a6e3a1;font-size:1.15vw;margin:1vh 0 0}
+#upcoming{color:#a6adc8;max-width:38vw;margin:0 auto;font-size:1.5vw;line-height:1.5}

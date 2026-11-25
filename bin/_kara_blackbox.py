@@ -298,25 +298,44 @@ class BlackBox:
         self.session = None
         self.last = None
         self.failure = None
+        self.free_bytes = None
+        self.verified = None
 
     def active(self):
         with self.lock:
             return self.session is not None and not self.session.stop.is_set()
 
-    def status(self):
+    def status(self, *, storage=False):
         with self.lock:
             record = self.session
-            return {"active": bool(record and not record.stop.is_set()),
+            status = {"active": bool(record and not record.stop.is_set()),
                     "finalizing": bool(record and record.stop.is_set()),
                     "session": record.identity if record else None,
                     "dropped": record.dropped if record else 0,
                     "latest": self.last, "error": self.failure}
+            if storage:
+                status["free_bytes"] = self.free_bytes
+                status["verified"] = self.verified
+                status["voice"] = bool(record and record.manifest["capture"]["voice"])
+                status["unavailable"] = sorted(record.unavailable) if record else []
+            return status
 
-    def voice_session(self):
+    def voice_session(self, track=None):
         with self.lock:
             record = self.session
-            if record and not record.stop.is_set() and record.manifest["capture"]["voice"]:
+            if (record and not record.stop.is_set() and record.manifest["capture"]["voice"]
+                    and (track is None or track in record.tracks)):
                 return record.identity
+
+    def disk_available(self):
+        path = self.root
+        while not path.exists() and path.parent != path:
+            path = path.parent
+        try:
+            self.free_bytes = shutil.disk_usage(path).free
+        except OSError:
+            self.free_bytes = None
+        return self.free_bytes
 
     def recover(self):
         if not self.root.is_dir():
@@ -336,9 +355,14 @@ class BlackBox:
             except (OSError, ValueError):
                 continue
 
-    def start(self, *, consent=False, voice=False, configuration=None):
+    def start(self, *, consent=False, voice=False, configuration=None, tracks=None):
         if consent is not True:
             raise ValueError("Confirme l’accord des participants et des responsables des mineurs.")
+        allowed = {"wifi", "whisper", "return", *GRAPH_TRACKS}
+        if tracks is not None and (not isinstance(tracks, list) or len(tracks) > len(allowed)
+                                   or any(not isinstance(track, str) or track not in allowed for track in tracks)):
+            raise ValueError("Pistes BlackBox invalides.")
+        selected = sorted(allowed if tracks is None else set(tracks)) if voice is True else []
         with self.lock:
             if self.session is not None:
                 return
@@ -348,20 +372,22 @@ class BlackBox:
             owner = open(self.root / ".writer.lock", "a", opener=private_file)
             try:
                 flock(owner, LOCK_EX | LOCK_NB)
-                if shutil.disk_usage(self.root).free < self.reserve + 65536:
+                if (self.disk_available() or 0) < self.reserve + 65536:
                     raise OSError("Espace disque insuffisant pour BlackBox.")
                 identity = datetime.now(timezone.utc).strftime("session-%Y%m%dT%H%M%S-") + uuid4().hex[:12]
                 folder = self.root / identity
                 folder.mkdir(mode=0o700)
                 manifest = {"format": FORMAT, "session": identity, "status": "recording",
                             "started": now(), "monotonic_ns": time.monotonic_ns(),
-                            "capture": {"voice": voice is True}, "configuration": clean(configuration or {}),
+                            "capture": {"voice": bool(selected), "tracks": selected},
+                            "configuration": clean(configuration or {}),
                             "quota_bytes": self.max_bytes if self.max_bytes is not None else
                                 (DEFAULT_VOICE_BYTES if voice is True else DEFAULT_BYTES)}
                 atomic_json(folder / "manifest.json", manifest)
                 record = Recording(self, folder, manifest, owner)
                 self.session = record
                 self.failure = None
+                self.verified = None
                 record.thread.start()
             except BaseException:
                 owner.close()
@@ -386,6 +412,8 @@ class BlackBox:
             if (record is None or record.stop.is_set()
                     or recording_session is not None and recording_session != record.identity):
                 return
+            if component == "acoustic" and event == "tap" and data.get("state") == "unavailable":
+                record.unavailable.add(data["track"])
             record.sequence += 1
             item = record.item(component, event, player, song, turn, position, data)
             try:
@@ -414,7 +442,7 @@ class BlackBox:
             return
         with self.lock:
             record = self.session
-            if (record is None or record.stop.is_set() or not record.manifest["capture"]["voice"]
+            if (record is None or record.stop.is_set() or track not in record.tracks
                     or recording_session is not None and recording_session != record.identity):
                 return
             # The per-packet schema only contains typed numeric clock fields
@@ -538,6 +566,57 @@ class Segment:
             self.file.close()
 
 
+def validate_recording(folder, manifest):
+    if manifest["format"] != FORMAT or manifest["session"] != folder.name:
+        raise ValueError("Manifeste incompatible.")
+    if manifest["status"] == "recording":
+        raise ValueError("La session est en cours ou doit être récupérée par Parole.")
+    if not {"events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"} <= set(manifest["files"]):
+        raise ValueError("Inventaire de session invalide.")
+    audio = {}
+    for name, entry in manifest["files"].items():
+        path = folder / name
+        if path.is_symlink():
+            raise ValueError("Chemin de capture invalide.")
+        if name not in ("events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"):
+            if not name.startswith("audio/") or not TRACK_NAME.fullmatch(name.removeprefix("audio/")) or path.parent.is_symlink():
+                raise ValueError("Chemin de capture invalide.")
+            audio[name] = wave_layout(path)
+        if path.stat().st_size != entry["bytes"] or digest(path) != entry["sha256"]:
+            raise ValueError(f"Intégrité invalide pour {name}.")
+    previous = 0
+    graph_tail, gaps = {}, 0
+    for item in events(folder / "events.jsonl"):
+        if item["session"] != folder.name or item["id"] <= previous:
+            raise ValueError("Identité ou ordre d’événement invalide.")
+        if item["event"] == "pcm":
+            data = item["data"]
+            rate, channels, frames, width, _ = audio[data["file"]]
+            graph = data["track"] in GRAPH_TRACKS
+            if (data["rate"], data["channels"], width) != (rate, channels, 4 if graph else 2) or not (
+                    0 <= data["sample"] < data["sample"] + data["frames"] <= frames):
+                raise ValueError("Index PCM invalide.")
+            if graph:
+                clock = data["clock"]
+                expected_planes = 6 if data["track"] == "monitor" else 1
+                if (any(type(clock[k]) is not int or clock[k] < 0 for k in
+                        ("driver", "epoch", "frame", "xrun", "monotonic_ns", "quantum", "present"))
+                        or clock["quantum"] != data["frames"]
+                        or clock["present"] & expected_planes != expected_planes):
+                    raise ValueError("Horloge PipeWire invalide.")
+                key = (item["turn"], data["track"], clock["epoch"])
+                last = graph_tail.get(key)
+                if last:
+                    if (clock["driver"] != last["driver"] or clock["xrun"] != last["xrun"]
+                            or clock["monotonic_ns"] <= last["monotonic_ns"]
+                            or clock["frame"] < last["frame"] + last["quantum"]):
+                        raise ValueError("Discontinuité d’horloge PipeWire dans une même fenêtre.")
+                    gaps += clock["frame"] > last["frame"] + last["quantum"]
+                graph_tail[key] = clock
+        previous = item["id"]
+    return {"valid": True, "status": manifest["status"], "session": folder.name, "graph_index_gaps": gaps}
+
+
 class Recording:
     def __init__(self, manager, folder, manifest, owner):
         self.manager, self.folder, self.manifest, self.owner = manager, folder, manifest, owner
@@ -549,6 +628,8 @@ class Recording:
         self.dropped = self.sequence = 0
         self.segments = {}
         self.pcm_labels = {}
+        self.tracks = frozenset(manifest["capture"]["tracks"])
+        self.unavailable = set()
 
     def item(self, component, event, player, song, turn, position, data):
         return {"id": self.sequence, "session": self.identity, "component": component, "event": event,
@@ -579,7 +660,7 @@ class Recording:
                 segment.close()
 
     def write(self):
-        summary, error = None, None
+        summary, error, verified = None, None, None
         written = 0
         next_sample = 0.
         next_disk = 0.
@@ -590,7 +671,7 @@ class Recording:
                 while not self.stop.is_set() or not self.pending.empty():
                     clock = time.monotonic()
                     if clock >= next_disk:
-                        if shutil.disk_usage(self.folder).free < self.manager.reserve:
+                        if (self.manager.disk_available() or 0) < self.manager.reserve:
                             raise OSError("Réserve disque BlackBox atteinte.")
                         next_disk = clock + 2
                     if clock >= next_sample:
@@ -638,11 +719,17 @@ class Recording:
         try:
             summary = finish_manifest(self.folder, self.manifest, reason=self.reason,
                                       dropped=self.dropped, error=error)
+            # Use the same streaming integrity checks as the CLI with the
+            # closed segments and published inventory.
+            validate_recording(self.folder, self.manifest)
+            verified = True
         except (OSError, ValueError, KeyError) as exc:
+            verified = False
             error = error or f"Finalisation impossible ({type(exc).__name__})."
         finally:
             self.owner.close()
             with self.manager.lock:
                 self.manager.last = summary or self.manager.last
                 self.manager.failure = error
+                self.manager.verified = verified
                 self.manager.session = None

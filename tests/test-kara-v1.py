@@ -22,6 +22,7 @@ from gi.repository import GLib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_blackbox import BlackBox, atomic_json, events
+from _kara_import_queue import ImportQueue, digest
 from _kara_mobile_imports import MobileImports
 from _kara_mobile_room import MobileRoom, ORGANIZER_ATTEMPTS, RoomError
 from _kara_party import Party, Singer, Song, search_key
@@ -32,6 +33,39 @@ from _kara_tv import Receiver, rotating_context
 
 
 class BlackBoxTests(unittest.TestCase):
+    def test_track_selection_and_per_turn_voice_consent_on_synthetic_pcm(self):
+        with TemporaryDirectory() as directory:
+            box = BlackBox(Path(directory) / "blackbox")
+            box.start(consent=True, voice=True, tracks=["wifi"])
+            audio = RoomAudio(box)
+            with patch.object(audio, "_route_settings", return_value=("fixture", "device", {
+                    "volume_percent": 45, "profile": "fixture", "mic_gain_percent": 100,
+                    "chrome_echo": True, "chrome_noise": False})):
+                reader = audio.open_turn("owner", "Alex", "a" * 16, "Essai", scoring=False, require_consent=True)
+            try:
+                audio.runner = object()
+                route = audio.route
+                now = time.monotonic()
+                samples = bytes(1920)
+                audio.pcm(route, samples, 48000, now, 0, now * 1000)
+                self.assertFalse(audio.consented())
+                audio.ticket("owner", consent=True)
+                audio.pcm(route, samples, 48000, now + .02, 1, (now + .02) * 1000)
+                audio.return_pcm(route, samples, 1)
+                self.assertEqual(audio.applied(route), 0)
+                audio.enable_return()
+                self.assertEqual(audio.applied(route), 45)
+                audio.mute_return()
+                self.assertEqual(audio.applied(route), 0)
+            finally:
+                audio.close_turn()
+                reader.close()
+                box.stop(wait=True)
+            self.assertTrue(box.status(storage=True)["verified"])
+            folder, = box.root.glob("session-*")
+            capture = [event for event in events(folder / "events.jsonl") if event["event"] == "pcm"]
+            self.assertEqual([(event["data"]["track"], event["data"]["sequence"]) for event in capture], [("wifi", 1)])
+
     def setUp(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -150,7 +184,7 @@ class FakeController:
         self.remote_party = RemoteParty(self)
         self.room_audio = RoomAudio(self.blackbox)
         self.mobile_imports = SimpleNamespace(pending=lambda: False)
-        self.album_import = SimpleNamespace(running=False)
+        self.album_import = SimpleNamespace(running=False, imports_snapshot=([], {}))
         self.closed = self.validating = self.party_ready = False
         self.align_fraction = 0.
         self.align_status = ""
@@ -162,9 +196,17 @@ class FakeController:
         self.mobile_players = {}
         self.calls = []
         self.batch = []
+        self.available = set()
+        self.game_score = SimpleNamespace(breakdown=None, requested=False)
 
-    def start_blackbox(self, consent, voice=False):
-        self.blackbox.start(consent=consent, voice=voice)
+    def song_available(self, song, *, unscored=False):
+        return song.path in self.available
+
+    def countdown(self):
+        return 0
+
+    def start_blackbox(self, consent, voice=False, tracks=None):
+        self.blackbox.start(consent=consent, voice=voice, tracks=tracks)
 
     def stop_blackbox(self, reason="manual"):
         self.blackbox.stop(reason)
@@ -188,17 +230,17 @@ class FakeController:
             self.mobile_players[token].song = self.receiver.room.song_for(snapshot["song"])
         self.remote_party.changed_selection()
 
-    def begin_preparation(self, songs, *, for_party):
+    def begin_preparation(self, songs, *, for_party, force=False):
         self.calls.append("prepare")
         self.batch = songs
         self.validating = True
         return True
 
-    def start_turn(self, player):
+    def start_turn(self, player, *, independent=False):
         self.calls.append("start")
         self.party.active = player
-        self.turn_phase = "playing"
-        self.playback_state = "Playing"
+        self.turn_phase = "awaiting-mic" if independent else "playing"
+        self.playback_state = "Stopped" if independent else "Playing"
         self.blackbox.emit("party", "turn-start", player=player.name, song=player.song.title)
 
     def finish_turn(self, **kwargs):
@@ -214,6 +256,62 @@ class FakeController:
 
 
 class RoomTests(unittest.TestCase):
+    def test_mobile_confirmed_edition_enters_the_shared_queue_only_once(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            control = FakeController(path)
+            queue = ImportQueue(path / "state", path)
+            imports = MobileImports(control)
+            imports.bind_queue(queue)
+            queue.configure(paused=True)
+            imports.editions["edition"] = {"id": "MPREfixture", "title": "Album", "tracks": [{}]}
+            request = {"handle": "edition", "add": False, "rights": True, "direct": True}
+            first = imports.request("first", "Alex", request)
+            second = imports.request("second", "Jo", request)
+            self.assertEqual(first, second)
+            self.assertEqual(first["state"], "queued")
+            self.assertEqual(queue.count(), {"queued": 1})
+            receipt, = ImportQueue(path / "state", path).requests()
+            self.assertEqual(len(receipt["requests"]), 2)
+
+    def test_preparation_runs_once_for_shared_choice_and_first_turn_can_open(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            control = FakeController(path)
+            control.receiver = receiver = Receiver("127.0.0.1", b"", on_mobile=control.mobile_event)
+            self.addCleanup(receiver.close)
+            room = receiver.room
+            songs = [Song(path / title, title, "Artiste", "Album") for title in ("Premier", "Suite")]
+            for song in songs:
+                song.path.touch()
+            room.update_catalogue([(song, search_key(song.title)) for song in songs])
+            first, second, third = [room.join(name)["token"] for name in ("Alex", "Jo", "Sam")]
+            for token, song in ((first, songs[0]), (second, songs[0]), (third, songs[1])):
+                match = room.search(token, song.title)["results"][0]["id"]
+                room.choose(token, match, confirm=True)
+            self.idle_until(lambda: len(control.party.players) == 3)
+            remote = control.remote_party
+            remote.tick(time.monotonic())
+            self.assertEqual(control.batch, songs[:1])
+            remote.tick(time.monotonic())
+            self.assertEqual(control.calls, ["prepare"])
+            control.available.add(songs[0].path)
+            control.validating = False
+            remote.background_path = None
+            self.assertTrue(remote.can_open())
+            remote.command("open", "Alex", {"request": "0" * 24, "revision": remote.revision})
+            remote.tick(time.monotonic())
+            self.assertEqual(control.party.active.name, "Alex")
+            self.assertEqual(control.turn_phase, "awaiting-mic")
+            self.assertNotIn(songs[1].path, control.available)
+            with self.assertRaises(RoomError):
+                remote.command("player-start", "Jo", {"request": "1" * 24, "turn": remote.turn_id})
+            control.request_turn_start = lambda: control.calls.append("countdown")
+            data = {"request": "2" * 24, "turn": remote.turn_id}
+            remote.command("player-start", "Alex", data)
+            remote.command("player-start", "Alex", data)
+            self.assertEqual(control.calls.count("countdown"), 1)
+
     def test_tv_display_reopens_once_after_start_or_manual_close(self):
         receiver = Receiver("127.0.0.1", b"TV")
         try:
@@ -315,12 +413,32 @@ class RoomTests(unittest.TestCase):
             client = ssl.create_default_context(cafile=str(path / "cert"))
             control = FakeController(path)
             control.mobile_imports = MobileImports(control)
+            queue = ImportQueue(path / "state", path)
+            control.mobile_imports.bind_queue(queue)
+
+            def configure_imports(**settings):
+                queue.configure(**settings)
+                return True
+
+            control.album_import.configure = configure_imports
             receiver = Receiver("127.0.0.1", b"__MOBILE_JOIN_URL__", https=(origin, port, tls),
                                 on_mobile=control.mobile_event, imports=control.mobile_imports,
-                                diagnostics=control.blackbox, commands=control.remote_party.dispatch)
+                                diagnostics=control.blackbox, commands=control.remote_party.dispatch,
+                                display_key="c" * 64)
             control.receiver = receiver
             try:
                 base = origin + receiver.path
+                stable = origin + "/tv/etat"
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(stable, context=client, timeout=4)
+                self.assertEqual(denied.exception.status, 403)
+                with urlopen(Request(stable, headers={"Authorization": "Bearer " + "c" * 64}),
+                             context=client, timeout=4) as response:
+                    display = json.load(response)
+                    self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
+                self.assertEqual(display["join_url"], base + "/jouer")
+                self.assertRegex(display["organizer_pin"], r"^[0-9]{4}$")
+                self.assertNotIn("organizer_pin", json.loads(receiver.tv_request()))
 
                 def req(action, data=None, token=None, expected=200, custom_origin=origin, https=True):
                     headers = {"Origin": custom_origin}
@@ -342,7 +460,7 @@ class RoomTests(unittest.TestCase):
 
                 def command(pool, token, action, key, expected=200, **kwargs):
                     revision = control.remote_party.revision
-                    response = pool.submit(req, "/api/admin/" + action, {"request": key * 24, "revision": revision,
+                    response = pool.submit(req, "/api/admin/" + action, {"request": (key * 24)[:24], "revision": revision,
                                                                         **kwargs}, token, expected)
                     self.idle_until(response.done)
                     return response.result()
@@ -403,17 +521,24 @@ class RoomTests(unittest.TestCase):
                     job = req("/api/importer-album", request, b)["job"]
                     self.assertEqual(req("/api/importer-album", request, b)["job"], job)
                     self.assertEqual(control.mobile_imports.snapshot(token=b)[0]["state"], "approval")
-                    selected = control.mobile_imports.jobs[job]["requests"][b][1]
+                    selected = control.mobile_imports.jobs[job]["requests"][digest(b)][1]
                     self.assertEqual((selected["requested_title"], selected["requested_artist"]),
                                      ("Morceau inédit", "Interprète"))
                     command(pool, b, "import-cancel", "4", expected=403, job=job)
+                    command(pool, b, "import-pause", "a1", expected=403)
+                    command(pool, a, "import-pause", "a2")
+                    command(pool, a, "import-concurrency", "13", batches=6)
+                    self.assertEqual(queue.settings(), (True, 6))
+                    command(pool, a, "import-resume", "14")
+                    self.assertEqual(queue.settings(), (False, 6))
                     bulk = {"handle": group["handle"], "all": True, "rights": True}
                     req("/api/importer-album", {**bulk, "rights": False}, b, expected=400)
-                    req("/api/importer-album", bulk, b, expected=409)
+                    queued_bulk = req("/api/importer-album", bulk, b)["job"]
                     command(pool, a, "import-cancel", "5", job=job)
                     with patch.object(receiver, "commands") as dispatch:
                         participant = req("/api/importer-album", bulk, b)
                         batch = participant["job"]
+                        self.assertEqual(batch, queued_bulk)
                         self.assertNotIn("direct", participant)
                         dispatch.assert_not_called()
                         organizer = req("/api/importer-album", bulk, a)
@@ -453,35 +578,45 @@ class RoomTests(unittest.TestCase):
                 receiver.close()
 
     def test_discography_uses_one_queue_job_and_keeps_completed_albums_across_retry(self):
-        first = SimpleNamespace(done=False, process=None, outcomes={}, journal="premier")
-        second = SimpleNamespace(done=False, process=None, outcomes={}, journal="reprise")
-        enqueue = Mock(side_effect=(first, second))
+        root = Path(self.enterContext(TemporaryDirectory()))
+        queue = ImportQueue(root / "state", root / "library")
         refresh = Mock()
+        panel = SimpleNamespace(imports_snapshot=([], {}), launch_next=Mock(),
+                                retry_job=lambda identity: queue.transition(identity, "partial", "queued", "Relance"))
         control = SimpleNamespace(blackbox=Mock(), remote_party=SimpleNamespace(locked=False),
-                                  album_import=SimpleNamespace(imports=[], enqueue=enqueue),
-                                  refresh_after_import=refresh)
+                                  album_import=panel, refresh_after_import=refresh)
         imports = MobileImports(control)
+        imports.bind_queue(queue)
         releases = {"name": "Artiste", "albums": [{"id": "MPREa", "title": "A"}, {"id": "MPREb", "title": "B"}]}
         with patch.object(imports, "catalogue", return_value=releases):
             group = imports.albums("UC" + "a" * 22)
         job = imports.request("joueur", "Camille", {"handle": group["handle"], "all": True, "rights": True})["job"]
-        enqueue.assert_not_called()
+        self.assertEqual(queue.count(), {})
         imports.action(job, "approve")
-        targets = enqueue.call_args.args[0]
+        self.assertEqual(queue.count(), {"queued": 1})
+        identity = imports.jobs[job]["task_id"]
+        targets = queue.job(identity)["targets"]
         self.assertEqual([title for title, _ in targets], ["A", "B"])
-        first.done = True
-        first.outcomes = {targets[0][1]: {"status": "success", "audio_complete": True, "tracks": ["/tmp/kara-a"]},
-                          targets[1][1]: {"status": "failure"}}
-        imports.update(first, "finished", {"event": "failure"})
+        self.assertTrue(queue.claim(identity))
+        first = {"url": targets[0][1], "status": "success", "audio_complete": True, "tracks": ["/tmp/kara-a"]}
+        queue.album(identity, first)
+        queue.album(identity, {"url": targets[1][1], "status": "failure"})
+        queue.finish(identity, "failure", "Partiel")
+        task = SimpleNamespace(identity=identity, fraction=1., final_event="failure", outcomes=queue.outcomes(identity))
+        imports.update(task, "settled", {})
         self.assertEqual(imports.snapshot(token="joueur")[0]["state"], "partial")
         imports.action(job, "retry")
-        self.assertEqual(enqueue.call_args.args[0], targets[1:])
-        self.assertEqual(enqueue.call_args.kwargs["journal"], "premier")
-        second.done = True
-        second.outcomes = {targets[1][1]: {"status": "success", "audio_complete": True, "tracks": ["/tmp/kara-b"]}}
-        imports.update(second, "finished", {"event": "success"})
+        self.assertEqual(queue.count(), {"queued": 1})
+        self.assertEqual(queue.outcomes(identity)[targets[0][1]], first)
+        self.assertTrue(queue.claim(identity))
+        queue.album(identity, {"url": targets[1][1], "status": "success",
+                               "audio_complete": True, "tracks": ["/tmp/kara-b"]})
+        queue.finish(identity, "success", "Terminé")
+        task.final_event, task.outcomes = "success", queue.outcomes(identity)
+        imports.update(task, "settled", {})
         imports.integrated(refresh.call_args.args[1], None, {Path("/tmp/kara-a"), Path("/tmp/kara-b")})
-        self.assertEqual(imports.snapshot(token="joueur")[0]["state"], "done")
+        self.assertEqual(imports.snapshot(token="joueur"), [])
+        self.assertEqual(imports.snapshot(token="joueur", history=True)[0]["state"], "done")
 
     def test_audio_uses_bound_turn_and_independent_pcm_without_opening_pipewire(self):
         with TemporaryDirectory() as directory:

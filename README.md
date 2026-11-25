@@ -93,6 +93,7 @@ Le [guide Kara V1](docs/kara-v1.md) décrit la salle HTTPS, les commandes mobile
 | [Calibration audio](docs/audio-calibration.md) | Contrats, algorithmes, limites de mesure, tests et protocole S21FE à réaliser |
 | [Qualification du chant](docs/kara-qualification-chant.md) | Banc PCM, score, résultats comparatifs et protocole ADB |
 | [Source Tizen](tizen/app/README.md) | Application TV |
+| [Kara V2](docs/kara-v2.md) | Parcours mobile, préparation anticipée, BlackBox et démarrage avec Sway |
 | [Code micro](bin/_kara_micro_test.py) | Serveur HTTPS WebSocket |
 | [Page micro](bin/_kara_micro_test.html) | Interface mobile et calibration |
 | [AudioWorklet](bin/_kara_micro_worklet.js) | Capture audio et paquets PCM |
