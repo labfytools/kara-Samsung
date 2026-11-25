@@ -41,6 +41,8 @@ La qualification mesurée prend les huit premières lignes annotées de chaque t
 
 Vingt unités lexicales sont non évaluables par mot, car issues de la scission d’un mot court annoté en un seul temps. Douze mots et quatre débuts annotés restent sans repère acoustique. Le seuil de 500 ms est dépassé sur sept mots et un début de ligne parmi les observations comparables. Le seuil ne constitue donc pas une garantie individuelle sur ce témoin.
 
+La quantification Q5_0 a été comparée sur les trois mêmes extraits, avec la même configuration Vulkan et sans le contexte court. L’empreinte SHA-256 du fichier téléchargé a été vérifiée. Le temps cumulé est passé de 146,0 à 97,3 s (−33,3 %). La couverture est restée à 166/178 mots et 20/24 débuts de ligne. Le P95 global des mots est passé de 473 à 454 ms et le P95 global des lignes est resté à 342 ms. Sur l’extrait anglais, le P95 des débuts de ligne est monté de 558 à 798 ms. F16 reste la référence de production. Les mesures par langue sont conservées sous `timing-f16-scores.json` et `timing-q5-scores.json`. [Poids Q5_0 distribués par whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-large-v3-turbo-q5_0.bin)
+
 ## Relevé ArchASP du 25 novembre 2026
 
 | Mesure | Résultat |
