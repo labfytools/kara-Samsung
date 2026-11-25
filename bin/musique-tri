@@ -135,7 +135,7 @@ def album_artists(items, root):
                 matches = {credit for credit in suffixes if known_credit(credit)}
                 if len(matches) == 1:
                     artist = matches.pop()
-        resolved[track] = canonical_album_artist(artist, album)
+        resolved[track] = canonical_album_artist(artist, album, artist_id=tags.get("musicbrainzalbumartistid"))
     return resolved
 
 
@@ -344,7 +344,7 @@ def main():
                 importing = (args.rapport is not None and track.parent.parent == root / INBOX
                              and track.parent.name.startswith(".kara-"))
                 if importing and args.artiste_album:
-                    artist = canonical_album_artist(artist, album)
+                    artist = canonical_album_artist(artist, album, artist_id=tags.get("musicbrainzalbumartistid"))
                 target, moved = classify(track, tags, artist, album, root, args.apercu, reserved, importing,
                                          known_sources, args.reprise_interne if importing else None,
                                          preserve_tags=args.garder_tags_import,

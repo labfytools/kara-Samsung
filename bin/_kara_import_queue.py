@@ -227,6 +227,39 @@ class ImportQueue:
                 AND json_extract(payload,'$.audio_complete')=1
             """)]
 
+    def relocate_album_paths(self, moves):
+        prefixes = {str(source) + "/": str(target) + "/" for source, target in moves}
+
+        def track(value):
+            return next((target + value[len(source):] for source, target in prefixes.items()
+                         if isinstance(value, str) and value.startswith(source)), value)
+
+        def outcome(value):
+            changed = False
+            if "tracks" in value:
+                paths = [track(path) for path in value["tracks"]]
+                changed = paths != value["tracks"]
+                value["tracks"] = paths
+            for record in value.get("provenance", []):
+                if "path" in record:
+                    path = track(record["path"])
+                    changed |= path != record["path"]
+                    record["path"] = path
+            return changed
+
+        with self.connect(write=True) as db:
+            for job, url, saved in db.execute("SELECT job,url,payload FROM outcomes").fetchall():
+                value = json.loads(saved)
+                if outcome(value):
+                    db.execute("UPDATE outcomes SET payload=? WHERE job=? AND url=?", (json.dumps(value), job, url))
+            for identity, saved in db.execute("SELECT id,payload FROM requests").fetchall():
+                value = json.loads(saved)
+                changed = False
+                for result in value.get("results", {}).values():
+                    changed |= outcome(result)
+                if changed:
+                    db.execute("UPDATE requests SET payload=? WHERE id=?", (json.dumps(value), identity))
+
     def totals(self):
         with self.connect() as db:
             albums, tracks = set(), set()

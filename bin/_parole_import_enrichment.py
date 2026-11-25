@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 
+from _musique_oz import grouped_path
 from _parole_index import encoded_key
 
 LYRICS = "import_lyrics"
@@ -37,7 +38,8 @@ def paths_for(index, kind, subject):
     values = json.loads(row["payload"])["paths"]
     if len(values) > (BATCH_SIZE if kind == LYRICS else 1):
         raise ValueError("Lot d’enrichissement trop volumineux.")
-    return [path for value in values if (path := Path(value)).is_relative_to(index.root)
+    return [path for value in values
+            if (path := grouped_path(index.root, Path(value), database=index.path)).is_relative_to(index.root)
             and path != index.root and path.resolve() == path
             and (path.is_file() if kind == LYRICS else path.is_dir())]
 

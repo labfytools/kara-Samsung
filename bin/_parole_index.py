@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from _kara_paths import STATE
 from _kara_prepare import file_token
-from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, probe
+from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, grouped_artist, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 DEFAULTS = {
@@ -551,6 +551,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
     for row in previous.values():
         inodes[row["dev"], row["inode"]].append(row)
     generation = uuid4().hex
+    group_rules = album_groups(index.path)
     counts = dict(scanned=0, changed=0, missing=0, errors=0)
     pending, unchanged = [], []
     now = time()
@@ -660,6 +661,8 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
             artist = tags.get("artist") or UNKNOWN_ARTIST
             owner = tags.get("albumartist") or artist
             album = tags.get("album") or ""
+            artist_id = tags.get("artistid") or tags.get("musicbrainzalbumartistid") or ""
+            owner = grouped_artist(group_rules, owner, album, artist_id) or owner
             release_id = tags.get("albumid") or tags.get("musicbrainzalbumid") or ""
             year = integer(str(tags.get("year") or tags.get("date") or "")[:4])
             edition = encoded_key(owner, album, release_id or year, str(path.parent))
@@ -670,7 +673,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                 previous=(old["path"] if old["path"] != str(path) else old["previous"]) if old else None,
                                 title=title, artist=artist, owner=owner, album=album, edition=edition, duration=duration,
                                 disc=integer(tags.get("disc") or tags.get("discnumber")), track=integer(tags.get("track") or tags.get("tracknumber")),
-                                year=year, artist_id=tags.get("artistid") or tags.get("musicbrainzalbumartistid") or "",
+                                year=year, artist_id=artist_id,
                                 release_id=release_id, plays=integer(strawberry["playcount"]) if strawberry else 0,
                                 lyrics=lyrics, lrc=lrc, kara=kara, search=key(" ".join((title, artist, owner, album))),
                                 seen=generation, added=old["added"] if old else now, checked=now, info=document(info),

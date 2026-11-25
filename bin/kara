@@ -30,7 +30,8 @@ from _kara_import_queue import COMPLETE, ImportQueue, digest
 from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE, check_space,
                                    defer_service, lease, resource_slot, wait_service)
 from _kara_paths import BIN, DATA, catalogue_command
-from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, shared_mutation, source_video
+from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
+                         shared_mutation, source_video)
 from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_import_enrichment import schedule as schedule_enrichment
@@ -547,7 +548,7 @@ def available_tracks(paths, root):
     for value in paths:
         if not isinstance(value, str):
             continue
-        path = Path(value)
+        path = grouped_path(root, Path(value))
         if (path.is_absolute() and path.is_relative_to(root) and len(path.relative_to(root).parts) >= 3
                 and path.relative_to(root).parts[0] not in {INBOX, "YouTube"}
                 and path.resolve() == path and audio_file(path)):
@@ -759,8 +760,10 @@ def published_tracks(receipt, root):
             try:
                 filename, target, video, disc, track = json.loads(line)
                 key = staged_key(filename)
-                if not key or key[1] != video or not available_tracks([target], root):
+                paths = available_tracks([target], root)
+                if not key or key[1] != video or not paths:
                     continue
+                target = paths[0]
                 tags, _ = probe(target)
                 if source_video(tags.get("purl")) != video:
                     continue
@@ -823,9 +826,10 @@ def local_destination(record, candidates, root):
     # exclusive link. An occupied name or a torn publication proves nothing.
     # Check exact file bytes on first recovery and exact PCM after enrichment.
     for value in reversed(candidates):
-        if not available_tracks([value], root):
+        paths = available_tracks([value], root)
+        if not paths:
             continue
-        target = Path(value)
+        target = Path(paths[0])
         try:
             revision = stamp(target.stat())
             known = value == record.get("path")
@@ -1177,9 +1181,12 @@ def verified_publications(provenance, root, inbox, positions):
             continue
         slot = tuple(proof["position"])
         path = proof.get("path")
+        paths = available_tracks([path], root)
         if (len(slot) != 2 or any(type(n) is not int for n in slot) or slot not in positions or slot in verified
-                or not available_tracks([path], root)):
+                or not paths):
             continue
+        path = paths[0]
+        proof = {**proof, "path": path}
         try:
             if file_sha(path) == proof.get("sha256"):
                 verified[slot] = proof

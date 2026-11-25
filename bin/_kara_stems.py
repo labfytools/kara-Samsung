@@ -61,6 +61,35 @@ def stem_directory(song):
     return ROOT / token
 
 
+def rebind(song, previous):
+    # Artist grouping changes a path, not the input or model. Reuse an
+    # earlier generation only after validating the PCM and model signature.
+    try:
+        expected, token = source_signature(song)
+        prior = {**expected, "path": str(previous)}
+        old = ROOT / hashlib.sha256(json.dumps(prior, sort_keys=True).encode()).hexdigest()
+        if not (old / "meta.json").is_file():
+            return False
+        with lease(ROOT / "demucs.lock", wait=False) as lock:
+            if lock is None:
+                return False
+            if cached_stems(song):
+                return True
+            before = song.stat()
+            data = read_metadata(old)
+            processing = model_signature()
+            if data.get("source") != prior or data.get("processing") != processing or not data.get("audio"):
+                return False
+            audio = pcm_digest(song)
+            if data["audio"] != audio or not (files := stem_files(old)):
+                return False
+            with TemporaryDirectory(prefix="processing-", dir=ROOT) as directory:
+                publish(Path(directory), ROOT / token, song, before, expected, audio, processing, files, copy=True)
+            return True
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        return False
+
+
 def cached_stems(song):
     try:
         expected, _token = source_signature(song)

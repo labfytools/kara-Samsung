@@ -87,10 +87,15 @@ def album_associations(path, _revision):
     try:
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=.4)) as db:
             rules = {}
-            for old, album, new in db.execute("SELECT old_artist,album,new_artist FROM associations"):
-                rules.setdefault((old, album), set()).add(new)
-                rules.setdefault((artist_spelling(old), artist_spelling(album)), set()).add(new)
-            return {pair: next(iter(names)) for pair, names in rules.items() if len(names) == 1}
+            for old, album, new, identities in db.execute("""
+                SELECT a.old_artist,a.album,a.new_artist,group_concat(DISTINCT s.artist_id)
+                FROM associations AS a LEFT JOIN songs AS s ON s.owner=a.new_artist AND s.album=a.album
+                GROUP BY a.old_artist,a.album,a.new_artist
+            """):
+                known = {value for raw in (identities or "").split(",") if (value := musicbrainz_artist(raw))}
+                for pair in ((old, album), (artist_spelling(old), artist_spelling(album))):
+                    rules.setdefault(pair, {}).setdefault(new, set()).update(known)
+            return {pair: next(iter(names.items())) for pair, names in rules.items() if len(names) == 1}
     except sqlite3.Error:
         return {}
 
@@ -103,27 +108,95 @@ def artist_spelling(value):
     return tuple("".join(c for c in credit if c.isalnum()) for credit in credits)
 
 
-def album_group(credit, album):
-    # Same library directory as the maintenance index, exposed read-only to
-    # the existing import/tri path. A change in WAL refreshes the process cache.
-    key = sha256(json.dumps([str(SHARED_LIBRARY)], ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
-    path = STATE / "kara/parole" / key / "maintenance.sqlite3"
+def musicbrainz_artist(value):
+    value = (value or "").casefold()
+    return value if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value) else ""
+
+
+def index_file(root):
+    key = sha256(json.dumps([str(root)], ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+    return STATE / "kara/parole" / key / "maintenance.sqlite3"
+
+
+def index_revision(path):
     try:
         stamp = path.stat().st_mtime_ns
     except OSError:
         return None
     wal = path.with_name(path.name + "-wal")
     try:
-        revision = stamp, wal.stat().st_mtime_ns
+        return stamp, wal.stat().st_mtime_ns
     except OSError:
-        revision = stamp, 0
-    rules = album_associations(path, revision)
-    return rules.get((credit, album)) or rules.get((artist_spelling(credit), artist_spelling(album)))
+        return stamp, 0
 
 
-def canonical_album_artist(credit, album=None):
+def album_groups(database):
+    # WAL changes also invalidate the cache used by the existing sorter.
+    revision = index_revision(database)
+    return album_associations(database, revision) if revision is not None else {}
+
+
+def grouped_artist(rules, credit, album, artist_id=None):
+    rule = rules.get((credit, album)) or rules.get((artist_spelling(credit), artist_spelling(album)))
+    if rule:
+        owner, known = rule
+        identity = musicbrainz_artist(artist_id)
+        if not identity or not known or identity in known:
+            return owner
+
+
+def album_group(credit, album, *, database=None, artist_id=None):
+    return grouped_artist(album_groups(database or index_file(SHARED_LIBRARY)), credit, album, artist_id)
+
+
+@lru_cache(maxsize=4)
+def group_locations(database, _revision):
+    from contextlib import closing
+
+    locations = {}
+    try:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=.4)) as db:
+            for state, value in db.execute("SELECT state,value FROM reviews WHERE kind='artist_group' ORDER BY checked"):
+                for row in json.loads(value)["moves"]:
+                    source, target = (Path(row[field]) for field in ("source", "destination"))
+                    if any(p.is_absolute() or len(p.parts) != 2 or ".." in p.parts for p in (source, target)):
+                        continue
+                    if state in ("undoing", "undone"):
+                        source, target = target, source
+                        locations.pop(target, None)
+                    locations[source] = target
+    except (sqlite3.Error, ValueError, KeyError, TypeError):
+        return {}
+    return locations
+
+
+def grouped_path(root, path, *, database=None):
+    # Historical receipts remain immutable. Resolve only missing paths and
+    # only through a recorded album move for this collection.
+    if not path.is_relative_to(root) or path.exists() or path.is_symlink():
+        return path
+    parts = path.relative_to(root).parts
+    if len(parts) < 2:
+        return path
+    database = database or index_file(root)
+    revision = index_revision(database)
+    if revision is None:
+        return path
+    locations = group_locations(database, revision)
+    parent = Path(*parts[:2])
+    visited = set()
+    while parent not in visited and parent in locations:
+        visited.add(parent)
+        parent = locations[parent]
+        destination = (root / parent).joinpath(*parts[2:])
+        if destination.exists() and destination.resolve() == destination:
+            return destination
+    return path
+
+
+def canonical_album_artist(credit, album=None, *, artist_id=None):
     credit = credit or ""
-    if album and (group := album_group(credit, album)):
+    if album and (group := album_group(credit, album, artist_id=artist_id)):
         return group
     lead = credit.split(",", 1)[0].strip()
     if re.fullmatch(r"Juan Luis Guerra(?:\s*(?:&|y)?\s*4[.:]\s*40)?", lead, flags=re.IGNORECASE):

@@ -22,6 +22,7 @@ from _kara_prepare import PreparedCache, file_token, lrc_token
 from _kara_refine import VERSION as REFINEMENT_VERSION
 from _kara_stems import ROOT as STEM_ROOT, FILES, cached_stems, stem_directory
 from _parole_codex import KINDS, research
+from _parole_artist_groups import recover as recover_artist_groups
 from _parole_index import Index, document, encoded_key, inventory, sidecar
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
@@ -1008,6 +1009,12 @@ class Maintenance:
                     self.journal.emit("SYSTEM", "Maintenance déjà supervisée par une autre instance", "WARNING")
                     return
                 self.owner = owner
+                try:
+                    if recovered := recover_artist_groups(self.index, self.import_queue,
+                                                          **({"state": self.state_root} if self.state_root else {})):
+                        self.journal.emit("ALBUM", f"{recovered} regroupement(s) repris")
+                except (OSError, sqlite3.Error, ValueError):
+                    self.journal.emit("ALBUM", "Regroupement interrompu à vérifier", "ERROR")
                 if self.index.recover():
                     self.journal.emit("IDLE", "Préparation nocturne interrompue avant le redémarrage", "WARNING")
                     self.recover_night_drafts()
