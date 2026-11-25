@@ -21,6 +21,7 @@ from _kara_refine import VERSION as REFINEMENT_VERSION
 from _kara_stems import ROOT as STEM_ROOT, FILES, cached_stems, stem_directory
 from _parole_codex import KINDS, research
 from _parole_index import Index, document, encoded_key, inventory, sidecar
+from _parole_import_diagnostics import ImportDiagnostics
 from _parole_process import Interrupted, run
 from _parole_resources import Resources
 from _parole_sources import discover, seed, controls
@@ -112,6 +113,7 @@ class Maintenance:
         self.state_root = state
         self.collection = collection
         self.import_queue = import_queue
+        self.import_diagnostics = ImportDiagnostics(self, import_queue) if import_queue is not None else None
         self.cache = cache or PreparedCache()
         self.resources = Resources(self.index.root)
         self.journal = Journal(self.index.folder)
@@ -334,6 +336,23 @@ class Maintenance:
             self.wake.set()
         return True
 
+    def queue_import_patch(self, task):
+        query = json.loads(task["payload"])
+        result = None
+        with self.index.db() as db:
+            row = db.execute("SELECT value FROM reviews WHERE kind='codex' AND subject=?", (task["subject"],)).fetchone()
+            if row:
+                result = json.loads(row[0])
+        if query.get("kind") != "import_failure" or not result or result.get("resolution", {}).get("action") != "code":
+            return False
+        subject = encoded_key("import_patch", task["subject"])
+        query.update(kind="import_patch", research_id=subject, diagnosis=result["proposal"],
+                     contract="Kara reprend la file SQLite par lot. Il conserve les reçus des pistes publiées et le verrou de bibliothèque.")
+        if self.index.enqueue("codex", subject, subject, 12, query):
+            self.journal.emit("CODEX", "Ébauche de correctif mise en file pour revue")
+            self.wake.set()
+        return True
+
     def active_sources(self, kind):
         with self.index.db() as db:
             return [r["name"] for r in db.execute("SELECT name FROM sources WHERE state='active' AND category LIKE ? LIMIT 20",
@@ -520,13 +539,16 @@ class Maintenance:
                                (document(time() + (DAY if error == "quota_distant" else HOUR)),))
                 return "temporary", error, HOUR
             return "temporary", error, min(DAY, 1800 * 2**min(task["attempts"], 5))
-        if query["kind"] == "adapter":
+        if query["kind"] in ("adapter", "import_patch"):
             proposed = bool(result["adapter_python"])
             self.index.review("codex", task["subject"], "proposal" if proposed else "review", result)
             self.journal.emit("CODEX", "Ébauche et tests disponibles pour revue" if proposed else
                               "Proposition de code indisponible")
             return "review", "validation utilisateur nécessaire", 0
         self.index.review("codex", task["subject"], result["status"], result)
+        if query["kind"] == "import_failure" and self.import_queue is not None:
+            self.import_queue.reconsider_import(task["subject"])
+            self.journal.emit("DOWNLOAD", "Diagnostic mutualisé disponible dans l’historique Codex")
         self.revision += 1
         self.journal.emit("CODEX", {"found": "Sources identifiées", "not_found": "Aucune source trouvée",
                                     "ambiguous": "Correspondance à vérifier"}[result["status"]])
@@ -711,6 +733,8 @@ class Maintenance:
             return
         if self.priority:
             return
+        if self.import_diagnostics:
+            self.import_diagnostics.tick(settings, now)
         self.resources.check(settings)
         local = self.index.claim(("cleanup",), now)
         if local:

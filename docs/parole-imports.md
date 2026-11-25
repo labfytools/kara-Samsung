@@ -50,10 +50,20 @@ Dans Parole, **Détails** ouvre le diagnostic sélectionnable et donne accès à
 
 **Historique** ouvre les lots clos après confirmation du catalogue. Les détails d’un lot partiel présentent les albums en échec ou en attente. Une erreur d’indexation conserve la demande dans la file et ses reçus permettent de relancer la vérification.
 
+
+## Diagnostic des échecs persistants
+
+La tentative initiale appartient au moteur d’import. Après l’enregistrement de son résultat et l’actualisation du catalogue, Parole peut planifier jusqu’à deux relances classiques pour un échec temporaire. Ces relances attendent 60 secondes puis 240 secondes au minimum, ou le délai signalé par le fournisseur s’il est plus long. Plusieurs échecs comparables peuvent différer leurs relances automatiques de 30 minutes. Les autres lots gardent les règles de la file. Les compteurs et échéances survivent à l’arrêt de Parole. La commande manuelle reste disponible dans l’import.
+
+Un échec persistant peut ensuite rejoindre le quota Codex commun si la catégorie **Échecs d’import** est activée. Une signature conserve la catégorie, l’étape, le fournisseur et les versions utiles. Les défauts dus à une version ou à une réponse d’API peuvent partager un diagnostic. Une playlist ou une édition inaccessible conserve sa propre identité. Parole transmet des faits typés et expurgés, dont le code de retour s’il est disponible. Le journal privé complet, les chemins locaux et les paramètres d’authentification restent locaux. Les limitations de requêtes, le manque d’espace, les permissions et les interruptions volontaires donnent lieu à une attente ou à la vérification locale.
+
+Un résultat Codex peut suggérer une autre adresse de catalogue. La relance automatique n’a lieu qu’une fois, après confirmation indépendante de la réponse du catalogue et de l’identité de l’édition déjà autorisée. La file conserve le même lot, la sélection et les reçus des pistes existantes. Une édition différente demande une validation. Les diagnostics de code peuvent donner lieu à une ébauche et à des tests simulés dans l’historique Codex. Leur intégration au programme et leur exécution demandent une revue explicite. Si Codex est indisponible, si aucune correction n’est confirmée ou si la tentative corrigée échoue, le lot reste **À vérifier**.
+
 ## Validation
 
 ```bash
 python3 tests/test-parole-import.py -v
+python3 tests/test-parole-import-recovery.py -v
 PAROLE_TEST_GTK=1 python3 tests/test-parole-import.py -v
 ```
 

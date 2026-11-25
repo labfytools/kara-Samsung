@@ -24,9 +24,12 @@ CATEGORIES = {
 
 
 class ImportIssue(ValueError):
-    def __init__(self, category, detail):
+    def __init__(self, category, detail, *, stage=None, returncode=None, tool=None):
         super().__init__(detail)
         self.category = category
+        self.stage = stage
+        self.returncode = returncode
+        self.tool = tool
 
 
 def failure_category(detail, default):

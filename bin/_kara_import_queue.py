@@ -64,6 +64,20 @@ class ImportQueue:
                     job TEXT NOT NULL, url TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY (job, url), FOREIGN KEY (job) REFERENCES jobs(id)
                 );
+                CREATE TABLE IF NOT EXISTS import_terminal (
+                    job TEXT PRIMARY KEY REFERENCES jobs(id), attempt INTEGER NOT NULL, value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS import_recovery (
+                    job TEXT PRIMARY KEY REFERENCES jobs(id), attempt INTEGER NOT NULL,
+                    signature TEXT NOT NULL, phase TEXT NOT NULL, due REAL NOT NULL,
+                    classic INTEGER NOT NULL DEFAULT 0, remedial INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS recovery_signature ON import_recovery(signature, phase, due);
+                CREATE TABLE IF NOT EXISTS import_recovery_history (
+                    job TEXT NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
+                    stamp REAL NOT NULL DEFAULT (unixepoch('subsec')), signature TEXT NOT NULL,
+                    phase TEXT NOT NULL, message TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS maintenance_receipts (
                     id TEXT PRIMARY KEY, job TEXT NOT NULL REFERENCES jobs(id)
                 );
@@ -216,12 +230,88 @@ class ImportQueue:
                 WHERE id=? AND state='queued'
             """, (identity,)).rowcount == 1
 
-    def finish(self, identity, event, message):
-        outcomes = self.outcomes(identity)
-        has_tracks = any(outcome.get("tracks") for outcome in outcomes.values())
-        state = {"success": "done", "skip": "done", "cancelled": "cancelled",
-                 "failure": "partial" if has_tracks else "failed"}[event]
-        self.transition(identity, "running", state, message, refresh=True)
+    def finish(self, identity, event, message, terminal=None):
+        with self.connect(write=True) as db:
+            has_tracks = db.execute("""SELECT 1 FROM outcomes WHERE job=?
+                                    AND json_array_length(json_extract(payload,'$.tracks'))>0 LIMIT 1""",
+                                    (identity,)).fetchone()
+            state = {"success": "done", "skip": "done", "cancelled": "cancelled",
+                     "failure": "partial" if has_tracks else "failed"}[event]
+            row = db.execute("""UPDATE jobs SET state=?,message=?,refresh=attempt+1
+                                WHERE id=? AND state='running' RETURNING attempt""",
+                             (state, message, identity)).fetchone()
+            if row is not None and terminal is not None:
+                db.execute("INSERT OR REPLACE INTO import_terminal VALUES(?,?,?)",
+                           (identity, row[0], json.dumps(terminal, ensure_ascii=False)))
+
+    def diagnosis_candidates(self, now, limit=20):
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT j.*, t.value AS terminal, r.phase AS recovery_phase, r.signature AS signature,
+                       coalesce(r.classic,0) AS classic, coalesce(r.remedial,0) AS remedial
+                FROM jobs j LEFT JOIN import_terminal t ON j.id=t.job AND j.attempt=t.attempt
+                     LEFT JOIN import_recovery r ON j.id=r.job
+                WHERE j.option IS NULL AND j.refresh=0 AND (
+                    (j.state IN ('failed','partial','review') AND (r.attempt IS NULL OR j.attempt!=r.attempt
+                          OR (r.phase IN ('retry_wait','codex_wait') AND r.due<=?)))
+                    OR (j.state IN ('done','cancelled') AND r.phase NOT IN ('done','cancelled')))
+                ORDER BY j.seq LIMIT ?
+            """, (now, limit))
+            return [self.decode(r) for r in rows]
+
+    def diagnosis_outcomes(self, identity):
+        # Stream failed outcomes independently of the size of the import lot.
+        with self.connect() as db:
+            cursor = db.execute("""SELECT payload FROM outcomes WHERE job=?
+                                   AND json_extract(payload,'$.status') IN ('failure','partial') ORDER BY rowid""",
+                                (identity,))
+            for value, in cursor:
+                yield json.loads(value)
+
+    def recover_import(self, row, signature, phase, message, due=0., *, replacement=None):
+        # The attempt generation guards against manual retry, integration
+        # acknowledgement and worker completion racing an automatic decision.
+        with self.connect(write=True) as db:
+            active = db.execute("SELECT state,attempt,refresh,targets,keys FROM jobs WHERE id=?",
+                                (row["id"],)).fetchone()
+            if (active is None or active["state"] != row["state"] or active["attempt"] != row["attempt"]
+                    or active["refresh"]):
+                return False
+            existing = db.execute("SELECT classic,remedial FROM import_recovery WHERE job=?", (row["id"],)).fetchone()
+            classic, remedial = existing if existing else (0, 0)
+            if phase == "classic" and classic >= 2 or phase == "verified" and remedial:
+                return False
+            if phase in ("classic", "verified"):
+                if replacement:
+                    old, new = replacement
+                    targets = json.loads(active["targets"])
+                    if not any(url == old for _, url in targets) or any(url == new for _, url in targets):
+                        return False
+                    targets = [(title, new if url == old else url) for title, url in targets]
+                    keys = sorted({import_key(url) for _, url in targets})
+                    db.execute("UPDATE jobs SET targets=?,keys=? WHERE id=?", (json.dumps(targets), json.dumps(keys), row["id"]))
+                    prior = db.execute("SELECT payload FROM outcomes WHERE job=? AND url=?", (row["id"], old)).fetchone()
+                    if prior is not None:
+                        saved = json.loads(prior[0])
+                        saved["url"] = new
+                        db.execute("UPDATE outcomes SET url=?,payload=? WHERE job=? AND url=?",
+                                   (new, json.dumps(saved), row["id"], old))
+                db.execute("UPDATE jobs SET state='queued',message=? WHERE id=?", (message, row["id"]))
+            elif phase == "review":
+                db.execute("UPDATE jobs SET state='review',message=? WHERE id=?", (message, row["id"]))
+            elif phase in ("retry_wait", "codex_wait"):
+                db.execute("UPDATE jobs SET message=? WHERE id=?", (message, row["id"]))
+            db.execute("INSERT OR REPLACE INTO import_recovery VALUES(?,?,?,?,?,?,?)",
+                       (row["id"], row["attempt"], signature, phase, due,
+                        classic + (phase == "classic"), remedial + (phase == "verified")))
+            db.execute("INSERT INTO import_recovery_history(job,attempt,signature,phase,message) VALUES(?,?,?,?,?)",
+                       (row["id"], row["attempt"], signature, phase, message))
+            return True
+
+    def reconsider_import(self, signature):
+        with self.connect() as db:
+            db.execute("""UPDATE import_recovery SET phase='codex_wait',due=0
+                          WHERE signature=? AND phase IN ('codex_wait','review')""", (signature,))
 
     def refreshed(self, generations):
         # A refresh running in Strawberry may finish after a retry. Its

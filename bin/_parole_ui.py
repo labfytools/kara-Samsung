@@ -853,7 +853,7 @@ class ParoleView:
         kinds = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4)
         for kind, title in (("lyrics", "Paroles"), ("lrc", "LRC"), ("album", "Albums"),
                             ("discography", "Discographies"), ("cover", "Pochettes"), ("metadata", "Métadonnées"),
-                            ("track", "Pistes"), ("identify", "Identification")):
+                            ("track", "Pistes"), ("identify", "Identification"), ("import_failure", "Échecs d’import")):
             widget = Gtk.CheckButton(label=title, active=kind in config["codex_categories"])
             def toggle_kind(control, category=kind):
                 selection = set(self.index.settings()["codex_categories"])
@@ -905,6 +905,8 @@ class ParoleView:
             identity = task["subject"]
             if change == "cancel":
                 self.maintenance.cancel("codex", identity)
+            elif change == "patch":
+                self.maintenance.queue_import_patch(task)
             elif change == "retry":
                 self.index.enqueue("codex", identity, task["revision"], 15, json.loads(task["payload"]), force=True)
                 self.maintenance.wake.set()
@@ -916,7 +918,8 @@ class ParoleView:
             refresh()
 
         for label, handler in (("Actualiser", refresh), ("Détails", lambda w: action(w, "details")),
-                               ("Annuler", lambda w: action(w, "cancel")), ("Relancer", lambda w: action(w, "retry"))):
+                               ("Annuler", lambda w: action(w, "cancel")), ("Relancer", lambda w: action(w, "retry")),
+                               ("Ébaucher un correctif", lambda w: action(w, "patch"))):
             actions.append(button(label, handler))
         refresh()
 

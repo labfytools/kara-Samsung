@@ -24,7 +24,7 @@ DEFAULTS = {
     "albums": True, "discography": True, "cover": True, "autoprepare": True, "import_tracks": False, "import_albums": False,
     "codex": False, "codex_auto": True, "codex_daily": 2, "codex_timeout": 120,
     "codex_model": "", "codex_effort": "low",
-    "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify"],
+    "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
     "gpu": 15, "disk_busy": 25, "network_interval": 20, "network_daily": 24, "heavy_daily": 3,
     "reserve_gib": 10, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,

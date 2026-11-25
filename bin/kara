@@ -79,7 +79,8 @@ class ImportProgress:
         if self.journal and event != "progress":
             self.journal.write(payload)
         if self.commit_result is not None and event in {"success", "failure", "skip", "cancelled"}:
-            self.commit_result(event, message)
+            terminal = {key: fields[key] for key in ("category", "detail", "interrupted") if key in fields}
+            self.commit_result(event, message, terminal)
         if self.json_output:
             with self.output_lock:
                 try:
@@ -99,8 +100,12 @@ class ImportProgress:
             self.journal.write({"event": "output", "url": self.url, "stage": stage,
                                 "command": command, "output": output})
 
-    def issue(self, stage, category, detail):
+    def issue(self, stage, category, detail, *, returncode=None, tool=None):
         diagnostic = {"stage": stage, "category": category, "detail": detail}
+        if type(returncode) is int:
+            diagnostic["returncode"] = returncode
+        if tool:
+            diagnostic["tool"] = Path(tool).name
         with self.download_lock:
             self.failures.append(diagnostic)
         return diagnostic
@@ -271,7 +276,7 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
             detail = f"{reason}\n{detail}"
         if download and category == "network":
             defer_service("youtube", 60 if "429" in detail else 12)
-        progress.issue(label, category, detail)
+        progress.issue(label, category, detail, returncode=result, tool=command[0])
     return result
 
 
@@ -403,10 +408,10 @@ def album_preflight(url, root, progress):
         command = catalogue_command("preparer", url, str(root))
         require_commands(command[0])
         if not Path(command[2]).is_file():
-            raise ImportIssue("dependency", f"Catalogue introuvable : {command[2]}")
+            raise ImportIssue("dependency", f"Catalogue introuvable : {command[2]}", stage="catalogue")
         result = youtube_metadata(command, progress, 70)
     except subprocess.TimeoutExpired as error:
-        raise ImportIssue("network", f"Délai dépassé pendant la recherche de cet album : {url}") from error
+        raise ImportIssue("network", f"Délai dépassé pendant la recherche de cet album : {url}", stage="catalogue") from error
     if result.stderr:
         progress.log("Catalogue YouTube Music", result.stderr)
     try:
@@ -415,18 +420,20 @@ def album_preflight(url, root, progress):
             raise ValueError("Réponse du catalogue invalide.")
     except ValueError as error:
         detail = result.stderr or result.stdout or str(error)
-        raise ImportIssue(failure_category(detail, "processing"), detail) from error
+        raise ImportIssue(failure_category(detail, "processing"), detail, stage="catalogue",
+                          returncode=result.returncode, tool="ytmusicapi") from error
     if result.returncode or "data" not in report:
         category = report.get("category")
         detail = report.get("error") or result.stderr or f"Réponse du catalogue invalide : {url}"
-        raise ImportIssue(category if category in CATEGORIES else "processing", detail)
+        raise ImportIssue(category if category in CATEGORIES else "processing", detail, stage="catalogue",
+                          returncode=result.returncode, tool="ytmusicapi")
     album = report["data"]
     if album is not None and (not isinstance(album, dict) or not isinstance(album.get("title"), str)
                               or not isinstance(album.get("url"), str) or not isinstance(album.get("tracks"), list)
                               or any(not isinstance(track, dict) or not isinstance(track.get("id"), str)
                                      or not isinstance(track.get("title"), str) for track in album["tracks"])):
         progress.log("Catalogue YouTube Music", result.stdout)
-        raise ImportIssue("processing", "Données d’album invalides dans la réponse du catalogue.")
+        raise ImportIssue("processing", "Données d’album invalides dans la réponse du catalogue.", stage="catalogue")
     return album
 
 
@@ -452,12 +459,13 @@ def playlist_entries(playlist, progress, snapshot):
         stderr = (error.stderr or b"").decode("utf-8", errors="replace")
         if stderr:
             progress.log("Résolution de la playlist", stderr)
-        raise ImportIssue("network", f"Délai dépassé : {url}\n{stderr}".strip()) from error
+        raise ImportIssue("network", f"Délai dépassé : {url}\n{stderr}".strip(), stage="playlist") from error
     if result.stderr:
         progress.log("Résolution de la playlist", result.stderr)
     if result.returncode:
         detail = result.stderr or result.stdout or f"yt-dlp a retourné le code {result.returncode}."
-        raise ImportIssue(failure_category(detail, "playlist"), f"{url}\n{detail.rstrip()}")
+        raise ImportIssue(failure_category(detail, "playlist"), f"{url}\n{detail.rstrip()}", stage="playlist",
+                          returncode=result.returncode, tool="yt-dlp")
     entries = {}
     try:
         for line in result.stdout.splitlines():
@@ -471,9 +479,9 @@ def playlist_entries(playlist, progress, snapshot):
             entries[index] = entry
     except (KeyError, TypeError, ValueError) as error:
         progress.log("Résolution de la playlist", result.stdout)
-        raise ImportIssue("processing", f"Réponse de playlist invalide : {url}\n{error}") from error
+        raise ImportIssue("processing", f"Réponse de playlist invalide : {url}\n{error}", stage="playlist") from error
     if not entries:
-        raise ImportIssue("playlist", f"La playlist ne renvoie aucune piste : {url}\n{result.stderr}".strip())
+        raise ImportIssue("playlist", f"La playlist ne renvoie aucune piste : {url}\n{result.stderr}".strip(), stage="playlist")
     expected = playlist_length(entries)
     if (len(entries) == expected and all(isinstance(entry.get("id"), str) and VIDEO_ID.fullmatch(entry["id"])
                                          for entry in entries.values())):
@@ -657,8 +665,9 @@ class BatchAlbum:
 
 def record_error(progress, stage, error, default="processing"):
     if isinstance(error, ImportIssue):
-        category = error.category
-    elif isinstance(error, OSError):
+        progress.issue(error.stage or stage, error.category, str(error), returncode=error.returncode, tool=error.tool)
+        return
+    if isinstance(error, OSError):
         category = failure_category(str(error), "path")
     else:
         category = default
@@ -893,7 +902,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
         outcome = dict(url=url, title=item.title, status=item.status, category=category, diagnostics=diagnostics,
                        added=item.added, tracks=item.tracks, audio_complete=item.audio_complete,
                        remaining=str(item.remaining) if item.remaining else None, identity=item.identity,
-                       processed=item.processed, message=message)
+                       processed=item.processed, message=message, artist=item.artist or "")
         if on_album is not None:
             on_album(outcome)
         progress.emit(fraction=index / len(urls), event="album", **outcome)
@@ -926,7 +935,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
         message = " · ".join(summary)
     event = ("failure" if failed else "cancelled" if stop.is_set() else
              "skip" if not counts["success"] and counts["present"] else "success")
-    fields = {}
+    fields = {"interrupted": True} if stop.is_set() else {}
     if not progress.json_output and failed:
         fields["detail"] = "\n\n".join(details)
     progress.emit(message, 1.0, event=event, **fields)
@@ -982,7 +991,7 @@ def main():
     if job:
         # Publish the local diagnostic first. The worker then commits the
         # final state before notifying GTK, including if GTK has closed.
-        progress.commit_result = lambda event, message: queue.finish(job["id"], event, message)
+        progress.commit_result = lambda event, message, terminal: queue.finish(job["id"], event, message, terminal)
     try:
         with ImportLog() as journal:
             progress.journal = journal
@@ -1020,7 +1029,7 @@ def main():
             except ImportIssue as error:
                 progress.finish_issue(error)
             except KeyboardInterrupt:
-                progress.finish_issue(ImportIssue("processing", "Import interrompu."))
+                progress.emit("Import interrompu.", event="cancelled", interrupted=True)
                 return 130
             except OSError as error:
                 progress.finish_issue(ImportIssue("path", str(error)))

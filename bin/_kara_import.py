@@ -485,7 +485,10 @@ class AlbumImport(Gtk.Revealer):
             identity, state = row["id"], row["state"]
             job = self.by_id.get(identity) or self.add_import(row)
             job.awaiting_refresh = bool(row["refresh"])
+            job.store_state = state
             if job.done:
+                if state in ("failed", "partial", "review") and job.process is None:
+                    job.message(row["message"], failed=True)
                 job.update_details()
             if job.process is not None:
                 continue
@@ -534,7 +537,7 @@ class AlbumImport(Gtk.Revealer):
         counts = self.queue.count()
         albums, tracks, settled, planned = self.queue.totals()
         active, waiting = counts.get("running", 0), counts.get("queued", 0)
-        errors = counts.get("failed", 0) + counts.get("partial", 0)
+        errors = counts.get("failed", 0) + counts.get("partial", 0) + counts.get("review", 0)
         downloads = slot_count(inbox / ".kara-transferts", DOWNLOADS)
         processing = slot_count(inbox / ".kara-traitements", PROCESSING)
         running = [job for job in self.imports if job.process is not None]
@@ -577,7 +580,8 @@ class AlbumImport(Gtk.Revealer):
 
     def retry_job(self, identity):
         if self.queue.transition(identity, "failed", "queued", "Relance en attente…") or self.queue.transition(
-                identity, "partial", "queued", "Relance en attente…"):
+                identity, "partial", "queued", "Relance en attente…") or self.queue.transition(
+                identity, "review", "queued", "Relance manuelle en attente…"):
             self.launch_next(force=True)
             return True
         return False
