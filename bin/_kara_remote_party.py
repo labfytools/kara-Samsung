@@ -326,9 +326,10 @@ class RemoteParty:
             force = song.path in self.retries
             if not force and (song.path in control.failed_alignments or control.song_available(song)):
                 continue
-            self.retries.discard(song.path)
             self.background_path = song.path
-            if not control.begin_preparation([song], for_party=False, force=force):
+            if control.begin_preparation([song], for_party=False, force=force):
+                self.retries.discard(song.path)
+            else:
                 self.background_path = None
             break
 

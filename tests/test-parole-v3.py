@@ -263,5 +263,70 @@ class SourceTests(Fixture):
                                                          registry=self.index), (None, None))
 
 
+@unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK") == "1", "Session GTK isolée requise")
+class GtkTests(Fixture):
+    def test_main_import_settings_details_and_tv(self):
+        os.environ["KARA_SILENT"] = "1"
+        os.environ["KARA_MUSIC_LIBRARY"] = str(self.root)
+        loader = importlib.machinery.SourceFileLoader("gtk_parole_fixture", str(ROOT / "bin/paroles-strawberry"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        app_module = importlib.util.module_from_spec(spec)
+        loader.exec_module(app_module)
+        from gi.repository import Gdk, Gio, GLib, Gtk
+        from types import SimpleNamespace
+
+        app_module.LIBRARY = self.root
+        Gtk.init()
+        app = Gtk.Application(application_id="fr.labfy.TestParoleV3", flags=Gio.ApplicationFlags.NON_UNIQUE)
+        self.assertTrue(app.register(None))
+        style = Gtk.CssProvider()
+        style.load_from_data(app_module.CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), style,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        path = self.audio()
+        with patch.object(app_module, "https_configured", return_value=False), patch.object(
+                app_module, "Maintenance", side_effect=lambda root, collection, **kwargs: Maintenance(
+                    root, None, state=self.base / "state", **kwargs)):
+            window = app_module.LyricsWindow(app)
+            window.open_parole()
+        view = window.parole_ui
+        self.addCleanup(window.destroy)
+        self.addCleanup(window.close_window, window)
+        window.maintenance.pause(True)
+        inventory(window.maintenance.index, None, window.maintenance.inspect_cache,
+                  lambda: False, lambda *_: None)
+        window.maintenance.revision += 1
+        view.refresh_state()
+        self.assertEqual(view.cards["total"].get_label(), "1")
+        self.assertEqual(view.songs.get_n_items(), 1)
+        view.card_action("no_lyrics")
+        self.assertEqual(view.songs.get_n_items(), 1)
+        view.card_action("ready")
+        self.assertEqual(view.songs.get_n_items(), 0)
+        view.all()
+        self.assertIsNone(window.legacy_controls.get_root())
+        view.details(view.songs.get_item(0).data)
+        window.open_import()
+        self.assertTrue(window.album_import.get_reveal_child())
+        self.assertEqual(window.album_import.get_root(), window.import_window)
+        for page in ("general", "sources", "codex", "storage", "resources"):
+            view.settings(page)
+            self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)
+        window.maintenance.journal.emit("SCAN", "Fixture")
+        view.console.update()
+        self.assertTrue(any(e[-1] == "Fixture" for e in view.console.lines))
+        view.console.hide_events(None)
+        self.assertFalse(view.console.lines)
+        with patch.object(window, "receiver", SimpleNamespace(https_listener=True, secure_tv_seen=__import__("time").monotonic())):
+            view.update_tv()
+            self.assertTrue(view.tv.has_css_class("tv-ok"))
+        view.update_tv()
+        self.assertTrue(view.tv.has_css_class("tv-off"))
+        context = GLib.MainContext.default()
+        for _ in range(30):
+            if context.pending():
+                context.iteration(False)
+
+
 if __name__ == "__main__":
     unittest.main()

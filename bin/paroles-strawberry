@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -B
-"""Fenêtre de paroles synchronisées pour Strawberry, pilotée par MPRIS."""
+"""Gestion de la bibliothèque Parole et contrôleur de session Kara."""
 
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +41,8 @@ from _labfy_sync import MusicSync
 from _kara_tv import https_configured, start_receiver
 from _musique_oz import probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
+from _parole_maintenance import Maintenance
+from _parole_ui import ParoleView
 
 
 APP_ID = "fr.labfy.ParolesStrawberry"
@@ -53,69 +55,7 @@ LYRICS_TAGS = ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
 FADE_HEIGHT = 56
 LYRIC_FOCUS = 0.33
 LYRIC_FADES = ("fade-near", "fade-far", "fade-distant")
-CSS = b"""
-@define-color lyrics_background #1e1e2e;
-@define-color lyrics_text #9399b2;
-window { background: @lyrics_background; color: #cdd6f4; font-family: "Inter", sans-serif; }
-headerbar { background: #181825; color: #cdd6f4; box-shadow: none; }
-.track { padding: 14px 22px 13px; border-bottom: 1px solid #313244; }
-.header-title { font-weight: 700; font-size: 15px; }
-.transport-strip { padding: 12px 18px; background: #181825; }
-.transport-strip button { border-radius: 9px; }
-.transport-strip .play-main { background: #45475a; color: #cdd6f4; font-weight: 700; }
-.media-clock { color: #a6adc8; font-size: 13px; font-variant-numeric: tabular-nums; }
-.vocal-panel { padding: 11px 18px; background: #252538; border-bottom: 1px solid #313244; }
-.section-eyebrow { color: #b4befe; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
-.karaoke-options { padding: 9px 18px; background: #181825; border-bottom: 1px solid #313244; }
-.karaoke-options expander title { color: #cdd6f4; font-weight: 600; }
-.karaoke-options .game-controls { background: transparent; padding: 12px 0 4px; }
-.playlist-tracks row { border-radius: 6px; margin: 2px 0; }
-.playlist-tracks row:hover { background: #313244; }
-.playlist-tracks row:selected { background: #45475a; border-left: 3px solid #b4befe; }
-.track-title { color: #cdd6f4; font-size: 20px; font-weight: 700; }
-.artist { color: #a6adc8; font-size: 13px; }
-.lyric {
-    color: @lyrics_text;
-    font-size: 21px;
-    font-weight: 600;
-    padding: 8px 12px;
-    transition: color 220ms ease-out;
-}
-.lyric.fade-near { color: alpha(@lyrics_text, 0.78); }
-.lyric.fade-far { color: alpha(@lyrics_text, 0.49); }
-.lyric.fade-distant { color: alpha(@lyrics_text, 0.25); }
-.lyric.active {
-    background: #313244;
-    border-radius: 10px;
-    color: #cdd6f4;
-    font-size: 26px;
-    font-weight: 700;
-    transition-duration: 0ms;
-}
-.empty { padding: 28px; }
-.empty label { color: #cdd6f4; }
-.plain-lyrics { color: #cdd6f4; font-size: 21px; }
-.lyrics-info { color: #a6adc8; font-size: 13px; }
-.lyrics-footer { padding: 12px 22px; border-top: 1px solid #313244; }
-.lyrics-fade-top {
-    background-image: linear-gradient(to bottom, @lyrics_background, alpha(@lyrics_background, 0));
-}
-.lyrics-fade-bottom {
-    background-image: linear-gradient(to top, @lyrics_background, alpha(@lyrics_background, 0));
-}
-button.fetch { background: #b4befe; color: #181825; border-radius: 8px; }
-.game-controls { background: #181825; padding: 8px 22px; }
-.game-score { color: #b4befe; font-size: 15px; font-weight: 700; }
-.party-player { background: #252538; padding: 8px; border-radius: 9px; }
-.party-current { background: #313244; border-left: 3px solid #b4befe; }
-.party-name { color: #cdd6f4; font-weight: 700; }
-.alignment-progress { margin: 7px 22px; }
-.alignment-progress progress { background-color: #b4befe; }
-.tv-address { padding: 5px 22px 9px; background: #181825; }
-.album-import { background: #181825; border-bottom: 1px solid #313244; padding: 12px 22px; }
-.album-import progressbar progress { background-color: #b4befe; min-height: 5px; }
-.album-import .import-error { color: #f38ba8; }
-"""
+CSS = (BIN / "parole.css").read_bytes()
 
 
 def local_track(url):
@@ -176,8 +116,11 @@ def faded_scroll(scroll, *, top_share=0.18, bottom_share=0.30, height_limit=FADE
 
 class LyricsWindow(Gtk.ApplicationWindow):
     def __init__(self, application):
-        super().__init__(application=application, title="Paroles — Strawberry",
-                         default_width=670, default_height=720)
+        super().__init__(application=application, title="Parole",
+                         default_width=1210, default_height=805)
+        self.maintenance = None
+        self.parole_ui = None
+        self.import_window = None
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
         self.polling = False
         self.updated = time.monotonic()
@@ -268,16 +211,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.next_tv_update = 0.0
         self.game_status = ""
 
-        # Hiérarchie : actions secondaires dans Outils, contrôle musical toujours
-        # visible, options karaoké dans un panneau repliable.
-        header = Gtk.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Paroles · Strawberry",
-                                           css_classes=["header-title"]))
-        tools = Gtk.MenuButton(label="Outils", tooltip_text="Import et entretien de la bibliothèque")
-        tools_popover = Gtk.Popover()
-        tools_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7,
-                            margin_top=12, margin_bottom=12,
-                            margin_start=12, margin_end=12)
+        # The existing controller still owns the Kara core and GTK callbacks.
+        # The V3 view is attached on demand, including with the service owner.
         self.album_import = AlbumImport()
         self.album_import.can_launch = lambda: not (self.validating or self.party.active or self.game_score.requested
                                                    or self.remote_party.phase == "preparing")
@@ -288,33 +223,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_refresh_tasks = {}
         self.import_toggle = Gtk.ToggleButton(label="Importer un album")
         self.import_toggle.connect("toggled", self.album_import.toggle)
-        tools_box.append(self.import_toggle)
-        for title, option, tooltip in (
-            ("Pochettes manquantes", "--pochettes-manquantes", "Chercher les pochettes absentes"),
-            ("Paroles manquantes", "--paroles-manquantes", "Chercher les paroles et fichiers LRC absents"),
-        ):
-            button = Gtk.Button(label=title, tooltip_text=tooltip)
-            button.connect("clicked", self.search_missing, option, title)
-            button.connect("clicked", lambda *_: tools_popover.popdown())
-            tools_box.append(button)
         self.music_sync = MusicSync(self, LIBRARY, BIN)
-        if self.music_sync.launcher is not None and self.music_sync.launcher.is_file():
-            sync_settings = Gtk.Button(label="Réglages de synchronisation USB")
-            sync_settings.connect("clicked", lambda *_: tools_popover.popdown())
-            sync_settings.connect("clicked", self.music_sync.open_settings)
-            tools_box.append(sync_settings)
-        tools_popover.set_child(tools_box)
-        tools.set_popover(tools_popover)
-        header.pack_end(tools)
-        header.pack_end(self.music_sync.button)
         self.blackbox_button = Gtk.Button(label="BlackBox", tooltip_text="Enregistrer les diagnostics de la partie")
         self.blackbox_button.connect("clicked", self.toggle_blackbox)
-        header.pack_start(self.blackbox_button)
-        self.set_titlebar(header)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_child(root)
-        root.append(self.album_import)
+        # Existing V2 UI state feeds TV and local tools. The lyric widgets
+        # are kept detached so no desktop viewport animates during playback.
+        self.legacy_controls = root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         track = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["track"])
         self.title = Gtk.Label(xalign=0.0, wrap=True, css_classes=["track-title"])
         self.artist = Gtk.Label(xalign=0.0, wrap=True, css_classes=["artist"])
@@ -470,6 +385,34 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if https_configured():
             self.tv_toggle.set_active(True)
 
+    def open_parole(self):
+        if not self.parole_ui:
+            self.maintenance = Maintenance(LIBRARY, COLLECTION, import_queue=self.album_import.queue,
+                                           cache=self.references)
+            self.maintenance.set_priority(self.maintenance_busy())
+            self.parole_ui = ParoleView(self, self.maintenance)
+            self.set_titlebar(self.parole_ui.header())
+            self.set_child(self.parole_ui.root)
+            self.timers.append(GLib.timeout_add(850, self.parole_ui.refresh))
+            self.maintenance.start()
+        self.present()
+
+    def open_import(self, _button=None):
+        if self.import_window is None:
+            self.import_window = Gtk.Window(title="Importer des albums", transient_for=self,
+                                            destroy_with_parent=True, hide_on_close=True,
+                                            default_width=980, default_height=630)
+            scroll = Gtk.ScrolledWindow(vexpand=True)
+            scroll.set_child(self.album_import)
+            self.import_window.set_child(scroll)
+        self.import_toggle.set_active(True)
+        self.import_window.present()
+
+    def maintenance_busy(self):
+        return bool(self.validating or self.party.active is not None or self.game_score.requested
+                    or self.remote_party.phase in ("preparing", "running")
+                    or self.playback_state == "Playing" or self.album_import.running)
+
     def toggle_vocal_effect(self, button):
         if self.effect_changing:
             return
@@ -517,7 +460,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_CONTINUE
 
     def search_missing(self, _button, option, title):
-        self.import_toggle.set_active(True)
+        self.open_import()
         self.album_import.start_maintenance(option, title)
 
     def show_players(self, _button):
@@ -595,6 +538,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.blackbox_button.set_tooltip_text(state["error"] or (state["latest"] or {}).get("session")
                                                    or "Enregistrer les diagnostics de la partie")
         self.album_import.launch_next()
+        if self.maintenance:
+            self.maintenance.set_priority(self.maintenance_busy())
         return GLib.SOURCE_CONTINUE
 
     def set_remote_music_volume(self, percent):
@@ -695,6 +640,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
                         task.outcomes = self.album_import.queue.outcomes(task.identity)
                 self.mobile_imports.integrated(jobs, linked, visible)
                 self.album_import.acknowledge_refresh(generations)
+                if getattr(self, "maintenance", None):
+                    self.maintenance.rescan()
+                    self.maintenance.journal.emit("DOWNLOAD", f"{len(paths)} pistes signalées après import")
                 if self.music_window:
                     self.music_window.load_library()
                     # Strawberry can index files shortly after publication.
@@ -790,7 +738,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def preload_songs(self, songs, *, force=False):
         """Prépare des chansons de la bibliothèque sans créer de partie."""
         if self.validating or self.party.active is not None or self.game_toggle.get_active():
-            self.preparation_window.message.set_text("Termine la partie ou le traitement en cours.")
+            if self.preparation_window is not None:
+                self.preparation_window.message.set_text("Termine la partie ou le traitement en cours.")
             return False
         return self.begin_preparation(songs, for_party=False, force=force)
 
@@ -817,6 +766,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def begin_preparation(self, songs, *, for_party, force=False, force_paths=()):
         if self.closed or self.validating or self.party.active is not None:
+            return False
+        if getattr(self, "maintenance", None) and not self.maintenance.yield_heavy():
             return False
         plan = {song.path: song.title for song in songs}
         if not plan:
@@ -1175,6 +1126,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         return stems and (unscored or path in self.validated_songs)
 
     def start_turn(self, player, *, independent=False):
+        if getattr(self, "maintenance", None):
+            self.maintenance.set_priority(True)
         if self.validating or self.party.active is not None or player.song is None or not (independent or self.party_ready):
             return
         if os.environ.get("KARA_SILENT") == "1":
@@ -1786,6 +1739,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.tv_toggle.set_active(False)
         # Managed workers own their leases and write their own result. Closing
         # the window stops scheduling and leaves any admitted import recoverable.
+        if self.maintenance:
+            self.maintenance.close()
         self.album_import.closing = True
         self.album_import.cancel_search()
         self.music_sync.close()
@@ -2101,7 +2056,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.game_score.tick(self.times, self.duration, position, self.rate, now,
                                  self.word_times, self.word_ends, source=self.scoring_source())
         self.update_tv(position, now)
-        if not self.rows:
+        if not self.rows or not self.scroll.get_mapped():
             return GLib.SOURCE_CONTINUE
         active = bisect_right(self.times, position) - 1
         if active != self.active:
@@ -2209,7 +2164,7 @@ class App(Gtk.Application):
             else:
                 self.window.connect("close-request", self.release_window)
         if not service:
-            self.window.present()
+            self.window.open_parole()
         return 0
 
     def release_window(self, _window):

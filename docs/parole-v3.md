@@ -1,4 +1,6 @@
-# Persistance et maintenance de Parole V3
+# Parole V3
+
+Parole ouvre le tableau de bord de la bibliothèque. L’en-tête donne accès à l’importation, à la connexion TV et aux paramètres. La console affiche les étapes réellement observées. La consultation et la correction des paroles se font depuis les détails d’une chanson. La lecture, la notation, la salle, la télévision, les volumes et BlackBox utilisent le contrôleur Kara existant. Le mode `--service` continue de servir Tizen et les téléphones si la fenêtre Parole est masquée. La maintenance démarre à l’ouverture de la fenêtre Parole.
 
 ## Possession et persistance
 
@@ -44,7 +46,7 @@ Un résultat de recherche est recevable seulement si la CLI rapporte une recherc
 
 Les sources enregistrées sont consultables, désactivables et mesurées pendant les opérations. Une source compatible LRCLIB reçoit une configuration avec `host`, `path`, `terms` et `fixtures`. Chaque fixture indique `title`, `artist`, `album`, `duration`, éventuellement `album_artist`, `synced` et `sha256`. La valeur `sha256` vaut `null` pour un résultat attendu négatif, ou l’empreinte du texte vérifié pour un positif. Il faut au moins deux positifs et un négatif indépendants. Après confirmation que les conditions permettent les requêtes automatisées, Parole vérifie ces cas en arrière-plan. En cas de succès, la source est activée et les échecs de paroles ou de LRC redeviennent progressivement éligibles. Le format accepte uniquement l’adaptateur approuvé et ses paramètres JSON. Les destinations configurables sont publiques, les redirections sont refusées et chaque résolution DNS est épinglée à des adresses autorisées avant l’établissement de TLS.
 
-Le statut Local, Externe ou Généré du LRC apparaît dans le tableau. Les détails indiquent la provenance, la couverture si mesurée et les éventuels échecs. Le journal prend ses messages dans les événements des opérations et écarte les sorties des processus Codex.
+Le statut Local, Externe ou Généré du LRC apparaît dans le tableau. Les détails indiquent la provenance, la couverture si mesurée et les éventuels échecs. La console prend ses messages dans les événements des opérations, et ne recopie pas les détails des processus Codex.
 
 ## Qualification
 

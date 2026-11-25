@@ -22,10 +22,10 @@ def main():
         try:
             draft.write(f"""[Desktop Entry]
 Type=Application
-Name=Paroles Strawberry
-Comment=Paroles synchronisées avec le morceau en cours
+Name=Parole
+Comment=Gérer et préparer la bibliothèque musicale pour Kara
 Exec=/usr/bin/python3 -B {quoted}
-Icon=audio-input-microphone
+Icon=multimedia-player
 Terminal=false
 Categories=AudioVideo;Audio;
 StartupNotify=true

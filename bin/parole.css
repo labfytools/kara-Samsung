@@ -1,0 +1,135 @@
+/* Catppuccin Mocha · Lavender */
+@define-color base #1E1E2E;
+@define-color mantle #181825;
+@define-color crust #11111B;
+@define-color surface #313244;
+@define-color border #45475A;
+@define-color lavender #B4BEFE;
+@define-color text #CDD6F4;
+@define-color muted #A6ADC8;
+@define-color green #A6E3A1;
+@define-color yellow #F9E2AF;
+@define-color peach #FAB387;
+@define-color red #F38BA8;
+@define-color blue #89B4FA;
+@define-color mauve #CBA6F7;
+@define-color teal #94E2D5;
+
+
+
+window { background: @base; color: @text; font-family: "Inter", sans-serif; }
+headerbar { background: @mantle; color: @text; box-shadow: none; }
+.track { padding: 14px 22px 13px; border-bottom: 1px solid @surface; }
+.header-title { font-weight: 700; font-size: 15px; }
+.transport-strip { padding: 12px 18px; background: @mantle; }
+.transport-strip button { border-radius: 9px; }
+.transport-strip .play-main { background: @border; color: @text; font-weight: 700; }
+.media-clock { color: @muted; font-size: 13px; font-variant-numeric: tabular-nums; }
+.vocal-panel { padding: 11px 18px; background: @surface; border-bottom: 1px solid @surface; }
+.section-eyebrow { color: @lavender; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
+.karaoke-options { padding: 9px 18px; background: @mantle; border-bottom: 1px solid @surface; }
+.karaoke-options expander title { color: @text; font-weight: 600; }
+.karaoke-options .game-controls { background: transparent; padding: 12px 0 4px; }
+.playlist-tracks row { border-radius: 6px; margin: 2px 0; }
+.playlist-tracks row:hover { background: @surface; }
+.playlist-tracks row:selected { background: @border; border-left: 3px solid @lavender; }
+.track-title { color: @text; font-size: 20px; font-weight: 700; }
+.artist { color: @muted; font-size: 13px; }
+.lyric {
+    color: @muted;
+    font-size: 21px;
+    font-weight: 600;
+    padding: 8px 12px;
+    transition: color 220ms ease-out;
+}
+.lyric.fade-near { color: alpha(@muted, 0.78); }
+.lyric.fade-far { color: alpha(@muted, 0.49); }
+.lyric.fade-distant { color: alpha(@muted, 0.25); }
+.lyric.active {
+    background: @surface;
+    border-radius: 10px;
+    color: @text;
+    font-size: 26px;
+    font-weight: 700;
+    transition-duration: 0ms;
+}
+.empty { padding: 28px; }
+.empty label { color: @text; }
+.plain-lyrics { color: @text; font-size: 21px; }
+.lyrics-info { color: @muted; font-size: 13px; }
+.lyrics-footer { padding: 12px 22px; border-top: 1px solid @surface; }
+.lyrics-fade-top {
+    background-image: linear-gradient(to bottom, @base, alpha(@base, 0));
+}
+.lyrics-fade-bottom {
+    background-image: linear-gradient(to top, @base, alpha(@base, 0));
+}
+button.fetch { background: @lavender; color: @mantle; border-radius: 8px; }
+.game-controls { background: @mantle; padding: 8px 22px; }
+.game-score { color: @lavender; font-size: 15px; font-weight: 700; }
+.party-player { background: @surface; padding: 8px; border-radius: 9px; }
+.party-current { background: @surface; border-left: 3px solid @lavender; }
+.party-name { color: @text; font-weight: 700; }
+.alignment-progress { margin: 7px 22px; }
+.alignment-progress progress { background-color: @lavender; }
+.tv-address { padding: 5px 22px 9px; background: @mantle; }
+.album-import { background: @mantle; border-bottom: 1px solid @surface; padding: 12px 22px; }
+.album-import progressbar progress { background-color: @lavender; min-height: 5px; }
+.album-import .import-error { color: @red; }
+
+/* Shared surfaces for Parole, dialogues and the V2 import panel. */
+window { background-color: @base; color: @text; }
+headerbar { border-bottom: 1px solid @border; }
+entry, searchentry, spinbutton, dropdown button, button {
+    background-color: @surface;
+    background-image: none;
+    color: @text;
+    border: 1px solid @border;
+    border-radius: 7px;
+    box-shadow: none;
+    transition: background-color 140ms ease, border-color 140ms ease;
+}
+button:hover { background-color: @border; }
+button:checked { border-color: @lavender; }
+button:disabled { color: alpha(@muted, 0.56); }
+button:focus-visible, entry:focus-within, searchentry:focus-within { outline-color: @lavender; }
+button.primary-action, button.fetch { background-color: @lavender; color: @crust; font-weight: 700; }
+button.primary-action:hover, button.fetch:hover { background-color: @text; }
+.wordmark { color: @text; font-weight: 850; font-size: 17px; letter-spacing: 2.5px; padding: 1px 8px; }
+headerbar button.tv-button { border-radius: 50%; min-width: 32px; min-height: 32px; padding: 0; }
+.tv-off { color: @muted; }
+.tv-progress { color: @lavender; border-color: @lavender; }
+.tv-ok { color: @green; border-color: @green; }
+.tv-error { color: @red; border-color: @red; }
+.parole { color: @text; }
+.parole .stat-card { padding: 8px 12px; min-width: 112px; border-radius: 9px; }
+.parole .card-value { font-size: 20px; font-weight: 750; }
+.parole .library-tree, .parole columnview, listview, list, popover contents {
+    background-color: @mantle;
+    color: @text;
+}
+row:selected { background-color: @surface; color: @lavender; }
+.library-tree row { min-height: 27px; }
+columnview header button {
+    background-color: @surface; color: @muted; border-radius: 0; border-width: 0 0 1px;
+}
+.song-cell { padding: 3px 7px; }
+.maintenance-console { background-color: @crust; border: 1px solid @border; border-radius: 8px; padding: 7px; }
+.maintenance-console .journal-lines, .maintenance-console row { background-color: @crust; }
+.journal-line { font-family: "IBM Plex Mono", monospace; font-size: 12px; padding: 2px 5px; }
+.panel-content { padding: 14px; }
+.muted { color: @muted; }
+.neutral { color: @text; }
+.download { color: @blue; }
+.compute { color: @mauve; }
+.source { color: @teal; }
+.success { color: @green; }
+.warning { color: @peach; }
+.error { color: @red; }
+progressbar progress { background-color: @lavender; }
+progressbar trough { background-color: @surface; }
+textview, textview text { background-color: @crust; color: @text; }
+paned > separator, paned.wide > separator { background-color: @border; background-image: none; }
+paned > separator:hover { background-color: @lavender; }
+checkbutton check { background-color: @surface; border-color: @border; box-shadow: none; }
+checkbutton check:checked { background-color: @lavender; color: @crust; border-color: @lavender; }
