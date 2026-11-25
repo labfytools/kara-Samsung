@@ -66,8 +66,6 @@ YT_PROGRESS = (
     "--progress-template",
     "download:KARA_BYTES %(info.kara_index|1)d %(progress.downloaded_bytes|0)d "
     "%(progress.total_bytes,progress.total_bytes_estimate|0)d %(progress.status|unknown)s",
-    "--progress-template",
-    "postprocess:KARA_CONVERT %(info.kara_index|1)d %(progress.status|unknown)s",
     "--print", "after_move:KARA_DONE %(kara_index|1)d",
 )
 
@@ -190,12 +188,6 @@ class ImportProgress:
                     self.track_status("Préparation de l’audio", index, 0.94)
                 elif status == "downloading":
                     self.track_status("Téléchargement", index, estimate * 0.92)
-            elif marker == "KARA_CONVERT":
-                index, status = payload.split()
-                if transfer := self.transfers.get(int(index)):
-                    transfer.end()
-                if status != "finished":
-                    self.track_status("Préparation de l’audio", int(index), 0.95)
             elif marker == "KARA_DONE":
                 index = int(payload)
                 self.finished_positions.add(index)
@@ -301,7 +293,7 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
                     progress.measured(label, "library_wait", monotonic() - locked_at)
                 progress.emit(label, fraction)
                 continue
-            if download and line.startswith(("KARA_ITEM ", "KARA_BYTES ", "KARA_CONVERT ", "KARA_DONE ")):
+            if download and line.startswith(("KARA_ITEM ", "KARA_BYTES ", "KARA_DONE ")):
                 with progress.download_lock:
                     progress.yt_line(line)
                 continue
@@ -717,7 +709,12 @@ def download_track(source, folder, progress):
             transfer.started = transfer.reported_at = now
             download_event("audio-started", track=position)
         elif phase == "conversion-wait":
+            # yt-dlp can run postprocessors before downloading. Only the
+            # actual conversion boundary can close an open body interval.
             transfer.end()
+        elif phase == "conversion":
+            with progress.download_lock:
+                progress.track_status("Préparation de l’audio", position, 0.95)
         progress.audio_event("audio-phase", track=position, phase=phase)
 
     try:

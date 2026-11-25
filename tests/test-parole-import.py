@@ -1198,6 +1198,13 @@ os.execv(os.environ['REAL_FFMPEG'], [os.environ['REAL_FFMPEG'], *sys.argv[1:]])
         self.assertEqual(slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS), 0)
         self.assertEqual(slot_count(self.inbox / ".kara-transferts/youtube", MAX_DOWNLOADS), 0)
         self.await_pause(queue, worker)
+        journal = Path(queue.job(identity)["journal"])
+        events = [json.loads(line) for line in journal.read_text().splitlines()]
+        audio = [row["event"] for row in events if row["event"].startswith("audio-") and row["event"] != "audio-phase"]
+        self.assertEqual(audio[:3], ["audio-queued", "audio-started", "audio-first-byte"])
+        self.assertTrue(audio[3:-1] and set(audio[3:-1]) == {"audio-bytes"})
+        self.assertEqual(audio[-1], "audio-transfer-ended")
+        self.assertEqual(sum(row["size"] for row in events if row["event"] == "audio-bytes"), len(self.signal))
         self.assertFalse(Path(f"/proc/{pid}").exists())
         draft, = self.inbox.glob(".kara-reprise-*/.download/*.opus")
         self.assertGreater(draft.stat().st_size, 1024)

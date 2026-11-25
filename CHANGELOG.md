@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Déclencher la fin de mesure yt-dlp uniquement à la fin du corps audio ou à l’entrée en conversion, y compris lorsque yt-dlp exécute des postprocesseurs avant le téléchargement.
+
 - À la reprise d’un lot, préparer en priorité les albums encore en attente et conserver les tentatives interrompues ou en échec pour la suite du même lot.
 
 - Alterner les sources d’un lot dès la préparation des albums, prendre en compte l’attente de créneau dans le choix entre éditions équivalentes et afficher l’origine des limites dans Parole.
