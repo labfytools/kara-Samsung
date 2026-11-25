@@ -27,7 +27,7 @@ import _kara_stems as stems
 import _kara_turbo as turbo
 from _kara_import_resources import lease
 from _kara_paths import music_library
-from _parole_night import Login, PROFILES, PROFILES_PATH, mains_online
+from _parole_night import LOGIN, MANAGER, Login, PROFILES, PROFILES_PATH, mains_online
 from _parole_process import Interrupted, run
 from _parole_resources import block_device, multimedia_active
 
@@ -52,12 +52,13 @@ def record(path, data):
 
 
 class Monitor:
-    def __init__(self, workspace, library, profile, max_psi=1.0):
+    def __init__(self, workspace, library, profile, max_psi=1.0, *, closed_lid=False):
         self.devices = {block_device(path) for path in (workspace, library)}
         self.workspace, self.library = workspace, library
         self.profile = profile
         self.max_psi = max_psi
-        self.login = Login() if profile else None
+        self.login = Login() if profile or closed_lid else None
+        self.closed_lid = closed_lid
         self.cgroup = Path("/sys/fs/cgroup") / command(
             "systemctl", "--user", "show", "kara.service", "-p", "ControlGroup", "--value").lstrip("/")
         self.sensors = {p.joinpath("name").read_text().strip(): p
@@ -83,12 +84,15 @@ class Monitor:
     def sample(self, now):
         cpu_temp = read_sample(self.sensors["k10temp"] / "temp1_input", 1000)
         gpu_temp = read_sample(self.sensors["amdgpu"] / "temp1_input", 1000)
-        lid_open = self.lid.read_text().split()[-1] == "open"
-        # La combinaison de seuils est celle du mode de nuit. Ce banc capot
-        # ouvert n'emprunte aucun inhibiteur et ne change pas la veille système.
-        if not lid_open or mains_online() is not True:
-            self.reason = "Capot fermé ou alimentation hors secteur"
-        elif cpu_temp is None or gpu_temp is None or not (0 < cpu_temp < 78 and 0 < gpu_temp < 75):
+        lid_state = self.lid.read_text().split()[-1]
+        expected_lid = "closed" if self.closed_lid else "open"
+        # Preserve Parole's stricter cap when closed. A change of posture
+        # ends the run instead of silently mixing thermal conditions.
+        cpu_limit, gpu_limit = (70, 70) if self.closed_lid else (78, 75)
+        if lid_state != expected_lid or mains_online() is not True:
+            self.reason = "Position du capot modifiée ou alimentation hors secteur"
+        elif (cpu_temp is None or gpu_temp is None
+              or not (0 < cpu_temp < cpu_limit and 0 < gpu_temp < gpu_limit)):
             self.reason = f"Limite thermique ({cpu_temp} °C CPU, {gpu_temp} °C GPU)"
         mem = {key: int(value.split()[0]) for key, value in (
             line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())}
@@ -115,12 +119,14 @@ class Monitor:
             self.reason = "Réserve de 20 Gio"
         if self.login:
             try:
-                active_profile = self.login.get(PROFILES_PATH, PROFILES, "ActiveProfile", service=PROFILES)
+                if self.closed_lid and self.login.sleeping():
+                    self.reason = "Mise en veille demandée"
+                if self.profile:
+                    active_profile = self.login.get(PROFILES_PATH, PROFILES, "ActiveProfile", service=PROFILES)
+                    if active_profile != self.profile:
+                        self.reason = "Profil énergétique modifié"
             except self.login.glib.Error:
-                self.reason = "Profil énergétique indisponible"
-            else:
-                if active_profile != self.profile:
-                    self.reason = "Profil énergétique modifié"
+                self.reason = "État de la session ou du profil indisponible"
         disk = {}
         for line in Path("/proc/diskstats").read_text().splitlines():
             row = line.split()
@@ -186,6 +192,34 @@ class Timings:
                 pcm.__exit__(None, None, None)
 
         owner.pcm_file = measured
+
+
+@contextmanager
+def lid_mode(enabled):
+    if not enabled:
+        yield
+        return
+    login = Login()
+    interface = LOGIN + ".Manager"
+    try:
+        if (mains_online() is not True or login.sleeping()
+                or login.get(MANAGER, interface, "LidClosed")):
+            raise Interrupted("Qualification à démarrer sur secteur, capot ouvert")
+        # Keep only the low-level lid handle. Suspend remains available and
+        # the descriptor cannot outlive this parent or pass to the engines.
+        fd = login.inhibit("handle-lid-switch", "block")
+        try:
+            print("Banc prêt · fermer le capot dans les 90 s", flush=True)
+            deadline = monotonic() + 90
+            while not login.get(MANAGER, interface, "LidClosed"):
+                if monotonic() >= deadline or mains_online() is not True or login.sleeping():
+                    raise Interrupted("Fermeture du capot non admise")
+                sleep(.5)
+            yield
+        finally:
+            os.close(fd)
+    except login.glib.Error as error:
+        raise Interrupted("État du capot ou inhibiteur logind indisponible") from error
 
 
 def sizes(folder):
@@ -363,6 +397,7 @@ def bench(args):
         (workspace / "results").mkdir(exist_ok=True)
         sources = [*sorted((REPO / "bin").glob("_kara_*.py")), turbo.SOURCE, Path(__file__)]
         config = {"profile": args.profile, "demucs_threads": args.demucs_threads, "turbo_threads": args.threads,
+                  "closed_lid": args.closed_lid,
                   "memory_psi_limit_pct": args.memory_psi,
                   "stem_reference": str(args.stems_from) if args.stems_from else None,
                   "turbo_weights_file": prepare.file_token(turbo.MODEL), "demucs": stems.model_signature(),
@@ -385,7 +420,7 @@ def bench(args):
                 stem_results = (args.stems_from or workspace) / "results"
                 if mode in ("timed", "plain") and not (stem_results / f"{case_id}-demucs.json").exists():
                     raise ValueError("Le résultat Demucs est requis avant Turbo pour ce cas.")
-                monitor = Monitor(workspace, library, args.profile, args.memory_psi)
+                monitor = Monitor(workspace, library, args.profile, args.memory_psi, closed_lid=args.closed_lid)
                 print(f"{case_id} {mode}", flush=True)
                 deadline = monotonic() + 180
                 while (monitor.stop() and monotonic() < deadline and
@@ -432,6 +467,7 @@ def main():
     parser.add_argument("--library", type=Path, default=music_library())
     parser.add_argument("--corpus", type=Path, default=CASES)
     parser.add_argument("--profile", choices=("power-saver", "balanced", "performance"))
+    parser.add_argument("--closed-lid", action="store_true", help="Qualifier la charge avec fermeture physique du capot.")
     parser.add_argument("--memory-psi", choices=(1., 2., 3.), type=float, default=1.,
                         help="Seuil PSI manuel. Au-dessus de 1 %% le banc réserve 4 Gio de RAM disponible.")
     parser.add_argument("--threads", type=int, choices=range(1, 33), default=4)
@@ -462,7 +498,8 @@ def main():
             return 1
     else:
         try:
-            bench(args)
+            with lid_mode(args.closed_lid):
+                bench(args)
         except (ValueError, OSError, Interrupted, KeyboardInterrupt, RuntimeError, subprocess.SubprocessError) as error:
             print(f"Banc interrompu : {error}", file=sys.stderr)
             return 1

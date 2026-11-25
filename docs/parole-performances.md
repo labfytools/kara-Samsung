@@ -33,9 +33,11 @@ Pour rejouer, fournir un corpus JSON avec `id`, `song` (nom relatif d’un MP3),
 | Référence historique, deux morceaux complets | 4,43 chansons/h et 60,4 Mio par chanson. [Détail](parole-v3.md#essais-nocturnes-sur-archasp) |
 | Référence élargie | Les dix audios et LRC sont accessibles. Au seuil de 1 %, les essais Demucs ont été interrompus avant publication. Les trois premiers essais instrumentés ont atteint 1,16 à 1,29 % de pression mémoire. Après libération de mémoire et stabilisation du profil, un autre essai s’est arrêté à 1,52 %, avec 5,9 Gio encore disponibles. |
 | Témoin indépendant | La première analyse Vulkan a été arrêtée après 4,3 s de mesure, à 2,47 % de pression mémoire. Aucun écart temporel publiable sur ce témoin. |
-| Capot fermé | Qualification prolongée sous charge en attente. Les mesures historiques portent sur une fermeture sans calcul lourd. |
+| Capot fermé | La réouverture a interrompu une première mesure après 4,3 s. La seconde séquence de charge s’est arrêtée après 29,0 s à 3,05 % de PSI, avec des maxima CPU/GPU de 64,9/58 °C. |
 
 Les journaux privés de cette campagne se trouvent sous `.runtime/preparation-perf/`. Les tentatives interrompues sont exclues du débit et des moyennes de traitement.
+
+La qualification physique utilise `--closed-lid` dans un dossier séparé. Démarrer sur secteur et capot ouvert. Le banc prend un inhibiteur logind temporaire pour l’action du capot, annonce sa disponibilité et attend la fermeture physique. Il garde le plafond de 70 °C sur chacun des deux capteurs. La réouverture et une demande de mise en veille interrompent les moteurs. À la sortie des deux essais, l’inhibiteur a disparu et le profil Performance initial a été rétabli. La qualification prolongée reste en attente.
 
 ### Premier parcours complet du comparatif manuel
 
