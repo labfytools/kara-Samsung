@@ -64,6 +64,9 @@ class ImportQueue:
                     job TEXT NOT NULL, url TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY (job, url), FOREIGN KEY (job) REFERENCES jobs(id)
                 );
+                CREATE TABLE IF NOT EXISTS maintenance_receipts (
+                    id TEXT PRIMARY KEY, job TEXT NOT NULL REFERENCES jobs(id)
+                );
                 CREATE TABLE IF NOT EXISTS requests (
                     id TEXT PRIMARY KEY, payload TEXT NOT NULL
                 );
@@ -123,6 +126,17 @@ class ImportQueue:
             request["task_id"] = identity
             self.save_request(request, db=db)
         return identity
+
+    def enqueue_maintenance(self, receipt, title, url):
+        # Deduplication against desktop/mobile uses the existing queue. A
+        # committed receipt also survives completion, cancellation and restart.
+        with self.connect(write=True) as db:
+            row = db.execute("SELECT job FROM maintenance_receipts WHERE id=?", (receipt,)).fetchone()
+            if row:
+                return row[0]
+            identity = self.enqueue([(title, url)], db=db)
+            db.execute("INSERT INTO maintenance_receipts VALUES(?,?)", (receipt, identity))
+            return identity
 
     @staticmethod
     def decode(row):

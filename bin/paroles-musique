@@ -41,6 +41,12 @@ TRACK_WORKERS = 50
 
 
 class ServiceUnavailable(Exception):
+    def __init__(self, message, reason="unavailable"):
+        super().__init__(message)
+        self.reason = reason
+
+
+class AmbiguousLyrics(ValueError):
     pass
 
 
@@ -120,7 +126,7 @@ class LrcLib:
         for delay in (2, 5, None):
             last_attempt = delay is None
             if not self.gate.wait(urlsplit(request.full_url).hostname):
-                raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer")
+                raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer", "limited")
             try:
                 with self.opener.open(request, timeout=10) as response:
                     if response.headers.get_content_type() != "application/json":
@@ -136,16 +142,16 @@ class LrcLib:
                 if error.code == 404:
                     return None
                 if error.code not in {429, 500, 502, 503, 504}:
-                    raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}") from error
+                    raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}", "limited" if error.code == 429 else "unavailable") from error
                 delay = retry_delay(error.headers.get("Retry-After"), delay or 5)
                 self.gate.defer(urlsplit(request.full_url).hostname, delay)
                 if delay > 30:
-                    raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer") from error
+                    raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer", "limited") from error
                 if last_attempt:
-                    raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}") from error
+                    raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}", "limited" if error.code == 429 else "unavailable") from error
             except (URLError, TimeoutError) as error:
                 if delay is None:
-                    raise ServiceUnavailable(f"LRCLIB inaccessible : {error}") from error
+                    raise ServiceUnavailable(f"LRCLIB inaccessible : {error}", "network") from error
             time.sleep(delay)
 
     def find(self, title, artist, album, duration, album_artist, *, synced=False):
@@ -160,13 +166,15 @@ class LrcLib:
         base_title, _ = split_feature(clean_title(title))
         search_artist = album_artist or artist
         records = self.get("search", track_name=base_title, artist_name=search_artist)
-        result = best_transcript(records, title, artist, album, duration, album_artist, synced=synced)
+        result = best_transcript(records, title, artist, album, duration, album_artist,
+                                     synced=synced, strict=getattr(self, "strict", False))
         if result is not None:
             return result
         alternative = normalized(base_title)
         if "-" in alternative:
             records = self.get("search", track_name=alternative.replace("-", " "), artist_name=search_artist)
-            return best_transcript(records, title, artist, album, duration, album_artist, synced=synced)
+            return best_transcript(records, title, artist, album, duration, album_artist,
+                                     synced=synced, strict=getattr(self, "strict", False))
         return None
 
 
@@ -188,10 +196,13 @@ class LyricsOvh:
                 raw = response.read(MAX_RESPONSE + 1)
             return json.loads(raw) if len(raw) <= MAX_RESPONSE else None
         except HTTPError as error:
+            if error.code == 429 or error.code >= 500:
+                self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
             if error.code == 429:
                 self.gate.defer(urlsplit(request.full_url).hostname, retry_delay(error.headers.get("Retry-After"), 2))
             return None
         except (OSError, ValueError):
+            self.failure = ServiceUnavailable("Service indisponible", "network")
             return None
 
     def find(self, title, artist, album, duration, album_artist):
@@ -250,10 +261,13 @@ class PublicLyrics:
             if len(raw) <= MAX_RESPONSE:
                 return raw.decode("utf-8") if html else json.loads(raw)
         except HTTPError as error:
+            if error.code == 429 or error.code >= 500:
+                self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
             if error.code == 429:
                 self.gate.defer(urlsplit(request.full_url).hostname, retry_delay(error.headers.get("Retry-After"), 2))
             return None
         except (OSError, ValueError):
+            self.failure = ServiceUnavailable("Service indisponible", "network")
             return None
 
 
@@ -324,15 +338,18 @@ class QQMusic(PublicLyrics):
             song_id = song.get("mid")
             if not isinstance(song_id, str) or not re.fullmatch(r"[A-Za-z0-9]{8,32}", song_id):
                 continue
+            label = song.get("title") or song.get("name")
+            album_label = (song.get("album") or {}).get("name")
+            strict = getattr(self, "strict", False)
             metadata = dict(
-                trackName=self.remove_explicit(song.get("title") or song.get("name")),
+                trackName=label if strict else self.remove_explicit(label),
                 artistName=", ".join(singer["name"] for singer in song.get("singer") or []
                                      if isinstance(singer, dict) and isinstance(singer.get("name"), str)),
-                albumName=self.remove_explicit((song.get("album") or {}).get("name")),
+                albumName=album_label if strict else self.remove_explicit(album_label),
                 duration=song.get("interval"),
             )
-            score = recording_score(metadata, self.remove_explicit(title), artist,
-                                    self.remove_explicit(album), duration, album_artist)
+            score = recording_score(metadata, title if strict else self.remove_explicit(title), artist,
+                                    album if strict else self.remove_explicit(album), duration, album_artist)
             if score is not None:
                 candidates[song_id] = score
 
@@ -485,7 +502,7 @@ class LyricDownPage(HTMLParser):
             self.script = None
 
 
-def timed_local_lyrics(local, reference, duration):
+def timed_local_lyrics(local, reference, duration, *, strict=False):
     def tokens(line):
         return re.findall(r"[^\W_]+", folded(line), flags=re.UNICODE)
 
@@ -504,6 +521,10 @@ def timed_local_lyrics(local, reference, duration):
     result = []
     for line, words in local_lines:
         start, remote_words = remote_lines[remote_index]
+        if strict and (offset or len(words) != len(remote_words)):
+            # V3 keeps measured/external line boundaries. The established
+            # manual display may reconstruct split lines as before.
+            return None
         if offset and remote_index + 1 < len(remote_lines):
             end = remote_lines[remote_index + 1][0]
             start += (end - start) * offset / len(remote_words)
@@ -560,7 +581,7 @@ class LyricDown(PublicLyrics):
             region_free = re.sub(r"\s*\((?:u\.?k\.?|u\.?s\.?)(?: only)?\)$", "", found_album)
             if title_key(region_free) != title_key(album):
                 continue
-            result = timed_local_lyrics(local_text, "".join(page.lrc), duration)
+            result = timed_local_lyrics(local_text, "".join(page.lrc), duration, strict=getattr(self, "strict", False))
             if result:
                 (exact if title_key(found_album) == title_key(album) else regional).add(result)
         selected = exact or regional
@@ -577,38 +598,80 @@ class LyricsSources:
         self.lyricdown = LyricDown()
         self.lrclib_unavailable = None
 
-    def find(self, title, artist, album, duration, album_artist, *, synced, local_text=""):
+    def find(self, title, artist, album, duration, album_artist, *, synced, local_text="",
+             registry=None, strict=False):
         signature = (title, artist, album, duration, album_artist)
-        instrumental = False
-        if self.lrclib_unavailable is None:
-            try:
-                value = self.lrc.find(*signature, synced=synced)
-                if value:
-                    return value, "LRCLIB"
-                instrumental = value == ""
-            except ServiceUnavailable as exc:
-                self.lrclib_unavailable = exc
-
-        if not synced:
-            value = self.ovh.find(*signature)
-            if value is not None:
-                return value, "lyrics.ovh"
-
-        for client, source in ((self.netease, "NetEase"), (self.qqmusic, "QQ Music")):
-            value = client.find(*signature, synced=synced)
-            if value is not None:
-                return value, source
-
-        if synced:
-            value = self.lyricdown.find(*signature, local_text)
-            if value is not None:
-                return value, "LyricDown"
+        if registry:
+            from _parole_sources import LyricsEndpoint, ProviderUnavailable, record
+            with registry.db() as db:
+                providers = {r["id"]: r for r in db.execute("SELECT * FROM sources WHERE state='active'")}
         else:
-            value = self.genius.find(*signature)
-            if value is not None:
-                return value, "Genius"
-        if instrumental:
-            return "", "LRCLIB"
+            providers = None
+        clients = [
+            ("LRCLIB", self.lrc, {"synced": synced}),
+            *(([("lyrics.ovh", self.ovh, {})]) if not synced else []),
+            ("NetEase", self.netease, {"synced": synced}),
+            ("QQ Music", self.qqmusic, {"synced": synced}),
+            ("LyricDown", self.lyricdown, None) if synced else ("Genius", self.genius, {}),
+        ]
+        instrumental = None
+        failed = self.lrclib_unavailable
+        ambiguous = False
+        for name, client, kwargs in clients:
+            if providers is not None and name not in providers:
+                continue
+            if name == "LRCLIB" and self.lrclib_unavailable is not None:
+                continue
+            started = time.monotonic()
+            client.failure = None
+            client.strict = strict
+            try:
+                value = client.find(*signature, local_text) if kwargs is None else client.find(*signature, **kwargs)
+            except ServiceUnavailable as error:
+                self.lrclib_unavailable = failed = error
+                value = None
+            except AmbiguousLyrics:
+                ambiguous = True
+                value = None
+            error = client.failure or (self.lrclib_unavailable if name == "LRCLIB" else None)
+            failed = error or failed
+            if registry:
+                record(registry, name, "found" if value else "error" if error else "absent",
+                       time.monotonic() - started)
+            if value:
+                return value, name
+            if value == "":
+                instrumental = name
+        if providers:
+            compatible = sorted((r for r in providers.values() if r["adapter"] == "lrclib"),
+                                key=lambda r: (-(r["successes"] + 1) / (r["attempts"] + 2), r["latency"], r["id"]))
+            for row in compatible:
+                conf = json.loads(row["config"])
+                if not conf.get("validated") or ("lrc" if synced else "lyrics") not in row["category"].split(","):
+                    continue
+                started = time.monotonic()
+                try:
+                    response = LyricsEndpoint(conf["host"], conf["path"]).search(title, artist, album)
+                    value = best_transcript(response, *signature, synced=synced, strict=strict)
+                except AmbiguousLyrics:
+                    ambiguous = True
+                    record(registry, row["id"], "absent", time.monotonic() - started)
+                    continue
+                except (ProviderUnavailable, ValueError) as error:
+                    failed = error
+                    record(registry, row["id"], "error", time.monotonic() - started)
+                    continue
+                record(registry, row["id"], "found" if value else "absent", time.monotonic() - started)
+                if value is not None:
+                    return value, row["id"]
+        if instrumental is not None:
+            return "", instrumental
+        if strict and ambiguous:
+            raise AmbiguousLyrics("Correspondance ambiguë")
+        if strict and failed:
+            if isinstance(failed, ServiceUnavailable):
+                raise failed
+            raise ServiceUnavailable("Au moins un fournisseur est indisponible")
         if self.lrclib_unavailable is not None:
             raise self.lrclib_unavailable
         return None, None
@@ -648,8 +711,13 @@ def title_key(value):
 def recording_score(record, title, artist, album, duration, album_artist):
     if not isinstance(record, dict):
         return None
-    own_title, own_feat = split_feature(clean_title(normalized(title)))
-    their_title, their_feat = split_feature(clean_title(normalized(record.get("trackName"))))
+    own_raw, their_raw = normalized(title), normalized(record.get("trackName"))
+    versions = (REMASTER_SUFFIX.search(own_raw), REMASTER_SUFFIX.search(their_raw))
+    if bool(versions[0]) != bool(versions[1]) or (versions[0] and
+            title_key(versions[0][0]) != title_key(versions[1][0])):
+        return None
+    own_title, own_feat = split_feature(clean_title(own_raw))
+    their_title, their_feat = split_feature(clean_title(their_raw))
     if not own_title or title_key(their_title) != title_key(own_title):
         return None
     their_album = record.get("albumName")
@@ -710,7 +778,7 @@ def verified_lyrics(record, title, artist, album, duration, album_artist, *, syn
     return transcript(record, duration, synced)
 
 
-def best_transcript(records, title, artist, album, duration, album_artist, *, synced):
+def best_transcript(records, title, artist, album, duration, album_artist, *, synced, strict=False):
     if not isinstance(records, list):
         return None
     candidates = []
@@ -724,6 +792,8 @@ def best_transcript(records, title, artist, album, duration, album_artist, *, sy
         return None
     top = max(score for score, _ in candidates)
     matches = {text for score, text in candidates if score == top}
+    if strict and len(matches) > 1:
+        raise AmbiguousLyrics("Textes divergents pour la même identité")
     return matches.pop() if len(matches) == 1 else None
 
 
@@ -788,11 +858,17 @@ def save_lrc(path, lyrics):
     with NamedTemporaryFile(dir=path.parent, prefix=".paroles-", mode="w", encoding="utf-8") as draft:
         draft.write(lyrics + "\n")
         draft.flush()
+        os.fsync(draft.fileno())
         share_file(draft.name, path)
         try:
             os.link(draft.name, path)
         except FileExistsError:
             return False
+        directory = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     return True
 
 

@@ -1,0 +1,267 @@
+#!/usr/bin/python3 -B
+"""Fixtures locales, sans lecture ni capture audio et sans compte réseau réel."""
+from hashlib import sha256
+from pathlib import Path
+from contextlib import closing
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from time import time
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "bin"))
+
+from _kara_audio_identity import pcm_digest
+from _kara_prepare import lrc_token
+from _parole_catalogue import check_album, check_discography, compare
+from _parole_codex import authenticate, daily_slot, validate
+from _parole_index import Index, inventory, encoded_key
+from _parole_maintenance import Journal, Maintenance
+from _parole_process import Interrupted, run
+from _parole_sources import LyricsEndpoint, discover, external_ips, public_url, seed, controls, validate_endpoint
+from _parole_work import lyrics_engine, save_correction
+
+ARTIST = "aaaaaaaa-0000-0000-0000-000000000001"
+RELEASE = "aaaaaaaa-0000-0000-0000-000000000002"
+GROUP = "aaaaaaaa-0000-0000-0000-000000000003"
+OTHER = "aaaaaaaa-0000-0000-0000-000000000004"
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.root = self.base / "music"
+        self.root.mkdir()
+        self.index = Index(self.root, self.base / "state")
+
+    def audio(self, name="01 Chanson.flac"):
+        path = self.root / "Groupe" / "Album" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", "5", "-metadata", "title=Chanson", "-metadata", "artist=Groupe, Invité",
+                        "-metadata", "album_artist=Groupe", "-metadata", "album=Album",
+                        "-metadata", "track=1", str(path)], check=True)
+        return path
+
+    def scan(self, **kwargs):
+        return inventory(self.index, kwargs.pop("db", None), lambda *_: ("", "absent", {}),
+                         lambda: False, lambda *_: None, **kwargs)
+
+    def songs(self):
+        with self.index.db() as db:
+            return db.execute("SELECT * FROM songs ORDER BY path").fetchall()
+
+
+class InventoryTests(Fixture):
+    def test_incremental_rename_and_disappearance(self):
+        path = self.audio()
+        path.with_suffix(".lrc").write_text("[00:01.00]Tout commence ici\n[00:02.00]Et continue là\n")
+        self.assertEqual(self.scan()["changed"], 1)
+        row = self.songs()[0]
+        self.assertEqual((row["artist"], row["owner"], row["lrc"], row["track"]),
+                         ("Groupe, Invité", "Groupe", "local", 1))
+        self.assertEqual(self.scan(reader=lambda _: self.fail("probe sur fichier inchangé"))["changed"], 0)
+        moved = path.with_name("Renommée.flac")
+        path.rename(moved)
+        path.with_suffix(".lrc").rename(moved.with_suffix(".lrc"))
+        self.scan()
+        self.assertEqual((self.songs()[0]["id"], self.songs()[0]["previous"]), (row["id"], str(path)))
+        moved.unlink()
+        self.scan(limit=1)
+        self.assertEqual(len(self.songs()), 1)
+        self.assertEqual(self.scan()["missing"], 1)
+
+    def test_read_only_strawberry_and_lrc_correction(self):
+        song = self.audio()
+        db = self.base / "collection.db"
+        st = song.stat()
+        with closing(sqlite3.connect(db)) as source, source:
+            source.execute("CREATE TABLE songs (url,title,artist,album,albumartist,lyrics,mtime,filesize,length,unavailable)")
+            source.execute("INSERT INTO songs VALUES(?,?,?,?,?,?,?,?,?,0)",
+                           (song.as_uri(), "Chanson", "Groupe, Invité", "Album", "Groupe",
+                            "Tout commence ici", int(st.st_mtime), st.st_size, 5_000_000_000))
+        before = sha256(db.read_bytes()).digest()
+        self.scan(db=db)
+        row = self.songs()[0]
+        self.assertEqual(row["lyrics"], "Strawberry")
+        self.assertEqual(json.loads(row["info"])["plain"], "Tout commence ici")
+        self.assertEqual(sha256(db.read_bytes()).digest(), before)
+        save_correction(self.index, row["id"], ".lrc", None, "[00:01.000]Tout commence ici")
+        version = lrc_token(song.with_suffix(".lrc"))
+        with self.assertRaises(ValueError):
+            save_correction(self.index, row["id"], ".lrc", None, "[00:01.500]Correction")
+        save_correction(self.index, row["id"], ".lrc", version, "[00:01.500]Correction")
+        backups = list((self.index.folder / "corrections" / row["id"]).glob("*.lrc"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("Tout commence", backups[0].read_text())
+
+    def test_manual_group_only_applies_to_album(self):
+        folder = self.base / "state/kara/music-tidy-backups/snapshot"
+        folder.mkdir(parents=True)
+        (folder / "manifest.json").write_text(json.dumps({"status": "complete", "files": [
+            {"source": "Groupe, Invité/Album/Chanson.flac", "destination": "Groupe/Album/Chanson.flac",
+             "changes": {"albumartist": "Groupe"}},
+            {"source": "../Album/x.flac", "destination": "Groupe/Album/x.flac", "changes": {"albumartist": "Groupe"}}]}))
+        self.assertEqual(self.index.associations(self.base / "state"), 1)
+        with self.index.db() as db:
+            row, = db.execute("SELECT * FROM associations").fetchall()
+            self.assertEqual(tuple(row)[:3], ("Groupe, Invité", "Album", "Groupe"))
+
+    def test_pcm_identity_survives_tag_edit_but_changes_for_real_pcm_change(self):
+        path = self.audio()
+        other = path.with_name("Retag.flac")
+        changed = path.with_name("Décalé.flac")
+        subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-c:a", "copy",
+                        "-metadata", "album_artist=Autre", str(other)], check=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-t", "3", str(changed)], check=True)
+        self.assertEqual(pcm_digest(path), pcm_digest(other))
+        self.assertNotEqual(pcm_digest(path), pcm_digest(changed))
+
+
+class QueueTests(Fixture):
+    def test_resume_dedupe_cancel_and_budget(self):
+        self.index.enqueue("lyrics", "song", "v1", now=100.)
+        self.index.enqueue("lyrics", "song", "v1", now=101.)
+        task = self.index.claim(("lyrics",), 102., bucket="network", limit=2)
+        self.assertEqual(task["attempts"], 1)
+        self.assertIsNone(self.index.claim(("lyrics",), 103.))
+        self.index.recover()
+        task = self.index.claim(("lyrics",), 104., bucket="network", limit=2)
+        self.assertEqual(task["attempts"], 2)
+        self.index.cancel("lyrics", "song")
+        self.index.finish(task, "done")
+        self.index.enqueue("lyrics", "song", "v1", now=105.)
+        self.assertIsNone(self.index.claim(("lyrics",), 106.))
+        self.index.enqueue("lyrics", "other", "v1", now=105.)
+        self.assertIsNone(self.index.claim(("lyrics",), 106., bucket="network", limit=2))
+        self.assertEqual(self.index.claim(("lyrics",), 100_000., bucket="network", limit=2)["subject"], "other")
+
+    def test_journal_masks_credentials_even_in_catalogue_text(self):
+        journal = Journal(self.index.folder)
+        self.addCleanup(journal.close)
+        journal.emit("CODEX", "Album https://example.org/secret-track token: NEVER_DISPLAY")
+        journal.emit("DOWNLOAD", "Cookie: NEVER_PERSIST")
+        self.assertNotIn("NEVER_", repr(journal.snapshot()))
+        self.assertNotIn("secret-track", journal.path.read_text())
+        self.assertNotIn("NEVER_", repr(journal.history()))
+
+    def test_supervised_cancellation_and_timeout(self):
+        stop_after = time() + .15
+        with self.assertRaises(Interrupted):
+            run([sys.executable, "-c", "import time; time.sleep(60)"],
+                stop=lambda: time() >= stop_after, timeout=2)
+        with self.assertRaises(TimeoutError):
+            run([sys.executable, "-c", "import time; time.sleep(60)"], stop=lambda: False, timeout=.15)
+        with self.assertRaises(ValueError):
+            run([sys.executable, "-c", "print('x' * 10000)"], stop=lambda: False, timeout=3, maximum=100)
+
+
+def official(first="Tout commence ici"):
+    return {"id": RELEASE, "status": "Official", "title": "Album", "date": "2024-04-02",
+            "artist-credit": [{"name": "Groupe", "artist": {"id": ARTIST}}],
+            "release-group": {"id": GROUP},
+            "media": [{"position": 1, "track-count": 1, "tracks": [{"position": 1, "title": first}]},
+                      {"position": 2, "track-count": 1, "tracks": [{"position": 1, "title": "Final"}]}]}
+
+
+class CatalogueTests(unittest.TestCase):
+    first = dict(disc=1, track=1, title="Tout commence ici", owner="Groupe", album="Album",
+                 artist_id=ARTIST, release_id=RELEASE, year=2024)
+    second = dict(disc=2, track=1, title="Final")
+
+    def test_real_position_and_multidisc(self):
+        self.assertEqual(compare([self.first, self.second], official())[0], "complete")
+        status, details = compare([self.first, self.first], official())
+        self.assertEqual(status, "incomplete")
+        self.assertEqual(details["missing"], [[2, 1, "Final"]])
+        self.assertEqual(len(details["duplicates"]), 1)
+        self.assertEqual(compare([{**self.first, "disc": 0}], official())[0], "ambiguous")
+
+    def test_edition_verification_homonymous_discography(self):
+        status, details = check_album([self.first], (), lambda path, **_: official())
+        self.assertEqual((status, details["verified"]), ("incomplete", True))
+        ambiguous = {**self.first, "release_id": ""}
+        self.assertEqual(check_album([ambiguous], (), lambda p, **_: {"releases": [official()], "count": 1}
+                                     if p == "release" else official())[0], "ambiguous")
+        self.assertEqual(check_discography("", set(), set(), ["Album"])[0], "ambiguous")
+        state, details = check_discography(ARTIST, {GROUP}, {"album"}, ["Album"], lambda p, **_: {
+            "release-group-count": 4, "release-groups": [{"id": GROUP, "title": "Album", "primary-type": "Album"},
+            {"id": OTHER, "title": "Absent", "primary-type": "Album", "first-release-date": "2020"},
+            {"id": RELEASE, "title": "Live", "primary-type": "Album", "secondary-types": ["Live"], "first-release-date": "2020"},
+            {"id": RELEASE, "title": "Collaboration", "primary-type": "Album", "first-release-date": "2022",
+             "artist-credit": [{"artist": {"id": ARTIST}}, {"artist": {"id": OTHER}}]}]})
+        self.assertEqual((state, [r["title"] for r in details["missing"]]), ("checked", ["Absent"]))
+
+
+class SourceTests(Fixture):
+    def response(self, source):
+        return {"research_id": "id", "identification": "Chanson", "status": "found", "sources": [source],
+                "missing": [], "matches": [], "contradictions": [], "confidence": "high", "proposal": "", "restrictions": []}
+
+    def source(self, url="https://lyrics.example.org/api/search"):
+        return dict(url=url, documentation="https://lyrics.example.org/docs",
+                    terms="https://lyrics.example.org/terms", category="lrc", adapter="lrclib")
+
+    def test_schema_url_quota_and_discovery(self):
+        source = self.source()
+        self.assertEqual(validate(self.response(source), "id")["status"], "found")
+        for bad in ("https://127.0.0.1/a", "http://example.org", "file:///etc/passwd",
+                    "https://secret@music.org/path", "https://music.org:123/a", "https://a.local/a"):
+            with self.subTest(url=bad), self.assertRaises(ValueError):
+                validate(self.response(self.source(bad)), "id")
+        with patch("socket.getaddrinfo", return_value=[(None, None, None, None, ("192.168.0.1", 443))]):
+            with self.assertRaises(ValueError):
+                external_ips("music.example.org")
+        seed(self.index)
+        identity, added = discover(self.index, source, "id")
+        self.assertTrue(added)
+        self.assertEqual(discover(self.index, source, "x"), (identity, False))
+        controls(self.index, identity, "active")
+        with self.index.db() as db:
+            self.assertEqual(db.execute("SELECT state FROM sources WHERE id=?", (identity,)).fetchone()[0], "pending")
+        self.assertTrue(daily_slot(self.index, 1, now=1500))
+        self.assertFalse(daily_slot(self.index, 1, now=1700))
+        self.assertTrue(daily_slot(self.index, 1, now=90000))
+        with self.assertRaises(PermissionError):
+            authenticate(self.base, lambda: False, self.base / "auth.json")
+
+    def test_validated_endpoint_is_reused_and_can_be_disabled(self):
+        seed(self.index)
+        source = self.source()
+        identity, _ = discover(self.index, source, "id")
+        engine = lyrics_engine()
+        text = "[00:01.000]Enfin la musique"
+        record = dict(trackName="Chanson", artistName="Groupe", albumName="Album", duration=30,
+                      syncedLyrics=text)
+        fixtures = [{"title": title, "artist": "Groupe", "album": "Album", "duration": 30, "synced": True,
+                     "sha256": sha256(text.encode()).hexdigest() if title != "Fausse" else None}
+                    for title in ("Chanson", "Autre", "Fausse")]
+
+        def lookup(_, title, *_args):
+            return [{**record, "trackName": title}] if title != "Fausse" else []
+
+        endpoint = LyricsEndpoint("lyrics.example.org", "/api/search")
+        controls(self.index, "LRCLIB", "disabled")
+        controls(self.index, "NetEase", "disabled")
+        controls(self.index, "QQ Music", "disabled")
+        controls(self.index, "LyricDown", "disabled")
+        with patch("_parole_sources.fetch", return_value=b"Conditions"), patch.object(LyricsEndpoint, "search", lookup):
+            validate_endpoint(self.index, identity, endpoint, source["terms"], fixtures, engine.best_transcript)
+            self.assertEqual(engine.LyricsSources().find("Chanson", "Groupe", "Album", 30, "Groupe", synced=True,
+                                                         registry=self.index), (text, identity))
+            controls(self.index, identity, "excluded")
+            self.assertEqual(engine.LyricsSources().find("Chanson", "Groupe", "Album", 30, "Groupe", synced=True,
+                                                         registry=self.index), (None, None))
+
+
+if __name__ == "__main__":
+    unittest.main()

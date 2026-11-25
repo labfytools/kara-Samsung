@@ -1,15 +1,18 @@
 """Formats et métadonnées communs aux deux commandes de l'audiothèque."""
 from contextlib import contextmanager
 from fcntl import LOCK_EX, LOCK_NB, flock
+from functools import lru_cache
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 from unicodedata import combining, normalize
 from urllib.parse import parse_qs, urlsplit
 
-from _kara_paths import music_library
+from _kara_paths import STATE, music_library
 
 AUDIO = frozenset((".aac", ".aif", ".aiff", ".alac", ".flac", ".m4a", ".mp3",
                    ".ogg", ".oga", ".opus", ".wav", ".wma"))
@@ -34,9 +37,9 @@ def audio_files(path):
                     yield track
 
 
-def probe(path):
+def probe(path, *, include_duration=False):
     command = ("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-of", "json",
-               "-show_entries", "format_tags:stream=index,codec_type:stream_disposition=attached_pic:stream_tags",
+               "-show_entries", "format=duration:format_tags:stream=index,codec_type:stream_disposition=attached_pic:stream_tags",
                str(path))
     output = subprocess.run(command, capture_output=True, check=True, timeout=20)
     info = json.loads(output.stdout)
@@ -50,6 +53,14 @@ def probe(path):
             if isinstance(value, str) and value.strip():
                 tag = re.sub(r"[^a-z0-9]", "", key.casefold())
                 tags[tag] = value.strip()
+    if include_duration:
+        try:
+            from math import isfinite
+            duration = float(info.get("format", {}).get("duration", 0))
+            if isfinite(duration) and duration > 0:
+                tags["duration_seconds"] = duration
+        except (TypeError, ValueError):
+            pass
     pictures = [stream for stream in streams if stream.get("disposition", {}).get("attached_pic")]
     pictures.sort(key=lambda stream: "front" not in stream.get("tags", {}).get("comment", "").casefold())
     return tags, pictures
@@ -66,8 +77,40 @@ def component(value, fallback):
     return value.encode("utf-8")[:170].decode("utf-8", "ignore").rstrip(" .") or fallback
 
 
+@lru_cache(maxsize=4)
+def album_associations(path, _revision):
+    from contextlib import closing
+
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=.4)) as db:
+            return {(old, album): new for old, album, new in db.execute(
+                """SELECT old_artist,album,min(new_artist) FROM associations
+                   GROUP BY old_artist,album HAVING count(DISTINCT new_artist)=1""")}
+    except sqlite3.Error:
+        return {}
+
+
+def album_group(credit, album):
+    # Same library directory as the maintenance index, exposed read-only to
+    # the existing import/tri path. A change in WAL refreshes the process cache.
+    key = sha256(json.dumps([str(SHARED_LIBRARY)], ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+    path = STATE / "kara/parole" / key / "maintenance.sqlite3"
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    wal = path.with_name(path.name + "-wal")
+    try:
+        revision = stamp, wal.stat().st_mtime_ns
+    except OSError:
+        revision = stamp, 0
+    return album_associations(path, revision).get((credit, album))
+
+
 def canonical_album_artist(credit, album=None):
     credit = credit or ""
+    if album and (group := album_group(credit, album)):
+        return group
     lead = credit.split(",", 1)[0].strip()
     if re.fullmatch(r"Juan Luis Guerra(?:\s*(?:&|y)?\s*4[.:]\s*40)?", lead, flags=re.IGNORECASE):
         return "Juan Luis Guerra"
