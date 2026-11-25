@@ -50,7 +50,21 @@ class MusicSync:
             self.parent.maintenance.journal.emit("SYNC", message, level)
 
     def command(self, mode):
-        return [str(self.launcher), mode, "--pc", str(self.library)]
+        args = [str(self.launcher), mode, "--pc", str(self.library)]
+        if mode in {"session", "resume"} and self.connection.get("exclude_dirs"):
+            # On current engines the shared scope applies before planning,
+            # so an active import can coexist with unrelated USB operations.
+            roots = {INBOX}
+            library = self.library.resolve()
+            for directory in self.technical_dirs():
+                if directory.is_relative_to(library) and directory != library:
+                    roots.add(directory.relative_to(library).as_posix())
+            args.extend(f"--exclude-dir={root}" for root in sorted(roots))
+        return args
+
+    @staticmethod
+    def technical_dirs():
+        return tuple(directory.resolve() for directory in (CACHE / "paroles-strawberry", STATE / "kara", DATA / "kara"))
 
     def poll(self):
         if self.probe is not None or self.closed:
@@ -702,7 +716,7 @@ class SyncWindow(Gtk.Window):
         # approval when an operation would touch its import inbox or undo a
         # recorded album move that Labfy cannot prove from its USB baseline.
         root = self.controller.library
-        technical = tuple(directory.resolve() for directory in (CACHE / "paroles-strawberry", STATE / "kara", DATA / "kara"))
+        technical = self.controller.technical_dirs()
         for _, step in steps:
             for field in ("source", "path"):
                 path = Path(step[field])

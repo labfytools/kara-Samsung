@@ -192,25 +192,20 @@ class SyncTests(unittest.TestCase):
 
             inbox_file = pc / "A_trier/Audio en attente.opus"
             inbox_file.write_bytes(b"hors collection")
-            dialog = open_preview()
-            dialog.confirm.emit("clicked")
-            self.assertIn("A_trier figure dans le plan", dialog.summary.get_text())
-            self.assertFalse((phone / "A_trier").exists())
-            dialog.cancel_button.emit("clicked")
-            wait_for(lambda: dialog.process is None)
-            dialog.close()
-            inbox_file.unlink()
-
             cache_file = pc / "cache/paroles-strawberry/stems/voice.wav"
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_bytes(b"cache hors collection")
+            publishable = Path("Paroles prêtes.lrc")
+            (pc / publishable).write_text("[00:01.00] Paroles publiées", encoding="utf-8")
             dialog = open_preview()
-            dialog.confirm.emit("clicked")
-            self.assertIn("Un fichier technique de Kara figure dans le plan", dialog.summary.get_text())
+            self.assertEqual({row["path"] for row in dialog.entries}, {publishable.as_posix(), removed.as_posix()})
+            self.assertFalse(dialog.deletions.get_active())
+            confirm(dialog)
+            self.assertEqual((phone / publishable).read_bytes(), (pc / publishable).read_bytes())
+            self.assertFalse((phone / "A_trier").exists())
             self.assertFalse((phone / "cache").exists())
-            dialog.cancel_button.emit("clicked")
-            wait_for(lambda: dialog.process is None)
             dialog.close()
+            inbox_file.unlink()
             cache_file.unlink()
 
             retry = Path("Piste à reprendre.opus")
@@ -238,6 +233,7 @@ class SyncTests(unittest.TestCase):
             wait_for(lambda: dialog.process is None)
             self.assertEqual(dialog.summary.get_text(), "Synchronisation terminée.")
             self.assertEqual((phone / retry).read_bytes(), (pc / retry).read_bytes())
+            self.assertFalse((device / "mock-power.json").exists())
             dialog.close()
 
             console = window.parole_ui.console
