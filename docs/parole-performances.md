@@ -124,6 +124,21 @@ Le manifeste Turbo et ses repères sont déjà persistés séparément des piste
 
 L’environnement installé associe Demucs 4.0.1 à PyTorch et Torchaudio 2.6.0 `+cpu`. Il déclare `cuda=None` et `hip=None`. Le Vulkan de whisper.cpp équipe Turbo. Demucs utilise le modèle `htdemucs`, des segments de 7 s, un chevauchement de 10 %, zéro décalage aléatoire et une tâche de segment. Le traitement produit les deux stems FLAC. Demucs expose un parallélisme de segments sur CPU et plusieurs modèles. Leur coût mémoire, leur vitesse et la qualité nécessitent des comparaisons sur des morceaux terminés. [Implémentation Demucs](https://github.com/facebookresearch/demucs/blob/main/demucs/apply.py) · [Matrice AMD ROCm](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html)
 
+### Demucs à six fils CPU
+
+Les dix morceaux de référence ont été rejoués à six fils, avec les mêmes poids, segments, chevauchements et sorties FLAC. Le comparatif manuel a utilisé le profil Économie capot ouvert et le seuil de 3 % de PSI. Le dernier titre a exigé une reprise après un arrêt à 3,28 % de PSI.
+
+| Mesure sur dix titres | Deux fils | Six fils |
+| --- | ---: | ---: |
+| Temps Demucs moyen | 192,5 s | 120,7 s |
+| CPU cumulé moyen par titre | 358,8 s | 613,3 s |
+| Maximum CPU / GPU | 75,6 / 69 °C | 71,4 / 65 °C |
+| Maximum RSS rapporté pour un enfant | 2 142 Mio | 1 681 Mio |
+
+Le temps mural baisse de 37,3 %. Les vingt pistes ont le même taux, le même nombre d’échantillons et la même origine temporelle que leurs témoins. Les différences PCM sont limitées à une unité de quantification 16 bits. Le plus grand rapport RMS entre l’écart et la piste correspondante est de −100,1 dB. Les profils produisent des arrondis différents.
+
+Au seuil de 1 % appliqué par Parole la nuit, un nouveau passage à six fils sur `en-rap-alternance` s’est arrêté après 29,2 s à 1,23 % de PSI. Les deux fils restent le réglage nocturne. Les mesures sont conservées sous `demucs-six/`, `demucs-six-strict/` et `demucs-six-comparison.json`.
+
 ### Cas de génération depuis un texte
 
 Une fixture passe par la publication LRC de Kara avec 24 mots observés sur 25 et quatre débuts de ligne sur cinq. Avant la correction, le seuil de couverture des mots déclenchait l’arrêt avant le premier essai local, alors que la publication exigeait encore le cinquième début. Après la correction, la même fixture publie les cinq lignes. Elle exécute une seule passe globale simulée, puis deux décodages simulés sur des fenêtres de moins de sept secondes. Le PCM encadrant ces fenêtres est décodé par FFmpeg. Aucun seuil acoustique ou de publication ne change. Le test mesure la décision et le travail demandé au décodeur. Le résultat sur les chansons complètes reste à qualifier.
