@@ -576,6 +576,14 @@ class Maintenance:
             return "review", "LRC original non ordinaire", 0
         local = rejected is not None and song["lrc"] in ("local", "externe", "généré")
         saved = self.cache.cached(path, verify=False)
+        if nocturnal and local and not saved:
+            insufficient = self.cache.cached(path, verify=False, insufficient=True)
+            if insufficient:
+                # A structurally valid LRC can fail the acoustic check. Its
+                # negative receipt survives the handoff to a verified alternate.
+                local = False
+                if insufficient["source"]["kind"] == "fallback":
+                    return "review", "référence Kara insuffisante", 0
         reference_option, provider = None, "Strawberry"
         if not saved and not local and nocturnal:
             if json.loads(song["side"]) != [sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]:
@@ -680,6 +688,9 @@ class Maintenance:
             self.journal.emit("KARA", f"Chanson prête · {song['title']}")
             return "done", "prêt", 0
         self.refresh_song(song)
+        if (nocturnal and local and analyzed and
+                self.cache.cached(path, verify=False, insufficient=True)):
+            return "temporary", "LRC local insuffisant · recherche d’une autre référence", 10
         return "review", "référence Kara insuffisante", 0
 
     def do_codex(self, task):

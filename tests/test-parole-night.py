@@ -13,7 +13,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
-from _parole_index import document
+from _kara_prepare import file_token
+from _parole_index import document, sidecar
 from _parole_maintenance import Maintenance
 from _parole_night import Desktop, Login, mains_online
 
@@ -176,6 +177,32 @@ class NightTests(unittest.TestCase):
         self.assertEqual((result["mode"], result["lyrics"]), ("plain", "Paroles locales vérifiées"))
         self.assertEqual(self.owner.night_reference(song, path), result)
         self.owner.output.assert_called_once()
+
+    def test_local_lrc_rejected_acoustically_gets_one_alternate_lookup(self):
+        path = self.owner.index.root / "song.opus"
+        path.write_bytes(b"fixture")
+        path.with_suffix(".lrc").write_text("[00:04.000]Refrain")
+        song = {"id": "fixture", "path": str(path), "token": document(file_token(path)), "title": "Chanson",
+                "side": document([sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]), "lrc": "local",
+                "duration": 25, "previous": None, "info": document({"plain": "Refrain"})}
+        self.owner.index.song = Mock(return_value=song)
+        self.owner.refresh_song = Mock()
+        self.owner.resources.allowed_storage = Mock(return_value=True)
+        negative = {}
+        self.owner.cache.cached = Mock(side_effect=lambda *_, **kw: negative if kw.get("insufficient") and negative else None)
+
+        def analyze(*_args, **_kwargs):
+            negative["source"] = {"kind": "local"}
+            return 1, b""
+
+        self.owner.output = Mock(side_effect=analyze)
+        self.owner.night_reference = Mock(return_value={"state": "not_found"})
+        with patch("_parole_maintenance.cached_stems", return_value=(Path("a"), Path("b"))):
+            self.assertEqual(self.owner.prepare({"subject": "fixture"}, nocturnal=True)[0], "temporary")
+            self.assertEqual(self.owner.prepare({"subject": "fixture"}, nocturnal=True)[0], "review")
+        self.owner.output.assert_called_once()
+        self.owner.night_reference.assert_called_once_with(song, path)
+        self.assertEqual(path.with_suffix(".lrc").read_text(), "[00:04.000]Refrain")
 
     def test_real_subprocess_stops_on_power_loss_sleep_heat_space_and_kara(self):
         cases = ("Demucs", "Turbo", "veille", "température", "stockage", "Kara", "activité", "désactivation")
