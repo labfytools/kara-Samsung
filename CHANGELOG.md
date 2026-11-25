@@ -18,3 +18,4 @@
 - Configurer les délais et quotas des recherches classiques, avec une régulation persistante par fournisseur.
 - Afficher dans Parole le bilan persistant de la dernière session nocturne, avec la cadence et le stockage mesurés.
 - Exiger un backend Vulkan initialisé pour les analyses nocturnes et conserver le profil système sur les versions de TLP dont les demandes survivent au client.
+- Documenter les essais nocturnes ArchASP sur deux morceaux complets et la validation sur secteur, écran éteint.

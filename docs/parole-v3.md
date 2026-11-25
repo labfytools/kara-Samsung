@@ -40,7 +40,7 @@ Sur ArchASP, `swayidle.service` lance le verrou QuickShell à 300 s et coupe les
 
 Les seuils initiaux capot ouvert sont de 78 °C CPU et 75 °C GPU. Le seuil capot fermé ne dépasse jamais 70 °C et requiert une qualification thermique préalable sur le Vivobook. Demucs limite ses fils de calcul à deux. Parole demande un profil Économie temporaire uniquement si le gestionnaire de profils sait le libérer à la déconnexion. TLP 1.11.0 a conservé une demande après disparition du client sur ArchASP. Avec TLP, Parole respecte donc le profil choisi dans QuickShell et applique les mêmes seuils. Au retour d’activité, à la reprise de Kara, au débranchement, à la réouverture du capot ou si une mesure requise devient indisponible, le traitement est interrompu. Les résultats validés restent réutilisables.
 
-Le fichier d’unité livré est [kara.service](../contrib/systemd/user/kara.service). Son installation dans le gestionnaire utilisateur est nécessaire pour démarrer au login sans ouvrir Parole. Elle ne requiert aucun changement de `logind.conf`, de la configuration swayidle ou du verrou QuickShell. Sur ArchASP, l’unité livrée n’était pas installée au moment du relevé.
+Le fichier d’unité livré est [kara.service](../contrib/systemd/user/kara.service). Son activation dans le gestionnaire utilisateur démarre Kara à la connexion graphique sans ouvrir Parole. Sur ArchASP, le service a été activé avec le mode nocturne capot ouvert et écran éteint, après autorisation. Les seuils initiaux ont été conservés. Les réglages système de logind et de swayidle n’ont pas été modifiés.
 
 Le bilan de la dernière période d’inactivité est conservé dans l’index. Il affiche les chansons prêtes et restantes, les LRC corrigés ou générés, les échecs, les interruptions, les reports, le temps cumulé des tentatives clôturées et la variation du cache alloué. La cadence est calculée sur ces tentatives, y compris le temps passé sur les échecs. Un arrêt inattendu marque la tentative en cours comme interrompue et conserve les totaux clôturés. La reprise retire les brouillons marqués et retrouve les caches valides publiés avant l’arrêt.
 
@@ -92,3 +92,20 @@ Pour les tests graphiques, utiliser `PAROLE_TEST_GTK=1` sur un bureau ou un comp
 | Codex CLI 0.172.0 | Après montage du compagnon, recherche native avec résultats et réponse conforme au schéma Parole. Documentation publique LRCLIB vérifiée en 15,8 s dans Bubblewrap. |
 
 La qualification ne fixe pas la précision de 500 ms. Elle demande un corpus dont les débuts de ligne et de mot sont annotés indépendamment. Les temps observés sur un morceau court ne donnent pas la moyenne de la bibliothèque. La TV physique, la découverte effective d’un nouveau fournisseur par Codex et une campagne d’importation automatique sur la collection réelle restent à qualifier.
+
+### Essais nocturnes sur ArchASP
+
+Deux morceaux complets ont été traités sur des copies privées, capot ouvert, avec Demucs CPU à deux fils et Turbo Vulkan. Les mesures utilisent temporairement le profil Économie de TLP. Le profil Performance a fait dépasser 85 °C au CPU pendant l’essai initial. En Économie, les essais terminés ont mesuré au plus 74,9 °C au CPU et 61 °C au GPU. Le décodeur strict a confirmé `Vulkan0`. Lorsque le pilote a été masqué pour le seul processus de test, il a quitté avec le code 4 avant d’annoncer sa disponibilité.
+
+| Morceau entier | Demucs | Turbo avec LRC | Couverture mots / lignes | Repères corrigés | Cache alloué |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Rap rapide, 6 min 04 | 386,2 s | 764,3 s | 84,9 % / 82,4 % | 120 | 69,6 Mio |
+| Chant, 4 min 36 | 282,5 s | 191,4 s | 95,2 % / 92,9 % | 32 | 51,3 Mio |
+
+Les deux corrections sont validées dans Kara. Aucun repère corrigé ne dépend d’une interpolation seule. Les originaux audio et LRC ont été vérifiés après l’essai. Sur les deux passages validés, la cadence observée est de 4,43 chansons par heure de calcul et le cache total est de 120,8 Mio, soit environ 268 Mio par heure de calcul. Le calcul additionne les mesures Demucs et Turbo des deux parcours validés et exclut les essais supplémentaires et interruptions.
+
+Les deux morceaux ont ensuite été traités à partir de leurs seules paroles. Les durées Turbo étaient de 698,5 s et 192,1 s. La génération a refusé les deux publications, faute d’appui acoustique sur tous les débuts de ligne. Les fixtures vérifient également le cas publiable. Les couvertures mesurent les repères établis par le moteur et ne mesurent pas l’erreur face à une annotation indépendante.
+
+Un essai Turbo s’est arrêté lorsque l’état secteur est devenu indéterminé. La reprise a retrouvé la séparation du morceau de rap rapide en 0,5 s. Sur un troisième morceau, la perte effective du secteur a arrêté Demucs après 280 s, avant publication. La réserve a été vérifiée sur les volumes de la bibliothèque et sur une partition de test offrant 7,24 Gio libres, rejetée sans remplissage artificiel. Un service utilisateur transitoire a démarré la maintenance sans fenêtre sur une bibliothèque isolée. logind a autorisé la demande de veille manuelle avec les inhibiteurs de Parole en place, puis une terminaison forcée a confirmé la libération des descripteurs.
+
+Sur le bureau réel, l’option **Maintenir éveillé** de QuickShell bloquait le verrouillage et l’extinction automatiques. Après sa désactivation par l’utilisateur, le signal d’inactivité, le verrouillage QuickShell et l’extinction Sway ont été observés sur secteur, capot ouvert. Le service installé a ensuite démarré sans fenêtre et terminé l’inventaire initial sans erreur.
