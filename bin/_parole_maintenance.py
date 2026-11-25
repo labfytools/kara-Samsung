@@ -644,7 +644,7 @@ class Maintenance:
                 command = ["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_prepare.py"),
                            "--cache", str(self.cache.root), "--local-only"]
                 if nocturnal:
-                    command.extend(("--device", "gpu", "--observed-corrections-only"))
+                    command.extend(("--device", "gpu", "--require-vulkan", "--observed-corrections-only"))
                 if song["previous"] and not reference_option:
                     command.extend(("--previous-path", song["previous"]))
                 if reference_option:

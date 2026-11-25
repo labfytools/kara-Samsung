@@ -17,3 +17,4 @@
 - Ajouter la préparation nocturne sur secteur, séquentielle et sans plafond quotidien, sous la supervision du service Kara. Porter la réserve de disque à 20 Gio.
 - Configurer les délais et quotas des recherches classiques, avec une régulation persistante par fournisseur.
 - Afficher dans Parole le bilan persistant de la dernière session nocturne, avec la cadence et le stockage mesurés.
+- Exiger un backend Vulkan initialisé pour les analyses nocturnes et conserver le profil système sur les versions de TLP dont les demandes survivent au client.

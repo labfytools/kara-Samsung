@@ -99,8 +99,9 @@ def decode_segment(start, end, no_speech, tokens, origin, duration):
 
 class TurboDecoder:
     """One native context for the batch. Every frame is bounded and unprompted."""
-    def __init__(self, binary, model, device, threads, *, logs=False):
-        self.process = subprocess.Popen([str(binary), "--prepare", str(model), device, str(threads)],
+    def __init__(self, binary, model, device, threads, *, logs=False, require_vulkan=False):
+        backend = "vulkan" if require_vulkan else device
+        self.process = subprocess.Popen([str(binary), "--prepare", str(model), backend, str(threads)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=None if logs else subprocess.DEVNULL)
         self.buffer = bytearray()

@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_maintenance import Maintenance
-from _parole_night import Desktop, mains_online
+from _parole_night import Desktop, Login, mains_online
 
 
 class PowerTests(unittest.TestCase):
@@ -36,8 +36,15 @@ class PowerTests(unittest.TestCase):
             self.assertIs(mains_online(root), False)
             (ac / "online").write_text("1")
             self.assertIs(mains_online(root), True)
+            (root / "removed-during-read").mkdir()
+            self.assertIs(mains_online(root), True)
             (ac / "online").write_text("?")
             self.assertIsNone(mains_online(root))
+
+    def test_tlp_version_with_retained_holds_is_not_asked_to_hold(self):
+        login = Login.__new__(Login)
+        login.get = Mock(return_value="tlp-pd 1.11.0")
+        self.assertIsNone(login.hold_economy())
 
 
 class NightTests(unittest.TestCase):
@@ -57,7 +64,7 @@ class NightTests(unittest.TestCase):
         self.login = self.night.login = SimpleNamespace(
             inhibit=Mock(side_effect=lambda *_: os.open("/dev/null", os.O_RDONLY)),
             observe=lambda: self.state, sleeping=lambda: self.state.sleeping,
-            hold_economy=Mock(return_value=Mock()), get=Mock(return_value="power-saver"),
+            hold_economy=Mock(return_value=object()), release_economy=Mock(), get=Mock(return_value="power-saver"),
             glib=SimpleNamespace(Error=RuntimeError))
         self.owner.index.configure(night_enabled=True, startup=False)
         self.settings = self.owner.current_settings = self.owner.index.settings()
@@ -96,7 +103,7 @@ class NightTests(unittest.TestCase):
         for fd in fds:
             with self.assertRaises(OSError):
                 os.fstat(fd)
-        self.login.hold_economy.return_value.close_sync.assert_called()
+        self.login.release_economy.assert_called_with(self.login.hold_economy.return_value)
         self.assertNotIn(("sleep", "block"), [call.args for call in self.login.inhibit.call_args_list])
 
     def test_budget_survives_restart_and_real_resume_resets_it(self):

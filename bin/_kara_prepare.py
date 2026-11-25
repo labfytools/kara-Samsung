@@ -324,7 +324,7 @@ def choose_alignment(orders, heard, duration, progress):
 
 class Preparer:
     def __init__(self, cache, *, device="gpu", threads=None, logs=False, reader=retrieve,
-                 separate_if_needed=False, trace=None):
+                 separate_if_needed=False, trace=None, require_vulkan=False):
         self.cache = cache
         self.device = device
         self.threads = threads if threads is not None else (4 if device == "gpu" else 8)
@@ -332,6 +332,7 @@ class Preparer:
         self.reader = reader
         self.separate_if_needed = separate_if_needed
         self.trace = trace
+        self.require_vulkan = require_vulkan
         self.decoder = None
         self.binary = None
         self.model_lock = None
@@ -401,7 +402,8 @@ class Preparer:
     def load_decoder(self):
         if self.decoder is None:
             self.reserve_model()
-            self.decoder = TurboDecoder(self.binary, self.cache.model, self.device, self.threads, logs=self.logs)
+            self.decoder = TurboDecoder(self.binary, self.cache.model, self.device, self.threads,
+                                        logs=self.logs, require_vulkan=self.require_vulkan)
         return self.decoder
 
     def transcribe(self, song, language, progress):
@@ -478,7 +480,9 @@ class Preparer:
                            "sha256": fingerprint(source if kind == "local" else text.encode()),
                            **({"plain_file": plain_file} if plain is not None and rejected else {})},
                 "source_lrc": text, "source_order": source_order, "duration": duration, "lines": lines,
-                "segments": segments, "observation": {"input": "original"}, "report": report}
+                "segments": segments, "observation": {
+                    "input": "original", **({"acceleration": "vulkan"} if self.require_vulkan else {})},
+                "report": report}
 
     def deepen(self, song, item, progress):
         base = item["report"]
@@ -662,6 +666,7 @@ def main():
     parser.add_argument("--reference-provider", default="Strawberry")
     parser.add_argument("--rejected-lrc", type=json.loads, help="Version du LRC à conserver sans modification")
     parser.add_argument("--observed-corrections-only", action="store_true")
+    parser.add_argument("--require-vulkan", action="store_true")
     parser.add_argument("--previous-path", type=Path)
     parser.add_argument("--local-only", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -672,6 +677,8 @@ def main():
     parser.add_argument("--backend-logs", action="store_true")
     parser.add_argument("--separate-if-needed", action="store_true")
     args = parser.parse_args()
+    if args.require_vulkan and args.device != "gpu":
+        parser.error("La préparation Vulkan requiert --device gpu.")
 
     def cancel(_signal, _frame):
         raise KeyboardInterrupt
@@ -685,7 +692,7 @@ def main():
 
     preparer = Preparer(PreparedCache(args.cache), device=args.device, threads=args.threads, logs=args.backend_logs,
                         reader=local_reader if args.local_only else retrieve,
-                        separate_if_needed=args.separate_if_needed,
+                        separate_if_needed=args.separate_if_needed, require_vulkan=args.require_vulkan,
                         trace=(lambda song, kind, **payload: send("evidence", song, kind=kind, evidence=payload))
                         if args.trace else None)
     plain = read_source(args.plain_reference) if args.plain_reference is not None else None

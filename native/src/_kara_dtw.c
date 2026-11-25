@@ -1,5 +1,6 @@
 #include <inttypes.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,24 @@ static struct whisper_context *open_model(const char *model, bool gpu)
     config.dtw_aheads_preset = WHISPER_AHEADS_LARGE_V3_TURBO;
     struct whisper_context *context = whisper_init_from_file_with_params(model, config);
     return context;
+}
+
+struct vulkan_probe {
+    atomic_bool selected;
+    atomic_bool failed;
+};
+
+static void probe_vulkan(enum ggml_log_level level, const char *message, void *userdata)
+{
+    (void)level;
+    struct vulkan_probe *probe = userdata;
+    const char selected[] = "whisper_backend_init_gpu: using Vulkan";
+    const char failed[] = "whisper_backend_init_gpu: failed to initialize";
+    if (strncmp(message, selected, sizeof(selected) - 1) == 0)
+        atomic_store(&probe->selected, true);
+    if (strncmp(message, failed, sizeof(failed) - 1) == 0)
+        atomic_store(&probe->failed, true);
+    fputs(message, stderr);
 }
 
 static struct whisper_full_params decode_options(const char *language)
@@ -198,10 +217,22 @@ static void print_prepared(struct whisper_context *context)
     }
 }
 
-static int prepare_stream(const char *model, bool gpu, int threads)
+static int prepare_stream(const char *model, bool gpu, int threads, bool require_vulkan)
 {
     enum { MAX_SAMPLES = 29 * WHISPER_SAMPLE_RATE, MAX_LANG = 15 };
+    static struct vulkan_probe probe;
+    /* Whisper may fall back to CPU after a GPU request. Its pinned backend
+     * reports device selection and initialization failure before it is ready. */
+    if (require_vulkan)
+        whisper_log_set(probe_vulkan, &probe);
     struct whisper_context *context = open_model(model, gpu);
+    if (require_vulkan)
+        whisper_log_set(NULL, NULL);
+    if (context && require_vulkan && (!atomic_load(&probe.selected) || atomic_load(&probe.failed))) {
+        whisper_free(context);
+        fputs("Kara: Vulkan backend unavailable\n", stderr);
+        return 4;
+    }
     float *samples = malloc(MAX_SAMPLES * sizeof(*samples));
     if (!context || !samples) {
         if (context)
@@ -276,10 +307,11 @@ int main(int argc, char **argv)
     if (argc == 5 && strcmp(argv[1], "--prepare") == 0) {
         char *end;
         long threads = strtol(argv[4], &end, 10);
-        if (*end || threads < 1 || threads > 32 ||
-            (strcmp(argv[3], "cpu") != 0 && strcmp(argv[3], "gpu") != 0))
+        const bool strict_gpu = strcmp(argv[3], "vulkan") == 0;
+        const bool gpu = strict_gpu || strcmp(argv[3], "gpu") == 0;
+        if (*end || threads < 1 || threads > 32 || (!gpu && strcmp(argv[3], "cpu") != 0))
             return 2;
-        return prepare_stream(argv[2], strcmp(argv[3], "gpu") == 0, (int)threads);
+        return prepare_stream(argv[2], gpu, (int)threads, strict_gpu);
     }
     if (argc == 4 && strcmp(argv[1], "--stream") == 0)
         return stream_audio(argv[2], argv[3], false);

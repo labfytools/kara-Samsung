@@ -18,9 +18,13 @@ PROFILES_PATH = "/org/freedesktop/UPower/PowerProfiles"
 
 def mains_online(root=Path("/sys/class/power_supply")):
     """True pour un secteur système confirmé, False hors secteur, None si inconnu."""
-    readings = []
+    measured = unknown = False
     try:
-        for device in root.iterdir():
+        devices = list(root.iterdir())
+    except OSError:
+        return None
+    for device in devices:
+        try:
             kind = (device / "type").read_text().strip()
             scope = device / "scope"
             if kind == "Battery" or (scope.is_file() and scope.read_text().strip() == "Device"):
@@ -32,12 +36,15 @@ def mains_online(root=Path("/sys/class/power_supply")):
             if kind == "Unknown":
                 continue
             value = (device / "online").read_text().strip()
-            if value not in ("0", "1"):
-                return None
-            readings.append(value == "1")
-    except OSError:
-        return None
-    return any(readings) if readings else None
+            if value == "1":
+                # A USB hot-unplug may remove another sysfs directory during
+                # this pass. It cannot negate positive system AC evidence.
+                return True
+            measured |= value == "0"
+            unknown |= value != "0"
+        except OSError:
+            unknown = True
+    return False if measured and not unknown else None
 
 
 def command(*args):
@@ -140,21 +147,36 @@ class Login:
         return fd
 
     def hold_economy(self):
-        # A private bus connection owns this temporary profile request. TLP
-        # restores the selected profile when its caller disconnects, even if
-        # Parole crashes or an acknowledgement is lost.
+        version = self.get(PROFILES_PATH, PROFILES, "Version", service=PROFILES)
+        if version.startswith("tlp-pd"):
+            # TLP 1.11.0 leaves its hold after the bus owner disappears.
+            # Crash-safe backends are required before Parole changes profiles.
+            return None
+        # power-profiles-daemon releases all holds owned by a disconnected
+        # caller. Use a private bus as a fallback to the explicit release.
         address = self.gio.dbus_address_get_for_bus_sync(self.gio.BusType.SYSTEM, None)
         flags = self.gio.DBusConnectionFlags
         bus = self.gio.DBusConnection.new_for_address_sync(
             address, flags.AUTHENTICATION_CLIENT | flags.MESSAGE_BUS_CONNECTION)
         try:
-            bus.call_sync(PROFILES, PROFILES_PATH, PROFILES, "HoldProfile",
-                          self.glib.Variant("(sss)", ("power-saver", "Préparation nocturne Kara", "fr.labfy.ParolesStrawberry")),
-                          self.glib.VariantType("(u)"), self.gio.DBusCallFlags.NO_AUTO_START, 600, None)
+            cookie = bus.call_sync(PROFILES, PROFILES_PATH, PROFILES, "HoldProfile",
+                                   self.glib.Variant("(sss)", ("power-saver", "Préparation nocturne Kara", "fr.labfy.ParolesStrawberry")),
+                                   self.glib.VariantType("(u)"), self.gio.DBusCallFlags.NO_AUTO_START, 600, None).unpack()[0]
         except self.glib.Error:
             bus.close_sync(None)
             raise
-        return bus
+        return bus, cookie
+
+    def release_economy(self, hold):
+        bus, cookie = hold
+        try:
+            bus.call_sync(PROFILES, PROFILES_PATH, PROFILES, "ReleaseProfile",
+                          self.glib.Variant("(u)", (cookie,)), None,
+                          self.gio.DBusCallFlags.NO_AUTO_START, 450, None)
+        except self.glib.Error:
+            pass
+        finally:
+            bus.close_sync(None)
 
 
 class Night:
@@ -183,9 +205,9 @@ class Night:
         os.close(self.fd)
         self.fd = self.delay = None
         if self.profile is not None:
-            connection, self.profile = self.profile, None
+            hold, self.profile = self.profile, None
             try:
-                connection.close_sync(None)
+                self.login.release_economy(hold)
             except self.login.glib.Error:
                 pass
         self.journal.emit("IDLE", "Retour à la politique normale de veille")
@@ -277,7 +299,7 @@ class Night:
             # Systems without the profile service still enforce the same
             # live thermal limits.
             self.journal.emit("IDLE", "Profil Économie temporaire indisponible")
-        else:
+        if self.profile is not None:
             self.journal.emit("IDLE", "Profil Économie temporaire demandé")
         if self.budget is None:
             self.index.night_budget(now)
