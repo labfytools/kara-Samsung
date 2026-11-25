@@ -15,6 +15,7 @@ from _musique_oz import INBOX, group_locations, grouped_path, index_revision
 SIDES = ("PC", "Android")
 INVALID = Gtk.INVALID_LIST_POSITION
 PAGE_SIZE = 140
+LOG_EVERY = 100
 OPERATION_LABELS = {"add": "Fichier transféré", "modify": "Fichier actualisé", "copy": "Copie vérifiée",
                     "rename": "Fichier renommé", "delete": "Fichier mis en réserve"}
 OPERATION_VERBS = {"Transfert": "copy", "Renommage": "rename", "Mise en réserve": "delete"}
@@ -67,7 +68,7 @@ class MusicSync:
         return tuple(directory.resolve() for directory in (CACHE / "paroles-strawberry", STATE / "kara", DATA / "kara"))
 
     def poll(self):
-        if self.probe is not None or self.closed:
+        if self.probe is not None or self.closed or (self.dialog is not None and self.dialog.process is not None):
             return GLib.SOURCE_CONTINUE
         if not self.available():
             self.connected({"state": "unavailable", "message": "Lanceur Labfy introuvable ou non exécutable."})
@@ -165,6 +166,9 @@ class SyncWindow(Gtk.Window):
         self.confirmed = False
         self.closed = False
         self.stopping = False
+        self.suspending = False
+        self.transferring = False
+        self.android_available = None
         self.updating_choices = False
         self.terminal_event = False
         self.statistics = {}
@@ -259,10 +263,17 @@ class SyncWindow(Gtk.Window):
         self.repair_button = Gtk.Button(label="Réparer l’indexation", visible=False)
         self.repair_button.connect("clicked", self.repair_media)
         footer.append(self.repair_button)
+        self.abandon_button = Gtk.Button(label="Abandonner le plan", visible=False,
+                                         tooltip_text="Conserver les fichiers déjà publiés et refaire un aperçu")
+        self.abandon_button.connect("clicked", self.abandon)
+        footer.append(self.abandon_button)
+        self.suspend_button = Gtk.Button(label="Suspendre", sensitive=False)
+        self.suspend_button.connect("clicked", self.suspend)
+        footer.append(self.suspend_button)
         self.cancel_button = Gtk.Button(label="Annuler")
         self.cancel_button.connect("clicked", self.cancel)
         footer.append(self.cancel_button)
-        self.confirm = Gtk.Button(label="Confirmer", sensitive=False, css_classes=["suggested-action"])
+        self.confirm = Gtk.Button(label="Démarrer", sensitive=False, css_classes=["suggested-action"])
         self.confirm.connect("clicked", self.apply)
         footer.append(self.confirm)
         self.connected()
@@ -275,8 +286,14 @@ class SyncWindow(Gtk.Window):
             if self.path.get_text() == previous:
                 self.path.set_text(self.configured_path)
         text = state.get("message", "Vérification USB…")
+        if state.get("protocol"):
+            text += f" · {state['protocol']}"
+        if state.get("usb_mbps") is not None:
+            text += f" · Liaison négociée à {state['usb_mbps']:g} Mbit/s"
         if state.get("android"):
             text += f" · {state['android']}"
+            if self.android_available is not None:
+                text += f" · {GLib.format_size(self.android_available)} disponibles"
         resume = state.get("resume")
         needs_helper = resume is None or resume["completed"] < resume["total"]
         if needs_helper and state.get("helper") is False:
@@ -316,11 +333,14 @@ class SyncWindow(Gtk.Window):
         idle = self.process is None and self.saving is None
         self.path.set_editable(idle)
         self.save_button.set_sensitive(idle and changed_path and state.get("state") != "unavailable")
-        self.preview_button.set_label("Reprendre la synchronisation" if resumable else "Aperçu")
+        self.preview_button.set_label("Reprendre" if resumable else "Aperçu")
         self.preview_button.set_sensitive(idle and not changed_path and state.get("state") == "ready" and
                                           (not resumable or media_only or state.get("helper", True)))
         self.repair_button.set_visible(bool(state.get("media_repair")) and state.get("resume") is None)
         self.repair_button.set_sensitive(idle and not changed_path and state.get("state") == "ready")
+        self.abandon_button.set_visible(bool(saved and state.get("abandon_plan")))
+        self.abandon_button.set_sensitive(idle and not changed_path and state.get("state") == "ready")
+        self.suspend_button.set_sensitive(self.transferring and not self.stopping)
         self.cancel_button.set_label("Annuler" if self.process is not None else "Fermer")
         self.cancel_button.set_sensitive(not self.stopping)
         self.edit_box.set_sensitive(has_plan)
@@ -385,8 +405,17 @@ class SyncWindow(Gtk.Window):
         args = [*self.controller.command("repair-media"), "--android", self.controller.connection["android"]]
         self.start_process(args, "Préparation de la réparation MediaStore…")
 
+    def abandon(self, _button):
+        if not self.abandon_button.get_visible() or not self.abandon_button.get_sensitive():
+            return
+        args = [*self.controller.command("abandon"), "--android", self.controller.connection["android"]]
+        self.start_process(args, "Abandon du plan interrompu…")
+
     def start_process(self, args, message):
         self.terminal_event = False
+        self.transferring = False
+        self.suspending = False
+        self.android_available = None
         self.operations = Counter()
         self.pending_operation = None
         self.copy_kinds = {}
@@ -417,6 +446,7 @@ class SyncWindow(Gtk.Window):
             # Let the child finish its cooperative stop and persist its
             # journal state even when the main window has closed.
             self.application.hold()
+            self.transferring = args[1] == "resume"
             stream = Gio.DataInputStream.new(self.process.get_stdout_pipe())
             stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_line)
         self.refresh_controls()
@@ -443,6 +473,7 @@ class SyncWindow(Gtk.Window):
         self.process = None
         self.confirmed = False
         self.stopping = False
+        self.transferring = False
         if not self.closed:
             self.progress.set_visible(False)
             self.file_progress.set_visible(False)
@@ -471,7 +502,11 @@ class SyncWindow(Gtk.Window):
         _, kind, side, path = self.pending_operation
         self.pending_operation = None
         self.operations[kind] += 1
-        self.controller.log(f"{OPERATION_LABELS[kind]} · {side} · {path}")
+        total = self.operations.total()
+        if self.operations[kind] <= 3:
+            self.controller.log(f"{OPERATION_LABELS[kind]} · {side} · {path}")
+        elif total % LOG_EVERY == 0:
+            self.controller.log(f"{total} opérations vérifiées dans cette session.")
 
     def end_report(self, message, level="INFO", *, pending=None):
         self.terminal_event = True
@@ -506,14 +541,29 @@ class SyncWindow(Gtk.Window):
         elif event == "error":
             if resume := data.get("resume"):
                 self.complete_operation(resume["completed"])
-            self.end_report(data["message"], "WARNING" if self.stopping or self.closed else "ERROR")
+            if self.suspending and resume:
+                self.end_report("Synchronisation suspendue. La progression est sauvegardée.")
+            else:
+                self.end_report(data["message"], "WARNING" if self.stopping or self.closed else "ERROR")
         elif event == "done":
             if self.pending_operation is not None:
                 self.complete_operation(self.pending_operation[0] + 1)
             pending = data.get("media_pending", 0)
-            status = (f" · {pending} chemin(s) à traiter via Réparer l’indexation." if pending else "")
-            message = "Réparation MediaStore terminée." if data.get("repair") else "Synchronisation terminée."
-            self.end_report(message + status, "WARNING" if pending else "INFO", pending=pending)
+            # The engine just closed the journal. Invalidate a previous probe
+            # immediately so reopening the dialog cannot offer a stale resume.
+            self.controller.connection.update(recover=False, resume=None, media_repair=bool(pending), media_pending=pending)
+            if data.get("abandoned"):
+                message = "Plan abandonné. Les fichiers déjà publiés sont conservés."
+            elif data.get("repair"):
+                message = "Réparation MediaStore à poursuivre." if pending else "Réparation MediaStore terminée."
+            else:
+                message = "Transferts terminés. Indexation Android incomplète." if pending else "Synchronisation terminée."
+            if pending:
+                message += f" {pending} chemin(s) à traiter via Réparer l’indexation."
+            if "adb_commands" in data:
+                self.controller.log(f"Mesures · {data['adb_commands']} commandes ADB · {data['elapsed']:.2f} s · "
+                                    f"{GLib.format_size(data['verified_bytes'])} vérifiés dans le plan")
+            self.end_report(message, "WARNING" if pending else "INFO", pending=pending)
 
     def on_event(self, data):
         event = data["event"]
@@ -536,11 +586,20 @@ class SyncWindow(Gtk.Window):
             else:
                 self.progress.pulse()
         elif event == "preview" and not self.stopping:
-            self.connection_label.set_text(f"Galaxy S21 FE connecté par USB · {data['android']}")
+            self.android_available = data.get("available_android")
+            self.connected()
             self.statistics = data["statistics"]
             self.corrections = data["corrections"]
             self.show_plan(data["entries"], self.corrections)
             self.controller.log(f"Aperçu prêt · {len(self.entries)} proposition(s), {len(self.conflicts)} conflit(s)")
+            if times := data.get("seconds"):
+                self.controller.log(f"Inventaire PC {times['inventory_pc']:.2f} s · Android {times['inventory_android']:.2f} s · "
+                                    f"Comparaison {times['compare']:.2f} s · {data['adb_commands']} commandes ADB")
+            state = self.controller.connection
+            if state.get("protocol") and state.get("concurrency"):
+                self.controller.log(f"Transport {state['protocol']} sur USB · {state['concurrency']} transfert simultané")
+            if deferred := self.statistics.get("deferred"):
+                self.controller.log(f"{deferred} fichier(s) en cours de modification reporté(s).", "WARNING")
         elif event == "transfer" and not self.stopping:
             self.progress.set_fraction(min(1, data["transferred"] / data["total"]))
             self.progress.set_show_text(True)
@@ -551,8 +610,10 @@ class SyncWindow(Gtk.Window):
             eta = data["eta"]
             estimate = "estimation en cours" if eta is None else f"env. {eta // 60} min {eta % 60:02d} s"
             self.transfer_status.set_visible(True)
-            self.transfer_status.set_text(
-                f"{GLib.format_size(data['rate'])}/s · {GLib.format_size(data['remaining'])} restants · {estimate}")
+            rate = GLib.format_size(data.get("instant_rate", data["rate"]))
+            average = f" · {GLib.format_size(data['average_rate'])}/s en moyenne" if "average_rate" in data else ""
+            self.transfer_status.set_text(f"{rate}/s instantané{average} · "
+                                          f"{GLib.format_size(data['remaining'])} restants · {estimate}")
         elif event == "media":
             transferred, indexed = data["transferred"], data["indexed"]
             errors = data["errors"]
@@ -574,6 +635,8 @@ class SyncWindow(Gtk.Window):
             self.power_status.set_visible(bool(data.get("active") or data.get("pending")))
         elif event == "error" and data.get("recover"):
             self.controller.connection.update(recover=True, resume=data.get("resume"))
+            self.connected()
+        elif event == "done":
             self.connected()
 
     @staticmethod
@@ -696,7 +759,8 @@ class SyncWindow(Gtk.Window):
             sizes[step["side"]] += step["bytes"]
         self.deletions.set_visible(deletions > 0)
         stats = self.statistics
-        self.summary.set_text(f"{stats.get('total_files', 0)} fichiers · {stats.get('transferable', 0)} transférables · "
+        identical = f"{stats['identical']} déjà synchronisé(s) · " if "identical" in stats else ""
+        self.summary.set_text(f"{stats.get('total_files', 0)} fichiers · {identical}{stats.get('transferable', 0)} transférables · "
                               f"{stats.get('blocked', 0)} incompatibles · {stats.get('conflicts', 0)} conflits\n"
                               f"{stats.get('corrected', 0)} chemins avec correspondance Android\n"
                               f"{counts['copy']} transfert(s) choisi(s) · {counts['rename']} renommage(s) · "
@@ -768,6 +832,7 @@ class SyncWindow(Gtk.Window):
                        all(choice[0]["kind"] != "delete" for choice in row["choices"].values()))
             self.copy_kinds[SIDES[side], path] = "modify" if replaces else "add"
         self.confirmed = False
+        self.transferring = True
         self.rescan_on_finish = True
         self.refresh_controls()
         self.controller.log("Plan de synchronisation confirmé.")
@@ -793,6 +858,16 @@ class SyncWindow(Gtk.Window):
         self.stopping = True
         self.summary.set_text("Annulation en cours…")
         self.process.send_signal(signal.SIGTERM)
+        self.refresh_controls()
+
+    def suspend(self, _button):
+        if not self.suspend_button.get_sensitive():
+            return
+        self.suspending = self.stopping = True
+        self.summary.set_text("Sauvegarde de la progression…")
+        # A cooperative signal releases ADB and persists its cursor. Stopping
+        # the process with SIGSTOP would retain the USB and library locks.
+        self.process.send_signal(signal.SIGINT)
         self.refresh_controls()
 
     def close_request(self, _window):

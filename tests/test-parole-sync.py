@@ -132,6 +132,10 @@ class SyncTests(unittest.TestCase):
 
             dialog = open_preview()
             self.assertFalse(dialog.entries)
+            self.assertEqual(dialog.confirm.get_label(), "Démarrer")
+            self.assertIn("déjà synchronisé", dialog.summary.get_text())
+            self.assertIn("disponibles", dialog.connection_label.get_text())
+            self.assertIn("ADB", dialog.connection_label.get_text())
             confirm(dialog)
             dialog.close()
 
@@ -236,12 +240,34 @@ class SyncTests(unittest.TestCase):
             self.assertFalse((device / "mock-power.json").exists())
             dialog.close()
 
+            paused = Path("Suspendre cette copie.lrc")
+            (pc / paused).write_bytes(b"payload after resume")
+            dialog = open_preview()
+            uploads = device / "upload-stage.log"
+            recorded = uploads.stat().st_size
+            hold_upload = device / "hold-upload"
+            hold_upload.touch()
+            dialog.confirm.emit("clicked")
+            wait_for(lambda: uploads.stat().st_size > recorded)
+            self.assertTrue(dialog.suspend_button.get_sensitive())
+            dialog.suspend_button.emit("clicked")
+            wait_for(lambda: dialog.process is None and sync.connection.get("resume"))
+            self.assertIn("Synchronisation suspendue", dialog.summary.get_text())
+            self.assertFalse((phone / paused).exists())
+            self.assertEqual(dialog.preview_button.get_label(), "Reprendre")
+            hold_upload.unlink()
+            dialog.preview_button.emit("clicked")
+            wait_for(lambda: dialog.process is None)
+            self.assertEqual((phone / paused).read_bytes(), (pc / paused).read_bytes())
+            dialog.close()
+
             console = window.parole_ui.console
             categories = console.category.get_model()
             console.category.set_selected(next(i for i in range(categories.get_n_items())
                                                if categories.get_string(i) == "SYNC"))
             lines = [console.stringify(entry) for entry in console.lines]
-            for fragment in ("Aperçu prêt", "Fichier transféré · Android · Nouvelle piste.opus",
+            for fragment in ("Aperçu prêt", "Inventaire PC", "commandes ADB", "Transport ADB sur USB",
+                             "Fichier transféré · Android · Nouvelle piste.opus",
                              "Fichier actualisé · Android · Conservé/Album/cover.jpg", "Fichier renommé",
                              "[ERROR] La bibliothèque est déjà utilisée", "Bilan de la session",
                              "Copie vérifiée · Android · Piste à reprendre.opus"):
