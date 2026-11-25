@@ -262,7 +262,7 @@ class MobileImports:
         result = []
         requesters = {}
         seeking = history and before is not None
-        with self.lock, (self.queue.connect() if history and self.queue else nullcontext()) as db:
+        with self.lock, (self.queue.connect() if self.queue else nullcontext()) as db:
             if db is not None:
                 db.execute("BEGIN")
             for job in reversed(self.jobs.values()):

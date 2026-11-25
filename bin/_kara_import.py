@@ -253,7 +253,8 @@ class AlbumImport(Gtk.Revealer):
                     job = ImportJob(row["targets"], None, identity=row["id"], option=row["option"],
                                     journal=row["journal"])
                     job.outcomes = self.queue.outcomes(row["id"])
-                    job.finish_import("success" if row["state"] == "done" else "cancelled",
+                    event = {"done": "success", "cancelled": "cancelled"}.get(row["state"], "failure")
+                    job.finish_import(event,
                                       row["message"], 1., "", notify=False, history=True)
                     selection = Gtk.ListBoxRow(child=job, activatable=False)
                     rows.append(selection)
@@ -835,7 +836,7 @@ class AlbumImport(Gtk.Revealer):
 
     def add_import(self, row):
         job = ImportJob(row["targets"], self.import_finished, identity=row["id"], option=row["option"],
-                        retry=self.retry_job, journal=row["journal"])
+                        retry=self.retry_job, journal=row["journal"], remove=self.remove_job)
         job.outcomes = self.queue.outcomes(job.identity)
         self.by_id[job.identity] = job
         self.imports.append(job)
@@ -867,7 +868,7 @@ class AlbumImport(Gtk.Revealer):
         return GLib.SOURCE_REMOVE
 
     def sync_queue(self):
-        rows = self.queue.rows()
+        rows = self.queue.rows(include_hidden_refresh=True)
         paused, capacity = self.queue.settings()
         inbox = SHARED_LIBRARY / INBOX
         can_start = self.can_launch() and not paused
@@ -885,6 +886,17 @@ class AlbumImport(Gtk.Revealer):
         active = sum(row["state"] == "running" for row in rows)
         for row in rows:
             identity, state = row["id"], row["state"]
+            if not row["visible"]:
+                # Clearing a lot hides the card immediately. The independently
+                # persisted catalogue acknowledgement must still be replayed.
+                if row["refresh"] and self.refreshing.get(identity) != row["refresh"]:
+                    task = ImportJob(row["targets"], None, identity=identity, option=row["option"],
+                                     journal=row["journal"])
+                    task.outcomes = self.queue.outcomes(identity)
+                    event = {"done": "success", "cancelled": "cancelled"}.get(state, "failure")
+                    task.finish_import(event, row["message"], 1., "", notify=False, history=True)
+                    self.schedule_refresh(task, row["refresh"])
+                continue
             job = self.by_id.get(identity) or self.add_import(row)
             job.awaiting_refresh = bool(row["refresh"])
             job.store_state = state
@@ -931,9 +943,9 @@ class AlbumImport(Gtk.Revealer):
                 job.finish_import(kind, row["message"], 1., detail, notify=False)
             if row["refresh"] and job.done and self.refreshing.get(identity) != row["refresh"]:
                 self.schedule_refresh(job, row["refresh"])
-        visible = {row["id"] for row in rows}
+        visible = {row["id"] for row in rows if row["visible"]}
         for job in list(self.imports):
-            if job.identity not in visible and job.done:
+            if job.identity not in visible and job.process is None:
                 self.import_rows.remove(job)
                 self.imports.remove(job)
                 self.by_id.pop(job.identity)
@@ -950,7 +962,7 @@ class AlbumImport(Gtk.Revealer):
         self.pause.set_sensitive(pause_state != "suspending")
         if pause_state == "paused" and self.imports_snapshot[1].get("pause_state") != "paused":
             self.on_update(None, "queue", {"message": "File suspendue · état sauvegardé · créneaux libérés"})
-        counts = self.queue.count()
+        counts = self.queue.count(visible=True)
         albums, tracks, settled, planned = self.queue.totals()
         active, waiting = counts.get("running", 0), counts.get("queued", 0)
         errors = counts.get("failed", 0) + counts.get("partial", 0) + counts.get("review", 0)
@@ -1007,6 +1019,14 @@ class AlbumImport(Gtk.Revealer):
             return True
         return False
 
+    def remove_job(self, identity):
+        try:
+            self.queue.delete_history((identity,))
+        except (OSError, sqlite3.Error) as error:
+            self.message(f"Retrait impossible · {error}", failed=True)
+            return
+        self.launch_next(force=True)
+
     def cancel_job(self, identity):
         if self.queue.transition(identity, "queued", "cancelled", "Demande annulée", refresh=True):
             self.launch_next(force=True)
@@ -1037,7 +1057,7 @@ def read_final_detail(path):
 
 
 class ImportJob(Gtk.Box):
-    def __init__(self, jobs, on_finished, *, identity, option=None, retry=None, journal=None):
+    def __init__(self, jobs, on_finished, *, identity, option=None, retry=None, journal=None, remove=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.identity = identity
         self.jobs = jobs
@@ -1045,6 +1065,7 @@ class ImportJob(Gtk.Box):
         self.keys = {import_key(url) for _, url in jobs} if option is None else set()
         self.on_finished = on_finished
         self.retry = retry
+        self.remove = remove
         self.journal = journal
         self.done = False
         self.process = None
@@ -1088,6 +1109,11 @@ class ImportJob(Gtk.Box):
         self.retry_button = Gtk.Button(label="Relancer les échecs", visible=False)
         self.retry_button.connect("clicked", self.retry_failed)
         header.append(self.retry_button)
+        self.remove_button = Gtk.Button(label="Retirer", visible=False,
+                                        tooltip_text="Retirer ce lot de la liste et de l’historique")
+        if remove:
+            self.remove_button.connect("clicked", lambda _: remove(identity))
+        header.append(self.remove_button)
         self.append(header)
         self.progress = Gtk.ProgressBar(show_text=True)
         self.append(self.progress)
@@ -1306,6 +1332,7 @@ class ImportJob(Gtk.Box):
         self.detail_text = "\n\n".join(sections)
         self.details_button.set_visible(len(sections) > 1)
         self.retry_button.set_visible(bool(self.failed_jobs and self.retry))
+        self.remove_button.set_visible(bool(self.done and self.remove))
 
     def retry_failed(self, _button):
         if self.failed_jobs and self.retry(self.identity):

@@ -98,7 +98,7 @@ class QueueTests(unittest.TestCase):
                 queue.enqueue([("Album", local + "?provider=Bandcamp&edition=" + release + "%3Ftoken=secret")])
             self.assertEqual(queue.count(), {})
 
-    def test_only_acknowledged_imports_move_to_history(self):
+    def test_integration_tracks_remain_recoverable_until_acknowledged(self):
         with TemporaryDirectory(prefix="parole-history-") as temporary:
             root = Path(temporary)
             queue = ImportQueue(root / "state", root)
@@ -110,7 +110,7 @@ class QueueTests(unittest.TestCase):
             queue.finish(identity, "success", "Album téléchargé")
             row = queue.rows()[0]
             self.assertTrue(row["refresh"])
-            self.assertEqual(queue.history(), [])
+            self.assertEqual(queue.history()[0]["id"], identity)
             queue.integration_failed(identity, row["refresh"], [missing])
             self.assertEqual(queue.rows()[0]["state"], "partial")
             self.assertEqual(queue.outcomes(identity)[good]["status"], "success")
@@ -158,13 +158,18 @@ class QueueTests(unittest.TestCase):
         integrating, _ = add(6, "success", acknowledge=False)
         waiting, _ = add(7)
         mobile.bind_queue(queue)
-        self.assertEqual(len(mobile.snapshot(organizer=True, history=True)), 4)
+        self.assertEqual(len(mobile.snapshot(organizer=True, history=True)), 6)
         self.assertEqual(len(mobile.snapshot(token="member", history=True)), 1)
         self.assertEqual(queue.totals(), (1, 2, 2, 3))
 
-        self.assertEqual(queue.delete_history((linked, cancelled, waiting, partial, integrating)), 2)
+        self.assertEqual(queue.delete_history((linked, cancelled, waiting, partial, integrating)), 4)
         self.assertEqual(queue.history_policy(), (0, 1))
         self.assertEqual(mobile.snapshot(token="member", history=True), [])
+        self.assertEqual([row["id"] for row in queue.rows()], [waiting])
+        self.assertEqual(queue.count(visible=True), {"queued": 1})
+        self.assertEqual(queue.totals(), (0, 0, 0, 1))
+        self.assertEqual([row["id"] for row in queue.rows(include_hidden_refresh=True)], [integrating, waiting])
+        self.assertNotIn(partial, [row["id"] for row in queue.diagnosis_candidates(time.time())])
         self.assertEqual(queue.delete_history(successful=True), 1)
         self.assertEqual([row["id"] for row in queue.history()], [previous_cancellation])
         self.assertEqual(queue.delete_history(), 1)
@@ -183,7 +188,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(restarted.enqueue([("Déjà en cours", pending_url)]), partial)
         self.assertEqual(restarted.job(waiting)["state"], "queued")
         restarted.refreshed([(integrating, restarted.job(integrating)["refresh"])])
-        self.assertEqual([row["id"] for row in restarted.history()], [integrating])
+        self.assertEqual(restarted.history(), [])
         self.assertEqual(restarted.totals(), (0, 1, 0, 2))
 
     def test_history_retention_uses_closure_date_and_persists(self):
@@ -222,7 +227,7 @@ class QueueTests(unittest.TestCase):
         date = time.time() - 45 * 86400
         # Reconstruct the previous schema with an existing settlement receipt.
         with queue.connect(write=True) as db:
-            db.execute("DROP TRIGGER import_history_closed")
+            db.execute("DROP TRIGGER import_history_settled")
             db.execute("DROP TABLE import_history")
             db.execute("DROP TABLE history_policy")
             db.execute("""INSERT INTO import_recovery_history(job,attempt,stamp,signature,phase,message)
@@ -1455,8 +1460,13 @@ def archive(index, state):
     return job
 
 success = archive(0, 'done')
-selection = [archive(i, 'cancelled') for i in (1, 2)]
-last = archive(3, 'cancelled')
+selection = [archive(1, 'failed'), archive(2, 'cancelled')]
+last = archive(3, 'partial')
+individual = archive(4, 'review')
+panel.launch_next(force=True)
+assert set(panel.by_id) == {selection[0], last, individual}
+panel.by_id[individual].remove_button.emit('clicked')
+assert individual not in panel.by_id
 panel.show_history(panel.history_button)
 history = panel.history_window
 
@@ -1477,6 +1487,8 @@ for row in traverse(rows):
 assert len(rows.get_selected_rows()) == 2
 button(history, 'Supprimer la sélection').emit('clicked')
 assert {row['id'] for row in queue.history()} == {success, last}
+assert set(panel.by_id) == {last}
+assert panel.imports_snapshot[1]['errors'] == 1
 button(history, 'Effacer les importations réussies').emit('clicked')
 assert [row['id'] for row in queue.history()] == [last]
 
@@ -1495,10 +1507,14 @@ assert len(queue.history()) == 1
 respond('Effacer')
 assert queue.history() == []
 assert rows.get_row_at_index(0) is None
+assert panel.by_id == {}
+assert panel.imports_snapshot[1]['errors'] == 0
+assert panel.overall.get_fraction() == 0
+assert ImportQueue().rows() == []
 retention = next(item for item in traverse(history) if isinstance(item, Gtk.DropDown))
 retention.set_selected(2)
-assert ImportQueue().history_policy() == (30, 3)
-assert panel.imports_snapshot[1]['history_revision'] == 3
+assert ImportQueue().history_policy() == (30, 4)
+assert panel.imports_snapshot[1]['history_revision'] == 4
 history.close()
 assert panel.history_window is None
 owner.destroy()

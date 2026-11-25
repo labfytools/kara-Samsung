@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Retirer immédiatement les lots effacés, y compris les échecs, de la file visible et de ses compteurs. Permettre le retrait individuel et conserver les reçus et les résultats de reprise.
+
 - Nettoyer l’historique des imports par sélection, résultat ou durée, avec une visibilité partagée entre Parole et la salle et des compteurs centrés sur la file.
 - Suspendre les téléchargements et enrichissements actifs de la file d’import, conserver leurs reçus de reprise et partager l’état confirmé entre Parole et le mobile.
 - Publier l’audio des imports gérés avant les recherches de paroles et de pochettes. Confier l’enrichissement à la file de maintenance persistante.

@@ -20,6 +20,10 @@ MAX_BATCHES = 8
 COMPLETE = {"success", "present", "duplicate"}
 BUSY = ("queued", "running")
 HISTORY_DAYS = (0, 7, 30, 90)
+# A lot explicitly retried by its owner can be active again. Its old
+# history entry stays hidden, and pending catalogue acknowledgements survive.
+VISIBLE = "(NOT EXISTS (SELECT 1 FROM import_history WHERE job=jobs.id AND removed=1) OR state IN ('queued','running'))"
+CURRENT = f"(state NOT IN ('done','cancelled') OR refresh>0) AND {VISIBLE}"
 
 
 def import_key(url):
@@ -111,20 +115,24 @@ class ImportQueue:
                     removed INTEGER NOT NULL DEFAULT 0 CHECK (removed IN (0,1))
                 );
                 CREATE INDEX IF NOT EXISTS history_expiry ON import_history(removed,closed_at);
-                CREATE TRIGGER IF NOT EXISTS import_history_closed AFTER UPDATE OF state,refresh ON jobs
-                    WHEN NEW.state IN ('done','cancelled') AND NEW.refresh=0
-                    BEGIN
-                        INSERT OR IGNORE INTO import_history(job,closed_at) VALUES(NEW.id,unixepoch('subsec'));
-                    END;
             """)
             db.execute("INSERT OR IGNORE INTO settings VALUES (1, 0, ?)", (DEFAULT_BATCHES,))
-            if db.execute("INSERT OR IGNORE INTO history_policy(id,days) VALUES(1,0)").rowcount:
-                # Old lots have no close timestamp. Use the recorded
-                # settlement if available, or begin retention at migration.
+            db.execute("INSERT OR IGNORE INTO history_policy(id,days) VALUES(1,0)")
+            if not db.execute("SELECT 1 FROM sqlite_schema WHERE name='import_history_settled'").fetchone():
+                # Backfill terminal lots once, atomically with installation of
+                # the new trigger. Existing timestamps and tombstones survive.
                 db.execute("""INSERT OR IGNORE INTO import_history(job,closed_at)
                               SELECT id,coalesce((SELECT max(stamp) FROM import_recovery_history
-                                            WHERE job=jobs.id AND phase IN ('done','cancelled')),?)
-                              FROM jobs WHERE state IN ('done','cancelled') AND refresh=0""", (time(),))
+                                            WHERE job=jobs.id AND phase IN ('done','cancelled','review')),?)
+                              FROM jobs WHERE state IN ('done','cancelled','failed','partial','review')
+                                AND NOT EXISTS (SELECT 1 FROM import_history WHERE job=id)""", (time(),))
+                db.execute("DROP TRIGGER IF EXISTS import_history_closed")
+                db.execute("""CREATE TRIGGER import_history_settled AFTER UPDATE OF state ON jobs
+                              WHEN NEW.state IN ('done','cancelled','failed','partial','review')
+                              BEGIN
+                                  INSERT OR IGNORE INTO import_history(job,closed_at)
+                                  VALUES(NEW.id,unixepoch('subsec'));
+                              END""")
 
     @contextmanager
     def connect(self, write=False):
@@ -250,16 +258,17 @@ class ImportQueue:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone()
             return self.decode(row) if row else None
 
-    def rows(self):
+    def rows(self, *, include_hidden_refresh=False):
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM jobs WHERE state NOT IN ('done', 'cancelled') OR refresh>0 ORDER BY seq")
+            predicate = f"({CURRENT}) OR refresh>0" if include_hidden_refresh else CURRENT
+            rows = db.execute(f"SELECT *, {VISIBLE} AS visible FROM jobs WHERE {predicate} ORDER BY seq")
             return [self.decode(row) for row in rows]
 
     def history(self, before=None, limit=25):
         with self.connect() as db:
             rows = db.execute("""
                 SELECT jobs.* FROM jobs JOIN import_history ON job=id
-                WHERE state IN ('done', 'cancelled') AND refresh=0 AND removed=0
+                WHERE state NOT IN ('queued','running') AND removed=0
                     AND (? IS NULL OR seq < ?) ORDER BY seq DESC LIMIT ?
             """, (before, before, limit))
             return [self.decode(row) for row in rows]
@@ -270,7 +279,9 @@ class ImportQueue:
             return row["days"], row["revision"]
 
     def history_removed(self, identity, db):
-        return db.execute("SELECT 1 FROM import_history WHERE job=? AND removed=1", (identity,)).fetchone() is not None
+        return db.execute("""SELECT 1 FROM import_history JOIN jobs ON id=job
+                             WHERE job=? AND removed=1 AND state NOT IN ('queued','running')""",
+                          (identity,)).fetchone() is not None
 
     def configure_history(self, days):
         if type(days) is not int or days not in HISTORY_DAYS:
@@ -304,16 +315,19 @@ class ImportQueue:
         count = db.execute("""UPDATE import_history SET removed=1
                               WHERE removed=0 AND (? IS NULL OR closed_at<=?)
                               AND (? IS NULL OR job IN (SELECT value FROM json_each(?)))
-                              AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id=import_history.job AND refresh=0
-                                          AND state IN ('done','cancelled') AND (NOT ? OR state='done'))""",
+                              AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id=import_history.job
+                                          AND state NOT IN ('queued','running')
+                                          AND (NOT ? OR state='done'))""",
                            (cutoff, cutoff, selection, selection, successful)).rowcount
         if count:
             db.execute("UPDATE history_policy SET revision=revision+1 WHERE id=1")
         return count
 
-    def count(self):
+    def count(self, *, visible=False):
+        where = f"WHERE {CURRENT}" if visible else ""
         with self.connect() as db:
-            return {row[0]: row[1] for row in db.execute("SELECT state,count(*) FROM jobs GROUP BY state")}
+            return {row[0]: row[1] for row in db.execute(
+                f"SELECT state,count(*) FROM jobs {where} GROUP BY state")}
 
     def pending(self):
         with self.connect() as db:
@@ -373,8 +387,8 @@ class ImportQueue:
             # Drive the join from current lots, using the partial index, so
             # polling the panel does not scan archived album payloads.
             for url, payload, state in db.execute(
-                    """SELECT url,payload,state FROM jobs CROSS JOIN outcomes
-                       WHERE (state NOT IN ('done','cancelled') OR refresh>0) AND outcomes.job=jobs.id"""):
+                    f"""SELECT url,payload,state FROM jobs CROSS JOIN outcomes
+                        WHERE ({CURRENT}) AND outcomes.job=jobs.id"""):
                 outcome = json.loads(payload)
                 status = outcome["status"]
                 if state != "cancelled" and (status in COMPLETE or
@@ -383,9 +397,9 @@ class ImportQueue:
                 if outcome["status"] in ("success", "present"):
                     albums.add(outcome.get("identity") or import_key(url))
                 tracks.update(outcome.get("tracks", ()))
-            planned = db.execute("""
+            planned = db.execute(f"""
                 SELECT coalesce(sum(json_array_length(targets)),0)
-                FROM jobs WHERE (state NOT IN ('done','cancelled') OR refresh>0)
+                FROM jobs WHERE ({CURRENT})
                     AND option IS NULL AND state!='cancelled'
             """).fetchone()[0]
         return len(albums), len(tracks), settled, planned
@@ -449,8 +463,10 @@ class ImportQueue:
                        coalesce(r.classic,0) AS classic, coalesce(r.remedial,0) AS remedial
                 FROM jobs j LEFT JOIN import_terminal t ON j.id=t.job AND j.attempt=t.attempt
                      LEFT JOIN import_recovery r ON j.id=r.job
-                WHERE j.option IS NULL AND j.refresh=0 AND (
-                    (j.state IN ('failed','partial','review') AND (r.attempt IS NULL OR j.attempt!=r.attempt
+                WHERE j.option IS NULL AND j.refresh=0
+                    AND NOT EXISTS (SELECT 1 FROM import_history WHERE job=j.id AND removed=1) AND (
+                    (j.state IN ('failed','partial','review')
+                     AND (r.attempt IS NULL OR j.attempt!=r.attempt
                           OR (r.phase IN ('retry_wait','codex_wait') AND r.due<=?)))
                     OR (j.state IN ('done','cancelled') AND r.phase NOT IN ('done','cancelled')))
                 ORDER BY j.seq LIMIT ?
@@ -476,7 +492,7 @@ class ImportQueue:
             active = db.execute("SELECT state,attempt,refresh,targets,keys FROM jobs WHERE id=?",
                                 (row["id"],)).fetchone()
             if (active is None or active["state"] != row["state"] or active["attempt"] != row["attempt"]
-                    or active["refresh"]):
+                    or active["refresh"] or self.history_removed(row["id"], db)):
                 return False
             existing = db.execute("SELECT classic,remedial FROM import_recovery WHERE job=?", (row["id"],)).fetchone()
             classic, remedial = existing if existing else (0, 0)
