@@ -37,9 +37,9 @@ def audio_files(path):
                     yield track
 
 
-def probe(path, *, include_duration=False):
+def probe(path, *, include_duration=False, include_codec=False):
     command = ("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-of", "json",
-               "-show_entries", "format=duration:format_tags:stream=index,codec_type:stream_disposition=attached_pic:stream_tags",
+               "-show_entries", "format=duration:format_tags:stream=index,codec_type,codec_name:stream_disposition=attached_pic:stream_tags",
                str(path))
     output = subprocess.run(command, capture_output=True, check=True, timeout=20)
     info = json.loads(output.stdout)
@@ -61,6 +61,8 @@ def probe(path, *, include_duration=False):
                 tags["duration_seconds"] = duration
         except (TypeError, ValueError):
             pass
+    if include_codec:
+        tags["codec"] = audio.get("codec_name", "")
     pictures = [stream for stream in streams if stream.get("disposition", {}).get("attached_pic")]
     pictures.sort(key=lambda stream: "front" not in stream.get("tags", {}).get("comment", "").casefold())
     return tags, pictures

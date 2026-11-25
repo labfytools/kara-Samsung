@@ -62,7 +62,7 @@ Les reçus vérifient le contenu audio publié avant de sauter une piste lors d�
 
 Dans le sélecteur de sources, **Bandcamp** propose le site officiel et son aide au téléchargement. Récupérer l’album gratuit ou déjà acheté avec les droits applicables, puis sélectionner le dossier ou le ZIP dans Parole. La page publique de l’édition peut être renseignée pour conserver sa référence dans le résultat. Il s’agit d’une provenance déclarée. Parole ne déclenche aucun achat. L’API publiée documente les comptes, ventes et commandes des partenaires. Le parcours auditeur utilise les fichiers remis directement par Bandcamp. [Documentation de l’API](https://bandcamp.com/developer) · [Récupération des achats](https://get.bandcamp.help/en/articles/15263192-can-i-re-download-my-purchases)
 
-**Toutes les sources** donne accès aux recherches YouTube Music et Internet Archive ainsi qu’au choix de fichiers locaux. Sélectionner un fournisseur pour n’interroger que celui-ci ou afficher son parcours officiel. Les résultats YouTube Music et Internet Archive restent identifiés par leur source. Les formats de sortie pris en charge par l’import local, dont le FLAC, restent inchangés pendant la copie.
+**Toutes les sources** donne accès aux recherches YouTube Music, Internet Archive et Jamendo quand celui-ci est configuré, ainsi qu’au choix de fichiers locaux. Sélectionner un fournisseur pour n’interroger que celui-ci ou afficher son parcours officiel. Les résultats restent identifiés par leur source. Les formats pris en charge par l’import local, dont le FLAC, restent inchangés pendant la copie.
 
 ### Qobuz
 
@@ -85,6 +85,12 @@ Sélectionner **Sites d’artistes et de labels** et indiquer la page HTTPS publ
 Rechercher par artiste ou titre, ou coller une fiche publique `https://archive.org/details/identifiant`. Parole confirme le type audio, la licence explicite et l’inventaire via l’API de la plateforme. Les éditions publiques avec CC0, CC BY ou CC BY-SA compatibles affichent le nombre de pistes originales, leurs formats et l’accès gratuit. Les résultats qui exigent une authentification, une licence différente ou un fichier marqué privé sont écartés.
 
 Chaque piste originale admissible est transférée avec les limites de la file commune. Le contrôle SHA-1 publié par la plateforme protège contre un transfert tronqué ou altéré. Les fichiers dérivés encodés par la plateforme ne sont pas téléchargés. La file conserve la licence, la fiche publique, l’identifiant du fichier et la somme SHA-256 calculée à la réception. Une piste déjà publiée est vérifiée et réutilisée lors d’une reprise. [API de lecture des fiches](https://archive.org/developers/md-read.html) · [Règles d’accès automatisé](https://archive.org/developers/bots.html)
+
+### Jamendo
+
+L’adaptateur utilise l’API officielle. Renseigner `KARA_JAMENDO_CLIENT_ID` dans l’environnement qui lance Parole avec l’identifiant d’une application Jamendo autorisée. Une fiche d’album est proposée seulement si `zip_allowed` et le champ `audiodownload_allowed` de chaque piste sont vrais et que les licences sont compatibles. Le lien d’une piste demande sa propre autorisation de téléchargement. Les liens d’écoute restent inutilisés. Le moteur demande le FLAC à l’API fichier et vérifie le codec avant le tri. La file conserve l’identifiant Jamendo, la licence, la fiche et le SHA-256 des fichiers reçus. [Authentification de l’application](https://developer.jamendo.com/v3.0/authentication) · [Autorisations d’album](https://developer.jamendo.com/v3.0/albums/tracks) · [Téléchargements des pistes](https://developer.jamendo.com/v3.0/tracks/file)
+
+Sans identifiant d’application, sélectionner **Jamendo** pour ouvrir le site officiel, récupérer un téléchargement autorisé et importer les fichiers avec leur page et leur licence. L’identifiant public que la documentation propose pour les tests de lecture a renvoyé le code 11 « application suspendue » sur les trois points d’entrée interrogés. Aucun téléchargement réel par l’API n’a pu être qualifié avec cet identifiant.
 
 ## Diagnostic des échecs persistants
 
@@ -117,3 +123,5 @@ Le parcours Free Music Archive est testé avec un FLAC de synthèse. Le test vé
 Le parcours des sites d’artistes a été vérifié en bibliothèque isolée avec le MP3 officiel de *This Too Shall Pass* par Scott Buckley, sous licence CC BY 4.0. Le fichier audio a été classé avec un PCM identique, son format et sa provenance. L’enrichissement en ligne était simulé et l’absence de pochette a laissé le lot partiel. Le test automatisé couvre aussi un lot qui se termine et le refus des références privées. [Fichier et crédits officiels](https://www.scottbuckley.com.au/library/this-too-shall-pass/)
 
 Internet Archive a renvoyé la fiche *Glow Wave* de La Machine de la Mort, sous licence CC BY 4.0. Les dix MP3 originaux totalisant 36 248 422 octets ont été téléchargés et les dix fichiers publiés sont identiques octet pour octet aux fichiers reçus. La relance n’a transféré aucune piste. L’enrichissement simulé a laissé la pochette à compléter. Les tests automatisés couvrent une reprise partielle, un fichier privé et la distinction entre fichier original et dérivé. [Fiche et crédits officiels](https://archive.org/details/glow-wave)
+
+Les essais Jamendo simulent les réponses officielles et le transport avec des FLAC de synthèse. Ils couvrent l’absence d’identifiant, les deux permissions de téléchargement, le refus de paramètres ambigus, la recherche, l’identité PCM et la reprise limitée à la piste en échec.

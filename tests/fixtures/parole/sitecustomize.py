@@ -98,3 +98,28 @@ if "PAROLE_TEST_CONFIG" in os.environ:
 
         archive.fetch = archive_fetch
         archive.open_original = open_archive_file
+
+    if config.get("jamendo_release") and Path(sys.argv[0]).name == "kara":
+        from contextlib import contextmanager
+
+        sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
+        import _parole_jamendo as jamendo
+        from _kara_import_result import ImportIssue
+
+        def jamendo_fetch(url, **_kwargs):
+            path = urlsplit(url).path
+            row = config["jamendo_release"]
+            result = row["tracks"][0] | {"artist_name": row["artist_name"]} if path == "/v3.0/tracks/" else row
+            return {"headers": {"status": "success", "code": 0}, "results": [result]}
+
+        @contextmanager
+        def open_jamendo_track(_index, _inbox, track):
+            with Path(config["requests"]).open("a") as journal:
+                journal.write(track.identifier + "\n")
+            if track.identifier in config.get("jamendo_failures", []):
+                raise ImportIssue("network", "Transfert d’essai interrompu.")
+            with Path(config["jamendo_originals"][track.identifier]).open("rb") as stream:
+                yield stream
+
+        jamendo.fetch = jamendo_fetch
+        jamendo.open_track = open_jamendo_track

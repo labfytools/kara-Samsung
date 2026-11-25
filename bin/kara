@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -B
-"""Prépare un album YouTube Music ou complète la bibliothèque partagée."""
+"""Importe un album ou complète la bibliothèque partagée."""
 import argparse
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -30,8 +30,9 @@ from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING,
                                    defer_service, lease, resource_slot, wait_service)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, shared_mutation, source_video
-from _parole_import_providers import ARCHIVE, YOUTUBE, archive_identifier
+from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
 import _parole_archive as archive
+import _parole_jamendo as jamendo
 
 DOWNLOAD_WORKERS = 2
 # Both Parole and the CLI use this engine. A Kara-local update can fix the
@@ -851,6 +852,23 @@ def import_internet_archive(item, root, inbox, previous, stop, seen, identity):
                    source, source, album.license, "catalogue")
 
 
+def import_jamendo(item, root, inbox, previous, stop, seen, selection):
+    kind, identity = selection
+    item.provider = JAMENDO
+    item.identity = f"jamendo:{kind}:{identity}"
+    item.tracks = available_tracks(previous.get("tracks", []), root)
+    index = import_provider_index(root, item.provider)
+    if item.identity in seen:
+        item.status = "duplicate"
+        return
+    with resource_slot(inbox / ".kara-catalogue", CATALOGUE):
+        release = jamendo.item(index, kind, identity)
+    item.title, item.artist = release.title, release.artist
+    source = jamendo.release_url(kind, identity)
+    import_entries(item, root, inbox, previous, stop, seen, jamendo.entries(index, inbox, release),
+                   source, source, "", "catalogue")
+
+
 def import_entries(item, root, inbox, previous, stop, seen, reader, source, reference, license_url, verification):
     progress = item.progress
     item.tracks = available_tracks(previous.get("tracks", []), root)
@@ -902,10 +920,12 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                         if not checksum:
                             break
                         with resource_slot(inbox / ".kara-traitements", PROCESSING):
-                            tags, _ = probe(draft)
+                            tags, _ = probe(draft, include_codec=bool(entry.format))
                             if not (tags.get("title") and (tags.get("album") or len(audio) == 1)
                                     and (tags.get("albumartist") or tags.get("artist"))):
                                 raise ImportIssue("path", "Métadonnées titre, album ou artiste manquantes.")
+                            if entry.format and tags["codec"] != entry.format:
+                                raise ImportIssue("processing", "Le fichier reçu ne correspond pas au format demandé.")
                             records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft)}
                         active[stage] = name
                         item.processed += 1
@@ -942,7 +962,8 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                         {"provider": item.provider, "external_id": entries[name].external_id or records[name]["sha256"],
                          "sha256": records[name]["sha256"], "member": name, "source": source, "path": str(track),
                          "edition_ref": reference, "verification": verification,
-                         **({"license": license_url} if license_url else {})}
+                         **({"license": entries[name].license or license_url}
+                            if entries[name].license or license_url else {})}
                         for name, track in sorted(targets.items())
                     ]
                     local_sidecars(targets, entries, root, progress)
@@ -1115,6 +1136,10 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
                     progress.emit(f"{ARCHIVE} · vérification de la fiche", event="provider", provider=ARCHIVE)
                     report("Vérification dans la collection", 0)
                     import_internet_archive(item, root, inbox, previous.get(url, {}), stop, seen, external)
+                elif external := jamendo_identifier(urlsplit(url)):
+                    progress.emit(f"{JAMENDO} · vérification de la fiche", event="provider", provider=JAMENDO)
+                    report("Vérification dans la collection", 0)
+                    import_jamendo(item, root, inbox, previous.get(url, {}), stop, seen, external)
                 else:
                     progress.emit(f"{YOUTUBE} · vérification du lien", event="provider", provider=YOUTUBE)
                     report("Vérification dans la collection", 0)
@@ -1188,6 +1213,7 @@ def main():
     mode.add_argument("--lot", nargs="+", help=argparse.SUPPRESS)
     mode.add_argument("--import-file", metavar="LOT", help=argparse.SUPPRESS)
     mode.add_argument("--chercher-archives", metavar="ARTISTE_OU_ALBUM", help="recherche Internet Archive")
+    mode.add_argument("--chercher-jamendo", metavar="ARTISTE_OU_ALBUM", help="recherche Jamendo")
     parser.add_argument("--import-lease", type=int, help=argparse.SUPPRESS)
     mode.add_argument("--revision", action="store_true",
                       help="recherche les pochettes et les paroles manquantes dans toute la bibliothèque")
@@ -1198,14 +1224,16 @@ def main():
     parser.add_argument("--suivi-json", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reprendre", metavar="JOURNAL", help="relance les liens en échec depuis ce journal")
     args = parser.parse_args()
-    if args.chercher_archives is not None:
+    if args.chercher_archives is not None or args.chercher_jamendo is not None:
         try:
-            provider_index = import_provider_index(SHARED_LIBRARY, ARCHIVE)
+            provider, adapter, query = ((ARCHIVE, archive, args.chercher_archives) if args.chercher_archives is not None
+                                        else (JAMENDO, jamendo, args.chercher_jamendo))
+            provider_index = import_provider_index(SHARED_LIBRARY, provider)
             inbox = SHARED_LIBRARY / INBOX
             if not inbox.is_dir() or inbox.is_symlink():
                 raise ImportIssue("path", "Dossier de réception absent ou symbolique.")
             with resource_slot(inbox / ".kara-catalogue", CATALOGUE):
-                print(json.dumps({"data": archive.search(provider_index, args.chercher_archives)}, ensure_ascii=False))
+                print(json.dumps({"data": adapter.search(provider_index, query)}, ensure_ascii=False))
             return 0
         except (OSError, ValueError) as error:
             print(json.dumps({"category": getattr(error, "category", "network"), "error": str(error)}, ensure_ascii=False))

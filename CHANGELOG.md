@@ -30,3 +30,4 @@
 - Importer les téléchargements officiels de Free Music Archive avec une page publique et une licence compatible renseignées.
 - Conserver la page publique de téléchargement et la licence déclarée pour les fichiers remis par les artistes et labels.
 - Rechercher et importer les fichiers audio originaux publics d’Internet Archive après vérification de la licence et de l’intégrité des transferts.
+- Intégrer l’API Jamendo pour les albums et pistes autorisés lorsque l’identifiant d’application est configuré, avec un parcours local dans les autres cas.

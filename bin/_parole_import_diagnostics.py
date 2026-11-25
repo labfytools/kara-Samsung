@@ -11,7 +11,7 @@ from _kara_import_local import LOCAL as LOCAL_PROVIDER, local_url
 from _kara_import_queue import import_key
 from _kara_paths import catalogue_command
 from _parole_index import encoded_key
-from _parole_import_providers import ARCHIVE, archive_identifier
+from _parole_import_providers import ARCHIVE, JAMENDO, archive_identifier, jamendo_identifier
 from _parole_process import Interrupted
 
 HOUR = 3600
@@ -67,10 +67,12 @@ def classify(entry, outcome):
         parsed = urlsplit(source)
         host = parsed.hostname
         from_archive = archive_identifier(parsed) is not None
+        from_jamendo = jamendo_identifier(parsed) is not None
     except ValueError:
         host = None
         from_archive = False
-    provider = "YouTube Music" if host in YTHOSTS else ARCHIVE if from_archive else "Local"
+        from_jamendo = False
+    provider = "YouTube Music" if host in YTHOSTS else ARCHIVE if from_archive else JAMENDO if from_jamendo else "Local"
     http_match = re.search(r"\bhttp(?: error)?[ :]+([1-5][0-9]{2})\b", detail)
     http = int(http_match[1]) if http_match else None
     stage = next((identifier for fragment, identifier in (
@@ -87,7 +89,7 @@ def classify(entry, outcome):
         cause = "permissions"
     elif local_input and category == "path":
         cause = "local_file"
-    elif from_archive and category == "path" and not re.search(r"\bhttp 5\d\d\b", detail):
+    elif (from_archive or from_jamendo) and category == "path":
         cause = "authorization"
     elif http == 429 or re.search(r"too many requests|retry-after|rate.limit|limitation de requêtes", detail):
         cause = "rate"

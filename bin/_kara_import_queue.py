@@ -10,7 +10,7 @@ from uuid import uuid4
 from _kara_import_local import local_selection, local_url
 from _kara_paths import STATE
 from _musique_oz import SHARED_LIBRARY
-from _parole_import_providers import archive_identifier
+from _parole_import_providers import archive_identifier, jamendo_identifier
 
 DEFAULT_BATCHES = 4
 MAX_BATCHES = 8
@@ -25,6 +25,8 @@ def import_key(url):
         return ("url", url)
     if value := archive_identifier(parsed):
         return ("archive", value)
+    if match := jamendo_identifier(parsed):
+        return ("jamendo_" + match[0], match[1])
     if parsed.hostname not in {"music.youtube.com", "www.youtube.com", "youtube.com", "youtu.be"}:
         return ("url", url)
     query = parse_qs(parsed.query)

@@ -394,6 +394,11 @@ class GtkTests(Fixture):
         self.assertEqual(imports.artist.get_placeholder_text(), "Artiste ou album")
         self.assertTrue(imports.can_search_archive())
         self.assertFalse(imports.can_search_youtube())
+        with patch.dict(os.environ, {"KARA_JAMENDO_CLIENT_ID": ""}):
+            imports.provider.set_selected(names.index("Jamendo"))
+            self.assertFalse(imports.can_search_jamendo())
+            self.assertTrue(imports.official_download.get_visible())
+            self.assertTrue(imports.download_license.get_visible())
         for page in ("general", "sources", "codex", "storage", "resources", "night"):
             view.settings(page)
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)

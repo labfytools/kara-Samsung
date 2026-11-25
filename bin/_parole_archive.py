@@ -1,19 +1,16 @@
 """Authorized audio files from the public Internet Archive item API."""
 from contextlib import contextmanager
 from dataclasses import dataclass
-import http.client
 from pathlib import PurePosixPath
 import re
-import ssl
-from time import monotonic
-from urllib.parse import quote, urlencode, urljoin, urlsplit
+from urllib.parse import quote, urlencode
 
 from _kara_import_local import Entry, MAX_AUDIO, MAX_ENTRIES
-from _kara_import_resources import DOWNLOADS, defer_service, resource_slot
+from _kara_import_resources import DOWNLOADS, resource_slot
 from _kara_import_result import ImportIssue
 from _musique_oz import AUDIO
-from _parole_import_providers import ARCHIVE, ARCHIVE_ID as IDENTIFIER, OPEN_LICENSES
-from _parole_sources import PinnedHTTPS, ProviderUnavailable, fetch, public_url, wait_provider
+from _parole_import_providers import ARCHIVE, ARCHIVE_ID as IDENTIFIER, license_for
+from _parole_sources import ProviderUnavailable, fetch, open_audio
 
 HOST = "archive.org"
 SITE = "https://archive.org"
@@ -24,20 +21,6 @@ INTERVAL = 1.2
 
 def release_url(value):
     return f"{SITE}/details/{value}"
-
-
-def license_for(value):
-    if not isinstance(value, str) or len(value) > 120:
-        return ""
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return ""
-    if (parsed.scheme not in {"http", "https"} or parsed.netloc not in {"creativecommons.org", "www.creativecommons.org"}
-            or parsed.query or parsed.fragment):
-        return ""
-    url = "https://creativecommons.org" + parsed.path.rstrip("/") + "/"
-    return url if url in OPEN_LICENSES.values() else ""
 
 
 def restricted(fields):
@@ -163,60 +146,13 @@ def search(index, query):
     return results
 
 
-class Download:
-    def __init__(self, payload, deadline):
-        self.payload = payload
-        self.deadline = deadline
-
-    def read(self, size):
-        if monotonic() >= self.deadline:
-            raise ImportIssue("network", "Délai Internet Archive dépassé.")
-        try:
-            return self.payload.read1(size)
-        except (OSError, http.client.HTTPException) as error:
-            raise ImportIssue("network", "Transfert Internet Archive interrompu.") from error
-
-
 @contextmanager
 def open_original(index, inbox, album, file):
-    with resource_slot(inbox / ".kara-transferts", DOWNLOADS):
-        try:
-            wait_provider(index, ARCHIVE, HOST, INTERVAL)
-        except ProviderUnavailable as error:
-            raise ImportIssue("network", str(error), stage="Téléchargement Internet Archive") from error
-        url = f"{SITE}/download/{album.identifier}/{quote(file.name, safe='/')}"
-        deadline = monotonic() + 360
-        for _ in range(4):
-            parts = public_url(url)
-            # The documented download endpoint may select another Internet
-            # Archive storage node. No credentials or external redirects travel.
-            if parts.hostname != HOST and not parts.hostname.endswith("." + HOST):
-                raise ImportIssue("path", "Redirection hors d’Internet Archive refusée.")
-            connection = PinnedHTTPS(parts.hostname, timeout=12, context=ssl.create_default_context())
-            try:
-                request = parts.path + ("?" + parts.query if parts.query else "")
-                try:
-                    connection.request("GET", request, headers={"User-Agent": "Parole/3 (Kara music library)"})
-                    response = connection.getresponse()
-                except (OSError, http.client.HTTPException) as error:
-                    raise ImportIssue("network", "Transfert Internet Archive indisponible.") from error
-                if response.status in {301, 302, 303, 307, 308} and response.getheader("Location"):
-                    url = urljoin(url, response.getheader("Location"))
-                    continue
-                if response.status == 429 or response.status >= 500:
-                    delay = response.getheader("Retry-After", "")
-                    defer_service(HOST, min(int(delay), 86400) if delay.isdecimal() and len(delay) < 8 else 120)
-                    raise ImportIssue("network", f"Internet Archive HTTP {response.status}")
-                if response.status != 200:
-                    raise ImportIssue("path", f"Fichier Internet Archive indisponible (HTTP {response.status}).")
-                length = response.getheader("Content-Length")
-                if length is not None and length != str(file.size):
-                    raise ImportIssue("processing", "La longueur du fichier Internet Archive a changé.")
-                yield Download(response, deadline)
-                return
-            finally:
-                connection.close()
-        raise ImportIssue("network", "Trop de redirections Internet Archive.")
+    url = f"{SITE}/download/{album.identifier}/{quote(file.name, safe='/')}"
+    with resource_slot(inbox / ".kara-transferts", DOWNLOADS), open_audio(
+            url, registry=index, provider=ARCHIVE, service=HOST, hosts=(HOST,), expected_size=file.size,
+            interval=INTERVAL) as stream:
+        yield stream
 
 
 @contextmanager

@@ -9,7 +9,9 @@ ALL = "Toutes les sources"
 YOUTUBE = "YouTube Music"
 ARTIST_SITES = "Sites d’artistes et de labels"
 ARCHIVE = "Internet Archive"
+JAMENDO = "Jamendo"
 ARCHIVE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+JAMENDO_ID = re.compile(r"[1-9][0-9]{0,11}")
 OPEN_LICENSES = {
     "CC0 1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
     "CC BY 3.0": "https://creativecommons.org/licenses/by/3.0/",
@@ -27,6 +29,28 @@ def archive_identifier(parts):
     if len(path) == 3 and path[1] == "details" and ARCHIVE_ID.fullmatch(path[2]):
         return path[2]
     return None
+
+
+def jamendo_identifier(parts):
+    if (parts.scheme != "https" or parts.netloc not in {"jamendo.com", "www.jamendo.com"}
+            or parts.query or parts.fragment):
+        return None
+    match = re.fullmatch(r"/(track|album)/([1-9][0-9]{0,11})(?:/[A-Za-z0-9_-]{1,160})?/?", parts.path)
+    return (match[1], match[2]) if match else None
+
+
+def license_for(value):
+    if not isinstance(value, str) or len(value) > 120:
+        return ""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    if (parsed.scheme not in {"http", "https"} or parsed.netloc not in {"creativecommons.org", "www.creativecommons.org"}
+            or parsed.query or parsed.fragment):
+        return ""
+    url = "https://creativecommons.org" + parsed.path.rstrip("/") + "/"
+    return url if url in OPEN_LICENSES.values() else ""
 
 
 @dataclass(frozen=True)
@@ -90,4 +114,10 @@ MANUAL = {
         "", "", "",
         re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}"),
         re.compile(r"/[A-Za-z0-9_~.%+/-]{1,290}"), tuple(OPEN_LICENSES.values()), require_reference=True),
+    JAMENDO: ManualProvider(
+        "jamendo.com", "https://www.jamendo.com/",
+        "https://developer.jamendo.com/v3.0/authentication",
+        re.compile(r"(?:www\.)?jamendo\.com"),
+        re.compile(r"/(?:track|album)/[1-9][0-9]{0,11}(?:/[A-Za-z0-9_-]{1,160})?/?"),
+        tuple(OPEN_LICENSES.values()), require_reference=True, require_license=True),
 }

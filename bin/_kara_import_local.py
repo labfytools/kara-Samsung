@@ -118,11 +118,13 @@ def check_zip_directory(source):
 @dataclass(frozen=True)
 class Entry:
     name: str
-    size: int
+    size: int | None
     revision: list
     open: object
     sha1: str = ""
     external_id: str = ""
+    format: str = ""
+    license: str = ""
 
 
 def directory_entries(fd):
@@ -233,27 +235,38 @@ def wanted(name):
 
 
 def read_entry(entry, destination, stop):
-    if not 0 < entry.size <= MAX_AUDIO:
+    if entry.size is not None and not 0 < entry.size <= MAX_AUDIO:
         raise ImportIssue("path", "Taille audio locale hors limites.")
-    check_space(destination.parent, extra=entry.size + MAX_MEDIA * PROCESSING)
+    check_space(destination.parent, extra=(entry.size or 0) + MAX_MEDIA * PROCESSING)
     digest = sha256()
     expected = sha1(usedforsecurity=False) if entry.sha1 else None
     with entry.open() as source, NamedTemporaryFile(dir=destination.parent, prefix=".local-") as draft:
         revision = entry.revision
         if len(revision) == 5 and stamp(os.fstat(source.fileno())) != revision:
             raise OSError("Le fichier source a changé avant lecture.")
-        remaining = entry.size
+        size = entry.size if entry.size is not None else getattr(source, "length", None)
+        if size is not None and not 0 < size <= MAX_AUDIO:
+            raise ImportIssue("path", "Taille audio distante hors limites.")
+        remaining = size if size is not None else MAX_AUDIO
+        if entry.size is None and size is not None:
+            check_space(destination.parent, extra=size + MAX_MEDIA * PROCESSING)
         while remaining:
             if stop.is_set():
                 return None
             data = source.read(min(remaining, BLOCK))
             if not data:
-                raise ImportIssue("network" if expected else "path", "Fichier source incomplet.")
+                if size is not None:
+                    raise ImportIssue("network" if entry.external_id else "path", "Fichier source incomplet.")
+                break
+            if size is None and remaining % (8 * BLOCK) < len(data):
+                check_space(destination.parent, extra=MAX_MEDIA * PROCESSING)
             remaining -= len(data)
             digest.update(data)
             if expected is not None:
                 expected.update(data)
             draft.write(data)
+        if not draft.tell():
+            raise ImportIssue("network" if entry.external_id else "path", "Fichier audio vide.")
         if source.read(1) or (len(revision) == 5 and stamp(os.fstat(source.fileno())) != revision):
             raise OSError("Le fichier source a changé pendant la lecture.")
         if expected is not None and expected.hexdigest() != entry.sha1:

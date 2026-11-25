@@ -27,7 +27,7 @@ from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index
-from _parole_import_providers import ARTIST_SITES, OPEN_LICENSES
+from _parole_import_providers import ARTIST_SITES, JAMENDO, OPEN_LICENSES
 from _parole_sources import controls, seed
 
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
@@ -419,6 +419,51 @@ class AlbumImportTests(unittest.TestCase):
             _, results, _ = self.run_import(target, expected=1)
             self.assertEqual((results[0]["category"], results[0]["tracks"]), ("path", []))
         self.assertEqual(self.requests.read_text(), "")
+
+    def test_jamendo_uses_both_permissions_and_retries_only_failed_tracks(self):
+        source = self.temp / "jamendo"
+        originals = {}
+        tracks = []
+        license_url = OPEN_LICENSES["CC BY 4.0"]
+        for position, identifier in enumerate(("30123", "30124"), 1):
+            path = source / f"{identifier}.flac"
+            self.make_local_track(path, position, album="Album Jamendo")
+            tracks.append({"id": identifier, "position": str(position), "duration": "4", "name": f"Son local {position}",
+                           "license_ccurl": license_url, "audio": "https://stream.jamendo.com/example",
+                           "audiodownload": f"https://storage.jamendo.com/download/track/{identifier}/flac/",
+                           "audiodownload_allowed": True})
+            originals[identifier] = str(path)
+        release = {"id": "1820", "name": "Album Jamendo", "artist_name": self.config["artist"],
+                   "zip_allowed": True, "tracks": tracks}
+        self.config.update(jamendo_release=release, jamendo_originals=originals, jamendo_failures=["30124"])
+        self.update_config()
+        env = dict(self.env, KARA_JAMENDO_CLIENT_ID="fixtureid")
+        url = "https://www.jamendo.com/album/1820/album-jamendo"
+        no_client = dict(self.env)
+        no_client.pop("KARA_JAMENDO_CLIENT_ID", None)
+        _, denied, _ = self.run_import(url, env=no_client, expected=1)
+        self.assertEqual(denied[0]["category"], "dependency")
+        for subject, permission in ((release, "zip_allowed"), (tracks[1], "audiodownload_allowed")):
+            subject[permission] = "true"
+            self.update_config()
+            _, denied, _ = self.run_import(url, env=env, expected=1)
+            self.assertEqual((denied[0]["category"], denied[0]["tracks"]), ("path", []))
+            subject[permission] = True
+        self.assertEqual(self.requests.read_text(), "")
+        self.update_config()
+        query = subprocess.check_output([str(BIN / "kara"), "--chercher-jamendo", self.config["artist"]], env=env)
+        result, = json.loads(query)["data"]
+        self.assertEqual((result["provider"], result["tracks"], result["formats"]), (JAMENDO, 2, ["FLAC"]))
+        journal, outcomes, _ = self.run_import(url, expected=1, env=env)
+        self.assertEqual((outcomes[0]["status"], outcomes[0]["added"]), ("partial", 1))
+        self.config["jamendo_failures"].clear()
+        self.update_config()
+        _, outcomes, _ = self.run_import(url, previous=journal, env=env)
+        self.assertEqual((outcomes[0]["status"], outcomes[0]["added"], outcomes[0]["processed"]), ("success", 1, 1))
+        self.assertEqual(Counter(self.requests.read_text().splitlines()), {"30123": 1, "30124": 2})
+        for evidence in outcomes[0]["provenance"]:
+            self.assertEqual(evidence["license"], license_url)
+            self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(originals[evidence["external_id"]]))
 
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]
