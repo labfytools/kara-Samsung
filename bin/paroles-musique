@@ -2,13 +2,14 @@
 """Récupère les paroles pour Strawberry et les intègre sans réencodage."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from email.utils import parsedate_to_datetime
 from fcntl import LOCK_EX, LOCK_NB, flock
 from html import unescape
 from html.parser import HTMLParser
-from itertools import groupby
+from hashlib import sha256
+from itertools import groupby, islice
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ import shutil
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from threading import Lock
+from threading import Lock, local
 import time
 from unicodedata import combining, normalize
 from urllib.error import HTTPError, URLError
@@ -27,8 +28,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_artist,
                          probe, share_file, shared_mutation)
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
-from _kara_import_resources import defer_service, wait_service
+from _kara_import_resources import PROCESSING, RATE_DIRECTORY, defer_service, resource_slot, wait_service
 from _kara_import_result import ImportIssue
+from _parole_lyrics_lookup import KeepAlive, cache_identity, cached, remember
 
 
 LIBRARY = SHARED_LIBRARY
@@ -37,7 +39,7 @@ FILE_TAGS = {".flac", ".m4a", ".mp3"}
 LYRICS_TAGS = {"lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx"}
 REMASTER_SUFFIX = re.compile(r"\s*[\[(](?:\d{4}\s+)?remaster(?:ed)?(?:\s+(?:\d{4}|deluxe box set))?[\])]\s*$", re.I)
 MAX_RESPONSE = 2 * 1024 * 1024
-TRACK_WORKERS = 50
+TRACK_WORKERS = 4
 
 
 class ServiceUnavailable(Exception):
@@ -83,13 +85,18 @@ class RequestGate:
         self.next_request = 0.0
         self.paused = False
         self.provider = None
+        self.deadline = None
+        self.requests = 0
+
+    def remaining(self, limit):
+        return limit if self.deadline is None else max(0., min(limit, self.deadline - time.monotonic()))
 
     def wait(self, host):
         if self.provider is not None:
             from _parole_sources import ProviderUnavailable, wait_provider
 
             try:
-                wait_provider(*self.provider, host, self.interval, max_wait=12)
+                wait_provider(*self.provider, host, self.interval, max_wait=self.remaining(12))
                 return True
             except ProviderUnavailable as error:
                 raise ServiceUnavailable(str(error), "limited") from error
@@ -110,9 +117,13 @@ class RequestGate:
                     return True
             time.sleep(delay)
 
-    def defer(self, host, delay):
+    def defer(self, host, delay, status=429):
         if self.provider is not None or os.environ.get("KARA_IMPORT_PROCESSING"):
             defer_service(host, delay)
+            if self.provider:
+                from _parole_import_metrics import limited
+
+                limited(*self.provider, delay, status)
             return
         with self.lock:
             if delay > 30:
@@ -120,24 +131,46 @@ class RequestGate:
             else:
                 self.next_request = max(self.next_request, time.monotonic() + delay)
 
+    @contextmanager
+    def open(self, opener, request, timeout):
+        host = urlsplit(request.full_url).hostname
+        slot = (resource_slot(RATE_DIRECTORY / "lyrics" / sha256(self.provider[1].encode()).hexdigest(),
+                              2, timeout=self.remaining(8)) if self.provider else nullcontext())
+        try:
+            with slot:
+                if not self.remaining(timeout) or not self.wait(host) or not (budget := self.remaining(timeout)):
+                    raise ServiceUnavailable("Créneau fournisseur indisponible", "limited")
+                self.requests += 1
+                with opener.open(request, timeout=budget) as response:
+                    yield response
+        except ImportIssue as error:
+            raise ServiceUnavailable(str(error), "limited") from error
+
 
 class LrcLib:
     def __init__(self):
         self.opener = build_opener(NoRedirect)
         self.gate = RequestGate(0.75)
+        self.answers = None
 
     def get(self, endpoint, **params):
         url = f"https://lrclib.net/api/{endpoint}?{urlencode(params)}"
+        if self.answers is not None and url in self.answers:
+            return self.answers[url]
+        response = self.fetch(url)
+        if self.answers is not None and len(self.answers) < 3:
+            self.answers[url] = response
+        return response
+
+    def fetch(self, url):
         request = Request(url, headers={
             "Accept": "application/json",
             "User-Agent": "ParolesMusique/1.0 (client local pour Strawberry)",
         })
-        for delay in (2, 5, None):
+        for delay in ((None,) if self.gate.provider else (2, 5, None)):
             last_attempt = delay is None
-            if not self.gate.wait(urlsplit(request.full_url).hostname):
-                raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer", "limited")
             try:
-                with self.opener.open(request, timeout=10) as response:
+                with self.gate.open(self.opener, request, 6 if self.gate.provider else 10) as response:
                     if response.headers.get_content_type() != "application/json":
                         raise ServiceUnavailable("réponse LRCLIB inattendue")
                     raw = response.read(MAX_RESPONSE + 1)
@@ -153,7 +186,7 @@ class LrcLib:
                 if error.code not in {429, 500, 502, 503, 504}:
                     raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}", "limited" if error.code == 429 else "unavailable") from error
                 delay = retry_delay(error.headers.get("Retry-After"), delay or 5)
-                self.gate.defer(urlsplit(request.full_url).hostname, delay)
+                self.gate.defer(urlsplit(request.full_url).hostname, delay, error.code)
                 if delay > 30:
                     raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer", "limited") from error
                 if last_attempt:
@@ -196,19 +229,22 @@ class LyricsOvh:
         request = Request(f"https://api.lyrics.ovh/{path}", headers={
             "Accept": "application/json", "User-Agent": "ParolesMusique/1.1",
         })
-        if not self.gate.wait(urlsplit(request.full_url).hostname):
-            return None
         try:
-            with self.opener.open(request, timeout=6) as response:
+            with self.gate.open(self.opener, request, 6) as response:
                 if response.headers.get_content_type() != "application/json":
+                    self.failure = ServiceUnavailable("Réponse JSON attendue")
                     return None
                 raw = response.read(MAX_RESPONSE + 1)
-            return json.loads(raw) if len(raw) <= MAX_RESPONSE else None
+            if len(raw) > MAX_RESPONSE:
+                self.failure = ServiceUnavailable("Réponse trop volumineuse")
+                return None
+            return json.loads(raw)
         except HTTPError as error:
             if error.code == 429 or error.code >= 500:
                 self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
-            if error.code == 429:
-                self.gate.defer(urlsplit(request.full_url).hostname, retry_delay(error.headers.get("Retry-After"), 2))
+            if error.code == 429 or error.code >= 500:
+                self.gate.defer(urlsplit(request.full_url).hostname,
+                                retry_delay(error.headers.get("Retry-After"), 5), error.code)
             return None
         except (OSError, ValueError):
             self.failure = ServiceUnavailable("Service indisponible", "network")
@@ -262,18 +298,18 @@ class PublicLyrics:
         if referer:
             headers["Referer"] = referer
         request = Request(url, headers=headers)
-        if not self.gate.wait(urlsplit(request.full_url).hostname):
-            return None
         try:
-            with self.opener.open(request, timeout=6) as response:
+            with self.gate.open(self.opener, request, 6) as response:
                 raw = response.read(MAX_RESPONSE + 1)
             if len(raw) <= MAX_RESPONSE:
                 return raw.decode("utf-8") if html else json.loads(raw)
+            self.failure = ServiceUnavailable("Réponse trop volumineuse")
         except HTTPError as error:
             if error.code == 429 or error.code >= 500:
                 self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
-            if error.code == 429:
-                self.gate.defer(urlsplit(request.full_url).hostname, retry_delay(error.headers.get("Retry-After"), 2))
+            if error.code == 429 or error.code >= 500:
+                self.gate.defer(urlsplit(request.full_url).hostname,
+                                retry_delay(error.headers.get("Retry-After"), 5), error.code)
             return None
         except (OSError, ValueError):
             self.failure = ServiceUnavailable("Service indisponible", "network")
@@ -598,7 +634,7 @@ class LyricDown(PublicLyrics):
 
 
 class LyricsSources:
-    def __init__(self):
+    def __init__(self, *, persistent=False):
         self.lrc = LrcLib()
         self.ovh = LyricsOvh()
         self.netease = NetEase()
@@ -606,14 +642,32 @@ class LyricsSources:
         self.genius = Genius()
         self.lyricdown = LyricDown()
         self.lrclib_unavailable = None
+        self.clients = (self.lrc, self.ovh, self.netease, self.qqmusic, self.genius, self.lyricdown)
+        self.cache_hits = 0
+        self.providers = set()
+        if persistent:
+            for client in self.clients:
+                client.opener = KeepAlive(client.opener, MAX_RESPONSE)
+
+    def new_track(self):
+        self.lrc.answers = {}
+        for client in self.clients:
+            client.gate.deadline = time.monotonic() + 35
+
+    def close(self):
+        for client in self.clients:
+            if isinstance(client.opener, KeepAlive):
+                client.opener.close()
 
     def find(self, title, artist, album, duration, album_artist, *, synced, local_text="",
              registry=None, strict=False):
         signature = (title, artist, album, duration, album_artist)
         if registry:
+            from _parole_import_metrics import LOOKUP, SUCCEEDED, observe, snapshot
             from _parole_sources import LyricsEndpoint, ProviderUnavailable, record
             with registry.db() as db:
                 providers = {r["id"]: r for r in db.execute("SELECT * FROM sources WHERE state='active'")}
+            measured = snapshot(registry)
         else:
             providers = None
         clients = [
@@ -623,6 +677,19 @@ class LyricsSources:
             ("QQ Music", self.qqmusic, {"synced": synced}),
             ("LyricDown", self.lyricdown, None) if synced else ("Genius", self.genius, {}),
         ]
+        if providers is not None:
+            def rank(i):
+                name = clients[i][0]
+                row = providers.get(name)
+                sample = measured.get(name, {}).get(LOOKUP)
+                if name == "LRCLIB" and self.lrc.answers:
+                    return 0, 0, i
+                if row is None or not sample or sample["samples"] < 5:
+                    return 1, i + 2., i
+                success = (row["successes"] + 2) / (row["attempts"] + 4)
+                return 1, sample["mean"] / success, i
+
+            clients = [clients[i] for i in sorted(range(len(clients)), key=rank)]
         instrumental = None
         failed = self.lrclib_unavailable
         ambiguous = False
@@ -631,23 +698,47 @@ class LyricsSources:
                 continue
             if name == "LRCLIB" and self.lrclib_unavailable is not None:
                 continue
+            identity = None
+            if registry:
+                identity = cache_identity(name, signature, synced, local_text if name == "LyricDown" else "",
+                                          strict, providers[name]["config"])
+                hit, result = cached(registry, identity)
+                if hit:
+                    self.cache_hits += 1
+                    if result:
+                        return result, name
+                    if result == "":
+                        instrumental = name
+                    continue
+                if "limited_until" in measured.get(name, {}):
+                    failed = ServiceUnavailable("Fournisseur temporairement suspendu", "limited")
+                    continue
             started = time.monotonic()
             client.failure = None
             client.strict = strict
             client.gate.provider = (registry, name) if registry else None
+            request_count = client.gate.requests
+            conflict = False
             try:
                 value = client.find(*signature, local_text) if kwargs is None else client.find(*signature, **kwargs)
             except ServiceUnavailable as error:
-                self.lrclib_unavailable = failed = error
+                if not registry and name == "LRCLIB":
+                    self.lrclib_unavailable = error
+                client.failure = error
                 value = None
             except AmbiguousLyrics:
-                ambiguous = True
+                ambiguous = conflict = True
                 value = None
             error = client.failure or (self.lrclib_unavailable if name == "LRCLIB" else None)
             failed = error or failed
             if registry:
-                record(registry, name, "found" if value else "error" if error else "absent",
-                       time.monotonic() - started)
+                if not error and not conflict:
+                    remember(registry, identity, value)
+                if request_count != client.gate.requests:
+                    self.providers.add(name)
+                    elapsed = time.monotonic() - started
+                    record(registry, name, "found" if value is not None else "error" if error else "absent", elapsed)
+                    observe(registry, name, {LOOKUP: elapsed, SUCCEEDED: int(value is not None)})
             if value:
                 return value, name
             if value == "":
@@ -658,6 +749,16 @@ class LyricsSources:
             for row in compatible:
                 conf = json.loads(row["config"])
                 if not conf.get("validated") or ("lrc" if synced else "lyrics") not in row["category"].split(","):
+                    continue
+                identity = cache_identity(row["id"], signature, synced, "", strict, row["config"])
+                hit, result = cached(registry, identity)
+                if hit:
+                    self.cache_hits += 1
+                    if result is not None:
+                        return result, row["id"]
+                    continue
+                if "limited_until" in measured.get(row["id"], {}):
+                    failed = ServiceUnavailable("Fournisseur temporairement suspendu", "limited")
                     continue
                 started = time.monotonic()
                 try:
@@ -673,6 +774,7 @@ class LyricsSources:
                     record(registry, row["id"], "error", time.monotonic() - started)
                     continue
                 record(registry, row["id"], "found" if value else "absent", time.monotonic() - started)
+                remember(registry, identity, value)
                 if value is not None:
                     return value, row["id"]
         if instrumental is not None:
@@ -863,6 +965,7 @@ def save_lyrics(path, version, tags, lyrics, publication_root=None):
             shutil.copymode(path, draft)
             share_file(draft, path)
             os.replace(draft, path)
+            return track_version(path)
 
 
 def save_lrc(path, lyrics):
@@ -921,7 +1024,10 @@ def retrieve_lyrics(path, client, tags, *, synced):
     if not title or not artist:
         raise ValueError("titre ou artiste manquant")
     local_text = next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
-    return client.find(title, artist, tags.get("album"), duration_seconds(path), tags.get("albumartist"),
+    duration = round(tags.get("duration_seconds") or duration_seconds(path))
+    if not 1 <= duration <= 3600:
+        raise ValueError("durée hors limites de LRCLIB")
+    return client.find(title, artist, tags.get("album"), duration, tags.get("albumartist"),
                        synced=synced, local_text=local_text)
 
 
@@ -933,7 +1039,7 @@ def process_track(path, client, preview, synced=False, publication_root=None):
         return "format non pris en charge"
     version = track_version(path)
     try:
-        tags, _ = probe(path)
+        tags, _ = probe(path, include_duration=True)
     except subprocess.CalledProcessError as error:
         raise ValueError("lecture des tags échouée") from error
     if not synced and any(tags.get(key) for key in LYRICS_TAGS):
@@ -955,12 +1061,84 @@ def process_track(path, client, preview, synced=False, publication_root=None):
                 raise ValueError("fichier modifié pendant la recherche")
             return (f"paroles synchronisées · fichier .lrc · {source}" if save_lrc(sidecar, lyrics)
                     else "paroles synchronisées déjà présentes")
+    tags.pop("duration_seconds", None)
     save_lyrics(path, version, tags, lyrics, publication_root)
     return f"paroles intégrées · {source}"
 
 
+def process_import_track(path, client, index, settings, excluded, locks):
+    from _parole_index import document, sidecar as read_sidecar
+
+    version = track_version(path)
+    tags, _ = probe(path, include_duration=True)
+    duration = tags.pop("duration_seconds", 0.)
+    title, artist, album, owner = (tags.get(key) for key in ("title", "artist", "album", "albumartist"))
+    if (owner or artist) in excluded:
+        return "excluded", "excluded"
+    if not title or not artist or not 1 <= duration <= 3600:
+        return "review", "review"
+    duration = round(duration)
+    local_text = next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
+    local_text = local_text or read_sidecar(path, ".txt")[1]
+    if not local_text:
+        with index.db() as db:
+            row = db.execute("SELECT info FROM songs WHERE path=? AND token=?", (str(path), document(version))).fetchone()
+        if row:
+            local_text = json.loads(row["info"]).get("plain", "")
+    lrc_path = path.with_suffix(".lrc")
+    lrc_exists = lrc_path.exists() or lrc_path.is_symlink()
+    lrc_text = read_sidecar(path, ".lrc")[1] if lrc_exists else ""
+    lrc_present = bool(catalog_transcript(lrc_text, duration, synced=True))
+    plain_present = bool(local_text.strip()) or lrc_present
+    signature = (title, artist, album, duration, owner)
+    # The owner may process copies of the same recording in one batch.
+    # Only the lookup is shared. Each publication checks its own file version.
+    lock = locks[int.from_bytes(sha256(document(signature).encode()).digest()[:4]) % len(locks)]
+    with lock:
+        client.new_track()
+
+        def lookup(synced):
+            try:
+                value, _ = client.find(*signature, synced=synced, local_text=local_text,
+                                       registry=index, strict=True)
+            except ServiceUnavailable:
+                return "temporary", None
+            except AmbiguousLyrics:
+                return "review", None
+            return ("missing" if value is None else "found" if value else "instrumental"), value
+
+        plain, text = (("present", None) if plain_present else
+                       lookup(False) if settings["lyrics"] and path.suffix.lower() in STREAM_TAGS | FILE_TAGS
+                       else ("missing", None))
+        local_text = local_text or text or ""
+        if lrc_exists:
+            timed, lrc = ("present" if lrc_present else "review"), None
+        elif not settings["lrc"]:
+            timed, lrc = "missing", None
+        elif embedded := catalog_transcript(local_text, duration, synced=True):
+            timed, lrc = "found", embedded
+        else:
+            timed, lrc = lookup(True)
+    if text:
+        try:
+            with resource_slot(index.root / INBOX / ".kara-traitements", PROCESSING, timeout=12):
+                version = save_lyrics(path, version, tags, text, index.root)
+        except (OSError, ValueError, ImportIssue, subprocess.SubprocessError):
+            plain = "temporary"
+    if lrc:
+        try:
+            with shared_mutation(index.root):
+                if track_version(path) != version or path.resolve() != path:
+                    raise ValueError("fichier modifié pendant la recherche")
+                if not save_lrc(lrc_path, lrc):
+                    timed = "present"
+        except (OSError, ValueError):
+            timed = "temporary"
+    return plain, timed
+
+
 def run(tracks, root, preview, synced, tracking=False, publication_root=None):
-    client = None if preview else LyricsSources()
+    clients = local()
     workers = 1 if preview or publication_root else min(TRACK_WORKERS, len(tracks))
     activity_lock = Lock()
     active = 0
@@ -975,7 +1153,9 @@ def run(tracks, root, preview, synced, tracking=False, publication_root=None):
     def work(track):
         activity(1)
         try:
-            return track, process_track(track, client, preview, synced, publication_root), False
+            if not preview and not hasattr(clients, "source"):
+                clients.source = LyricsSources()
+            return track, process_track(track, getattr(clients, "source", None), preview, synced, publication_root), False
         except ServiceUnavailable as error:
             return track, str(error), True
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
@@ -993,8 +1173,11 @@ def run(tracks, root, preview, synced, tracking=False, publication_root=None):
     if workers <= 1:
         return publish(map(work, tracks))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(work, track) for track in tracks]
-        return publish(future.result() for future in as_completed(futures))
+        def batches():
+            paths = iter(tracks)
+            while batch := tuple(islice(paths, workers * 2)):
+                yield from pool.map(work, batch)
+        return publish(batches())
 
 
 def main():
@@ -1022,7 +1205,7 @@ def main():
         if not path.is_relative_to(root):
             parser.error("le fichier est hors de la bibliothèque")
         try:
-            tags, _ = probe(path)
+            tags, _ = probe(path, include_duration=True)
             lyrics, source = retrieve_lyrics(path, LyricsSources(), tags, synced=True)
         except (OSError, ValueError, ServiceUnavailable, subprocess.SubprocessError) as error:
             parser.exit(1, f"{error}\n")
@@ -1046,12 +1229,10 @@ def main():
     if args.apercu:
         return process_selection()
     if root == SHARED_LIBRARY:
-        if os.environ.get("KARA_IMPORT_PROCESSING"):
-            # Network, decoding and tag preparation can overlap other albums.
-            # Only the version-checked publication holds the library lock.
-            return process_selection(root)
-        with shared_mutation(root):
-            return process_selection()
+        # Network and remuxing run outside the shared library critical section.
+        os.environ.setdefault("KARA_SHARED_WAIT", "texte")
+        os.environ.setdefault("KARA_IMPORT_PROCESSING", "1")
+        return process_selection(root)
 
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "paroles-musique"
     state.mkdir(parents=True, exist_ok=True)

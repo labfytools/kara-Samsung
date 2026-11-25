@@ -280,9 +280,22 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual(restarted.claim(("import_lyrics",), time.time())["subject"], task["subject"])
         result = subprocess.check_output([sys.executable, "-B", str(BIN / "_parole_work.py"),
                                           "import_lyrics", task["subject"]], env=self.env, timeout=20)
-        self.assertEqual(json.loads(result)["state"], "complete")
+        evidence = json.loads(result)
+        self.assertEqual(evidence["state"], "complete")
+        self.assertGreater(evidence["lyrics"]["found"], 0)
+        self.assertEqual(evidence["requests"], evidence["lyrics"]["found"])
+        self.assertEqual(evidence["lyrics"]["found"], evidence["lrc"]["found"])
         self.assertTrue(published.with_suffix(".lrc").is_file())
         self.assertEqual(pcm_digest(published), pcm_digest(first))
+        # Simulate a retry on the original audio before enrichment. The new
+        # process must find both independently verified forms in SQLite.
+        published.with_suffix(".lrc").unlink()
+        shutil.copyfile(first, published)
+        cached = json.loads(subprocess.check_output([sys.executable, "-B", str(BIN / "_parole_work.py"),
+                                                    "import_lyrics", task["subject"]], env=self.env, timeout=20))
+        self.assertEqual(cached["requests"], 0)
+        self.assertGreaterEqual(cached["cache_hits"], 2)
+        self.assertTrue(published.with_suffix(".lrc").is_file())
         _, items, _ = self.run_import(url)
         self.assertEqual((items[0]["status"], items[0]["processed"]), ("present", 0))
         self.assertEqual(self.requests.read_text(), "")

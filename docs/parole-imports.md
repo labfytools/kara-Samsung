@@ -8,6 +8,10 @@ Un résultat « Audio complet » confirme que les pistes de l’édition sont di
 
 Kara intègre les pistes publiées par petits lots pendant l’import. La vérification globale avec la collection Strawberry intervient à la fin du lot. Les recherches repassent en maintenance classique quand le traitement initial laisse des éléments manquants. Les parties Kara interrompent cet enrichissement. Les imports en attente ont priorité sur la préparation lourde, qui retrouve ses tâches après la libération des ressources.
 
+Chaque lot d’enrichissement des paroles utilise une seule lecture initiale des métadonnées par piste. Le moteur privilégie les paroles déjà disponibles, partage la réponse LRCLIB entre le texte et le LRC et vérifie le fichier avant chaque publication. Il conserve les réponses vérifiées sept jours et les absences confirmées vingt-quatre heures dans l’index local. La clé inclut la durée, l’édition et les crédits. Un changement de configuration fournisseur rend les anciennes entrées inaccessibles. Les échecs et les limitations temporaires gardent leur statut propre.
+
+Le propriétaire de maintenance admet quatre recherches de pistes à la fois par défaut et ramène ce plafond à deux en cas de limitation HTTP ou de pression sur les ressources. Les créneaux HTTP, les quotas et les temporisations des fournisseurs restent mutualisés. La sélection exploite les mesures récentes du registre quand suffisamment de réponses ont été observées.
+
 ## Déplacement du dépôt sur ArchASP
 
 Le commit `2201869` a déplacé `kara` dans le dépôt dédié. Les appels de tri et de recherche de pochette utilisaient déjà le répertoire de `kara`, mais `musique-tri` et `musique-pochettes` sont restés dans `~/.dotfiles/bin/.local/bin`, accessible sur ArchASP par `~/.local/bin`. Ces deux exécutables n’avaient pas d’historique dans Git. Les copies datées du 22 novembre dans `~/.local/state/kara-tri-paroles-*` corroborent l’origine du script de tri. Les scripts locaux ont été repris dans `bin/`, avec des adaptations ciblées pour les chemins et la reprise.

@@ -1,14 +1,17 @@
 """Exécute une opération bornée avec les moteurs de la bibliothèque."""
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from functools import partial
 from importlib.machinery import SourceFileLoader
 import math
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
+from threading import Lock, local
 from time import monotonic
 
 from _kara_audio_identity import pcm_digest
@@ -18,6 +21,8 @@ from _musique_oz import shared_mutation
 from _parole_catalogue import check_album, check_discography, check_recording, request, MBID
 from _parole_index import Index, document, key, sidecar
 from _parole_import_enrichment import COVER, KINDS, LYRICS, paths_for
+from _parole_import_metrics import snapshot
+from _parole_lyrics_lookup import prune
 from _parole_sources import ProviderUnavailable, LyricsEndpoint, validate_endpoint, record, fetch
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
@@ -45,7 +50,7 @@ def lookup_song(index, identity, synced, *, read_only=False):
     if document(token) != song["token"]:
         return {"state": "rescan"}
     version = tuple(token)
-    tags, _ = engine.probe(path)
+    tags, _ = engine.probe(path, include_duration=True)
     stored = json.loads(song["info"])
     text = next((tags[k] for k in engine.LYRICS_TAGS if tags.get(k)), "") or stored.get("plain", "")
     local_text = sidecar(path, ".txt")[1] or text
@@ -58,7 +63,7 @@ def lookup_song(index, identity, synced, *, read_only=False):
     if synced and not read_only and (path.with_suffix(".lrc").exists() or path.with_suffix(".lrc").is_symlink()):
         return {"state": "present" if song["lrc"] != "à vérifier" else "invalid"}
     title, artist = tags.get("title"), tags.get("artist")
-    duration = engine.duration_seconds(path)
+    duration = round(tags.pop("duration_seconds", 0.))
     if not title or not artist or not math.isfinite(duration) or duration <= 0:
         return {"state": "invalid"}
     if (synced and (rows := parse_lrc(text)) and rows[-1][0] <= duration + 3
@@ -196,29 +201,57 @@ def import_enrichment(index, kind, subject):
         return {"state": state}
     engine = lyrics_engine()
     settings = index.settings()
-    client = engine.LyricsSources()
+    with index.db() as db:
+        excluded = {row[0] for row in db.execute("SELECT subject FROM exclusions WHERE kind='artist'")}
+    limits = snapshot(index)
+    worker_count = settings["import_lyrics_workers"]
+    if type(worker_count) is not int or worker_count not in (4, 8, 16):
+        worker_count = 4
+    # The batch belongs to one maintenance owner for the whole collection.
+    # HTTP gates and FFmpeg slots remain shared with other import processes.
+    if any(d.get("last_http") == 429 for d in limits.values()):
+        worker_count = min(worker_count, 2)
+    try:
+        available = next(int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
+                         if line.startswith("MemAvailable:"))
+        if available < settings["memory_mib"] * 1024 or os.getloadavg()[0] > (os.cpu_count() or 4):
+            worker_count = min(worker_count, 2)
+    except (OSError, ValueError, StopIteration):
+        worker_count = min(worker_count, 2)
+    clients = []
+    storage = local()
+    locks = tuple(Lock() for _ in range(31))
 
-    class RegisteredSources:
-        def find(self, *args, **kwargs):
-            return client.find(*args, **kwargs, registry=index, strict=True)
+    def initialize():
+        storage.source = engine.LyricsSources(persistent=True)
+        clients.append(storage.source)
 
-    source = RegisteredSources()
-    counts = defaultdict(int)
-    for path in paths:
-        for synced, flag in ((False, "lyrics"), (True, "lrc")):
-            if not settings[flag]:
-                counts["missing"] += 1
-                continue
-            try:
-                message = engine.process_track(path, source, False, synced, index.root)
-            except engine.ServiceUnavailable:
-                counts["temporary"] += 1
-            except (OSError, ValueError, subprocess.SubprocessError):
-                counts["missing"] += 1
-            else:
-                counts["missing" if message.startswith(("aucune", "titre", "format")) else "complete"] += 1
-    return {"state": "temporary" if counts["temporary"] else "not_found" if counts["missing"] else "complete",
-            "counts": dict(counts)}
+    def work(path):
+        began = monotonic()
+        try:
+            result = engine.process_import_track(path, storage.source, index, settings, excluded, locks)
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+            result = "temporary", "temporary"
+        return result, monotonic() - began
+
+    started = monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(paths)), initializer=initialize) as pool:
+            processed = list(pool.map(work, paths))
+    finally:
+        for source in clients:
+            source.close()
+    prune(index)
+    plain = Counter(result[0] for result, _ in processed)
+    timed = Counter(result[1] for result, _ in processed)
+    missing = {"missing", "review"}
+    state = ("temporary" if plain["temporary"] or timed["temporary"] else
+             "not_found" if missing & (plain.keys() | timed.keys()) else "complete")
+    return {"state": state, "lyrics": dict(plain), "lrc": dict(timed), "seconds": monotonic() - started,
+            "tracks_seconds": [seconds for _, seconds in processed], "workers": min(worker_count, len(paths)),
+            "requests": sum(c.gate.requests for source in clients for c in source.clients),
+            "cache_hits": sum(c.cache_hits for c in clients),
+            "providers": sorted({provider for c in clients for provider in c.providers})}
 
 
 def main():

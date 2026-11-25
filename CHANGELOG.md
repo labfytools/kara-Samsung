@@ -3,6 +3,7 @@
 ## En développement
 
 - Publier l’audio des imports gérés avant les recherches de paroles et de pochettes. Confier l’enrichissement à la file de maintenance persistante.
+- Mutualiser les recherches de texte et de LRC, limiter les requêtes par fournisseur et conserver les résultats vérifiés et les absences confirmées.
 
 - Documenter dans `AGENTS.md` les périmètres de commit, les contrôles avant chaque commit et la séparation entre développement et agent de recherche Parole.
 - Conserver le parcours Kara V2 avec salle mobile, démarrage TV autonome, BlackBox, mixage et file d’import persistante commune au bureau et au mobile. Voir `docs/kara-v2.md` et `docs/parole-imports.md`.

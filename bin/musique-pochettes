@@ -496,7 +496,9 @@ def main():
         with shared_mutation(root):
             albums = [album for album in select() if not has_cover(album) and any(map(audio_file, album.iterdir()))]
         return process_albums(albums, root, catalog, args.suivi_activite, missing_only=True)
-    if os.environ.get("KARA_IMPORT_PROCESSING"):
+    if os.environ.get("KARA_IMPORT_PROCESSING") or root == SHARED_LIBRARY:
+        os.environ.setdefault("KARA_IMPORT_PROCESSING", "1")
+        os.environ.setdefault("KARA_SHARED_WAIT", "suivi" if args.suivi_activite else "texte")
         with shared_mutation(root):
             albums = select()
         return process_albums(albums, root, catalog, args.suivi_activite)

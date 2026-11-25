@@ -7,7 +7,7 @@ from _parole_index import encoded_key
 LYRICS = "import_lyrics"
 COVER = "import_cover"
 KINDS = (LYRICS, COVER)
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 
 
 def schedule(index, tracks):

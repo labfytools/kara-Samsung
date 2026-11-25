@@ -27,6 +27,7 @@ DEFAULTS = {
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
     "import_strategy": "speed", "import_preferred": "",
+    "import_lyrics_workers": 4,
     "gpu": 15, "disk_busy": 25, "network_interval": 20, "network_daily": 24, "network_timeout": 145, "heavy_daily": 3,
     "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
     "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,

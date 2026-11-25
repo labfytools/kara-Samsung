@@ -37,7 +37,8 @@ def lease(path, *, wait=True):
 
 
 @contextmanager
-def resource_slot(directory, capacity, notice=None):
+def resource_slot(directory, capacity, notice=None, *, timeout=None):
+    deadline = time.monotonic() + timeout if timeout is not None else None
     while True:
         for index in range(capacity):
             with lease(directory / str(index), wait=False) as fd:
@@ -47,6 +48,8 @@ def resource_slot(directory, capacity, notice=None):
         if notice is not None:
             notice()
             notice = None
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ImportIssue("network", "Aucun créneau de requête disponible.")
         time.sleep(0.17)
 
 

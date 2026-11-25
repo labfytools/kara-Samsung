@@ -905,7 +905,9 @@ class Maintenance:
                 self.recover_night_drafts()
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
-            result = ("temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8)))
+            result = (("review", "enrichissement partiel · maintenance complémentaire", 0)
+                      if kind in IMPORT_ENRICHMENT and task["attempts"] >= 2 else
+                      ("temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8))))
         finally:
             with self.lock:
                 if self.cancelled == self.active:
