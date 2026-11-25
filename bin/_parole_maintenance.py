@@ -391,6 +391,20 @@ class Maintenance:
             self.wake.set()
         return True
 
+    def queue_provider_discovery(self, query):
+        query = " ".join(query.split())
+        if not 2 <= len(query) <= 180:
+            raise ValueError("Indique un artiste, un titre ou un album à rechercher.")
+        if not self.index.settings()["codex"]:
+            return False
+        identity = encoded_key("provider_search", query.casefold())
+        payload = {"research_id": identity, "kind": "provider_search", "manual": True,
+                   "artist": "", "title": "", "album": query, "providers": self.active_sources("import")}
+        if self.index.enqueue("codex", identity, identity, 15, payload, force=True):
+            self.journal.emit("CODEX", "Recherche de téléchargements autorisés mise en file")
+            self.wake.set()
+        return True
+
     def queue_adapter(self, source):
         if source["adapter"] != "custom" or source["state"] == "excluded" or not self.index.settings()["codex"]:
             return False
@@ -398,7 +412,7 @@ class Maintenance:
         identity = encoded_key("adapter", source["id"], config)
         payload = {"research_id": identity, "kind": "adapter", "artist": source["name"], "title": "",
                    "album": "", "url": config["url"], "documentation": config.get("docs", ""),
-                   "terms": config.get("terms", "")}
+                   "terms": config.get("terms", ""), "category": source["category"]}
         if self.index.enqueue("codex", identity, identity, 12, payload):
             self.journal.emit("CODEX", "Proposition d’adaptateur mise en file")
             self.wake.set()

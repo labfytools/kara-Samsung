@@ -92,6 +92,10 @@ L’adaptateur utilise l’API officielle. Renseigner `KARA_JAMENDO_CLIENT_ID` d
 
 Sans identifiant d’application, sélectionner **Jamendo** pour ouvrir le site officiel, récupérer un téléchargement autorisé et importer les fichiers avec leur page et leur licence. L’identifiant public que la documentation propose pour les tests de lecture a renvoyé le code 11 « application suspendue » sur les trois points d’entrée interrogés. Aucun téléchargement réel par l’API n’a pu être qualifié avec cet identifiant.
 
+### Découverte de téléchargements avec Codex
+
+Dans **Paramètres → Sources**, renseigner un artiste, un titre ou un album et lancer la recherche explicite. Elle utilise le quota Codex existant. Les résultats de catégorie `import` entrent dans le registre en attente, avec la documentation et les conditions publiées. Une source proposant seulement un téléchargement officiel peut être utilisée par le parcours local. Quand une interface autorisée nécessite du code, **Ébaucher l’adaptateur** prépare du texte et des tests simulés dans l’espace isolé de Codex. La proposition reste disponible pour revue. Toute intégration exécutable demande une validation explicite.
+
 ## Diagnostic des échecs persistants
 
 La tentative initiale appartient au moteur d’import. Après l’enregistrement de son résultat et l’actualisation du catalogue, Parole peut planifier jusqu’à deux relances classiques pour un échec temporaire. Ces relances attendent 60 secondes puis 240 secondes au minimum, ou le délai signalé par le fournisseur s’il est plus long. Plusieurs échecs comparables peuvent différer leurs relances automatiques de 30 minutes. Les autres lots gardent les règles de la file. Les compteurs et échéances survivent à l’arrêt de Parole. La commande manuelle reste disponible dans l’import.
@@ -125,3 +129,5 @@ Le parcours des sites d’artistes a été vérifié en bibliothèque isolée av
 Internet Archive a renvoyé la fiche *Glow Wave* de La Machine de la Mort, sous licence CC BY 4.0. Les dix MP3 originaux totalisant 36 248 422 octets ont été téléchargés et les dix fichiers publiés sont identiques octet pour octet aux fichiers reçus. La relance n’a transféré aucune piste. L’enrichissement simulé a laissé la pochette à compléter. Les tests automatisés couvrent une reprise partielle, un fichier privé et la distinction entre fichier original et dérivé. [Fiche et crédits officiels](https://archive.org/details/glow-wave)
 
 Les essais Jamendo simulent les réponses officielles et le transport avec des FLAC de synthèse. Ils couvrent l’absence d’identifiant, les deux permissions de téléchargement, le refus de paramètres ambigus, la recherche, l’identité PCM et la reprise limitée à la piste en échec.
+
+La découverte Codex est testée avec une réponse de recherche simulée. Le fournisseur découvert reste en attente et la demande d’ébauche demeure un travail séparé.

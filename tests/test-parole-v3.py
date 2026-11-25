@@ -259,6 +259,36 @@ class SourceTests(Fixture):
         return dict(url=url, documentation="https://lyrics.example.org/docs",
                     terms="https://lyrics.example.org/terms", category="lrc", adapter="lrclib")
 
+    def test_discovered_import_adapter_stays_pending(self):
+        maint = Maintenance(self.root, None, state=self.base / "state")
+        self.addCleanup(maint.close)
+        self.assertFalse(maint.queue_provider_discovery("Artiste / Album"))
+        maint.index.configure(codex=True)
+        maint.current_settings = maint.index.settings()
+        self.assertTrue(maint.queue_provider_discovery("Artiste / Album"))
+        with maint.index.db() as db:
+            task = db.execute("SELECT subject,payload FROM tasks WHERE kind='codex'").fetchone()
+        query = json.loads(task["payload"])
+        self.assertTrue(query["manual"])
+        self.assertEqual(query["kind"], "provider_search")
+        with self.assertRaises(ValueError):
+            validate(self.response(self.source()), "id", discovering=True)
+        source = self.source("https://archives.example.org/music") | {
+            "category": "import", "adapter": "custom", "documentation": "https://archives.example.org/docs"}
+        answer = self.response(source) | {"research_id": task["subject"]}
+        validate(answer, task["subject"], discovering=True)
+        with patch("_parole_maintenance.research", return_value=(answer, "")):
+            self.assertEqual(maint.do_codex(task)[0], "done")
+        with maint.index.db() as db:
+            found = db.execute("SELECT * FROM sources WHERE id='host:archives.example.org'").fetchone()
+        self.assertEqual((found["category"], found["state"]), ("import", "pending"))
+        controls(maint.index, found["id"], "active")
+        self.assertFalse(maint.index.source_enabled(found["id"]))
+        self.assertTrue(maint.queue_adapter(found))
+        with maint.index.db() as db:
+            tasks = [json.loads(row[0]) for row in db.execute("SELECT payload FROM tasks WHERE kind='codex'")]
+        self.assertTrue(any(data["kind"] == "adapter" and data["category"] == "import" for data in tasks))
+
     def test_schema_url_quota_and_discovery(self):
         source = self.source()
         self.assertEqual(validate(self.response(source), "id")["status"], "found")

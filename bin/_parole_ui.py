@@ -1060,6 +1060,23 @@ class ParoleView:
             actions.append(button(label, lambda w, m=mode: action(w, m)))
         area.append(button("Actualiser", refresh))
         area.append(button("Limites du fournisseur sélectionné…", lambda w: action(w, "limits")))
+
+        query = Gtk.Entry(placeholder_text="Artiste, titre ou album", max_length=180, hexpand=True)
+        discovery = box(Gtk.Orientation.HORIZONTAL, 4)
+        discovery.append(query)
+
+        def discover_providers(widget):
+            try:
+                if self.maintenance.queue_provider_discovery(query.get_text()):
+                    self.settings("codex")
+                else:
+                    show_details(widget, "Découverte de fournisseurs", "Active Codex dans les paramètres pour lancer la recherche.")
+            except (ValueError, OSError, sqlite3.Error) as error:
+                show_details(widget, "Découverte de fournisseurs", str(error))
+
+        query.connect("activate", discover_providers)
+        discovery.append(button("Chercher des téléchargements avec Codex", discover_providers))
+        area.append(discovery)
         refresh()
 
     def source_rate_dialog(self, source, config):
