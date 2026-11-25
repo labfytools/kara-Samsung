@@ -35,7 +35,8 @@ from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifi
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as compare_music, duration_ms,
                                     from_catalogue as music_facts, position, same_track)
-from _parole_music_registry import acoustic_evidence, original_tags, possible_duplicates, store_import, stored_fingerprint
+from _parole_music_registry import (acoustic_evidence, original_tags, possible_duplicates, registered_positions,
+                                    store_import, stored_fingerprint)
 from _parole_fingerprint import executable as fingerprint_tool, read as fingerprint
 from _parole_offer import load_plan, plan_id, rank as rank_offers
 import _parole_archive as archive
@@ -1192,6 +1193,20 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
     with lease(directory / "verrou") as guard:
         saved = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.is_file() else {}
         prior = verified_publications(saved.get("tracks", []) or previous.get("provenance", []), root, inbox, positions)
+        if len(prior) < len(positions):
+            try:
+                registered = verified_publications(registered_positions(index, first), root, inbox, positions)
+            except sqlite3.Error:
+                registered = {}
+            combined = registered | prior
+            folders = {Path(proof["path"]).parent for proof in combined.values()}
+            if len(folders) == 1:
+                count = len(set(registered) - set(prior))
+                prior = combined
+                if count:
+                    message = f"Identité canonique · {count} piste(s) intégrée(s) réutilisable(s)"
+                    progress.log("Identité canonique", message)
+                    progress.announce_provider("Identité canonique", message)
         item.provenance = list(prior.values())
         item.tracks = sorted({proof["path"] for proof in prior.values()})
         if len(prior) == len(positions):

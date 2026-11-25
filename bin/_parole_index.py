@@ -122,6 +122,9 @@ class Index:
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL, year INTEGER NOT NULL,
                     mb_artist TEXT NOT NULL, mb_group TEXT NOT NULL, mb_release TEXT NOT NULL, gtin TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS canonical_edition_release ON canonical_editions(mb_release)
+                    WHERE mb_release!='';
+                CREATE INDEX IF NOT EXISTS canonical_edition_gtin ON canonical_editions(gtin) WHERE gtin!='';
                 CREATE TABLE IF NOT EXISTS canonical_recordings (
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL,
                     pcm TEXT NOT NULL, mb_recording TEXT NOT NULL, mb_work TEXT NOT NULL, isrc TEXT NOT NULL

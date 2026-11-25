@@ -132,6 +132,8 @@ Les rapprochements de recherches portent un niveau de confiance et des preuves c
 
 Le tri peut réutiliser un fichier déjà publié si son original est identique octet pour octet, ou si l’identité PCM concorde dans une édition et à une position établies. Le fichier en bibliothèque est revérifié. Les crédits, fichiers associés et préparations existants sont conservés. Une édition distincte peut contenir le même enregistrement. La correspondance du PCM seule ne fusionne donc pas ses éditions.
 
+Avant un import multisource, les références déjà persistées peuvent couvrir certaines positions, même après un import initial depuis un fournisseur sélectionné seul. L’édition et l’enregistrement doivent être confirmés et le fichier local revérifié. Si les preuves pointent vers plusieurs dossiers d’édition, seuls les reçus du lot en cours peuvent servir à la reprise.
+
 Si `fpcalc` est disponible sur le PATH ou via le chemin absolu `KARA_FPCALC`, le registre conserve une empreinte Chromaprint sur les 120 premières secondes des nouveaux fichiers reçus. Les rapprochements utilisent seulement des pistes dont les métadonnées et durées sont compatibles. Une empreinte concordante apporte un indice sur l’enregistrement et apparaît dans la provenance. Une fusion d’édition ou une réutilisation de préparation Kara exige la preuve audio et temporelle déjà applicable. [Chromaprint et fpcalc](https://github.com/acoustid/chromaprint)
 
 ## Validation
@@ -171,5 +173,7 @@ Les tests d’identité ont confirmé les cas concordants avec variations de pr�
 Les stratégies et le basculement sont validés avec deux catalogues simulés. Après deux échecs sur la seconde piste Internet Archive, Jamendo a fourni cette seule position dans le même dossier. La première piste est restée identique et une relance n’a rien retéléchargé. La comparaison en ligne entre deux fournisseurs reste à qualifier avec un identifiant Jamendo autorisé et une édition commune confirmée.
 
 Le test de provenance importe le même FLAC par deux parcours, avec un renommage entre les deux. Il conserve un seul fichier, son LRC manuel et deux références de fournisseur. La variante Deluxe de même PCM conserve une édition séparée.
+
+Un second test intègre une première piste via un import Internet Archive direct. Le nouveau lot multisource reconnaît cette position et transfère uniquement la seconde via Jamendo.
 
 Avec fpcalc 1.6.0, l’empreinte de *This Too Shall Pass* a obtenu une similarité de 100 % en FLAC, 98,25 % en Opus à 64 kbit/s et 99,58 % en MP3 à 128 kbit/s après réencodage local. La piste indépendante *Afterglow Avenue* a obtenu 51,70 %. L’import isolé de la version Opus a retrouvé la similarité de 98,25 % et conservé les deux encodages. Les résultats couvrent une source et une piste de comparaison. [Fichier et crédits Scott Buckley](https://www.scottbuckley.com.au/library/this-too-shall-pass/) · [Fiche et crédits de Glow Wave](https://archive.org/details/glow-wave)

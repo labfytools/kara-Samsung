@@ -38,3 +38,4 @@
 - Conserver les identités et les provenances dans l’index existant et éviter une nouvelle copie quand l’identité locale est prouvée.
 - Afficher les preuves des rapprochements et accepter des alias d’artiste validés explicitement pour une édition.
 - Conserver les empreintes Chromaprint disponibles comme preuve complémentaire des rapprochements entre encodages.
+- Réutiliser les positions déjà intégrées d’une édition confirmée avant de lancer un transfert multisource.

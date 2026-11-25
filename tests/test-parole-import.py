@@ -471,7 +471,7 @@ class AlbumImportTests(unittest.TestCase):
             self.assertEqual(evidence["license"], license_url)
             self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(originals[evidence["external_id"]]))
 
-    def test_confirmed_equivalent_provider_fills_only_missing_position(self):
+    def equivalent_catalogues(self):
         source = self.temp / "equivalent"
         license_url = OPEN_LICENSES["CC BY 4.0"]
         release_id = "b90181d2-ff52-4bfb-aeb5-f8c66c8fed25"
@@ -501,14 +501,19 @@ class AlbumImportTests(unittest.TestCase):
         self.update_config()
         index = Index(self.library, self.temp / "state")
         seed(index)
-        index.configure(import_strategy="preferred", import_preferred=ARCHIVE)
-        target = create_plan(index, [
+        offers = [
             {"url": "https://archive.org/details/edition-fixture", "provider": ARCHIVE, "price": 0,
              "formats": ["FLAC"], "facts": archive_item("edition-fixture", archive).facts},
             {"url": "https://www.jamendo.com/album/48123", "provider": JAMENDO, "price": 0,
              "formats": ["FLAC"], "facts": jamendo_edition("album", jamendo).facts},
-        ])
+        ]
         env = dict(self.env, KARA_JAMENDO_CLIENT_ID="fixtureid")
+        return index, offers, env
+
+    def test_confirmed_equivalent_provider_fills_only_missing_position(self):
+        index, offers, env = self.equivalent_catalogues()
+        index.configure(import_strategy="preferred", import_preferred=ARCHIVE)
+        target = create_plan(index, offers)
         journal, partial, _ = self.run_import(target, env=env, expected=1)
         self.assertEqual((partial[0]["status"], partial[0]["provider"]), ("partial", ARCHIVE))
         first = Path(partial[0]["tracks"][0])
@@ -522,6 +527,17 @@ class AlbumImportTests(unittest.TestCase):
         _, replay, _ = self.run_import(target, env=env)
         self.assertEqual((replay[0]["status"], replay[0]["processed"]), ("present", 0))
         self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "02.flac", "39012"])
+
+    def test_confirmed_plan_reuses_existing_release_before_any_transfer(self):
+        index, offers, env = self.equivalent_catalogues()
+        _, partial, _ = self.run_import(offers[0]["url"], env=env, expected=1)
+        self.assertEqual(partial[0]["added"], 1)
+        original = partial[0]["tracks"][0]
+        index.configure(import_strategy="preferred", import_preferred=JAMENDO)
+        _, complete, _ = self.run_import(create_plan(index, offers), env=env)
+        self.assertEqual((complete[0]["status"], complete[0]["provider"], complete[0]["added"]), ("success", JAMENDO, 1))
+        self.assertIn(original, complete[0]["tracks"])
+        self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "39012"])
 
     def test_canonical_provenance_follows_a_renamed_file_and_avoids_a_second_copy(self):
         track = self.temp / "canonical-source" / "01.flac"

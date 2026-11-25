@@ -160,6 +160,43 @@ def stored_fingerprint(index, pcm):
     return row[0] if row else ""
 
 
+def registered_positions(index, release):
+    # Similar tags alone never prevent a download. Use a stable release
+    # identifier with compatible track evidence and a verifiable local PCM.
+    if not (release.release_id or release.barcode) or not release.count or len(release.tracks) != release.count:
+        return []
+    slots = {(t.disc, t.number): t for t in release.tracks}
+    with index.db(wait=.35) as db:
+        rows = db.execute("""
+            SELECT p.*,r.pcm,e.mb_release AS edition_mbid
+            FROM canonical_editions e JOIN canonical_references p ON p.edition=e.id
+            JOIN canonical_recordings r ON p.recording=r.id
+            WHERE ((:mb!='' AND e.mb_release!='' AND e.mb_release=:mb) OR
+                   (:gtin!='' AND e.gtin!='' AND e.gtin=:gtin))
+              AND r.pcm!='' AND e.title=:title AND e.artist=:artist
+            ORDER BY p.edition,p.disc,p.track,p.path,p.id
+        """, {"mb": release.release_id, "gtin": release.barcode, "title": normalized(release.title),
+              "artist": normalized(release.artist)})
+        editions = {}
+        for row in rows:
+            slot = (row["disc"], row["track"])
+            if slot not in slots or not recognized_path(index.root, row["path"]):
+                continue
+            if release.release_id and row["edition_mbid"] and row["edition_mbid"] != release.release_id:
+                continue
+            metadata = {"tags": json.loads(row["tags"]), **json.loads(row["evidence"])}
+            if same_track(slots[slot], track_metadata(comparison_tags(metadata))) != CONFIRMED:
+                continue
+            tracks = editions.setdefault(row["edition"], {})
+            tracks.setdefault(slot, {
+                **metadata, "path": row["path"], "provider": row["provider"], "external_id": row["external_id"],
+                "position": list(slot), "pcm": row["pcm"], "sha256": row["sha256"],
+            })
+            if len(editions) > 1:
+                return []
+    return list(next(iter(editions.values())).values()) if editions else []
+
+
 def acoustic_evidence(index, proof):
     current = parse_fingerprint(json.loads(proof["fingerprint"]))
     if current is None:
