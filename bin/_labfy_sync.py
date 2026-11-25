@@ -9,9 +9,15 @@ import signal
 
 from gi.repository import Gio, GLib, Gtk
 
+from _kara_paths import CACHE, DATA, STATE
+from _musique_oz import INBOX, group_locations, grouped_path, index_revision
+
 SIDES = ("PC", "Android")
 INVALID = Gtk.INVALID_LIST_POSITION
 PAGE_SIZE = 140
+OPERATION_LABELS = {"add": "Fichier transféré", "modify": "Fichier actualisé", "copy": "Copie vérifiée",
+                    "rename": "Fichier renommé", "delete": "Fichier mis en réserve"}
+OPERATION_VERBS = {"Transfert": "copy", "Renommage": "rename", "Mise en réserve": "delete"}
 
 
 class MusicSync:
@@ -25,18 +31,32 @@ class MusicSync:
         self.probe = None
         self.connection = {}
         self.dialog = None
-        self.button = Gtk.Button(icon_name="emblem-synchronizing-symbolic", visible=False,
-                                 tooltip_text="Synchroniser la musique en USB")
-        self.button.update_property([Gtk.AccessibleProperty.LABEL], ["Synchroniser la musique en USB"])
+        self.button = Gtk.Button(css_classes=["sync-button"])
+        content = Gtk.Box(spacing=6)
+        content.append(Gtk.Image.new_from_icon_name("emblem-synchronizing-symbolic"))
+        content.append(Gtk.Label(label="Synchroniser"))
+        self.button.set_child(content)
+        self.button.update_property([Gtk.AccessibleProperty.LABEL], ["Synchroniser"])
         self.button.connect("clicked", self.open)
+        self.connected({"state": "checking", "message": "Vérification USB…"})
         self.timer = GLib.timeout_add_seconds(3, self.poll)
         self.poll()
+
+    def available(self):
+        return self.launcher is not None and os.access(self.launcher, os.X_OK) and self.launcher.is_file()
+
+    def log(self, message, level="INFO"):
+        if not self.closed and self.parent.maintenance is not None:
+            self.parent.maintenance.journal.emit("SYNC", message, level)
 
     def command(self, mode):
         return [str(self.launcher), mode, "--pc", str(self.library)]
 
     def poll(self):
-        if self.probe is not None or self.launcher is None or not self.launcher.is_file():
+        if self.probe is not None or self.closed:
+            return GLib.SOURCE_CONTINUE
+        if not self.available():
+            self.connected({"state": "unavailable", "message": "Lanceur Labfy introuvable ou non exécutable."})
             return GLib.SOURCE_CONTINUE
         try:
             self.probe = Gio.Subprocess.new(self.command("probe"), Gio.SubprocessFlags.STDOUT_PIPE |
@@ -54,32 +74,45 @@ class MusicSync:
         try:
             _, data, _ = process.communicate_utf8_finish(result)
             state = json.loads(data)
-        except (GLib.Error, ValueError):
+            if (state.get("event") != "connection" or state.get("state") not in {"ready", "absent", "blocked"}
+                    or not isinstance(state.get("message"), str)):
+                raise ValueError("Réponse USB Labfy invalide.")
+        except (GLib.Error, ValueError, AttributeError):
             state = {"state": "blocked", "message": "Le diagnostic USB Labfy a échoué."}
         self.connected(state)
 
     def connected(self, state):
+        status, message = state["state"], state["message"]
+        if status != "checking" and (status, message) != (self.connection.get("state"), self.connection.get("message")):
+            self.log(message, "WARNING" if status in {"blocked", "unavailable"} else "INFO")
         self.connection = state
         self.requested = state.get("configured_android", self.requested)
-        if state["state"] != "checking":
-            self.button.set_visible(state["state"] != "absent")
-        self.button.set_tooltip_text("Synchroniser la musique en USB\n" + state["message"])
-        if self.dialog:
+        for style, enabled in (("sync-ready", status == "ready"), ("sync-unavailable", status != "ready")):
+            (self.button.add_css_class if enabled else self.button.remove_css_class)(style)
+        self.button.set_tooltip_text("Synchroniser la musique en USB\n" + message)
+        self.button.update_property([Gtk.AccessibleProperty.DESCRIPTION], [message])
+        if self.dialog and not self.dialog.closed:
             self.dialog.connected()
 
     def open(self, _button):
         created = self.dialog is None
         dialog = self.present_dialog()
         # Opening an overview must never run a recovery, which may restore a file.
-        if created and not self.connection.get("recover") and not self.connection.get("media_repair"):
-            dialog.prepare(None)
+        if dialog and created:
+            if self.connection.get("state") != "ready":
+                self.log(self.connection["message"], "WARNING")
+            elif not self.connection.get("recover") and not self.connection.get("media_repair"):
+                dialog.prepare(None)
 
     def open_settings(self, _button):
-        self.present_dialog().path.grab_focus()
+        if dialog := self.present_dialog():
+            dialog.path.grab_focus()
 
     def present_dialog(self):
         if self.dialog is None:
             self.dialog = SyncWindow(self)
+        if self.dialog.closed:
+            return None
         self.dialog.present()
         return self.dialog
 
@@ -98,7 +131,7 @@ class MusicSync:
         if self.probe is not None:
             self.probe.force_exit()
             self.probe = None
-        if self.dialog:
+        if self.dialog and not self.dialog.closed:
             self.dialog.close_request(self.dialog)
 
 
@@ -121,6 +154,7 @@ class SyncWindow(Gtk.Window):
         self.updating_choices = False
         self.terminal_event = False
         self.statistics = {}
+        self.corrections = {}
         self.sections = {}
         self.page = 0
         self.connect("close-request", self.close_request)
@@ -267,7 +301,7 @@ class SyncWindow(Gtk.Window):
         has_plan = self.process is not None and self.confirmed
         idle = self.process is None and self.saving is None
         self.path.set_editable(idle)
-        self.save_button.set_sensitive(idle and changed_path)
+        self.save_button.set_sensitive(idle and changed_path and state.get("state") != "unavailable")
         self.preview_button.set_label("Reprendre la synchronisation" if resumable else "Aperçu")
         self.preview_button.set_sensitive(idle and not changed_path and state.get("state") == "ready" and
                                           (not resumable or media_only or state.get("helper", True)))
@@ -289,6 +323,7 @@ class SyncWindow(Gtk.Window):
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
         except GLib.Error as error:
             self.summary.set_text(error.message)
+            self.controller.log(error.message, "ERROR")
             return
         self.application.hold()
         self.saving.communicate_utf8_async(None, None, self.settings_saved)
@@ -307,12 +342,14 @@ class SyncWindow(Gtk.Window):
                     self.summary.set_text("Dossier Android enregistré.")
             elif not self.closed:
                 self.summary.set_text(message["message"])
+                self.controller.log(message["message"], "ERROR")
         except (GLib.Error, ValueError, KeyError):
             if not self.closed:
-                self.summary.set_text("Impossible d’enregistrer le dossier Android.")
+                message = "Impossible d’enregistrer le dossier Android."
+                self.summary.set_text(message)
+                self.controller.log(message, "ERROR")
         finally:
-            if not self.closed:
-                self.refresh_controls()
+            self.process_released()
             self.application.release()
 
     def prepare(self, _button):
@@ -336,7 +373,13 @@ class SyncWindow(Gtk.Window):
 
     def start_process(self, args, message):
         self.terminal_event = False
+        self.operations = Counter()
+        self.pending_operation = None
+        self.copy_kinds = {}
+        self.media_errors = 0
+        self.rescan_on_finish = args[1] == "resume" or "--recover" in args
         self.summary.set_text(message)
+        self.controller.log(message)
         self.text.get_buffer().set_text("")
         self.progress.set_visible(True)
         self.file_progress.set_visible(False)
@@ -346,7 +389,7 @@ class SyncWindow(Gtk.Window):
         self.power_status.set_visible(False)
         self.navigation.set_visible(False)
         self.progress.pulse()
-        self.entries, self.conflicts, self.decisions = [], [], {}
+        self.entries, self.conflicts, self.decisions, self.corrections = [], [], {}, {}
         self.conflict_box.set_visible(False)
         self.deletions.set_visible(False)
         self.deletions.set_active(False)
@@ -354,7 +397,7 @@ class SyncWindow(Gtk.Window):
             self.process = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDIN_PIPE |
                                               Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
         except GLib.Error as error:
-            self.summary.set_text(error.message)
+            self.end_report(error.message, "ERROR")
             self.progress.set_visible(False)
         else:
             # Let the child finish its cooperative stop and persist its
@@ -371,38 +414,98 @@ class SyncWindow(Gtk.Window):
                 self.on_event(json.loads(line))
                 stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.on_line)
                 return
-        except (GLib.Error, ValueError) as error:
-            self.summary.set_text(str(error))
-            self.terminal_event = True
-            if self.process:
-                self.process.send_signal(signal.SIGTERM)
+        except (GLib.Error, ValueError, KeyError, TypeError) as error:
+            self.end_report(f"Réponse Labfy invalide · {error}", "ERROR")
+            self.process.send_signal(signal.SIGTERM)
         self.process.wait_async(None, self.finished)
 
     def finished(self, process, result):
         try:
             process.wait_finish(result)
         except GLib.Error as error:
-            self.summary.set_text(error.message)
-        if not self.closed and not self.terminal_event:
-            self.summary.set_text("La session Labfy a été interrompue.")
+            self.end_report(error.message, "ERROR")
+        if not self.terminal_event:
+            self.end_report("La session Labfy a été interrompue.", "ERROR")
         self.process = None
         self.confirmed = False
         self.stopping = False
-        self.progress.set_visible(False)
-        self.file_progress.set_visible(False)
-        self.refresh_controls()
         if not self.closed:
+            self.progress.set_visible(False)
+            self.file_progress.set_visible(False)
             probe = self.controller.probe
             if probe is not None:
                 self.controller.probe = None
                 probe.force_exit()
             self.controller.poll()
+        maintenance = self.controller.parent.maintenance
+        if self.rescan_on_finish and maintenance is not None and not self.controller.closed:
+            maintenance.rescan()
+        self.process_released()
         self.application.release()
 
+    def process_released(self):
+        if not self.closed:
+            self.refresh_controls()
+        elif self.process is None and self.saving is None:
+            self.controller.dialog = None
+
+    def complete_operation(self, completed):
+        # Labfy reports the index before execution. Only a later index or the
+        # persisted cursor proves publication, even when all bytes were sent.
+        if self.pending_operation is None or self.pending_operation[0] >= completed:
+            return
+        _, kind, side, path = self.pending_operation
+        self.pending_operation = None
+        self.operations[kind] += 1
+        self.controller.log(f"{OPERATION_LABELS[kind]} · {side} · {path}")
+
+    def end_report(self, message, level="INFO", *, pending=None):
+        self.terminal_event = True
+        if not self.closed:
+            self.summary.set_text(message)
+        counts = self.operations
+        detail = (f"Bilan de la session · {counts['add']} transféré(s), {counts['modify']} actualisé(s), "
+                  f"{counts['copy']} copie(s) reprise(s), {counts['rename']} renommé(s), "
+                  f"{counts['delete']} mis en réserve, {self.media_errors} erreur(s) d’indexation")
+        if level == "ERROR":
+            detail += ", 1 erreur de synchronisation"
+        if pending is not None:
+            detail += f", {pending} chemin(s) à indexer"
+        self.controller.log(message, level)
+        self.controller.log(detail)
+
+    def record_event(self, event, data):
+        if event == "progress":
+            message, count = data["message"], data["count"]
+            verb, _, location = message.partition(" · ")
+            if verb in OPERATION_VERBS:
+                side, _, path = location.partition(" · ")
+                self.complete_operation(count)
+                kind = self.copy_kinds.get((side, path), OPERATION_VERBS[verb])
+                self.pending_operation = (count, kind, side, path)
+            elif message == "Synchronisation terminée.":
+                self.complete_operation(count)
+        elif event == "media" and data["errors"] > self.media_errors:
+            self.media_errors = data["errors"]
+            self.controller.log(f"Indexation MediaStore · {self.media_errors} erreur(s), "
+                                f"{data['pending']} chemin(s) en attente", "WARNING")
+        elif event == "error":
+            if resume := data.get("resume"):
+                self.complete_operation(resume["completed"])
+            self.end_report(data["message"], "WARNING" if self.stopping or self.closed else "ERROR")
+        elif event == "done":
+            if self.pending_operation is not None:
+                self.complete_operation(self.pending_operation[0] + 1)
+            pending = data.get("media_pending", 0)
+            status = (f" · {pending} chemin(s) à traiter via Réparer l’indexation." if pending else "")
+            message = "Réparation MediaStore terminée." if data.get("repair") else "Synchronisation terminée."
+            self.end_report(message + status, "WARNING" if pending else "INFO", pending=pending)
+
     def on_event(self, data):
+        event = data["event"]
+        self.record_event(event, data)
         if self.closed:
             return
-        event = data["event"]
         if self.stopping and event in {"progress", "preview", "transfer"}:
             return
         if event == "progress":
@@ -421,7 +524,9 @@ class SyncWindow(Gtk.Window):
         elif event == "preview" and not self.stopping:
             self.connection_label.set_text(f"Galaxy S21 FE connecté par USB · {data['android']}")
             self.statistics = data["statistics"]
-            self.show_plan(data["entries"], data["corrections"])
+            self.corrections = data["corrections"]
+            self.show_plan(data["entries"], self.corrections)
+            self.controller.log(f"Aperçu prêt · {len(self.entries)} proposition(s), {len(self.conflicts)} conflit(s)")
         elif event == "transfer" and not self.stopping:
             self.progress.set_fraction(min(1, data["transferred"] / data["total"]))
             self.progress.set_show_text(True)
@@ -453,18 +558,9 @@ class SyncWindow(Gtk.Window):
         elif event == "power":
             self.power_status.set_text(data["message"])
             self.power_status.set_visible(bool(data.get("active") or data.get("pending")))
-        elif event == "error":
-            self.terminal_event = True
-            self.summary.set_text(data["message"])
-            if data.get("recover"):
-                self.controller.connection.update(recover=True, resume=data.get("resume"))
-                self.connected()
-        elif event == "done":
-            self.terminal_event = True
-            pending = data.get("media_pending", 0)
-            status = (f" · {pending} chemin(s) à traiter via Réparer l’indexation." if pending else "")
-            message = "Réparation MediaStore terminée." if data.get("repair") else "Synchronisation terminée."
-            self.summary.set_text(message + status)
+        elif event == "error" and data.get("recover"):
+            self.controller.connection.update(recover=True, resume=data.get("resume"))
+            self.connected()
 
     @staticmethod
     def describe(step):
@@ -569,24 +665,21 @@ class SyncWindow(Gtk.Window):
 
     def update_summary(self):
         counts = Counter()
+        counts["blocked"] = sum(row["kind"] == "blocked" for row in self.entries)
         sizes = [0, 0]
         deletions = 0
         counted = set()
-        for row in self.entries:
-            if row["kind"] == "blocked":
-                counts["blocked"] += 1
-            key = self.decisions.get(row["path"], "skip") if row["kind"] == "conflict" else "apply"
-            for step in row["choices"].get(key, ()):
-                token = step["side"], step["path"]
-                if token in counted:
+        for _, step in self.chosen_steps():
+            token = step["side"], step["path"]
+            if token in counted:
+                continue
+            counted.add(token)
+            if step["kind"] == "delete":
+                deletions += 1
+                if not self.deletions.get_active():
                     continue
-                counted.add(token)
-                if step["kind"] == "delete":
-                    deletions += 1
-                    if not self.deletions.get_active():
-                        continue
-                counts[step["kind"]] += 1
-                sizes[step["side"]] += step["bytes"]
+            counts[step["kind"]] += 1
+            sizes[step["side"]] += step["bytes"]
         self.deletions.set_visible(deletions > 0)
         stats = self.statistics
         self.summary.set_text(f"{stats.get('total_files', 0)} fichiers · {stats.get('transferable', 0)} transférables · "
@@ -598,11 +691,73 @@ class SyncWindow(Gtk.Window):
                               + (f" · {counts['blocked']} chemin(s) à corriger" if counts["blocked"] else ""))
         self.refresh_controls()
 
+    def chosen_steps(self):
+        for row in self.entries:
+            choice = self.decisions.get(row["path"], "skip") if row["kind"] == "conflict" else "apply"
+            for step in row["choices"].get(choice, ()):
+                yield row, step
+
+    def plan_problem(self, steps):
+        # Labfy owns selection, validation and writes. Parole can withhold
+        # approval when an operation would touch its import inbox or undo a
+        # recorded album move that Labfy cannot prove from its USB baseline.
+        root = self.controller.library
+        technical = tuple(directory.resolve() for directory in (CACHE / "paroles-strawberry", STATE / "kara", DATA / "kara"))
+        for _, step in steps:
+            for field in ("source", "path"):
+                path = Path(step[field])
+                if path.parts[:1] and path.parts[0].casefold() == INBOX.casefold():
+                    return f"Le dossier de réception {INBOX} figure dans le plan. Terminer le classement puis refaire l’aperçu."
+                if any((root / path).is_relative_to(directory) for directory in technical):
+                    return f"Un fichier technique de Kara figure dans le plan · {path}"
+        maintenance = self.controller.parent.maintenance
+        if maintenance is None:
+            return None
+        database = maintenance.index.path
+        locations = group_locations(database, index_revision(database))
+        if not locations:
+            return None
+        android_copies = {step["path"] for _, step in steps if step["side"] == 1 and step["kind"] == "copy"}
+        android_deletes = {step["path"] for _, step in steps if step["side"] == 1 and step["kind"] == "delete"}
+        pc_publications = {step["path"] for _, step in steps if step["side"] == 0 and step["kind"] != "delete"}
+        for row in self.entries:
+            path = row["path"]
+            if row["kind"] == "rename" or Path(*Path(path).parts[:2]) not in locations:
+                continue
+            old = root / path
+            new = grouped_path(root, old, database=database)
+            if new == old:
+                continue
+            current = new.relative_to(root).as_posix()
+            old_android = self.corrections.get(path, path)
+            new_android = self.corrections.get(current, current)
+            if path in pc_publications or (row["kind"] in {"add", "delete", "conflict", "blocked"}
+                                           and new_android in android_copies and old_android not in android_deletes):
+                return f"Regroupement à préserver · {path} → {current}. Vérifier l’ancien chemin Android avant de confirmer."
+        return None
+
     def apply(self, _button):
+        if not self.confirm.get_sensitive():
+            return
+        allow_delete = self.deletions.get_active()
+        steps = [(row, step) for row, step in self.chosen_steps() if step["kind"] != "delete" or allow_delete]
+        if problem := self.plan_problem(steps):
+            self.summary.set_text(problem)
+            self.controller.log(problem, "WARNING")
+            return
+        for row, step in steps:
+            if step["kind"] != "copy":
+                continue
+            side, path = step["side"], step["path"]
+            original = self.corrections.get(row["path"], row["path"]) if side == 1 else row["path"]
+            replaces = row["kind"] == "modify" or (row["kind"] == "conflict" and path == original and
+                       all(choice[0]["kind"] != "delete" for choice in row["choices"].values()))
+            self.copy_kinds[SIDES[side], path] = "modify" if replaces else "add"
         self.confirmed = False
+        self.rescan_on_finish = True
         self.refresh_controls()
-        data = json.dumps({"action": "apply", "conflicts": self.decisions,
-                           "delete": self.deletions.get_active()}).encode() + b"\n"
+        self.controller.log("Plan de synchronisation confirmé.")
+        data = json.dumps({"action": "apply", "conflicts": self.decisions, "delete": allow_delete}).encode() + b"\n"
         stream = self.process.get_stdin_pipe()
         stream.write_all_async(data, GLib.PRIORITY_DEFAULT, None, self.approval_sent)
 
@@ -612,6 +767,7 @@ class SyncWindow(Gtk.Window):
         except GLib.Error as error:
             if not self.closed:
                 self.summary.set_text(error.message)
+            self.controller.log(error.message, "ERROR")
             if self.process:
                 self.process.send_signal(signal.SIGTERM)
 
@@ -627,7 +783,7 @@ class SyncWindow(Gtk.Window):
 
     def close_request(self, _window):
         self.closed = True
-        self.controller.dialog = None
+        self.process_released()
         if self.process:
             self.process.send_signal(signal.SIGTERM)
         return False

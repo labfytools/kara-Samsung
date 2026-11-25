@@ -101,6 +101,9 @@ headerbar button.tv-button { border-radius: 50%; min-width: 32px; min-height: 32
 .tv-progress { color: @lavender; border-color: @lavender; }
 .tv-ok { color: @green; border-color: @green; }
 .tv-error { color: @red; border-color: @red; }
+headerbar button.sync-button image { color: @lavender; }
+headerbar button.sync-unavailable image { color: @muted; }
+headerbar button.sync-ready image { color: @teal; }
 .parole { color: @text; }
 .parole .stat-card { padding: 8px 12px; min-width: 112px; border-radius: 9px; }
 .parole .card-value { font-size: 20px; font-weight: 750; }

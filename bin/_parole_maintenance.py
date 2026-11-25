@@ -34,7 +34,7 @@ from _parole_sources import discover, seed, controls
 from _paroles_lrc import MAX_LRC_BYTES
 
 CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
-              "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "IDLE", "CACHE",
+              "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "SYNC", "IDLE", "CACHE",
               "SUCCESS", "WARNING", "ERROR")
 NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata", "codex", "source", "source_probe")
 HOUR = 3600

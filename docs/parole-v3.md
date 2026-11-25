@@ -1,6 +1,16 @@
 # Parole V3
 
-Parole ouvre le tableau de bord de la bibliothèque. L’en-tête donne accès à l’importation, à la connexion TV et aux paramètres. La console affiche les étapes réellement observées. La consultation et la correction des paroles se font depuis les détails d’une chanson. La lecture, la notation, la salle, la télévision, les volumes et BlackBox utilisent le contrôleur Kara existant. Le mode `--service` continue de servir Tizen et les téléphones si la fenêtre Parole est masquée. La maintenance démarre à l’ouverture de la fenêtre Parole.
+Parole ouvre le tableau de bord de la bibliothèque. L’en-tête donne accès à l’importation, à la synchronisation USB, à la connexion TV et aux paramètres. La console affiche les étapes réellement observées. La consultation et la correction des paroles se font depuis les détails d’une chanson. La lecture, la notation, la salle, la télévision, les volumes et BlackBox utilisent le contrôleur Kara existant. Le mode `--service` continue de servir Tizen et les téléphones si la fenêtre Parole est masquée. La maintenance démarre à l’ouverture de la fenêtre Parole.
+
+## Synchronisation USB
+
+Le bouton **Synchroniser** indique l’état du téléphone et ouvre le dialogue Labfy. Parole cherche `scripts/labfy-sync` dans le dépôt voisin `labfy-music-manager`. La variable `LABFY_MUSIC_MANAGER` permet d’indiquer son chemin absolu. Le dossier Android se règle depuis le dialogue ou dans **Paramètres → Général**.
+
+Le branchement du téléphone déclenche seulement la détection USB. Le dialogue présente les ajouts dans les deux sens, les mises à jour, les renommages, les conflits, les corrections de chemins et les suppressions proposées. **Confirmer** envoie au moteur les choix affichés. Les suppressions restent décochées à chaque aperçu. Une reprise du plan enregistré ou une réparation de MediaStore demande un clic dédié. La progression suit les compteurs réels de Labfy. Le filtre `SYNC` de la console affiche les opérations vérifiées, les erreurs et le bilan de la session.
+
+Labfy copie les fichiers audio, images et LRC en vérifiant leur empreinte SHA-256. Les tags et les paroles intégrées suivent le fichier audio et les corrections locales en `.txt` restent dans leur dossier. Les répertoires masqués sont ignorés. Les caches Demucs et Turbo, les captures BlackBox et l’état technique de Kara résident normalement hors de la racine musicale. Si les répertoires XDG les placent dans la bibliothèque, Parole refuse les opérations qui les concernent. Le dossier de réception `A_trier` est également exclu de la confirmation.
+
+Le moteur utilise le verrou `.labfy-music.lock` partagé avec les publications d’import, le tri, les enrichissements et les regroupements d’artistes. Si une publication possède déjà le verrou, Labfy signale que la bibliothèque est occupée et un nouvel aperçu peut être demandé ensuite. Au moment de publier, le moteur vérifie les fichiers concernés. Il propage les renommages d’album identifiés avec sa référence commune. Si un ancien chemin Android risque de recréer un fichier sous un artiste regroupé ou de doubler sa copie, Parole signale le chemin à vérifier avant la confirmation.
 
 ## Possession et persistance
 
@@ -77,6 +87,8 @@ node tests/test-kara-tizen.js
 ```
 
 Pour les tests graphiques, utiliser `PAROLE_TEST_GTK=1` sur un bureau ou un compositeur de test avec bus D-Bus dédié. Les essais du 25 novembre 2026 ont utilisé un Sway headless, une bibliothèque temporaire et le mode silencieux. L’échantillon de 80 pistes réelles a été inventorié en lecture seule. Les deux moteurs locaux ont été exécutés sur une copie privée d’un morceau de 22,754 s déjà muni d’un LRC. Aucun son ni microphone physique n’a été utilisé.
+
+`PAROLE_TEST_GTK=1 python3 -B tests/test-parole-sync.py -v` exerce les échanges entre Parole et le moteur Labfy avec le simulateur ADB de Labfy et deux bibliothèques temporaires.
 
 | Mesure observée | Résultat |
 | --- | --- |

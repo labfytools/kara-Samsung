@@ -12,6 +12,7 @@
 - Conserver aussi l’artiste de discographie dans les demandes de salle enregistrées avant approbation.
 - Apprendre le délai et le taux de correspondance par langue, genre et forme de paroles. Allonger la temporisation lorsque des erreurs HTTP se répètent.
 - Réveiller la maintenance à l’admission des albums et enchaîner les tâches d’enrichissement prêtes.
+- Rétablir le bouton de synchronisation USB Labfy dans l’en-tête de Parole, avec aperçu, suivi des opérations vérifiées et bilan dans la catégorie `SYNC`.
 
 - Documenter dans `AGENTS.md` les périmètres de commit, les contrôles avant chaque commit et la séparation entre développement et agent de recherche Parole.
 - Conserver le parcours Kara V2 avec salle mobile, démarrage TV autonome, BlackBox, mixage et file d’import persistante commune au bureau et au mobile. Voir `docs/kara-v2.md` et `docs/parole-imports.md`.

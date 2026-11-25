@@ -25,7 +25,7 @@ STATES = {"absent": "Absent", "prêt": "Prêt", "partiel": "Partiel", "externe":
           "généré": "Généré", "local": "Local", "intégré": "Intégré", "à vérifier": "À vérifier",
           "obsolète": "Obsolète", "instrumental": "Instrumental", "inconnu": "Inconnu"}
 CATEGORY_COLORS = {"DOWNLOAD": "download", "TURBO": "compute", "DEMUCS": "compute", "CODEX": "compute",
-                   "SOURCE": "source", "SCAN": "source", "IDLE": "source", "SUCCESS": "success",
+                   "SOURCE": "source", "SCAN": "source", "SYNC": "source", "IDLE": "source", "SUCCESS": "success",
                    "WARNING": "warning", "ERROR": "error"}
 
 
@@ -393,6 +393,7 @@ class ParoleView:
                          tooltip_text="Connecter Kara à la télévision")
         self.tv.update_property([Gtk.AccessibleProperty.LABEL], ["Connecter Kara à la télévision"])
         header.pack_end(self.tv)
+        header.pack_end(self.control.music_sync.button)
         header.pack_end(button("Importer des albums", self.control.open_import, "folder-download-symbolic",
                                css_classes=["primary-action"]))
         return header
@@ -967,7 +968,7 @@ class ParoleView:
             b, "--pochettes-manquantes", "Pochettes manquantes")))
         general.append(button("Rechercher les paroles manquantes", lambda b: self.control.search_missing(
             b, "--paroles-manquantes", "Paroles manquantes")))
-        if self.control.music_sync.launcher and self.control.music_sync.launcher.is_file():
+        if self.control.music_sync.available():
             general.append(button("Synchroniser la bibliothèque sur USB", self.control.music_sync.open_settings))
         stack.add_titled(scroller(general), "general", "Maintenance")
         resources = new()
