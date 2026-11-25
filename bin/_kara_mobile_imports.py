@@ -161,12 +161,15 @@ class MobileImports:
             handle = data.get("handle")
             if not isinstance(handle, str) or data.get("rights") is not True:
                 raise RoomError("Choisis un import et confirme l’autorisation.")
+            selected_artist = None
             if data.get("all") is True:
                 discography = self.discographies.get(handle)
                 if discography is None:
                     raise RoomError("Rouvre la liste des albums de l’artiste.")
                 title = discography["name"] or "Discographie"
                 albums = discography["albums"]
+                if discography.get("name") and discography.get("artist_id"):
+                    selected_artist = discography["name"], discography["artist_id"]
                 track_count = None
                 requested = (name, None, False)
             else:
@@ -186,6 +189,8 @@ class MobileImports:
                 track_count = len(album["tracks"])
                 requested = (name, album, data["add"])
             targets = tuple((album["title"], f"https://music.youtube.com/browse/{album['id']}") for album in albums)
+            routes = ({url: (*selected_artist, album["id"]) for (_, url), album in zip(targets, albums)}
+                      if selected_artist else {})
             direct = data.get("direct") is True and data.get("all") is not True and data.get("add") is False
             urls = frozenset(url for _, url in targets)
             if self.queue is None:
@@ -205,6 +210,8 @@ class MobileImports:
             for existing in self.jobs.values():
                 if existing["state"] not in FINISHED and urls == existing["urls"]:
                     revised = {**existing, "requests": {**existing["requests"], member: requested}}
+                    if routes and existing["state"] == "approval":
+                        revised["artist_routes"] = {**routes, **existing.get("artist_routes", {})}
                     if direct and existing["state"] == "approval":
                         self.enqueue(revised)
                     else:
@@ -215,7 +222,7 @@ class MobileImports:
             job = {"id": identity, "title": title, "targets": targets, "urls": urls,
                    "tracks": track_count, "state": "approval", "progress": 0.,
                    "message": "En attente de l’organisateur",
-                   "requests": {member: requested}, "notes": {}, "results": {}}
+                   "requests": {member: requested}, "notes": {}, "results": {}, "artist_routes": routes}
             if direct:
                 self.enqueue(job)
             else:
@@ -229,7 +236,8 @@ class MobileImports:
         # poll. Commit the receipt and lot together before replying to mobile.
         revised = {**job, "state": "queued", "message": "Dans la file Parole"}
         try:
-            task_id = self.queue.enqueue(job["targets"], request=self.copy_for_storage(revised))
+            task_id = self.queue.enqueue(job["targets"], request=self.copy_for_storage(revised),
+                                         artist_routes=job.get("artist_routes"))
         except (OSError, sqlite3.Error) as error:
             raise RoomError("Impossible d’enregistrer ce lot dans Parole.", 503) from error
         job.update(revised, task_id=task_id)

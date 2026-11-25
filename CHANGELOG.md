@@ -9,6 +9,7 @@
 - Autoriser l’enrichissement pendant un transfert audio lorsque Kara est disponible.
 - Regrouper les dossiers d’édition de manière réversible, avec reçu de déplacement, associations par album et conservation des pistes et de leurs fichiers associés.
 - Ajouter la sélection multiple d’artistes, l’aperçu des fichiers, la confirmation et l’annulation dans Parole.
+- Conserver aussi l’artiste de discographie dans les demandes de salle enregistrées avant approbation.
 
 - Documenter dans `AGENTS.md` les périmètres de commit, les contrôles avant chaque commit et la séparation entre développement et agent de recherche Parole.
 - Conserver le parcours Kara V2 avec salle mobile, démarrage TV autonome, BlackBox, mixage et file d’import persistante commune au bureau et au mobile. Voir `docs/kara-v2.md` et `docs/parole-imports.md`.

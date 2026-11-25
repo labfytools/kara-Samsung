@@ -30,6 +30,8 @@ Le second essai utilise seize pistes de synthèse, des réponses contrôlées et
 
 Lors de la sélection d’un artiste YouTube Music, Parole conserve l’identité de l’artiste et les identifiants d’album obtenus depuis sa discographie. La file garde cette provenance après redémarrage. L’import vérifie l’identifiant d’album pendant la résolution et utilise le nom sélectionné pour le dossier. Le crédit d’album du catalogue et les crédits complets des pistes sont conservés indépendamment.
 
+Une demande de discographie créée depuis la salle conserve la même référence pendant l’attente d’approbation, même si le service redémarre.
+
 La comparaison des graphies ignore certaines différences de casse, accents et ponctuation dans le cadre d’une association déjà validée pour un album. Elle garde les collaborateurs dans la comparaison. Les offres voisines proposées par une recherche textuelle nécessitent leurs propres preuves.
 
 Le moteur de regroupement prévisualise chaque dossier d’édition et son nombre de pistes. Il déplace le dossier entier sous un artiste existant. En cas de collision, il attribue à l’édition déplacée un nom de dossier distinct. Le reçu persistant permet l’annulation ou la reprise après interruption. La file et les références canoniques suivent les chemins déplacés. Les journaux de publication historiques restent lisibles et leurs anciens chemins sont résolus depuis le reçu. Les tags et les fichiers associés sont conservés. Les préparations Kara compatibles sont réassociées par vérification de l’audio et des références.

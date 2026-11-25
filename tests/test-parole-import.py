@@ -14,6 +14,7 @@ import sys
 import time
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
+from types import SimpleNamespace
 import unittest
 from zipfile import ZipFile
 
@@ -23,6 +24,7 @@ FIXTURES = ROOT / "tests/fixtures/parole"
 sys.path.insert(0, str(BIN))
 from _kara_audio_identity import pcm_digest
 from _kara_import_local import local_target
+from _kara_mobile_imports import MobileImports
 from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
@@ -53,6 +55,24 @@ class QuietHTTP(SimpleHTTPRequestHandler):
 
 
 class QueueTests(unittest.TestCase):
+    def test_mobile_discography_approval_keeps_the_selected_artist(self):
+        private = Path(self.enterContext(TemporaryDirectory()))
+        queue = ImportQueue(private / "state", private)
+        control = SimpleNamespace(blackbox=SimpleNamespace(emit=lambda *args, **kwargs: None))
+        mobile = MobileImports(control)
+        mobile.bind_queue(queue)
+        artist_id = "UC" + "a" * 22
+        mobile.discographies["catalogue"] = {"artist_id": artist_id, "name": "Bob Marley",
+                                           "albums": [{"id": "MPREtest01", "title": "Exodus"}]}
+        request = mobile.request("fixture-session", "Organisateur",
+                                 {"handle": "catalogue", "all": True, "rights": True})
+        restarted = MobileImports(control)
+        restarted.bind_queue(queue)
+        job = restarted.jobs[request["job"]]
+        restarted.enqueue(job)
+        self.assertEqual(queue.routes(job["task_id"]),
+                         {"https://music.youtube.com/browse/MPREtest01": ("Bob Marley", artist_id, "MPREtest01")})
+
     def test_spelling_keys_preserve_collaborator_boundaries(self):
         for a, b in (("Bob Marley & The Wailers", "Bob Marley and the Wailers"),
                      ("Guy2bezbar", "GUY2BEZBAR"), ("R.E.M.", "R E M"),
