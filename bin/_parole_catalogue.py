@@ -9,8 +9,8 @@ API = "https://musicbrainz.org/ws/2/"
 MBID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
 
 
-def request(path, **params):
-    result = fetch(f"{API}{path}?{urlencode(dict(fmt='json', **params))}")
+def request(path, *, registry=None, **params):
+    result = fetch(f"{API}{path}?{urlencode(dict(fmt='json', **params))}", registry=registry, provider="MusicBrainz")
     if result is None:
         return {}
     if not isinstance(result, dict):

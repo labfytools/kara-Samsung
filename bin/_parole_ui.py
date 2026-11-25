@@ -10,7 +10,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 from _kara_party import Song
 from _kara_import import show_details
 from _parole_index import key, document, encoded_key, sidecar
-from _parole_sources import controls
+from _parole_sources import configure_limits, controls, provider_limits
 from _parole_resources import GIB
 from _parole_work import save_correction
 
@@ -843,7 +843,8 @@ class ParoleView:
             ("temperature", "Température maximale (°C)", 45, 95),
             ("gpu", "Charge GPU avant départ (%)", 0, 95), ("disk_busy", "Activité disque avant départ (%)", 1, 95),
             ("network_interval", "Intervalle entre opérations réseau (secondes)", 5, 900),
-            ("network_daily", "Opérations réseau par jour", 1, 500),
+            ("network_daily", "Recherches classiques par jour", 0, 500),
+            ("network_timeout", "Durée maximale par recherche classique (secondes)", 15, 300),
             ("heavy_daily", "Préparations anticipées par jour", 1, 100),
         ):
             number(resources, *spec)
@@ -940,7 +941,8 @@ class ParoleView:
             elif change == "patch":
                 self.maintenance.queue_import_patch(task)
             elif change == "retry":
-                self.index.enqueue("codex", identity, task["revision"], 15, json.loads(task["payload"]), force=True)
+                payload = dict(json.loads(task["payload"]), manual=True)
+                self.index.enqueue("codex", identity, task["revision"], 15, payload, force=True)
                 self.maintenance.wake.set()
             else:
                 with self.index.db() as db:
@@ -993,6 +995,8 @@ class ParoleView:
                                                                 ensure_ascii=False, indent=2))
             elif mode == "check":
                 self.source_validation(source, config)
+            elif mode == "limits":
+                self.source_rate_dialog(source, config)
             elif mode == "adapter":
                 if self.maintenance.queue_adapter(source):
                     self.settings("codex")
@@ -1010,7 +1014,34 @@ class ParoleView:
         ):
             actions.append(button(label, lambda w, m=mode: action(w, m)))
         area.append(button("Actualiser", refresh))
+        area.append(button("Limites du fournisseur sélectionné…", lambda w: action(w, "limits")))
         refresh()
+
+    def source_rate_dialog(self, source, config):
+        daily, seconds = provider_limits(config)
+        window = Gtk.Window(title=f"Limites · {source['name']}", transient_for=self.settings_dialog,
+                            modal=True, destroy_with_parent=True, default_width=520)
+        panel = box(css_classes=["panel-content"])
+        daily_spin = Gtk.SpinButton.new_with_range(0, 2000, 1)
+        seconds_spin = Gtk.SpinButton.new_with_range(0, 300, 1)
+        for label, spin, value in (("Requêtes HTTP de maintenance par jour", daily_spin, daily),
+                                   ("Intervalle minimal (secondes)", seconds_spin, seconds)):
+            line = box(Gtk.Orientation.HORIZONTAL)
+            line.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+            spin.set_value(value)
+            line.append(spin)
+            panel.append(line)
+        panel.append(Gtk.Label(label="Un quota de 0 met les requêtes en pause. Le délai du fournisseur reste prioritaire.",
+                               xalign=0, wrap=True, css_classes=["muted"]))
+
+        def save(_):
+            configure_limits(self.index, source["id"], daily_spin.get_value_as_int(), seconds_spin.get_value_as_int())
+            self.maintenance.wake.set()
+            window.close()
+
+        panel.append(button("Enregistrer", save))
+        window.set_child(panel)
+        window.present()
 
     def source_validation(self, source, config):
         title = source["name"]

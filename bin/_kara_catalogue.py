@@ -1,5 +1,6 @@
 """Catalogue d’albums YouTube Music et contrôle d’import de kara."""
 import json
+import os
 import re
 import subprocess
 import sys
@@ -21,6 +22,14 @@ def client():
     from requests import Session
     from ytmusicapi import YTMusic
 
+    registry = None
+    if os.environ.get("KARA_PAROLE_COVER") == "1":
+        from _kara_paths import music_library
+        from _parole_index import Index
+        from _parole_sources import wait_provider
+
+        registry = Index(music_library())
+
     class CatalogueSession(Session):
         def request(self, method, url, **options):
             from email.utils import parsedate_to_datetime
@@ -29,7 +38,10 @@ def client():
 
             # Desktop suggestions, mobile lookup, covers and imports share
             # pacing with yt-dlp. A Retry-After applies to the next callers too.
-            wait_service("youtube", 0.5)
+            if registry is not None:
+                wait_provider(registry, "YouTube Music", "youtube", .8, max_wait=12)
+            else:
+                wait_service("youtube", 0.5)
             options.setdefault("timeout", (5, 12))
             try:
                 response = super().request(method, url, **options)

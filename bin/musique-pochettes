@@ -49,14 +49,25 @@ class HttpsOnly(HTTPRedirectHandler):
 
 
 class Catalog:
-    def __init__(self):
+    def __init__(self, registry=None):
         self.opener = build_opener(HttpsOnly)
+        self.registry = registry
     def get(self, url, limit):
         host = urlsplit(url).hostname
         request = Request(url, headers={"User-Agent": "MusiquePochettes/1.1"})
         for delay in (2, 5, None):
             try:
-                wait_service(host, SOURCE_INTERVALS.get(host, 0.15), max_wait=30)
+                interval = SOURCE_INTERVALS.get(host, 0.15)
+                if self.registry:
+                    from _parole_sources import COVER_PROVIDERS, wait_provider
+
+                    provider = COVER_PROVIDERS.get(host)
+                    if provider is not None:
+                        wait_provider(self.registry, provider, host, interval, max_wait=12)
+                    else:
+                        wait_service(host, interval, max_wait=30)
+                else:
+                    wait_service(host, interval, max_wait=30)
             except ImportIssue as error:
                 raise OSError(str(error)) from error
             try:
@@ -175,7 +186,6 @@ class Catalog:
 
 
     def youtube_music_cover(self, artist, album, count, urls):
-        self.wait_source("music.youtube.com")
         result = subprocess.run(
             catalogue_command("pochette", album, artist, str(count), *urls),
             capture_output=True, encoding="utf-8", timeout=55,
@@ -474,7 +484,13 @@ def main():
         except ValueError as error:
             parser.error(str(error))
 
-    catalog = Catalog() if args.en_ligne else None
+    registry = None
+    if args.en_ligne and os.environ.get("KARA_PAROLE_COVER") == "1":
+        from _parole_index import Index
+
+        os.environ["KARA_MUSIC_LIBRARY"] = str(root)
+        registry = Index(root)
+    catalog = Catalog(registry) if args.en_ligne else None
     if args.manquantes:
         os.environ.setdefault("KARA_SHARED_WAIT", "suivi" if args.suivi_activite else "texte")
         with shared_mutation(root):

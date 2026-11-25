@@ -128,6 +128,14 @@ class InventoryTests(Fixture):
 
 
 class QueueTests(Fixture):
+    def test_final_lookup_and_classic_queue_share_persistent_budget_and_spacing(self):
+        self.index.enqueue("lyrics", "song", "fixture", now=10)
+        self.assertTrue(self.index.reserve_daily("network", 2, now=10, gap=20))
+        self.assertIsNone(self.index.claim(("lyrics",), 29, bucket="network", limit=2, gap=20))
+        self.assertIsNotNone(self.index.claim(("lyrics",), 30, bucket="network", limit=2, gap=20))
+        self.assertFalse(self.index.reserve_daily("network", 2, now=90, gap=20))
+        self.assertFalse(self.index.reserve_daily("network", 0, now=100_000, gap=20))
+
     def test_automatic_codex_is_opt_in_and_manual_claims_remain_available(self):
         self.assertFalse(self.index.settings()["codex_auto"])
         self.index.enqueue("codex", "automatic", "rev", priority=10, now=5)
@@ -224,6 +232,25 @@ class CatalogueTests(unittest.TestCase):
 
 
 class SourceTests(Fixture):
+    def test_provider_quotas_and_intervals_are_independent(self):
+        from _parole_sources import ProviderUnavailable, configure_limits, wait_provider
+
+        seed(self.index)
+        configure_limits(self.index, "LRCLIB", 1, 6)
+        configure_limits(self.index, "MusicBrainz", 2, 0)
+        with patch("_parole_sources.wait_service") as host:
+            wait_provider(self.index, "LRCLIB", "lrclib.net", .75)
+            host.assert_called_with("lrclib.net", 6, max_wait=5)
+            with self.assertRaises(ProviderUnavailable):
+                wait_provider(self.index, "LRCLIB", "lrclib.net", .75)
+            wait_provider(self.index, "MusicBrainz", "musicbrainz.org", 1.2)
+            host.assert_called_with("musicbrainz.org", 1.2, max_wait=5)
+            controls(self.index, "MusicBrainz", "disabled")
+            host.reset_mock()
+            with self.assertRaises(ProviderUnavailable):
+                wait_provider(self.index, "MusicBrainz", "musicbrainz.org", 1.2)
+            host.assert_not_called()
+
     def response(self, source):
         return {"research_id": "id", "identification": "Chanson", "status": "found", "sources": [source],
                 "missing": [], "matches": [], "contradictions": [], "confidence": "high", "proposal": "", "restrictions": []}
@@ -281,7 +308,9 @@ class SourceTests(Fixture):
                      "sha256": sha256(text.encode()).hexdigest() if title != "Fausse" else None}
                     for title in ("Chanson", "Autre", "Fausse")]
 
-        def lookup(_, title, *_args):
+        def lookup(_, title, *_args, **transport):
+            self.assertIs(transport["registry"], self.index)
+            self.assertEqual(transport["provider"], identity)
             return [{**record, "trackName": title}] if title != "Fausse" else []
 
         endpoint = LyricsEndpoint("lyrics.example.org", "/api/search")

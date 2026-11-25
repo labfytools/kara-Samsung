@@ -1,6 +1,7 @@
 """Exécute une opération bornée avec les moteurs de la bibliothèque."""
 import json
 from collections import defaultdict
+from functools import partial
 from importlib.machinery import SourceFileLoader
 import math
 import os
@@ -13,7 +14,7 @@ from _kara_audio_identity import pcm_digest
 from _kara_paths import BIN, music_library
 from _kara_prepare import file_token
 from _musique_oz import shared_mutation
-from _parole_catalogue import check_album, check_discography, check_recording, MBID
+from _parole_catalogue import check_album, check_discography, check_recording, request, MBID
 from _parole_index import Index, document, key, sidecar
 from _parole_sources import ProviderUnavailable, LyricsEndpoint, validate_endpoint, record, fetch
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
@@ -103,7 +104,7 @@ def edition(index, identity):
             return "excluded", {}
         associations = [r[0] for r in db.execute("SELECT old_artist FROM associations WHERE album=? AND new_artist=?",
                                                 (local[0]["album"], local[0]["owner"]))]
-    return check_album(local, associations)
+    return check_album(local, associations, lookup=partial(request, registry=index))
 
 
 def discography(index, owner, settings):
@@ -129,7 +130,8 @@ def discography(index, owner, settings):
         artist_ids.update(artist_id for artist_id, groups in proofs.items() if len(groups) >= 2)
     identity = next(iter(artist_ids)) if len(artist_ids) == 1 else ""
     state, found = check_discography(identity, {r.get("release_group") for r in known},
-                                     {key(r["album"]) for r in rows}, settings["releases"])
+                                     {key(r["album"]) for r in rows}, settings["releases"],
+                                     lookup=partial(request, registry=index))
     if "missing" in found:
         found["missing"] = [r for r in found["missing"] if r["id"] not in excluded]
     found["artist_id"] = identity
@@ -146,8 +148,9 @@ def cover(index, subject):
     folder = Path(row["path"]).parent
     if folder.resolve(strict=True) != folder or len(folder.relative_to(index.root).parts) != 2:
         return "excluded"
-    result = subprocess.run([str(BIN / "musique-pochettes"), "--manquantes", "--en-ligne", "--suivi-activite", "--", str(folder)],
-                            env=dict(os.environ, KARA_IMPORT_PROCESSING="1"), stdout=subprocess.PIPE,
+    result = subprocess.run([str(BIN / "musique-pochettes"), "--bibliotheque", str(index.root),
+                             "--manquantes", "--en-ligne", "--suivi-activite", "--", str(folder)],
+                            env=dict(os.environ, KARA_IMPORT_PROCESSING="1", KARA_PAROLE_COVER="1"), stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, timeout=110)
     if result.returncode:
         return "temporary"
@@ -166,7 +169,7 @@ def verify_documentation(index, subject):
     if not addresses:
         return "missing"
     for url in sorted(addresses):
-        if fetch(url, accept="text/html") is None:
+        if fetch(url, accept="text/html", registry=index, provider=subject, validation=True) is None:
             return "missing"
     with index.db() as db:
         from time import time
@@ -212,7 +215,8 @@ def main():
                     title = tags.get("title") or sub(r"^\d{1,3}\s*-\s*", "", song["title"])
                     artist = tags.get("artist") or (parts[0] if len(parts) >= 3 else "")
                     album = tags.get("album") or (parts[1] if len(parts) >= 3 else "")
-                    state, value = check_recording(tags, title, artist, album, song["duration"])
+                    state, value = check_recording(tags, title, artist, album, song["duration"],
+                                                   lookup=partial(request, registry=index))
                     if state == "identified":
                         value["token"] = song["token"]
                 else:

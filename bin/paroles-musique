@@ -82,8 +82,17 @@ class RequestGate:
         self.lock = Lock()
         self.next_request = 0.0
         self.paused = False
+        self.provider = None
 
     def wait(self, host):
+        if self.provider is not None:
+            from _parole_sources import ProviderUnavailable, wait_provider
+
+            try:
+                wait_provider(*self.provider, host, self.interval, max_wait=12)
+                return True
+            except ProviderUnavailable as error:
+                raise ServiceUnavailable(str(error), "limited") from error
         if os.environ.get("KARA_IMPORT_PROCESSING"):
             try:
                 wait_service(host, self.interval, max_wait=30)
@@ -102,7 +111,7 @@ class RequestGate:
             time.sleep(delay)
 
     def defer(self, host, delay):
-        if os.environ.get("KARA_IMPORT_PROCESSING"):
+        if self.provider is not None or os.environ.get("KARA_IMPORT_PROCESSING"):
             defer_service(host, delay)
             return
         with self.lock:
@@ -625,6 +634,7 @@ class LyricsSources:
             started = time.monotonic()
             client.failure = None
             client.strict = strict
+            client.gate.provider = (registry, name) if registry else None
             try:
                 value = client.find(*signature, local_text) if kwargs is None else client.find(*signature, **kwargs)
             except ServiceUnavailable as error:
@@ -651,7 +661,8 @@ class LyricsSources:
                     continue
                 started = time.monotonic()
                 try:
-                    response = LyricsEndpoint(conf["host"], conf["path"]).search(title, artist, album)
+                    response = LyricsEndpoint(conf["host"], conf["path"]).search(
+                        title, artist, album, registry=registry, provider=row["id"])
                     value = best_transcript(response, *signature, synced=synced, strict=strict)
                 except AmbiguousLyrics:
                     ambiguous = True

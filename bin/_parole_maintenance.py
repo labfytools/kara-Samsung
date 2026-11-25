@@ -523,8 +523,13 @@ class Maintenance:
             if saved.pop("revision", None) == revision:
                 return saved
 
+        if ((settings["lrc"] or settings["generate"] and settings["lyrics"] and not local_text.strip())
+                and not self.index.reserve_daily("network", settings["network_daily"], gap=settings["network_interval"])):
+            return {"state": "limited"}
+
         def lookup(kind):
-            _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]], 145,
+            _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]],
+                                  settings["network_timeout"],
                                   maximum=6 * MAX_LRC_BYTES + 1024)
             return json.loads(data)
 
@@ -745,7 +750,7 @@ class Maintenance:
                 result = ("done", "nettoyé", 0)
             else:
                 _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
-                                      timeout=220 if kind == "source" else 145)
+                                      timeout=220 if kind == "source" else self.current_settings["network_timeout"])
                 value = json.loads(data)
                 if kind in ("lyrics", "lrc"):
                     result = self.do_song(task, value)
@@ -941,8 +946,10 @@ class Maintenance:
         kinds = [kind for kind in NETWORK if flags.get(kind, kind) is None or settings[flags.get(kind, kind)]]
         if (not settings["codex"] or now < settings.get("codex_suspended_until", 0)) and "codex" in kinds:
             kinds.remove("codex")
-        manual = self.index.claim(kinds, now, bucket="network", limit=settings["network_daily"], high=True,
-                                  codex_auto=settings["codex_auto"])
+        manual = self.index.claim(("codex",), now, high=True, codex_auto=settings["codex_auto"]) if "codex" in kinds else None
+        if manual is None:
+            manual = self.index.claim(tuple(kind for kind in kinds if kind != "codex"), now, bucket="network",
+                                      limit=settings["network_daily"], high=True, gap=settings["network_interval"])
         if manual is not None:
             self.next_network = now + settings["network_interval"]
             self.execute(manual)
@@ -956,7 +963,8 @@ class Maintenance:
             if kind not in kinds:
                 continue
             task = self.index.claim((kind,), now, bucket="network" if kind != "codex" else None,
-                                    limit=settings["network_daily"], codex_auto=settings["codex_auto"])
+                                    limit=settings["network_daily"], codex_auto=settings["codex_auto"],
+                                    gap=settings["network_interval"])
             if task is not None:
                 self.next_network = now + settings["network_interval"]
                 self.execute(task)

@@ -26,7 +26,7 @@ DEFAULTS = {
     "codex_model": "", "codex_effort": "low",
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
-    "gpu": 15, "disk_busy": 25, "network_interval": 20, "network_daily": 24, "heavy_daily": 3,
+    "gpu": 15, "disk_busy": 25, "network_interval": 20, "network_daily": 24, "network_timeout": 145, "heavy_daily": 3,
     "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
     "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,
     "night_idle": 420, "night_cpu_temperature": 78, "night_gpu_temperature": 75,
@@ -204,17 +204,46 @@ class Index:
         with self.db() as db:
             db.execute("UPDATE tasks SET state='suspended' WHERE state='running'")
 
-    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True):
+    @staticmethod
+    def can_reserve(db, bucket, day, now, limit, gap):
+        if limit <= 0:
+            return False
+        used = db.execute("SELECT used FROM daily_usage WHERE bucket=? AND day=?", (bucket, day)).fetchone()
+        if used and used[0] >= limit:
+            return False
+        if gap:
+            stamp = db.execute("SELECT value FROM settings WHERE key=?", ("network_last_" + bucket,)).fetchone()
+            if stamp and now < float(stamp[0]) + gap:
+                return False
+        return True
+
+    @staticmethod
+    def reserve(db, bucket, day, now, gap):
+        db.execute("""INSERT INTO daily_usage VALUES(?,?,1) ON CONFLICT(bucket,day)
+                      DO UPDATE SET used=used+1""", (bucket, day))
+        db.execute("DELETE FROM daily_usage WHERE day<date(?,'-31 days')", (day,))
+        if gap:
+            db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", ("network_last_" + bucket, document(now)))
+
+    def reserve_daily(self, bucket, limit, *, now=None, gap=0):
+        now = time() if now is None else now
+        day = date.fromtimestamp(now).isoformat()
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self.can_reserve(db, bucket, day, now, limit, gap):
+                return False
+            self.reserve(db, bucket, day, now, gap)
+            return True
+
+    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             day = date.fromtimestamp(now).isoformat()
-            if bucket:
-                used = db.execute("SELECT used FROM daily_usage WHERE bucket=? AND day=?", (bucket, day)).fetchone()
-                if used and used[0] >= limit:
-                    return None
+            if bucket and not self.can_reserve(db, bucket, day, now, limit, gap):
+                return None
             task = db.execute(f"""
                 UPDATE tasks SET state='running', updated=?, attempts=attempts+1
                 WHERE rowid=(SELECT rowid FROM tasks WHERE kind IN ({placeholders})
@@ -225,9 +254,7 @@ class Index:
                 RETURNING *
             """, (now, *kinds, now, high, codex_auto, now)).fetchone()
             if bucket and task is not None:
-                db.execute("""INSERT INTO daily_usage VALUES(?,?,1) ON CONFLICT(bucket,day)
-                              DO UPDATE SET used=used+1""", (bucket, day))
-                db.execute("DELETE FROM daily_usage WHERE day<date(?,'-31 days')", (day,))
+                self.reserve(db, bucket, day, now, gap)
             return task
 
     def finish(self, task, state, detail="", delay=0):

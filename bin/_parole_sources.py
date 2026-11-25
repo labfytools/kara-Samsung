@@ -23,14 +23,62 @@ BUILTINS = {
     "LyricDown": ("lyricdown.com", "lrc", ""),
     "YouTube Music": ("music.youtube.com", "catalogue,cover,import", ""),
     "MusicBrainz": ("musicbrainz.org", "catalogue,discography", "https://musicbrainz.org/doc/MusicBrainz_API"),
+    "Cover Art Archive": ("coverartarchive.org", "cover", ""),
+    "Deezer": ("api.deezer.com", "cover", ""),
+    "Apple Music": ("itunes.apple.com", "cover", ""),
+    "TheAudioDB": ("www.theaudiodb.com", "cover", ""),
 }
 HOST = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}")
 PATH = re.compile(r"/[a-zA-Z0-9_/-]{0,200}")
 MAX_RESPONSE = 1_000_000
+DEFAULT_REQUESTS = 200
+COVER_PROVIDERS = {host: identity for identity, (host, category, _) in BUILTINS.items()
+                   if "cover" in category or identity == "MusicBrainz"}
 
 
 class ProviderUnavailable(OSError):
     pass
+
+
+def provider_limits(config):
+    limits = config.get("rate", {})
+    daily, seconds = limits.get("daily", DEFAULT_REQUESTS), limits.get("seconds", 0)
+    if type(daily) is not int or not 0 <= daily <= 2000 or type(seconds) is not int or not 0 <= seconds <= 300:
+        raise ValueError("Limites de recherche fournisseur invalides")
+    return daily, seconds
+
+
+def configure_limits(index, identity, daily, seconds):
+    limits = {"daily": daily, "seconds": seconds}
+    provider_limits({"rate": limits})
+    with index.db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT config FROM sources WHERE id=?", (identity,)).fetchone()
+        if not row:
+            raise ValueError("Fournisseur inconnu")
+        config = json.loads(row[0])
+        config["rate"] = limits
+        db.execute("UPDATE sources SET config=? WHERE id=?", (document(config), identity))
+
+
+def wait_provider(index, identity, host, interval, *, max_wait=5, validation=False):
+    with index.db() as db:
+        row = db.execute("SELECT state,config FROM sources WHERE id=?", (identity,)).fetchone()
+    if not row or (row["state"] != "active" and not (validation and row["state"] != "excluded")):
+        raise ProviderUnavailable("Fournisseur désactivé")
+    daily, configured = provider_limits(json.loads(row["config"]))
+    if not daily:
+        raise ProviderUnavailable("Limite quotidienne du fournisseur atteinte")
+    try:
+        # The host gate already coordinates separate clients and import
+        # accesses. Settings can raise each protocol's minimum interval.
+        wait_service(host, max(interval, configured), max_wait=max_wait)
+    except ImportIssue as error:
+        raise ProviderUnavailable("Temporisation fournisseur") from error
+    if not validation and not index.source_enabled(identity):
+        raise ProviderUnavailable("Fournisseur désactivé pendant la temporisation")
+    if not index.reserve_daily("provider:" + identity, daily):
+        raise ProviderUnavailable("Limite quotidienne du fournisseur atteinte")
 
 
 def public_url(url):
@@ -73,13 +121,16 @@ class PinnedHTTPS(http.client.HTTPSConnection):
             raise
 
 
-def fetch(url, *, interval=1.2, accept="application/json"):
+def fetch(url, *, interval=1.2, accept="application/json", registry=None, provider=None, validation=False):
     parts = public_url(url)
-    service = "parole-" + parts.hostname
-    try:
-        wait_service(service, interval, max_wait=5)
-    except ImportIssue as error:
-        raise ProviderUnavailable("Temporisation fournisseur") from error
+    service = parts.hostname if registry is not None else "parole-" + parts.hostname
+    if registry is not None:
+        wait_provider(registry, provider, service, interval, validation=validation)
+    else:
+        try:
+            wait_service(service, interval, max_wait=5)
+        except ImportIssue as error:
+            raise ProviderUnavailable("Temporisation fournisseur") from error
     connection = PinnedHTTPS(parts.hostname, timeout=5, context=ssl.create_default_context())
     deadline = monotonic() + 12
     try:
@@ -155,8 +206,9 @@ def controls(index, identity, action):
             if action == "active" and source["state"] != "active":
                 # Retry gradually through the same bounded scheduler.
                 db.execute("""UPDATE tasks SET state='queued', due=?
-                    WHERE kind IN ('lyrics','lrc') AND state='review'
-                    AND detail='not_found'""", (time(),))
+                    WHERE state='review' AND (
+                         kind IN ('lyrics','lrc') AND detail='not_found'
+                         OR kind='prepare' AND detail='référence fiable absente')""", (time(),))
         else:
             return
         db.execute("INSERT INTO source_history VALUES(?,?,?)", (time(), identity, action))
@@ -172,9 +224,9 @@ class LyricsEndpoint:
         if not PATH.fullmatch(self.path) or "//" in self.path:
             raise ValueError("Point d’accès LRCLIB invalide")
 
-    def search(self, title, artist, album, interval=1.2):
+    def search(self, title, artist, album, interval=1.2, **transport):
         query = urlencode({"track_name": title, "artist_name": artist, "album_name": album or ""})
-        result = fetch(f"https://{self.host}{self.path}?{query}", interval=interval)
+        result = fetch(f"https://{self.host}{self.path}?{query}", interval=interval, **transport)
         if result is None:
             return []
         if not isinstance(result, list) or len(result) > 100:
@@ -191,11 +243,12 @@ def validate_endpoint(index, identity, endpoint, terms, fixtures, match, *, acti
     if len(fixtures) < 3 or len(fixtures) > 8 or sum(f["sha256"] is None for f in fixtures) < 1 or sum(
             f["sha256"] is not None for f in fixtures) < 2:
         raise ValueError("Deux résultats positifs et un résultat négatif sont requis")
-    if fetch(terms, accept="text/html") is None:
+    if fetch(terms, accept="text/html", registry=index, provider=identity, validation=True) is None:
         raise ValueError("Conditions d’utilisation introuvables")
     for fixture in fixtures:
         title, artist, album, duration = fixture["title"], fixture["artist"], fixture["album"], fixture["duration"]
-        value = match(endpoint.search(title, artist, album), title, artist, album,
+        value = match(endpoint.search(title, artist, album, registry=index, provider=identity, validation=True),
+                      title, artist, album,
                       duration, fixture.get("album_artist"), synced=fixture["synced"])
         hashed = sha256(value.encode()).hexdigest() if value else None
         if hashed != fixture["sha256"]:
