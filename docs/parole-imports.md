@@ -78,6 +78,8 @@ Le réglage **Lots simultanés** accepte de 1 à 8 lots et vaut 4 à la premièr
 
 Diminuer la concurrence laisse les lots actifs se terminer. Le panneau d’import et la salle indiquent les lots actifs, suspendus ou en attente, les albums terminés, les pistes traitées, les erreurs et l’avancement. La progression globale répartit le travail par album.
 
+La liste d’import occupe l’espace disponible entre les statistiques et le bouton **Historique**. Agrandir la fenêtre affiche davantage de lots. Les résultats de recherche gardent leur propre zone de défilement.
+
 Chaque lot travaille sur un album à la fois. Les lots partagent trois places de téléchargement avec conversion, deux places de préparation de catalogue et deux places de traitement. Chaque lot soumet au plus deux téléchargements à la fois. Le téléchargeur utilise un fragment par piste et limite le débit de chaque transfert à 512 Kio/s. La recherche de pochettes et de paroles s’effectue hors du verrou global. Le tri, la publication et la vérification de la version du fichier au moment de l’écriture utilisent ce verrou. La temporisation par fournisseur est partagée entre les processus. L’import conserve les mécanismes d’accès existants aux sources.
 
 La file exige 64 Mio libres dans l’espace d’état. L’admission d’un import audio conserve 2 Gio libres dans la bibliothèque, avec 1,5 Gio de marge supplémentaire pour les transferts et leurs fichiers temporaires. Le moteur surveille l’espace pendant les transferts et limite la taille annoncée d’une piste à 256 Mio. Les lots en attente restent enregistrés lorsque la bibliothèque manque d’espace.

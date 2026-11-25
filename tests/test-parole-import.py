@@ -1441,6 +1441,68 @@ panel.closing = True
                        env=dict(self.env, GTK_A11Y="none"), timeout=35, check=True)
 
     @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK"), "set PAROLE_TEST_GTK=1 in a GTK session")
+    def test_import_window_uses_available_height_with_a_long_queue(self):
+        validation = """
+import runpy
+import time
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+from _kara_import import AlbumImport
+
+controller = runpy.run_path("BIN/paroles-strawberry", run_name="parole_layout_fixture")["LyricsWindow"]
+owner = Gtk.Window()
+owner.album_import = panel = AlbumImport()
+owner.import_window = None
+owner.import_toggle = Gtk.ToggleButton()
+owner.import_toggle.connect("toggled", panel.toggle)
+panel.queue.configure(paused=True)
+with panel.queue.connect(write=True) as db:
+    for number in range(350):
+        panel.queue.enqueue([(f"Lot {number}", f"https://www.youtube.com/playlist?list=LAYOUT{number}")], db=db)
+panel.launch_next(force=True)
+owner.present()
+controller.open_import(owner)
+window = owner.import_window
+assert window.get_child() is panel
+adjustment = panel.import_view.get_vadjustment()
+context = GLib.MainContext.default()
+deadline = time.monotonic() + 3
+while not panel.import_view.get_mapped() and time.monotonic() < deadline:
+    context.iteration(False)
+    time.sleep(.01)
+
+def layout(height):
+    # Exercise GTK size allocation independently of a compositor's tiling
+    # policy. A tiled Wayland toplevel can ignore application size requests.
+    window.allocate(900, height, -1, None)
+    return adjustment.get_page_size()
+
+short = layout(440)
+tall = layout(820)
+assert tall > short + 250, (short, tall)
+assert adjustment.get_upper() > tall
+assert len(panel.by_id) == 350
+footer = panel.history_button.compute_bounds(window)[1]
+assert footer.get_y() + footer.get_height() > window.get_height() - 40
+with panel.queue.connect(write=True) as db:
+    db.execute("UPDATE jobs SET state='cancelled'")
+panel.launch_next(force=True)
+context = GLib.MainContext.default()
+deadline = time.monotonic() + 3
+while panel.import_view.get_vscrollbar().get_child_visible() and time.monotonic() < deadline:
+    while context.pending():
+        context.iteration(False)
+    time.sleep(.01)
+assert adjustment.get_upper() <= adjustment.get_page_size()
+assert not panel.import_view.get_vscrollbar().get_child_visible()
+window.destroy()
+owner.destroy()
+""".replace("BIN/paroles-strawberry", str(BIN / "paroles-strawberry"))
+        subprocess.run(["dbus-run-session", "--", sys.executable, "-B", "-c", validation], cwd=self.temp,
+                       env=dict(self.env, PYTHONPATH=str(BIN), GTK_A11Y="none"), timeout=20, check=True)
+
+    @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK"), "set PAROLE_TEST_GTK=1 in a GTK session")
     def test_history_window_multiselect_success_filter_and_confirmation(self):
         validation = """
 import gi

@@ -412,9 +412,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.import_window = Gtk.Window(title="Importer des albums", transient_for=self,
                                             destroy_with_parent=True, hide_on_close=True,
                                             default_width=980, default_height=630)
-            scroll = Gtk.ScrolledWindow(vexpand=True)
-            scroll.set_child(self.album_import)
-            self.import_window.set_child(scroll)
+            self.import_window.set_child(self.album_import)
         self.import_toggle.set_active(True)
         self.import_window.present()
 

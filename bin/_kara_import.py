@@ -110,7 +110,8 @@ class AlbumImport(Gtk.Revealer):
             self.queue = None
             self.queue_error = str(error)
 
-        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["album-import"])
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, hexpand=True, vexpand=True,
+                        css_classes=["album-import"])
         self.set_child(panel)
         form = Gtk.Box(spacing=8)
         panel.append(form)
@@ -196,8 +197,11 @@ class AlbumImport(Gtk.Revealer):
             self.concurrency.set_sensitive(False)
             self.queue_status.set_text(f"File indisponible · {self.queue_error}")
         self.import_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.import_view = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
-                                              propagate_natural_height=True, max_content_height=185, visible=False)
+        # The imports own the remaining height. Search results have their
+        # own bounded viewport so the controls and footer stay accessible.
+        self.import_view = Gtk.ScrolledWindow(hexpand=True, vexpand=True,
+                                              hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                              vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
         self.import_view.set_child(self.import_rows)
         panel.append(self.import_view)
         self.history_button = Gtk.Button(label="Historique", halign=Gtk.Align.END, sensitive=self.queue is not None)
@@ -843,7 +847,6 @@ class AlbumImport(Gtk.Revealer):
         job.update_counts()
         job.on_update = self.changed
         self.import_rows.prepend(job)
-        self.import_view.set_visible(True)
         return job
 
     def changed(self, job, kind, payload):
@@ -949,7 +952,6 @@ class AlbumImport(Gtk.Revealer):
                 self.import_rows.remove(job)
                 self.imports.remove(job)
                 self.by_id.pop(job.identity)
-        self.import_view.set_visible(bool(self.imports))
         self.update_queue_summary(capacity, inbox, limitation)
 
     def update_queue_summary(self, capacity, inbox, limitation):
