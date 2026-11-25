@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Préserver l’exécution de la maintenance quand une recherche est préparée à partir d’une édition ou d’une piste manquante.
+
 - Régler le plafond global des téléchargements audio entre 1 et 20, avec priorité manuelle, adaptation à la cadence et aux ressources, et statistiques de transfert mesurées.
 
 - Alimenter les créneaux de transfert par piste depuis plusieurs albums du même lot, avec publication audio et enrichissement indépendants.

@@ -232,6 +232,19 @@ class CatalogueTests(unittest.TestCase):
 
 
 class SourceTests(Fixture):
+    def test_maintenance_queries_use_track_review_and_fall_back_to_tags(self):
+        self.audio()
+        self.scan()
+        song, = self.songs()
+        maint = Maintenance(self.root, None, state=self.base / "state")
+        self.addCleanup(maint.close)
+        self.assertEqual(maint.query("lyrics", song["id"])["release_id"], song["release_id"])
+        self.assertEqual(maint.query("track", song["edition"])["missing_tracks"], [])
+        maint.index.review("album", song["edition"], "incomplete", {"id": RELEASE, "missing": [[1, 2, "Outro"]]})
+        query = maint.query("track", song["edition"])
+        self.assertEqual(query["release_id"], RELEASE)
+        self.assertEqual(query["missing_tracks"], [[1, 2, "Outro"]])
+
     def test_provider_quotas_and_intervals_are_independent(self):
         from _parole_sources import ProviderUnavailable, configure_limits, wait_provider
 

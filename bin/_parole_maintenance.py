@@ -388,6 +388,9 @@ class Maintenance:
                       if kind == "track" else None)
         if row is None:
             return None
+        # Track searches use the persisted edition review. Ordinary
+        # maintenance queries can fall back to the release tag in Strawberry.
+        release = json.loads(review["value"]) if review else {}
         revision = encoded_key(kind, subject, row["token"] if kind not in ("discography", "album", "cover") else "")
         return {"research_id": revision, "kind": kind, "artist": (row["owner"] if kind in ("discography", "album", "cover") else row["artist"])[:180],
                 "title": event_text(row["title"])[:180] if kind not in ("discography", "album", "cover") else "",
