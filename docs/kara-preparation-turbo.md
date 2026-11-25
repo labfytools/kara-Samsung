@@ -6,6 +6,10 @@ Dans **Joueurs**, chaque joueur choisit un fichier du catalogue Strawberry, puis
 
 La fenêtre **Préparer des chansons** permet d’alimenter le même cache hors partie. **Relancer l’analyse Turbo** reprend le travail local si une référence valide existe. Pour un titre dont la référence a été refusée, cette action relance le traitement. Hors mode jeu, **Minutage** permet d’afficher le LRC d’origine pour comparer le défilement ou revenir au calage source à l’écran. Le traitement utilise les fichiers existants, sans passer par Strawberry, GStreamer, un périphérique audio ou le micro. Un LRC local lisible est prioritaire. Pour un titre sans LRC, le résolveur de Parole peut obtenir des paroles minutées à partir des métadonnées et de la durée. Cette recherche conserve sa réponse dans la préparation et laisse le fichier audio et la bibliothèque intacts.
 
+Parole peut également transmettre une référence textuelle sans minutage à Turbo, après sa dernière recherche de LRC. Les mots sont associés aux observations en ordre monotone. Une ligne sans premier mot corroboré garde un début inconnu lors des reprises locales. La génération publie un fichier adjacent exclusivement si chaque ligne dispose d’un repère acoustique et si le manifeste satisfait les critères de notation Kara. L’écriture atomique refuse un LRC apparu entre-temps. Le manifeste conserve l’empreinte du texte d’origine.
+
+Les nouveaux reçus peuvent enregistrer une empreinte PCM comprenant l’ordre des canaux et le taux d’échantillonnage. Elle permet la réassociation après un changement de conteneur ou de tags si les échantillons sont identiques et si le modèle et la référence restent valides. Demucs utilise la même identité de flux pour réutiliser les deux pistes avec les paramètres et le modèle correspondants.
+
 ```sh
 python3 -B bin/_kara_prepare.py --backend-logs "/chemin/vers/le-morceau.opus"
 ```

@@ -7,6 +7,7 @@ from hashlib import sha256
 import json
 from math import isfinite
 import os
+import re
 from pathlib import Path
 import signal
 import stat
@@ -17,6 +18,7 @@ from time import monotonic, sleep
 from urllib.error import URLError
 
 from _kara_paths import BIN, STATE, music_library
+from _kara_audio_identity import pcm_digest
 from _kara_reference import (METHOD, MIN_LINE_COVERAGE, MIN_TOKEN_CONFIDENCE, MIN_TRANSCRIPT_AGREEMENT,
                              MIN_WORD_COVERAGE, VERSION, alignment, lrc_text)
 from _kara_refine import MAX_DISAGREEMENT, MIN_LOCAL_CONFIDENCE, VERSION as REFINEMENT_VERSION, refine
@@ -27,6 +29,8 @@ from _paroles_lrc import MAX_LRC_BYTES, source_orders
 
 CACHE_ROOT = STATE / "kara/prepared"
 MAX_MANIFEST = 16_000_000
+SECTION = re.compile(r"^\[(?:intro|outro|couplet|refrain|chorus|verse|bridge|pont|pre[- ]?chorus|pré[- ]?refrain|"
+                     r"interlude)(?:\s+\d+)?(?:\s*:\s*[^\]]{1,100})?\]$", re.I)
 
 
 def file_token(path):
@@ -199,8 +203,8 @@ class PreparedCache:
                 raise ValueError("Un autre processus prépare déjà ce morceau.") from error
             yield folder
 
-    def cached(self, song, *, verify=True, settings=None, rebind=None, insufficient=False):
-        folder = self.folder(song)
+    def cached(self, song, *, verify=True, settings=None, rebind=None, insufficient=False, previous=None):
+        folder = self.folder(previous or song)
         try:
             with (folder / "prepared.json").open("rb") as stream:
                 raw = stream.read(MAX_MANIFEST + 1)
@@ -217,7 +221,7 @@ class PreparedCache:
                          and number(item["report"]["line_coverage"], 0, 1))
             else:
                 valid = validate(item)
-            if item["song_id"] != path_id(song) or not valid or not matching_settings(item, settings):
+            if item["song_id"] != path_id(previous or song) or not valid or not matching_settings(item, settings):
                 return None
             source_path = song.with_suffix(".lrc")
             source = lrc_token(source_path)
@@ -227,8 +231,12 @@ class PreparedCache:
                 return None
             if verify:
                 raw_source = read_source(source_path) if source is not None else None
+                stored = item["audio"]
+                same_raw = stored["sha256"] == digest(song)
+                same_pcm = (not same_raw and stored.get("pcm_sha256")
+                            and pcm_digest(song) == stored["pcm_sha256"])
                 if (item["model"]["sha256"] != self.model_info()["sha256"]
-                        or item["audio"]["sha256"] != digest(song)
+                        or not (same_raw or same_pcm)
                         or (raw_source is not None and (item["source"]["sha256"] != fingerprint(raw_source)
                             or item["source_lrc"] != raw_source.decode("utf-8-sig")))
                         or (source is None and item["source"]["sha256"] !=
@@ -246,14 +254,25 @@ class PreparedCache:
                 rendered = stream.read(len(corrected) + 1)
             if item["lrc_sha256"] != key or rendered != corrected:
                 return None
-            if verify and rebind is not None and any(
+            if previous is not None and (not verify or rebind is None):
+                return None
+            if verify and rebind is not None and (previous is not None or any(
                     item[key]["file"] != token for key, token in
-                    zip(("audio", "source", "model"), (audio, source, model))):
+                    zip(("audio", "source", "model"), (audio, source, model)))):
+                # Rebind only after proving the recording, reference and model.
+                item["song_id"] = path_id(song)
+                if not same_raw:
+                    item["audio"]["sha256"] = digest(song)
+                if not item["audio"].get("pcm_sha256"):
+                    try:
+                        item["audio"]["pcm_sha256"] = pcm_digest(song)
+                    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+                        pass
                 for key, token in zip(("audio", "source", "model"), (audio, source, model)):
                     item[key]["file"] = token
                 self.publish(rebind, item)
             return item
-        except (OSError, KeyError, ValueError, TypeError, OverflowError, RecursionError):
+        except (OSError, KeyError, ValueError, TypeError, OverflowError, RecursionError, subprocess.SubprocessError):
             return None
 
     def publish(self, folder, item):
@@ -394,18 +413,27 @@ class Preparer:
             for offset in range(0, len(text), 6000):
                 self.trace(song, kind, offset=offset, text=text[offset:offset + 6000], **data)
 
-    def first_pass(self, song, lrc, settings, progress):
+    def first_pass(self, song, lrc, settings, progress, plain=None):
         audio_file = file_token(song)
         audio_hash = digest(song)
         source_file = lrc_token(lrc)
         progress("lyrics", 8)
-        source, provider = (read_source(lrc), "library") if source_file is not None else self.reader(song)
+        if plain is not None and source_file is not None:
+            raise ValueError("Un LRC est apparu avant la génération.")
+        source, provider = ((read_source(lrc), "library") if source_file is not None else
+                            (plain, "Strawberry") if plain is not None else self.reader(song))
         if len(source) > MAX_LRC_BYTES:
             raise ValueError("Fichier LRC trop volumineux.")
         text = source.decode("utf-8-sig")
         if self.trace:
             self.trace_text(song, "source-lrc", text, provider=provider, sha256=fingerprint(source))
-        orders = source_orders(text)
+        if plain is not None:
+            from unicodedata import normalize
+            rows = [(None, normalize("NFC", line.strip())) for line in text.splitlines()
+                    if not SECTION.fullmatch(line.strip()) and word_boundaries(line)]
+            orders = {"timestamps": rows}
+        else:
+            orders = source_orders(text)
         vocabulary = LyricVocabulary(t for _, t in orders["timestamps"])
         if not any(vocabulary.tokens):
             raise ValueError("Paroles minutées introuvables.")
@@ -420,9 +448,15 @@ class Preparer:
                       analysis_seconds=round(analysis_seconds, 3), real_time_factor=round(analysis_seconds / duration, 4))
         if self.decoder is not None:
             report["native_peak_rss_kib"] = self.decoder.peak_rss_kib()
+        audio = {"sha256": audio_hash, "file": audio_file}
+        try:
+            audio["pcm_sha256"] = pcm_digest(song)
+        except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+            # A receipt can still be validated against its exact file hash.
+            pass
         return {"version": VERSION, "method": METHOD, "song_id": path_id(song),
                 "title": song.stem, "language": language, "model": model, "settings": settings,
-                "audio": {"sha256": audio_hash, "file": audio_file},
+                "audio": audio,
                 "source": {"kind": "local" if source_file is not None else "retrieved",
                            "file": source_file, "provider": provider,
                            "sha256": fingerprint(source if source_file is not None else text.encode())},
@@ -482,7 +516,7 @@ class Preparer:
         item.update(lines=lines, report=report, refinement=stats)
         return ready
 
-    def prepare(self, song, *, force=False, progress=lambda *_: None):
+    def prepare(self, song, *, force=False, progress=lambda *_: None, plain=None, previous=None):
         song = Path(song).resolve(strict=True)
         start = monotonic()
         lrc = song.with_suffix(".lrc")
@@ -490,6 +524,8 @@ class Preparer:
             progress("cache", 2)
             settings = self.settings()
             item = self.cache.cached(song, settings=settings, rebind=folder)
+            if item is None and previous is not None:
+                item = self.cache.cached(song, settings=settings, rebind=folder, previous=previous)
             from_reference = item is not None
             if item and self.trace:
                 self.trace(song, "cache-revision", id=item["song_id"], lrc_sha256=item["lrc_sha256"],
@@ -505,12 +541,12 @@ class Preparer:
                     progress("cached", 100)
                     return True, item["report"], monotonic() - start, item["duration"]
                 if item is None:
-                    attempt = self.cache.cached(song, settings=settings, insufficient=True)
+                    attempt = self.cache.cached(song, settings=settings, insufficient=True) if plain is None else None
                     if attempt:
                         progress("cached_insufficient", 100)
                         return False, attempt["report"], monotonic() - start, attempt["duration"]
             if item is None:
-                item = self.first_pass(song, lrc, settings, progress)
+                item = self.first_pass(song, lrc, settings, progress, plain=plain)
             elif item["settings"] != settings:
                 item["baseline_settings"] = item["settings"]
                 item["settings"] = settings
@@ -540,6 +576,8 @@ class Preparer:
             item["state"] = "ready"
             if not from_reference or stats["recovered_mix"] or stats["recovered_stem"] or stats["quarantined"]:
                 item["prepared_at"] = datetime.now(timezone.utc).isoformat()
+            if plain is not None and not from_reference:
+                self.publish_generated(song, lrc, item, plain)
             self.cache.publish(folder, item)
             if self.trace:
                 self.trace_text(song, "corrected-lrc", lrc_text(item["lines"]), sha256=item["lrc_sha256"])
@@ -547,10 +585,48 @@ class Preparer:
             return True, report, monotonic() - start, duration
 
 
+    def publish_generated(self, song, lrc, item, plain):
+        from _musique_oz import shared_mutation, share_file
+
+        # Seed the canonical cache with the actual observed, generated LRC.
+        # A hard-link publication has no replace window, even with an editor.
+        raw = lrc_text(item["lines"]).encode()
+        if len(raw) > MAX_LRC_BYTES:
+            raise ValueError("LRC généré trop volumineux")
+        item["source_lrc"] = raw.decode()
+        item["source_order"] = "timestamps"
+        for line in item["lines"]:
+            line["source_start"] = line["display_start"]
+        item["source"].update(kind="local", sha256=fingerprint(raw), plain_sha256=fingerprint(plain))
+        if not validate(item):
+            raise ValueError("Le LRC généré ne conserve pas les références lexicales")
+        root = music_library()
+        if not song.is_relative_to(root) or song.resolve(strict=True) != song:
+            raise ValueError("Publication hors bibliothèque")
+        with shared_mutation(root):
+            if file_token(song) != item["audio"]["file"]:
+                raise ValueError("La chanson a changé avant publication.")
+            with NamedTemporaryFile(dir=lrc.parent, prefix=".parole-lrc-") as draft:
+                draft.write(raw)
+                draft.flush()
+                os.fsync(draft.fileno())
+                share_file(draft.name, lrc)
+                os.link(draft.name, lrc)
+                fd = os.open(lrc.parent, os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        item["source"]["file"] = lrc_token(lrc)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("songs", nargs="+", type=Path)
     parser.add_argument("--cache", type=Path, default=CACHE_ROOT)
+    parser.add_argument("--plain-reference", type=Path)
+    parser.add_argument("--previous-path", type=Path)
+    parser.add_argument("--local-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--force-path", type=Path, action="append", default=[])
     parser.add_argument("--trace", action="store_true")
@@ -567,10 +643,15 @@ def main():
         print(json.dumps({"event": event, "path": str(path), **data}, ensure_ascii=False), flush=True)
 
     signal.signal(signal.SIGTERM, cancel)
+    def local_reader(_song):
+        raise ValueError("Référence locale introuvable après la recherche Internet.")
+
     preparer = Preparer(PreparedCache(args.cache), device=args.device, threads=args.threads, logs=args.backend_logs,
+                        reader=local_reader if args.local_only else retrieve,
                         separate_if_needed=args.separate_if_needed,
                         trace=(lambda song, kind, **payload: send("evidence", song, kind=kind, evidence=payload))
                         if args.trace else None)
+    plain = read_source(args.plain_reference) if args.plain_reference is not None else None
     failed = False
     force_paths = {path.resolve() for path in args.force_path}
     try:
@@ -584,7 +665,7 @@ def main():
 
             try:
                 ready, report, elapsed, duration = preparer.prepare(
-                    song, force=args.force or song in force_paths, progress=progress)
+                    song, force=args.force or song in force_paths, progress=progress, plain=plain, previous=args.previous_path)
             except (EOFError, OSError, ValueError, RuntimeError, KeyError, URLError, subprocess.SubprocessError) as error:
                 preparer.close()
                 send("error", song, message=str(error))

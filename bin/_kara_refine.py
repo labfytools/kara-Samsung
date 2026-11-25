@@ -82,6 +82,11 @@ def target_gaps(entries, lines, duration, withheld):
                 stop += 1
             flags = [withheld[(line_idx, word["id"])] for _, word in entries[first:stop]
                      if (line_idx, word["id"]) in withheld]
+            if lines[line_idx]["source_start"] is None:
+                # Without a reference time, a long window cannot localize a
+                # phrase safely. Short intervals between words are still tried.
+                first = stop
+                continue
             shift = [item["start"] - item["source_start"] for item in lines[max(0, line_idx - 5):line_idx + 6]
                      if item["start"] is not None]
             # Long gaps can span an instrumental. The LRC helps select where
@@ -188,7 +193,7 @@ def consolidate(entries, gap, first, second, source, known):
 def refine(song, lines, basis, duration, language, decoder, *, vocal_stem=None,
            audit_only=False, progress=lambda *_: None):
     lines = deepcopy(lines)
-    withheld = audit_prefixes(lines)
+    withheld = audit_prefixes(lines) if lines[0]["source_start"] is not None else {}
     entries = [(i, word) for i, line in enumerate(lines) for word in line["words"]]
     n_known = sum(w["start"] is not None for _, w in entries)
     report = {"version": VERSION, "windows": 0, "decodes": 0, "stem_windows": 0,

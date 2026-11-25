@@ -163,6 +163,41 @@ class RefineTests(unittest.TestCase):
         engine.decode.assert_called_once_with(b"pcm", "fr", 0., beam=True)
 
 
+
+class PlainReferenceTests(unittest.TestCase):
+    def test_missing_line_has_no_timestamp(self):
+        rows = [(None, "Cette phrase existe"), (None, "Jamais observée")]
+        heard = [ObservedWord(word, i + 1., i + 1.1, .95) for i, word in enumerate(("cette", "phrase", "existe"))]
+        lines, report, ready = alignment(rows, heard, 9)
+        self.assertFalse(ready)
+        self.assertEqual(report["line_coverage"], .5)
+        self.assertIsNone(lines[1]["display_start"])
+
+    def test_refrain_publication_and_move_reuse_the_observed_reference(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio, model = root / "Titre.opus", root / "model"
+            audio.write_bytes(b"fixture audio")
+            model.write_bytes(b"fixture poids")
+            cache = prepare.PreparedCache(root / "prepared", model)
+            worker = prepare.Preparer(cache)
+            words = ["refrain", "appris", "refrain", "appris"]
+            heard = [ObservedWord(w, 1. + i*.5, 1.2 + i*.5, .99, "dtw") for i, w in enumerate(words)]
+            # The two occurrences must use their own observations even if the
+            # wording is identical. The bracketed section is a text heading.
+            with patch.object(worker, "settings", return_value={}), patch.object(
+                    worker, "transcribe", return_value=(5., "fr", heard, [], 0., .1)) as decode, patch.object(
+                    prepare, "music_library", return_value=root):
+                self.assertTrue(worker.prepare(audio, plain=b"[Chorus]\nRefrain appris\nRefrain appris\n")[0])
+                self.assertIn("[00:02.000]Refrain appris", audio.with_suffix(".lrc").read_text())
+                self.assertIsNotNone(cache.cached(audio, verify=False))
+                self.assertTrue(worker.prepare(audio)[0])
+                moved = audio.with_name("Autre chemin.opus")
+                audio.rename(moved)
+                audio.with_suffix(".lrc").rename(moved.with_suffix(".lrc"))
+                self.assertTrue(worker.prepare(moved, previous=audio)[0])
+                decode.assert_called_once()
+
 class CacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()

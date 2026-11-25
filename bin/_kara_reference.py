@@ -146,6 +146,32 @@ def finish_alignment(lines, duration, basis):
             line["start"] = line["end"] = None
             continue
         anchors.append(i)
+    if all(line["source_start"] is None for line in lines):
+        # Untimed references have no display fallback. Only a measured line
+        # onset may create a timestamp, including after a localized pass.
+        for line in lines:
+            begin = line["start"]
+            line["display_start"] = round(begin, 3) if begin is not None else None
+            line["start_origin"] = line["words"][0]["origin"] if begin is not None else "uncertain"
+        for index, following in zip(anchors, [*anchors[1:], len(lines)]):
+            line = lines[index]
+            upper = lines[following]["start"] if following < len(lines) else duration
+            if line["end"] is not None and not line["start"] < line["end"] <= upper:
+                line["end"] = None
+        coverage = count / total_words
+        line_coverage = len(anchors) / len(lines)
+        agreement = basis["transcript_agreement"]
+        report = {**basis, "lines": len(lines), "words": total_words, "matched_words": count,
+                  "word_coverage": round(coverage, 4), "line_coverage": round(line_coverage, 4),
+                  "transcript_agreement": round(agreement, 4), "uncertain_words": total_words - count,
+                  "uncertain_lines": len(lines) - len(anchors), "changed": 0,
+                  "display_only_changes": 0, "mean_delta": None, "max_delta": None, "examples": []}
+        stamps = [lines[i]["display_start"] for i in anchors]
+        ready = (len(anchors) == len(lines) and all(a < b for a, b in zip(stamps, stamps[1:]))
+                 and stamps[-1] < duration and coverage >= MIN_WORD_COVERAGE
+                 and agreement >= MIN_TRANSCRIPT_AGREEMENT)
+        return lines, report, ready
+
     # Preserve a good LRC start when it remains between neighboring DTW anchors.
     for i, index in enumerate(anchors):
         line = lines[index]

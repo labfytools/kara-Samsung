@@ -4,3 +4,4 @@
 
 - Documenter dans `AGENTS.md` les périmètres de commit, les contrôles avant chaque commit et la séparation entre développement et agent de recherche Parole.
 - Conserver le parcours Kara V2 avec salle mobile, démarrage TV autonome, BlackBox, mixage et file d’import persistante commune au bureau et au mobile. Voir `docs/kara-v2.md` et `docs/parole-imports.md`.
+- Aligner les textes sans minutage avec Turbo et publier un LRC seulement après validation acoustique de toutes ses lignes. Réutiliser les préparations et pistes Demucs sur preuve d’identité PCM.
