@@ -36,4 +36,9 @@ MANUAL = {
         "https://get.bandcamp.help/en/articles/15263192-can-i-re-download-my-purchases",
         re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62})\.bandcamp\.com"),
         re.compile(r"/(?:album|track)/[a-z0-9][a-z0-9-]{0,159}/?")),
+    "Qobuz": ManualProvider(
+        "qobuz.com", "https://www.qobuz.com/",
+        "https://help.qobuz.com/en/articles/369151-tutorial-how-to-download-without-qobuz-downloader",
+        re.compile(r"(?:www\.|open\.)?qobuz\.com"),
+        re.compile(r"/(?:[a-z]{2}-[a-z]{2}/)?album/(?:[a-z0-9][a-z0-9-]{0,159}/)?[a-z0-9]{5,30}/?")),
 }

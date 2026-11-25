@@ -25,3 +25,4 @@
 - Réutiliser la première transcription Vulkan lors d’une nouvelle tentative sur le même audio et dans la même langue, puis rejouer l’alignement et les reprises locales.
 - Importer les dossiers et les archives ZIP dans la file Parole, avec provenance, préservation des originaux et reprise des seules pistes manquantes.
 - Proposer le téléchargement officiel Bandcamp et conserver sa provenance déclarée lors de l’import local de l’album.
+- Accepter les ZIP et dossiers FLAC des achats Qobuz et conserver la référence publique de l’édition.

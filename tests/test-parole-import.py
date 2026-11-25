@@ -306,6 +306,20 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual((items[0]["category"], items[0]["tracks"]), ("path", []))
         self.assertEqual(self.requests.read_text(), "")
 
+    def test_qobuz_local_route_imports_a_flac_zip_with_edition_reference(self):
+        track = self.temp / "flac" / "01.flac"
+        self.make_local_track(track, 1, album="Archive FLAC")
+        archive = self.temp / "album-qobuz.zip"
+        with ZipFile(archive, "w") as output:
+            output.write(track, "01.flac")
+        release = "https://www.qobuz.com/fr-fr/album/album-test/0060254719724"
+        _, items, _ = self.run_import(local_target(archive.as_uri(), "Qobuz", release))
+        self.assertEqual((items[0]["status"], items[0]["provider"]), ("success", "Qobuz"))
+        evidence = items[0]["provenance"][0]
+        self.assertEqual(evidence["edition_ref"], release)
+        self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(track))
+        self.assertEqual(self.requests.read_text(), "")
+
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]
         artists = json.loads(subprocess.check_output([*command, "artistes", "Atelier"], cwd=self.temp, env=self.env))

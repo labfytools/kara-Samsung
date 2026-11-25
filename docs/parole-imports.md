@@ -62,7 +62,11 @@ Les reçus vérifient le contenu audio publié avant de sauter une piste lors d�
 
 Dans le sélecteur de sources, **Bandcamp** propose le site officiel et son aide au téléchargement. Récupérer l’album gratuit ou déjà acheté avec les droits applicables, puis sélectionner le dossier ou le ZIP dans Parole. La page publique de l’édition peut être renseignée pour conserver sa référence dans le résultat. Il s’agit d’une provenance déclarée. Parole ne déclenche aucun achat. L’API publiée documente les comptes, ventes et commandes des partenaires. Le parcours auditeur utilise les fichiers remis directement par Bandcamp. [Documentation de l’API](https://bandcamp.com/developer) · [Récupération des achats](https://get.bandcamp.help/en/articles/15263192-can-i-re-download-my-purchases)
 
-**Toutes les sources** donne accès à la recherche YouTube Music et au choix de fichiers locaux. Choisir **Bandcamp** pour afficher le parcours officiel et conserver ce fournisseur dans la provenance. Les formats de sortie pris en charge par l’import local, dont le FLAC, restent inchangés pendant la copie.
+**Toutes les sources** donne accès à la recherche YouTube Music et au choix de fichiers locaux. Sélectionner un fournisseur pour afficher son parcours officiel et conserver son nom dans la provenance. Les formats de sortie pris en charge par l’import local, dont le FLAC, restent inchangés pendant la copie.
+
+### Qobuz
+
+Sélectionner **Qobuz** après la récupération d’un album depuis **Mes achats**. Le téléchargement depuis le navigateur peut fournir un ZIP FLAC que Parole ouvre directement. Un dossier de fichiers FLAC déjà téléchargés fonctionne aussi. Qobuz propose plusieurs résolutions sans DRM pour les achats. La sélection de la résolution et la récupération des achats se font sur le site officiel. La page publique de l’album peut être enregistrée avec l’import. [Télécharger depuis le navigateur](https://help.qobuz.com/en/articles/369151-tutorial-how-to-download-without-qobuz-downloader) · [Formats des achats](https://help.qobuz.com/en/articles/10167-what-are-the-different-audio-formats-available-for-download)
 
 ## Diagnostic des échecs persistants
 
@@ -85,3 +89,5 @@ La suite crée une bibliothèque temporaire avec un son de synthèse. Elle utili
 Les essais locaux vérifient l’identité PCM de pistes FLAC, le maintien des sources, la conservation octet pour octet du LRC et de la pochette fournis, le refus d’un membre ZIP hors chemin et la reprise d’une seule piste dans un lot partiellement publié.
 
 Le parcours Bandcamp est testé avec un FLAC de synthèse et une référence publique représentative. Le test vérifie la provenance et la désactivation du fournisseur. Il ne se connecte pas à un compte Bandcamp.
+
+Le parcours Qobuz est testé avec un ZIP FLAC de synthèse et une référence d’édition au format Qobuz. Le test contrôle la conservation du PCM et de cette référence sans accéder à un compte ni à une commande.
