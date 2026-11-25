@@ -104,6 +104,12 @@ Un échec persistant peut ensuite rejoindre le quota Codex commun si la catégor
 
 Un résultat Codex peut suggérer une autre adresse de catalogue. La relance automatique n’a lieu qu’une fois, après confirmation indépendante de la réponse du catalogue et de l’identité de l’édition déjà autorisée. La file conserve le même lot, la sélection et les reçus des pistes existantes. Une édition différente demande une validation. Les diagnostics de code peuvent donner lieu à une ébauche et à des tests simulés dans l’historique Codex. Leur intégration au programme et leur exécution demandent une revue explicite. Si Codex est indisponible, si aucune correction n’est confirmée ou si la tentative corrigée échoue, le lot reste **À vérifier**.
 
+### Mesures des fournisseurs
+
+Les détails de **Paramètres → Sources** présentent les délais de recherche et de démarrage, le débit observé, la durée d’import, la réussite de récupération et le nombre exact d’échecs. La console indique le débit moyen mesuré lorsqu’il existe. Les moyennes donnent au moins 25 % de poids à la dernière mesure et vieillissent l’historique sur deux semaines. Le débit commence après le premier bloc d’octets et demande au moins 64 Kio supplémentaires observés. Les étapes d’enrichissement qui échouent après récupération audio ne comptent pas comme des échecs du fournisseur. Un fichier récupéré auparavant sur un site puis importé localement renseigne la durée locale. Les temps du téléchargement externe restent inconnus.
+
+Les réponses HTTP 429 et 5xx qui déclenchent une attente sont mémorisées avec leur échéance. L’expiration réadmet la source. La réinitialisation des statistiques efface les observations et conserve les temporisations en cours.
+
 ## Validation
 
 ```bash
@@ -131,3 +137,7 @@ Internet Archive a renvoyé la fiche *Glow Wave* de La Machine de la Mort, sous 
 Les essais Jamendo simulent les réponses officielles et le transport avec des FLAC de synthèse. Ils couvrent l’absence d’identifiant, les deux permissions de téléchargement, le refus de paramètres ambigus, la recherche, l’identité PCM et la reprise limitée à la piste en échec.
 
 La découverte Codex est testée avec une réponse de recherche simulée. Le fournisseur découvert reste en attente et la demande d’ébauche demeure un travail séparé.
+
+Les tests de mesures contrôlent la pondération récente, la persistance des comptes, la séparation entre démarrage et débit et l’expiration d’une limitation. Le parcours Internet Archive de synthèse vérifie l’enregistrement d’une recherche, d’un échec de récupération et de sa reprise réussie.
+
+Une mesure réelle isolée sur l’introduction de *Electric Funeral* a confirmé la somme de contrôle des 1 325 388 octets reçus. Sur ce transfert unique, le premier bloc est arrivé en 1,80 s et le débit après ce bloc était de 1,51 Mio/s. [Fiche et crédits officiels](https://archive.org/details/electric-funeral)

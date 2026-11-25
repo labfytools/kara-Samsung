@@ -19,6 +19,7 @@ from _kara_paths import BIN, catalogue_command
 from _parole_import_providers import (ALL, ARCHIVE, JAMENDO, MANUAL, OPEN_LICENSES, YOUTUBE,
                                       archive_identifier, jamendo_identifier)
 from _parole_jamendo import client_id as jamendo_client
+from _parole_import_metrics import LOOKUP, observe
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
@@ -82,6 +83,7 @@ class AlbumImport(Gtk.Revealer):
         self.can_launch = lambda: True
         self.on_update = lambda *_: None
         self.provider_enabled = lambda _: True
+        self.measure_index = None
         self.albums = []
         self.by_id = {}
         self.imports_snapshot = ([], {})
@@ -392,6 +394,7 @@ class AlbumImport(Gtk.Revealer):
     def search(self, action, value, callback, *, live=False):
         source = {"archive": ARCHIVE, "jamendo": JAMENDO}.get(action, YOUTUBE)
         mode = {"archive": "--chercher-archives", "jamendo": "--chercher-jamendo"}.get(action)
+        started = monotonic()
         try:
             command = [str(KARA), mode, value] if mode else catalogue_command(action, value)
             self.lookup = Gio.Subprocess.new(command, PIPE)
@@ -404,7 +407,7 @@ class AlbumImport(Gtk.Revealer):
         if not live:
             self.on_update(None, "provider", {"provider": source, "message": f"{source} · recherche de catalogue"})
         self.refresh_controls()
-        self.lookup.communicate_utf8_async(None, None, self.search_finished, (callback, source))
+        self.lookup.communicate_utf8_async(None, None, self.search_finished, (callback, source, started))
 
     def stop_lookup(self):
         if self.lookup is not None:
@@ -420,9 +423,11 @@ class AlbumImport(Gtk.Revealer):
         if process != self.lookup:
             return
         live = self.lookup_live
-        callback, source = call
+        callback, source, started = call
         self.lookup = None
         self.lookup_live = False
+        if source == YOUTUBE and not live and self.measure_index is not None:
+            observe(self.measure_index, source, {LOOKUP: monotonic() - started})
         self.refresh_controls()
         output = ""
         try:

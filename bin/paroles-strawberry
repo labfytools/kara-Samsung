@@ -390,6 +390,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.maintenance = Maintenance(LIBRARY, COLLECTION, import_queue=self.album_import.queue,
                                            cache=self.references, background=background)
             self.album_import.provider_enabled = self.maintenance.index.source_enabled
+            self.album_import.measure_index = self.maintenance.index
             self.album_import.refresh_providers()
             self.maintenance.set_priority(self.maintenance_busy())
             self.maintenance.start()
@@ -606,8 +607,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 self.maintenance.journal.emit("DOWNLOAD", payload["message"])
             elif kind == "album":
                 level = "WARNING" if payload["status"] in {"failure", "partial"} else "INFO"
+                rate = payload.get("measured_bytes_per_second")
+                throughput = f" · {rate / (1024**2):.2f} Mio/s mesurés" if rate else ""
                 self.maintenance.journal.emit(
-                    "DOWNLOAD", f"{payload['provider']} · {payload['title']} · {payload['message']}", level)
+                    "DOWNLOAD", f"{payload['provider']} · {payload['title']} · {payload['message']}{throughput}", level)
 
     def reload_after_import(self):
         self.import_refresh_timer = None

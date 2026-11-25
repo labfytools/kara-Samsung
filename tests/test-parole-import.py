@@ -27,6 +27,7 @@ from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index
+from _parole_import_metrics import LOOKUP, SUCCEEDED, TOTAL, snapshot
 from _parole_import_providers import ARTIST_SITES, JAMENDO, OPEN_LICENSES
 from _parole_sources import controls, seed
 
@@ -405,6 +406,8 @@ class AlbumImportTests(unittest.TestCase):
             self.assertEqual(record["external_id"], f"{identifier}/{record['member']}")
             self.assertEqual(record["license"], license_url)
             self.assertEqual(pcm_digest(record["path"]), pcm_digest(originals[record["member"]]))
+        measured = snapshot(Index(self.library, self.temp / "state"))["Internet Archive"]
+        self.assertEqual((measured[LOOKUP]["samples"], measured[TOTAL]["samples"], measured[SUCCEEDED]["total"]), (1, 2, 1))
 
     def test_internet_archive_never_opens_a_restricted_file_or_license(self):
         target = "https://archive.org/details/restricted-fixture"

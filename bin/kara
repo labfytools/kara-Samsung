@@ -12,6 +12,7 @@ import re
 from selectors import DefaultSelector, EVENT_READ
 from shutil import which
 import signal
+import sqlite3
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -31,6 +32,7 @@ from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING,
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, shared_mutation, source_video
 from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
+from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 import _parole_archive as archive
 import _parole_jamendo as jamendo
 
@@ -78,6 +80,8 @@ class ImportProgress:
         self.lyrics_added = 0
         self.lyrics_synced = 0
         self.cover_counts = (0, 0)
+        self.measure_index = None
+        self.transfers = {}
 
     def emit(self, message, fraction=None, *, event="progress", **fields):
         if self.report is not None:
@@ -146,6 +150,9 @@ class ImportProgress:
             elif marker == "KARA_BYTES":
                 index, downloaded, size, status = payload.split()
                 index = max(1, int(index))
+                transfer = self.transfers.get(index)
+                if transfer is not None:
+                    transfer.received(int(downloaded), monotonic())
                 estimate = max(0.0, min(1.0, int(downloaded) / int(size))) if int(size) > 0 else 0.0
                 if status == "finished":
                     self.track_status("Préparation de l’audio", index, 0.94)
@@ -614,7 +621,12 @@ def download_track(source, folder, progress):
     with resource_slot(directory, DOWNLOADS, lambda: progress.emit("En attente d’un téléchargement…")) as slot:
         check_space(folder, extra=WORKING_RESERVE)
         wait_service("youtube", 0.5)
-        return run(label, command, progress=progress, download=True, announce=False, resource=(slot,), disk=folder)
+        with progress.download_lock:
+            transfer = progress.transfers[position] = Transfer(monotonic())
+        result = run(label, command, progress=progress, download=True, announce=False, resource=(slot,), disk=folder)
+        if not result and progress.measure_index is not None:
+            observe(progress.measure_index, YOUTUBE, transfer.measurements())
+        return result
 
 
 def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False):
@@ -1104,6 +1116,12 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
     if not root.is_dir() or not inbox.is_dir() or inbox.is_symlink():
         raise ImportIssue("path", f"Bibliothèque ou dossier de réception absent ou symbolique : {inbox}")
     require_commands("ffmpeg", "ffprobe", BIN / "musique-tri")
+    from _parole_index import Index
+
+    try:
+        metrics = Index(root)
+    except (OSError, sqlite3.Error):
+        metrics = None
     counts = Counter()
     added = 0
     details = []
@@ -1113,7 +1131,9 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
         child = ImportProgress(journal=progress.journal, json_output=progress.json_output, url=url)
         child.guard = progress.guard
         child.download_lock = RLock()
+        child.measure_index = metrics
         item = BatchAlbum(url, (titles or {}).get(url) or f"Album {index}", child)
+        started = monotonic()
 
         def report(message, fraction):
             with child.download_lock:
@@ -1167,6 +1187,22 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
             outcome["provenance"] = item.provenance
         if item.provider:
             outcome["provider"] = item.provider
+        if metrics is not None and item.provider and item.status not in {"pending", "duplicate"}:
+            failures = [value for value in diagnostics if value["category"] in {"network", "download", "audio_unavailable"}
+                        and not value["stage"].startswith(("Paroles", "Pochettes"))]
+            if item.audio_complete and (item.processed or item.added) or failures:
+                observe(metrics, item.provider, {TOTAL: monotonic() - started, SUCCEEDED: int(item.audio_complete)})
+            if item.provider == YOUTUBE:
+                for value in failures:
+                    code = re.search(r"\bhttp(?: error)?[ :]+(429|5\d\d)\b", value["detail"], re.I)
+                    if code:
+                        limited(metrics, YOUTUBE, 60 if code[1] == "429" else 12, int(code[1]))
+            try:
+                measured = snapshot(metrics).get(item.provider, {}).get(THROUGHPUT)
+            except sqlite3.Error:
+                measured = None
+            if measured:
+                outcome["measured_bytes_per_second"] = measured["mean"]
         if on_album is not None:
             on_album(outcome)
         progress.emit(fraction=index / len(urls), event="album", **outcome)
@@ -1233,7 +1269,12 @@ def main():
             if not inbox.is_dir() or inbox.is_symlink():
                 raise ImportIssue("path", "Dossier de réception absent ou symbolique.")
             with resource_slot(inbox / ".kara-catalogue", CATALOGUE):
-                print(json.dumps({"data": adapter.search(provider_index, query)}, ensure_ascii=False))
+                started = monotonic()
+                try:
+                    results = adapter.search(provider_index, query)
+                finally:
+                    observe(provider_index, provider, {LOOKUP: monotonic() - started})
+                print(json.dumps({"data": results}, ensure_ascii=False))
             return 0
         except (OSError, ValueError) as error:
             print(json.dumps({"category": getattr(error, "category", "network"), "error": str(error)}, ensure_ascii=False))

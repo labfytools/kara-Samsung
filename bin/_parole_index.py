@@ -105,6 +105,14 @@ class Index:
                 CREATE TABLE IF NOT EXISTS source_history (
                     stamp REAL NOT NULL, source TEXT NOT NULL, action TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS import_provider_metrics (
+                    source TEXT NOT NULL, metric TEXT NOT NULL, mean REAL NOT NULL,
+                    samples INTEGER NOT NULL, total REAL NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY(source, metric)
+                );
+                CREATE TABLE IF NOT EXISTS import_provider_limits (
+                    source TEXT PRIMARY KEY, until REAL NOT NULL, status INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS exclusions (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(kind, subject)
                 );

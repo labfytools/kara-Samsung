@@ -10,6 +10,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 from _kara_party import Song
 from _kara_import import show_details
 from _parole_index import key, document, encoded_key, sidecar
+from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_sources import configure_limits, controls, provider_limits
 from _parole_resources import GIB
 from _parole_work import save_correction
@@ -1036,7 +1037,25 @@ class ParoleView:
                 with self.index.db() as db:
                     history = [dict(r) for r in db.execute("SELECT * FROM source_history WHERE source=? ORDER BY stamp DESC LIMIT 30",
                                                            (identity,))]
-                show_details(widget, source["name"], json.dumps({**source, "config": config, "historique": history},
+                try:
+                    metrics = import_metrics(self.index).get(identity, {})
+                except sqlite3.Error:
+                    metrics = {}
+                stats = {}
+                for name, label, unit, scale in (
+                    (LOOKUP, "Recherche", "s", 1), (STARTUP, "Début du transfert", "s", 1),
+                    (THROUGHPUT, "Débit", "Mio/s", 1 / 1024**2), (TOTAL, "Durée de l’import", "s", 1),
+                    (SUCCEEDED, "Réussite de la récupération", "%", 100),
+                ):
+                    if value := metrics.get(name):
+                        stats[label] = f"{value['mean'] * scale:.2f} {unit} · {value['samples']} observation(s)"
+                if value := metrics.get(SUCCEEDED):
+                    stats["Échecs de récupération"] = value["samples"] - int(value["total"])
+                if "limited_until" in metrics:
+                    expiry = datetime.fromtimestamp(metrics["limited_until"]).strftime("%d/%m %H:%M")
+                    stats["Limite temporaire"] = f"HTTP {metrics['last_http']} · jusqu’à {expiry}"
+                show_details(widget, source["name"], json.dumps({**source, "config": config, "historique": history,
+                                                                  "mesures d’import": stats},
                                                                 ensure_ascii=False, indent=2))
             elif mode == "check":
                 self.source_validation(source, config)
