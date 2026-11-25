@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from zipfile import BadZipFile, ZipFile
 import os
 
-from _kara_import_resources import MAX_MEDIA, PROCESSING, check_space
+from _kara_import_resources import ImportSuspended, MAX_MEDIA, PROCESSING, check_space, checkpoint, current_pause
 from _kara_import_result import ImportIssue
 from _musique_oz import AUDIO, share_file
 from _parole_import_providers import MANUAL
@@ -126,6 +126,7 @@ class Entry:
     format: str = ""
     license: str = ""
     position: tuple[int, int] | None = None
+    open_range: object = None
 
 
 def directory_entries(fd):
@@ -239,6 +240,8 @@ def read_entry(entry, destination, stop):
     if entry.size is not None and not 0 < entry.size <= MAX_AUDIO:
         raise ImportIssue("path", "Taille audio locale hors limites.")
     check_space(destination.parent, extra=(entry.size or 0) + MAX_MEDIA * PROCESSING)
+    if entry.open_range is not None and current_pause() is not None:
+        return resume_verified_entry(entry, destination, stop)
     digest = sha256()
     expected = sha1(usedforsecurity=False) if entry.sha1 else None
     with entry.open() as source, NamedTemporaryFile(dir=destination.parent, prefix=".local-") as draft:
@@ -252,9 +255,11 @@ def read_entry(entry, destination, stop):
         if entry.size is None and size is not None:
             check_space(destination.parent, extra=size + MAX_MEDIA * PROCESSING)
         while remaining:
+            checkpoint()
             if stop.is_set():
                 return None
             data = source.read(min(remaining, BLOCK))
+            checkpoint()
             if not data:
                 if size is not None:
                     raise ImportIssue("network" if entry.external_id else "path", "Fichier source incomplet.")
@@ -275,6 +280,65 @@ def read_entry(entry, destination, stop):
         draft.flush()
         os.fsync(draft.fileno())
         os.link(draft.name, destination)
+    return digest.hexdigest()
+
+
+def resume_verified_entry(entry, destination, stop):
+    # The stage name commits to the supplier's revision. Never make a prefix
+    # visible as audio until the complete original matches its manifest.
+    partial = destination.with_name("." + destination.name + ".part")
+    received = sha1(usedforsecurity=False)
+    digest = sha256()
+    fd = os.open(partial, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o660)
+    try:
+        with os.fdopen(fd, "r+b") as draft:
+            try:
+                offset = draft.seek(0, os.SEEK_END)
+                if offset >= entry.size:
+                    offset = draft.seek(0)
+                    draft.truncate()
+                with entry.open_range(offset) as source:
+                    if offset and getattr(source, "offset", 0) != offset:
+                        offset = 0
+                        draft.truncate(0)
+                    draft.seek(0)
+                    remaining = offset
+                    while remaining:
+                        checkpoint()
+                        block = draft.read(min(remaining, BLOCK))
+                        if not block:
+                            raise OSError("Brouillon de reprise tronqué.")
+                        received.update(block)
+                        digest.update(block)
+                        remaining -= len(block)
+                    remaining = entry.size - offset
+                    while remaining:
+                        checkpoint()
+                        if stop.is_set():
+                            return None
+                        block = source.read(min(remaining, BLOCK))
+                        checkpoint()
+                        if not block:
+                            raise ImportIssue("network", "Fichier source incomplet.")
+                        received.update(block)
+                        digest.update(block)
+                        draft.write(block)
+                        remaining -= len(block)
+                    if source.read(1) or received.hexdigest() != entry.sha1:
+                        raise ImportIssue("network", "Somme de contrôle du fichier distant incorrecte.")
+            except ImportSuspended:
+                draft.flush()
+                os.fsync(draft.fileno())
+                raise
+            draft.flush()
+            os.fsync(draft.fileno())
+            os.link(partial, destination)
+    except ImportSuspended:
+        raise
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    partial.unlink()
     return digest.hexdigest()
 
 

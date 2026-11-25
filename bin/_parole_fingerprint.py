@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from shutil import which
 import subprocess
+from _kara_import_resources import run_checked
 
 VERSION = 1
 ALGORITHM = 2
@@ -52,13 +53,13 @@ def read(path, *, tool=None, retain=()):
     try:
         # Only verified, bounded PCM is routed to fpcalc. The outer decoder
         # owns protocols and cannot open a remote playlist or media segment.
-        audio = subprocess.run(
+        audio = run_checked(
             ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-protocol_whitelist", "file,pipe", "-i", str(path),
              "-map", "0:a:0", "-t", str(SECONDS), "-vn", "-ac", "1", "-ar", str(RATE), "-f", "s16le", "pipe:1"],
             check=True, capture_output=True, timeout=30, pass_fds=retain).stdout
         if len(audio) % 2 or not 0 < len(audio) <= RATE * SECONDS * 2:
             return None
-        output = subprocess.run(
+        output = run_checked(
             [tool, "-format", "s16le", "-rate", str(RATE), "-channels", "1", "-length", str(SECONDS),
              "-algorithm", str(ALGORITHM), "-raw", "-json", "-"], input=audio,
             check=True, capture_output=True, timeout=15, pass_fds=retain).stdout

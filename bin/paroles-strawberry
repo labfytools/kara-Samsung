@@ -605,6 +605,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def report_import_update(self, job, kind, payload):
         self.mobile_imports.update(job, kind, payload)
+        if kind in {"queue", "suspended"} and getattr(self, "maintenance", None):
+            self.maintenance.journal.emit("DOWNLOAD", payload["message"])
+            self.maintenance.wake.set()
         if kind == "album" and payload.get("tracks"):
             self.import_published_paths.update(map(Path, payload["tracks"]))
             if self.import_refresh_timer is None and not self.import_refresh_active:

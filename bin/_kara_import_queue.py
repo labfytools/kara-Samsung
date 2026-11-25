@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from _kara_import_local import local_selection, local_url
+from _kara_import_resources import lease
 from _kara_paths import STATE
 from _musique_oz import SHARED_LIBRARY
 from _parole_import_providers import archive_identifier, jamendo_identifier
@@ -120,14 +121,40 @@ class ImportQueue:
             row = db.execute("SELECT paused, batches FROM settings WHERE id=1").fetchone()
             return bool(row["paused"]), row["batches"]
 
+    def pause_requested(self):
+        return self.settings()[0]
+
+    def activity(self, *, shared=True):
+        # A worker holds a shared lease from admission through visible
+        # checkpoint/cleanup. An exclusive probe confirms quiescence across
+        # GTK, maintenance, and a restart of either owner.
+        return lease(self.directory / "activity.lock", shared=shared, wait=shared)
+
+    def draining(self, db):
+        if db.execute("SELECT 1 FROM jobs WHERE state='running' LIMIT 1").fetchone():
+            return True
+        with self.activity(shared=False) as idle:
+            return idle is None
+
+    def pause_state(self):
+        with self.connect() as db:
+            db.execute("BEGIN")
+            if not db.execute("SELECT paused FROM settings WHERE id=1").fetchone()[0]:
+                return "running"
+            return "suspending" if self.draining(db) else "paused"
+
     def configure(self, *, paused=None, batches=None):
         if paused is not None and type(paused) is not bool:
             raise ValueError("État de pause invalide.")
         if batches is not None and (type(batches) is not int or not 1 <= batches <= MAX_BATCHES):
             raise ValueError(f"Choisis entre 1 et {MAX_BATCHES} lots simultanés.")
         with self.connect(write=True) as db:
+            current = bool(db.execute("SELECT paused FROM settings WHERE id=1").fetchone()[0])
+            if current and paused is False and self.draining(db):
+                raise ValueError("La suspension de la file est encore en cours.")
             db.execute("UPDATE settings SET paused=coalesce(?,paused), batches=coalesce(?,batches) WHERE id=1",
                        (paused, batches))
+            return paused is not None and paused != current
 
     def enqueue(self, targets, *, option=None, journal=None, request=None, artist_routes=None, db=None):
         if db is None:
@@ -182,6 +209,8 @@ class ImportQueue:
             row = db.execute("SELECT job FROM maintenance_receipts WHERE id=?", (receipt,)).fetchone()
             if row:
                 return row[0]
+            if db.execute("SELECT paused FROM settings WHERE id=1").fetchone()[0]:
+                return None
             identity = self.enqueue([(title, url)], db=db)
             db.execute("INSERT INTO maintenance_receipts VALUES(?,?)", (receipt, identity))
             return identity
@@ -214,7 +243,9 @@ class ImportQueue:
 
     def pending(self):
         with self.connect() as db:
-            return bool(db.execute("SELECT 1 FROM jobs WHERE state IN ('queued','running') AND option IS NULL LIMIT 1")
+            return bool(db.execute("""SELECT 1 FROM jobs WHERE option IS NULL AND
+                                   (state='running' OR (state='queued' AND
+                                   (SELECT paused FROM settings WHERE id=1)=0)) LIMIT 1""")
                         .fetchone())
 
     def enrichment_groups(self):
@@ -314,6 +345,12 @@ class ImportQueue:
 
     def finish(self, identity, event, message, terminal=None):
         with self.connect(write=True) as db:
+            if event == "suspended":
+                # A suspended attempt stays in the same lot. Its outcome,
+                # refresh generation and terminal failure record survive.
+                db.execute("""UPDATE jobs SET state='queued',message=?
+                              WHERE id=? AND state='running'""", (message, identity))
+                return
             has_tracks = db.execute("""SELECT 1 FROM outcomes WHERE job=?
                                     AND json_array_length(json_extract(payload,'$.tracks'))>0 LIMIT 1""",
                                     (identity,)).fetchone()
@@ -354,6 +391,9 @@ class ImportQueue:
         # The attempt generation guards against manual retry, integration
         # acknowledgement and worker completion racing an automatic decision.
         with self.connect(write=True) as db:
+            if phase in ("classic", "verified") and db.execute(
+                    "SELECT paused FROM settings WHERE id=1").fetchone()[0]:
+                return False
             active = db.execute("SELECT state,attempt,refresh,targets,keys FROM jobs WHERE id=?",
                                 (row["id"],)).fetchone()
             if (active is None or active["state"] != row["state"] or active["attempt"] != row["attempt"]

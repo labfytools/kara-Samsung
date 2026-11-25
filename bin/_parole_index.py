@@ -349,12 +349,12 @@ class Index:
                 self.write_night_report(db, report)
             return task
 
-    def finish(self, task, state, detail="", delay=0, *, night=None):
+    def finish(self, task, state, detail="", delay=0, *, night=None, refund_attempt=False):
         now = time()
         with self.db() as db:
-            changed = db.execute("""UPDATE tasks SET state=?, detail=?, updated=?, due=?
+            changed = db.execute("""UPDATE tasks SET state=?, detail=?, updated=?, due=?, attempts=attempts-?
                           WHERE kind=? AND subject=? AND state='running' AND revision=?""",
-                                 (state, detail[:300], now, now + delay,
+                                 (state, detail[:300], now, now + delay, refund_attempt,
                                   task["kind"], task["subject"], task["revision"])).rowcount
             if night is not None:
                 report = self.read_night_report(db)

@@ -3,6 +3,8 @@
 import argparse
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from hashlib import file_digest
 import json
@@ -27,8 +29,9 @@ from _kara_import_local import LOCAL, local_entries, local_selection, local_url,
 
 from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_category, retry_albums
 from _kara_import_queue import COMPLETE, ImportQueue, digest
-from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE, check_space,
-                                   defer_service, lease, resource_slot, wait_service)
+from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE, ImportPause,
+                                   ImportSuspended, check_space, checkpoint as pause_checkpoint, current_pause, defer_service, lease,
+                                   resource_slot, terminate_group, wait_service)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
                          shared_mutation, source_video)
@@ -102,7 +105,7 @@ class ImportProgress:
         payload = {"event": event, "message": message, "fraction": fraction, **fields}
         if self.journal and event not in ("progress", "transfer"):
             self.journal.write(payload)
-        if self.commit_result is not None and event in {"success", "failure", "skip", "cancelled"}:
+        if self.commit_result is not None and event in {"success", "failure", "skip", "cancelled", "suspended"}:
             terminal = {key: fields[key] for key in ("category", "detail", "interrupted") if key in fields}
             self.commit_result(event, message, terminal)
         if self.json_output:
@@ -196,7 +199,7 @@ class ImportProgress:
 
 
 def run(label, command, *, progress=None, fraction=None, download=False, announce=True,
-        total=0, unit="pistes traitées", span=0.0, resource=None, disk=None):
+        total=0, unit="pistes traitées", span=0.0, resource=None, disk=None, cooperative=False):
     if announce:
         if progress is None:
             print(f"\n{label}", flush=True)
@@ -205,6 +208,10 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
     env = {**os.environ, "KARA_SHARED_WAIT": "suivi" if progress else "texte"}
     if progress is None:
         return subprocess.run(command, env=env).returncode
+    pause_checkpoint()
+    pause = current_pause()
+    if cooperative and pause is not None:
+        env["KARA_IMPORT_COOPERATIVE_SORT"] = "1"
     errors = deque(maxlen=32)
     tail = deque(maxlen=32)
     processed = 0
@@ -225,7 +232,7 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
         with resource_slot(directory, PROCESSING, lambda: progress.emit("En attente d’un traitement…")) as slot:
             progress.measured(label, "processing_queue", monotonic() - waiting)
             return run(label, command, progress=progress, fraction=fraction, announce=False,
-                       total=total, unit=unit, span=span, resource=(slot,))
+                       total=total, unit=unit, span=span, resource=(slot,), cooperative=cooperative)
     started = monotonic()
     try:
         if resource and not download:
@@ -241,11 +248,16 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
 
     def watch():
         deadline = monotonic() + (360 if download else 1800)
-        interval = 1 if disk else max(0., deadline - monotonic())
+        interval = .1 if pause is not None else 1 if disk else max(0., deadline - monotonic())
+        next_space = monotonic()
         while not finished.wait(interval):
+            if pause is not None and pause.is_set() and not cooperative:
+                terminate_group(process)
+                return
             try:
-                if disk is not None:
+                if disk is not None and monotonic() >= next_space:
                     check_space(disk)
+                    next_space = monotonic() + 1
                 if monotonic() < deadline:
                     continue
                 abort.append(("network" if download else "processing", "Délai maximal du sous-processus dépassé."))
@@ -314,6 +326,9 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
     finished.set()
     watchdog.join()
     progress.measured(label, "subprocess", monotonic() - started, returncode=result)
+    if cooperative and pause is not None and result == 75:
+        raise ImportSuspended
+    pause_checkpoint()
     if result:
         detail = "\n".join(errors or tail) or f"{command[0]} a retourné le code {result}."
         category = failure_category(detail, "download" if download else "processing")
@@ -400,6 +415,7 @@ def require_commands(*commands):
 def bounded_metadata(command, guard, timeout):
     # Metadata is consumed one album at a time. Stop a malformed extractor
     # response before it can fill RAM or the filesystem with captured output.
+    pause_checkpoint()
     deadline = monotonic() + timeout
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=BIN,
                           pass_fds=guard, start_new_session=True) as process, DefaultSelector() as reader:
@@ -407,11 +423,12 @@ def bounded_metadata(command, guard, timeout):
         reader.register(process.stdout, EVENT_READ, output)
         reader.register(process.stderr, EVENT_READ, errors)
         try:
-            while reader.get_map():
+            while reader.get_map() or process.poll() is None:
+                pause_checkpoint()
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(command, timeout, stderr=bytes(errors))
-                for key, _ in reader.select(remaining):
+                for key, _ in reader.select(min(.15, remaining)):
                     block = os.read(key.fd, 65536)
                     if not block:
                         reader.unregister(key.fileobj)
@@ -421,6 +438,9 @@ def bounded_metadata(command, guard, timeout):
                         raise ImportIssue("processing", "Réponse de catalogue ou de playlist trop volumineuse.")
             return subprocess.CompletedProcess(command, process.wait(timeout=max(0., deadline - monotonic())),
                                                output.decode("utf-8", "replace"), errors.decode("utf-8", "replace"))
+        except ImportSuspended:
+            terminate_group(process)
+            raise
         except (ImportIssue, subprocess.TimeoutExpired):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -679,7 +699,7 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
                    [str(BIN / "musique-tri"), "--bibliotheque", str(SHARED_LIBRARY),
                     "--rapport", str(report), "--rapport-detaille", "--reprise-interne", str(receipt),
                     *credit, *(["--garder-tags-import"] if preserve_tags else ()), *destination, *filing, "--", str(batch)],
-                   progress=progress, fraction=0.76, resource="processing")
+                   progress=progress, fraction=0.76, resource="processing", cooperative=True)
         if not report.is_file():
             if not code:
                 progress.issue("Tri dans l’audiothèque", "processing", "Rapport du tri absent.")
@@ -853,6 +873,7 @@ def local_sidecars(tracks, entries, root, progress):
         albums.setdefault(Path(name).parent, set()).add(track.parent)
     with shared_mutation(root, wait=True):
         for name, track in tracks.items():
+            pause_checkpoint()
             if not available_tracks([str(track)], root):
                 continue
             source = Path(name)
@@ -971,6 +992,7 @@ def publish_staged(item, root, inbox, folder, records, active, targets, receipt,
     progress = item.progress
     if progress.measure_index is not None:
         for stage, name in tuple(active.items()):
+            pause_checkpoint()
             try:
                 target = reuse_duplicate(progress.measure_index, name, records[name], folder, inbox, progress)
             except sqlite3.Error as error:
@@ -1038,6 +1060,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                 targets = {}
                 active = {}
                 for number, name in enumerate(audio, 1):
+                    pause_checkpoint()
                     if stop.is_set():
                         break
                     entry = entries[name]
@@ -1275,6 +1298,7 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
         if not saved.get("active") and failure_counts.get(previous_source) == 1:
             ranked.sort(key=lambda row: row.offer["provider"] != previous_source)
         for choice in ranked:
+            pause_checkpoint()
             if stop.is_set():
                 return
             offer = choice.offer
@@ -1464,7 +1488,8 @@ def import_album(item, root, inbox, previous, stop, seen):
                     with ThreadPoolExecutor(max_workers=min(DOWNLOAD_WORKERS, len(tasks))) as pool:
                         # Only this album supplies work. A discography never
                         # allocates a future for every track of every release.
-                        list(pool.map(transfer, tasks))
+                        list(pool.map(lambda source, scope: scope.run(transfer, source), tasks,
+                                      (copy_context() for _ in tasks)))
                 if any(audio_files(folder)):
                     check_space(folder, extra=MAX_MEDIA * PROCESSING)
                     item.added, sorted_tracks = sort_audio(folder, progress, item.artist, receipt, filing_artist=filing_artist)
@@ -1509,6 +1534,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
     seen = set()
     urls = list(dict.fromkeys(urls))
     for index, url in enumerate(urls, 1):
+        pause_checkpoint()
         # A cooperative stop leaves untouched targets and their prior outcomes
         # alone. The active album still reconciles its publication receipts.
         if stop.is_set():
@@ -1558,6 +1584,20 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
                     progress.emit(f"{YOUTUBE} · vérification du lien", event="provider", provider=YOUTUBE)
                     report("Vérification dans la collection", 0)
                     import_album(item, root, inbox, previous.get(url, {}), stop, seen)
+            except ImportSuspended:
+                # Publications made since the previous attempt have their
+                # own receipts. Preserve the outcome and replay new receipts
+                # on resume, without starting more probes or publications.
+                saved = previous.get(url, {})
+                outcome = dict(saved, url=url, title=item.title, status="suspended",
+                               message="Album suspendu · reprise en attente", audio_complete=False,
+                               tracks=sorted(set(saved.get("tracks", ())) | set(item.tracks)),
+                               remaining=str(item.remaining) if item.remaining else saved.get("remaining"),
+                               identity=item.identity or saved.get("identity", ""), provider=item.provider,
+                               added=saved.get("added", 0) + item.added, processed=item.processed)
+                on_album(outcome)
+                progress.emit(event="album", **outcome)
+                raise
             except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as error:
                 record_error(child, "Import de l’album", error)
         enrichment = None
@@ -1718,7 +1758,7 @@ def main():
         # final state before notifying GTK, including if GTK has closed.
         progress.commit_result = lambda event, message, terminal: queue.finish(job["id"], event, message, terminal)
     try:
-        with ImportLog() as journal:
+        with ExitStack() as resources, ImportLog() as journal:
             progress.journal = journal
             journal.write({"event": "header", "version": 1, "library": str(SHARED_LIBRARY), "urls": urls,
                            "queue_job": job["id"] if job else None})
@@ -1726,6 +1766,13 @@ def main():
                 queue.set_journal(job["id"], journal.path)
             progress.emit(f"Journal : {journal.path}", event="journal", path=str(journal.path))
             try:
+                if job:
+                    activity = resources.enter_context(queue.activity())
+                    progress.guard += (activity,)
+                    pause = resources.enter_context(ImportPause(queue.pause_requested))
+                    resources.enter_context(pause.scope())
+                    if queue.pause_requested():
+                        raise ImportSuspended
                 if args.revision:
                     return revise()
                 if maintenance:
@@ -1752,6 +1799,10 @@ def main():
                 return prepare_batch(urls, progress, stop, previous, titles=titles,
                                      routes=queue.routes(job["id"]) if job else None,
                                      on_album=(lambda outcome: queue.album(job["id"], outcome)) if job else None)
+            except ImportSuspended:
+                progress.emit("Transferts et traitements arrêtés · état sauvegardé · reprise en attente",
+                              event="suspended")
+                return 0
             except ImportIssue as error:
                 progress.finish_issue(error)
             except KeyboardInterrupt:

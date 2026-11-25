@@ -181,7 +181,7 @@ class AlbumImport(Gtk.Revealer):
         self.concurrency_handler = self.concurrency.connect("value-changed", self.configure_concurrency)
         controls.append(self.concurrency)
         self.pause = Gtk.Button(label="Mettre la file en pause")
-        self.pause.set_tooltip_text("Suspend les nouveaux départs. Les lots actifs peuvent se terminer.")
+        self.pause.set_tooltip_text("Suspend les imports et leurs enrichissements en cours. Les données reprises sont conservées.")
         self.pause.connect("clicked", lambda _: self.configure(paused=not self.imports_snapshot[1].get("paused", False)))
         controls.append(self.pause)
         self.queue_status = Gtk.Label(xalign=0., wrap=True, hexpand=True, css_classes=["lyrics-info"])
@@ -735,16 +735,21 @@ class AlbumImport(Gtk.Revealer):
         try:
             if self.queue is None:
                 raise OSError(self.queue_error)
-            self.queue.configure(**settings)
+            changed = self.queue.configure(**settings)
         except (OSError, sqlite3.Error, ValueError) as error:
             self.message(str(error), failed=True)
             return False
+        if changed:
+            message = ("Pause de la file demandée" if settings["paused"] else
+                       "Reprise de la file · lots et enrichissements en attente réactivés")
+            self.on_update(None, "queue", {"message": message})
         self.launch_next(force=True)
         return True
 
     def add_import(self, row):
         job = ImportJob(row["targets"], self.import_finished, identity=row["id"], option=row["option"],
                         retry=self.retry_job, journal=row["journal"])
+        job.outcomes = self.queue.outcomes(job.identity)
         self.by_id[job.identity] = job
         self.imports.append(job)
         job.update_counts()
@@ -756,7 +761,7 @@ class AlbumImport(Gtk.Revealer):
     def changed(self, job, kind, payload):
         if kind == "progress":
             self.on_update(job, kind, payload)
-        elif kind in {"finished", "album", "running", "provider"}:
+        elif kind in {"finished", "album", "running", "provider", "suspended"}:
             self.on_update(job, kind, payload)
             self.next_poll = 0
 
@@ -784,7 +789,6 @@ class AlbumImport(Gtk.Revealer):
                     check_space(inbox, extra=WORKING_RESERVE)
             except ImportIssue as error:
                 can_start, limitation = False, str(error)
-        self.pause.set_label("Reprendre la file" if paused else "Mettre la file en pause")
         self.concurrency.handler_block(self.concurrency_handler)
         self.concurrency.set_value(capacity)
         self.concurrency.handler_unblock(self.concurrency_handler)
@@ -794,11 +798,14 @@ class AlbumImport(Gtk.Revealer):
             job = self.by_id.get(identity) or self.add_import(row)
             job.awaiting_refresh = bool(row["refresh"])
             job.store_state = state
+            job.queue_paused = paused
             if job.done:
                 if state in ("failed", "partial", "review") and job.process is None:
                     job.message(row["message"], failed=True)
                 job.update_details()
             if job.process is not None:
+                if paused:
+                    job.message("Suspension en cours…")
                 continue
             if state in {"running", "queued"}:
                 if job.done:
@@ -806,20 +813,22 @@ class AlbumImport(Gtk.Revealer):
                     self.imports.remove(job)
                     job = self.add_import(row)
                 job.store_state = state
-                job.message(row["message"])
+                job.queue_paused = paused
+                job.message("En pause · reprise en attente" if paused and state == "queued" else row["message"])
                 if state == "running" or can_start and active < capacity:
                     with lease(self.queue.directory / f"{identity}.lock", wait=False) as fd:
                         if fd is None:
                             # An import started by the previous instance still
                             # owns the lot. Its worker commits the result itself.
                             if state == "running":
-                                job.message("Import actif · session précédente")
+                                job.message("Suspension en cours…" if paused else "Import actif · session précédente")
                             continue
                         if state == "running":
-                            self.queue.transition(identity, "running", "queued", "Import interrompu · reprise en attente")
+                            message = ("En pause · reprise en attente" if paused else "Import interrompu · reprise en attente")
+                            self.queue.transition(identity, "running", "queued", message)
                             job.store_state = "queued"
                             active -= 1
-                            job.message("Import interrompu · reprise en attente")
+                            job.message(message)
                         if can_start and active < capacity and self.queue.claim(identity):
                             active += 1
                             job.outcomes = self.queue.outcomes(identity)
@@ -839,9 +848,15 @@ class AlbumImport(Gtk.Revealer):
                 self.imports.remove(job)
                 self.by_id.pop(job.identity)
         self.import_view.set_visible(bool(self.imports))
-        self.update_queue_summary(paused, capacity, inbox, limitation)
+        self.update_queue_summary(capacity, inbox, limitation)
 
-    def update_queue_summary(self, paused, capacity, inbox, limitation):
+    def update_queue_summary(self, capacity, inbox, limitation):
+        pause_state = self.queue.pause_state()
+        self.pause.set_label({"running": "Mettre la file en pause", "suspending": "Suspension en cours…",
+                              "paused": "Reprendre la file"}[pause_state])
+        self.pause.set_sensitive(pause_state != "suspending")
+        if pause_state == "paused" and self.imports_snapshot[1].get("pause_state") != "paused":
+            self.on_update(None, "queue", {"message": "File suspendue · état sauvegardé · créneaux libérés"})
         counts = self.queue.count()
         albums, tracks, settled, planned = self.queue.totals()
         active, waiting = counts.get("running", 0), counts.get("queued", 0)
@@ -857,7 +872,8 @@ class AlbumImport(Gtk.Revealer):
         self.imports_snapshot = (owner_rows, dict(active=active, waiting=waiting, albums=albums, tracks=tracks,
                                                   errors=errors, downloads=downloads, processing=processing,
                                                   audio_bytes_per_second=sum(rates) if rates else None,
-                                                  progress=progress, paused=paused, batches=capacity,
+                                                  progress=progress, paused=pause_state != "running",
+                                                  pause_state=pause_state, batches=capacity,
                                                   limitation=CATEGORIES["space"] if limitation else "",
                                                   max_batches=MAX_BATCHES))
         summary = (f"{active} lot(s) actif(s) · {waiting} en attente · {albums} album(s) audio complet(s) · "
@@ -946,6 +962,7 @@ class ImportJob(Gtk.Box):
         self.refresh_generation = 0
         self.awaiting_refresh = False
         self.store_state = "queued"
+        self.queue_paused = False
         self.measured = False
         self.result = None
         self.outcomes = {}
@@ -1030,6 +1047,9 @@ class ImportJob(Gtk.Box):
                  "running" if self.process else self.store_state)
         if self.awaiting_refresh and state == "done":
             state, status = "integrating", "Actualisation de la bibliothèque"
+        if self.queue_paused and state in {"queued", "running"}:
+            state, status = (("suspended", "En pause · reprise en attente") if state == "queued" else
+                             ("suspending", "Suspension en cours…"))
         return dict(id=f"queue:{self.identity}", title=self.title, albums=len(self.jobs), tracks=None,
                     state=state, progress=self.fraction if self.measured else None, message=status, note="",
                     remaining=[{"title": title or (outcome or {}).get("title") or "Import par lien",
@@ -1096,7 +1116,7 @@ class ImportJob(Gtk.Box):
                 self.fraction = max(self.fraction, fraction)
                 self.progress.set_fraction(self.fraction)
             self.update_counts()
-        elif event in {"success", "failure", "skip", "cancelled"}:
+        elif event in {"success", "failure", "skip", "cancelled", "suspended"}:
             details = self.diagnostics(payload)
             if isinstance(payload.get("detail"), str):
                 details.insert(0, payload["detail"])
@@ -1121,6 +1141,20 @@ class ImportJob(Gtk.Box):
         except GLib.Error:
             completed = False
         event, text, fraction, detail = self.result or ("failure", "Kara s’est arrêté avant le bilan.", None, "")
+        if completed and event == "suspended":
+            self.process = None
+            if self.timer is not None:
+                GLib.source_remove(self.timer)
+                self.timer = None
+            self.result = None
+            self.store_state = "queued"
+            self.stopping = self.stop_ready = False
+            self.stop.set_sensitive(False)
+            self.transfer_rates.clear()
+            self.album_fraction = 0.
+            self.message(text)
+            self.on_update(self, "suspended", {"message": text})
+            return
         if not completed and event not in {"failure", "cancelled"}:
             event, text = "failure", "Kara s’est arrêté avec une erreur."
         self.finish_import(event, text, fraction, detail)

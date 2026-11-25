@@ -14,6 +14,7 @@ import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 from _kara_import_local import stamp
+from _kara_import_resources import ImportPause, ImportSuspended, checkpoint, run_checked
 from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file, audio_files,
                          canonical_album_artist, component, mutation_report, probe, share_file, shared_mutation,
                          SHARED_LIBRARY, source_video, title_pair)
@@ -40,7 +41,7 @@ def same_import_track(source, target, tags):
             return False
         hashes = []
         for track in (source, target):
-            result = subprocess.run(
+            result = run_checked(
                 ("ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
                  "-i", str(track), "-map", "0:a:0", "-c", "copy", "-f", "hash", "-hash", "sha256", "pipe:1"),
                 capture_output=True, check=True, timeout=30,
@@ -147,7 +148,7 @@ def write_tags(source, target, tags, updates, recover=False):
         metadata.extend(("-metadata", assignment, "-metadata:s:a:0", assignment))
     with TemporaryDirectory(dir=target.parent, prefix=".tri-") as temp:
         draft = Path(temp) / source.name
-        subprocess.run(
+        run_checked(
             ("ffmpeg", "-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file,pipe",
              "-i", str(source), "-map", "0", "-c", "copy", *metadata, str(draft)),
             capture_output=True, check=True, timeout=60,
@@ -315,6 +316,7 @@ def main():
     # FFprobe can run in parallel with a different album's publication. The
     # exact input version must still match when the shared lock is obtained.
     for track in tracks:
+        checkpoint()
         try:
             token = stamp(track.lstat())
             tags, _ = probe(track)
@@ -338,6 +340,9 @@ def main():
         destinations = set()
         added = 0
         for track, tags in items:
+            # One receipt and its atomic publication form a safe unit. A
+            # pause can also interrupt a draft conversion before publication.
+            checkpoint()
             try:
                 artist = args.artiste_album.strip() if args.artiste_album else artists[track]
                 album = args.nom_album.strip() if args.nom_album else tags.get("album")
@@ -364,4 +369,15 @@ def main():
 
 
 if __name__ == "__main__":
+    if os.environ.get("KARA_IMPORT_COOPERATIVE_SORT") == "1":
+        from _kara_import_queue import ImportQueue
+
+        queue = ImportQueue()
+        try:
+            with ImportPause(queue.pause_requested) as pause, pause.scope():
+                if queue.pause_requested():
+                    raise ImportSuspended
+                raise SystemExit(main())
+        except ImportSuspended:
+            raise SystemExit(75)
     raise SystemExit(main())

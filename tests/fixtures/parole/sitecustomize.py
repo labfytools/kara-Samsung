@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from types import ModuleType
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
@@ -34,6 +35,9 @@ if "PAROLE_TEST_CONFIG" in os.environ:
             if url.hostname == "coverartarchive.org":
                 return response(Path(config["cover"]).read_bytes(), "image/jpeg")
             if url.hostname == "lrclib.net" and url.path == "/api/get":
+                if marker := config.get("lyric_wait"):
+                    Path(marker).touch()
+                    time.sleep(20)
                 album = parameters.get("album_name", [""])[0]
                 if album in config["lyric_failures"]:
                     return response("Fixture: le serveur des paroles ne répond pas en JSON.".encode(), "text/plain")
@@ -88,12 +92,14 @@ if "PAROLE_TEST_CONFIG" in os.environ:
             return config["archive_item"]
 
         @contextmanager
-        def open_archive_file(_index, _inbox, _album, file):
+        def open_archive_file(_index, _inbox, _album, file, offset=0):
             with Path(config["requests"]).open("a") as journal:
                 journal.write(file.name + "\n")
             if file.name in config.get("archive_failures", []):
                 raise ImportIssue("network", "Serveur de stockage d’essai indisponible.")
             with Path(config["archive_originals"][file.name]).open("rb") as stream:
+                stream.seek(offset)
+                stream.offset = offset
                 yield stream
 
         archive.fetch = archive_fetch

@@ -73,7 +73,7 @@ class ImportLog:
         with self.lock:
             self.file.write(json.dumps({"stamp": time(), **payload}, ensure_ascii=False) + "\n")
             self.file.flush()
-            if payload.get("event") in {"header", "success", "skip", "failure", "cancelled"}:
+            if payload.get("event") in {"header", "success", "skip", "failure", "cancelled", "suspended"}:
                 os.fsync(self.file.fileno())
 
 

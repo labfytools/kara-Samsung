@@ -11,7 +11,7 @@ import ssl
 from time import monotonic, time
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
-from _kara_import_resources import defer_service, wait_service
+from _kara_import_resources import checkpoint, current_pause, defer_service, wait_service
 from _kara_import_result import ImportIssue
 from _parole_index import document
 from _parole_import_providers import ARCHIVE, JAMENDO, MANUAL
@@ -112,18 +112,44 @@ def external_ips(host):
 
 
 class PinnedHTTPS(http.client.HTTPSConnection):
+    def watch(self, stream):
+        if (pause := current_pause()) is not None:
+            pause.watch_socket(stream)
+            self.import_socket = stream
+
+    def forget(self):
+        if (pause := current_pause()) is not None and hasattr(self, "import_socket"):
+            pause.forget_socket(self.import_socket)
+            del self.import_socket
+
     def connect(self):
         # Resolve once, validate every answer and connect to the literal
         # address. TLS still authenticates the original DNS name.
         address = external_ips(self.host)[0]
         with_tls = socket.socket(socket.AF_INET6 if len(address) == 4 else socket.AF_INET, socket.SOCK_STREAM)
         try:
+            self.watch(with_tls)
             with_tls.settimeout(self.timeout)
             with_tls.connect(address)
-            self.sock = self._context.wrap_socket(with_tls, server_hostname=self.host)
+            self.forget()
+            with_tls = self._context.wrap_socket(with_tls, server_hostname=self.host, do_handshake_on_connect=False)
+            self.watch(with_tls)
+            with_tls.do_handshake()
+            self.sock = with_tls
         except BaseException:
             with_tls.close()
             raise
+
+
+@contextmanager
+def https_connection(host, timeout):
+    connection = PinnedHTTPS(host, timeout=timeout, context=ssl.create_default_context())
+    try:
+        yield connection
+    finally:
+        connection.close()
+        if isinstance(connection, PinnedHTTPS):
+            connection.forget()
 
 
 def fetch(url, *, interval=1.2, accept="application/json", registry=None, provider=None, validation=False):
@@ -136,54 +162,62 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
             wait_service(service, interval, max_wait=5)
         except ImportIssue as error:
             raise ProviderUnavailable("Temporisation fournisseur") from error
-    connection = PinnedHTTPS(parts.hostname, timeout=5, context=ssl.create_default_context())
     deadline = monotonic() + 12
-    try:
-        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
-        connection.request("GET", path, headers={"Accept": accept, "User-Agent": "Parole/3 (Kara music library)"})
-        response = connection.getresponse()
-        if response.status == 404:
-            return None
-        if response.status == 429 or response.status >= 500:
-            retry = response.getheader("Retry-After", "")
-            delay = min(int(retry), 86400) if retry.isdecimal() and len(retry) < 8 else 120
-            defer_service(service, delay)
-            if provider in (ARCHIVE, JAMENDO):
-                limited(registry, provider, delay, response.status)
-            raise ProviderUnavailable(f"Fournisseur HTTP {response.status}")
-        if response.status != 200:
-            raise ValueError(f"Réponse HTTP {response.status} refusée")
-        if accept == "application/json" and "application/json" not in response.getheader("Content-Type", ""):
-            raise ValueError("Type de réponse inattendu")
-        data = bytearray()
-        while block := response.read1(32 * 1024):
-            data.extend(block)
-            if len(data) > MAX_RESPONSE or monotonic() > deadline:
-                raise ProviderUnavailable("Réponse fournisseur hors limites")
-        return json.loads(data) if accept == "application/json" else bytes(data)
-    except ProviderUnavailable:
-        raise
-    except (OSError, http.client.HTTPException) as error:
-        raise ProviderUnavailable("Source indisponible") from error
-    finally:
-        connection.close()
+    with https_connection(parts.hostname, 5) as connection:
+        try:
+            checkpoint()
+            path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+            connection.request("GET", path, headers={"Accept": accept, "User-Agent": "Parole/3 (Kara music library)"})
+            response = connection.getresponse()
+            if response.status == 404:
+                return None
+            if response.status == 429 or response.status >= 500:
+                retry = response.getheader("Retry-After", "")
+                delay = min(int(retry), 86400) if retry.isdecimal() and len(retry) < 8 else 120
+                defer_service(service, delay)
+                if provider in (ARCHIVE, JAMENDO):
+                    limited(registry, provider, delay, response.status)
+                raise ProviderUnavailable(f"Fournisseur HTTP {response.status}")
+            if response.status != 200:
+                raise ValueError(f"Réponse HTTP {response.status} refusée")
+            if accept == "application/json" and "application/json" not in response.getheader("Content-Type", ""):
+                raise ValueError("Type de réponse inattendu")
+            data = bytearray()
+            while True:
+                checkpoint()
+                if not (block := response.read1(32 * 1024)):
+                    break
+                data.extend(block)
+                if len(data) > MAX_RESPONSE or monotonic() > deadline:
+                    raise ProviderUnavailable("Réponse fournisseur hors limites")
+            checkpoint()
+            return json.loads(data) if accept == "application/json" else bytes(data)
+        except ProviderUnavailable:
+            raise
+        except (OSError, http.client.HTTPException) as error:
+            checkpoint()
+            raise ProviderUnavailable("Source indisponible") from error
 
 
 class AudioDownload:
-    def __init__(self, payload, started, deadline, length):
+    def __init__(self, payload, started, deadline, length, offset=0):
         self.payload = payload
         self.deadline = deadline
         self.length = length
+        self.offset = offset
         self.transfer = Transfer(started)
         self.finished = False
 
     def read(self, size):
+        checkpoint()
         if monotonic() >= self.deadline:
             raise ImportIssue("network", "Délai de téléchargement dépassé.")
         try:
             block = self.payload.read1(size)
         except (OSError, http.client.HTTPException) as error:
+            checkpoint()
             raise ImportIssue("network", "Transfert audio interrompu.") from error
+        checkpoint()
         if block:
             self.transfer.received(self.transfer.bytes + len(block), monotonic())
         else:
@@ -192,7 +226,7 @@ class AudioDownload:
 
 
 @contextmanager
-def open_audio(url, *, registry, provider, service, hosts, expected_size=None, interval=1.2):
+def open_audio(url, *, registry, provider, service, hosts, expected_size=None, interval=1.2, offset=0):
     # Rate and authorization are checked before contacting any storage node.
     # Redirects must stay in the adapter's allowed domains and keep TLS.
     try:
@@ -202,17 +236,22 @@ def open_audio(url, *, registry, provider, service, hosts, expected_size=None, i
     started = monotonic()
     deadline = started + 360
     for _ in range(4):
+        checkpoint()
         parts = public_url(url)
         if not any(parts.hostname == host or parts.hostname.endswith("." + host) for host in hosts):
             raise ImportIssue("path", f"Redirection hors de {provider} refusée.")
-        connection = PinnedHTTPS(parts.hostname, timeout=12, context=ssl.create_default_context())
-        try:
+        with https_connection(parts.hostname, 12) as connection:
             request = (parts.path or "/") + ("?" + parts.query if parts.query else "")
             try:
-                connection.request("GET", request, headers={"User-Agent": "Parole/3 (Kara music library)"})
+                headers = {"User-Agent": "Parole/3 (Kara music library)"}
+                if offset:
+                    headers["Range"] = f"bytes={offset}-"
+                connection.request("GET", request, headers=headers)
                 response = connection.getresponse()
             except (OSError, http.client.HTTPException) as error:
+                checkpoint()
                 raise ImportIssue("network", f"Transfert {provider} indisponible.") from error
+            checkpoint()
             if response.status in {301, 302, 303, 307, 308} and response.getheader("Location"):
                 url = urljoin(url, response.getheader("Location"))
                 continue
@@ -222,22 +261,25 @@ def open_audio(url, *, registry, provider, service, hosts, expected_size=None, i
                 defer_service(service, delay)
                 limited(registry, provider, delay, response.status)
                 raise ImportIssue("network", f"{provider} HTTP {response.status}")
-            if response.status != 200:
+            if response.status == 206 and offset and expected_size is not None:
+                if response.getheader("Content-Range") != f"bytes {offset}-{expected_size - 1}/{expected_size}":
+                    raise ImportIssue("processing", f"Reprise partielle {provider} non vérifiable.")
+            elif response.status == 200:
+                offset = 0
+            else:
                 raise ImportIssue("path", f"Fichier {provider} indisponible (HTTP {response.status}).")
             raw_length = response.getheader("Content-Length")
             length = int(raw_length) if raw_length is not None and re.fullmatch(r"[0-9]{1,10}", raw_length) else None
-            if raw_length is not None and (length is None or expected_size is not None and length != expected_size):
+            if raw_length is not None and (length is None or expected_size is not None and length != expected_size - offset):
                 raise ImportIssue("processing", f"La longueur du fichier {provider} a changé.")
             media = response.getheader("Content-Type", "").split(";", 1)[0].casefold()
             if media and not (media.startswith("audio/") or media in {"application/octet-stream", "application/ogg"}):
                 raise ImportIssue("processing", f"La réponse {provider} n’est pas un fichier audio.")
-            stream = AudioDownload(response, started, deadline, length)
+            stream = AudioDownload(response, started, deadline, length, offset)
             yield stream
             if stream.finished:
                 observe(registry, provider, stream.transfer.measurements())
             return
-        finally:
-            connection.close()
     raise ImportIssue("network", f"Trop de redirections {provider}.")
 
 

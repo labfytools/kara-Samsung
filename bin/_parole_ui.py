@@ -205,6 +205,9 @@ class Console:
         lyrics, lrc = self.maintenance.import_activity
         line = (f"{summary.get('downloads', 0)} téléchargement(s) · {lyrics} recherche(s) de texte · "
                 f"{lrc} recherche(s) LRC · {summary.get('albums', 0)} album(s) audio complet(s)")
+        if summary.get("pause_state") in {"suspending", "paused"}:
+            line += " · " + ("Suspension des imports en cours…" if summary["pause_state"] == "suspending"
+                             else "Imports et enrichissements suspendus")
         if rate := summary.get("audio_bytes_per_second"):
             line += f" · {rate / 1024**2:.2f} Mio/s mesurés"
         self.import_metrics.set_label(f"{line}\n{self.import_summary}" if self.import_summary else line)

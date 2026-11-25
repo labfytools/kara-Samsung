@@ -53,6 +53,8 @@ with NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".info.json", dir=con
     draft.flush()
     position = arguments.index("--cookies-from-browser")
     del arguments[position:position + 2]
+    if config.get("fixed_transfer_buffer"):
+        arguments[:0] = ["--no-resize-buffer", "--buffer-size", "4096"]
     import subprocess
     sys.exit(subprocess.run([config["real_downloader"], "--ignore-config", *arguments[:-2],
                              "--load-info-json", draft.name]).returncode)

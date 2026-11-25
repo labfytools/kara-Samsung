@@ -278,7 +278,7 @@ class MobileImports:
                 state = job["state"]
                 message = job["message"]
                 if task and (state in ("queued", "running") or state != "done" and
-                             task["state"] in ("queued", "running")):
+                             task["state"] in ("queued", "running", "suspending", "suspended")):
                     state, message = task["state"], task["message"]
                 result.append(dict(id=job["id"], title=job["title"], tracks=job["tracks"],
                                    albums=len(job["targets"]), state=state, message=message,

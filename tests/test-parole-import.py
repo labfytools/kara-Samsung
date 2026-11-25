@@ -25,7 +25,7 @@ sys.path.insert(0, str(BIN))
 from _kara_audio_identity import pcm_digest
 from _kara_import_local import local_target
 from _kara_mobile_imports import MobileImports
-from _kara_import_queue import ImportQueue
+from _kara_import_queue import ImportQueue, digest
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index, inventory
@@ -844,6 +844,206 @@ class AlbumImportTests(unittest.TestCase):
                 return
             time.sleep(0.04)
         self.fail("La fixture n’a pas atteint l’état attendu")
+
+    def launch_managed(self, queue, identity):
+        with lease(queue.directory / f"{identity}.lock") as fd:
+            self.assertTrue(queue.claim(identity))
+            return self.managed_worker(queue, identity, fd)
+
+    def await_pause(self, queue, *workers):
+        start = time.monotonic()
+        self.assertTrue(queue.configure(paused=True))
+        self.assertEqual(queue.pause_state(), "suspending")
+        self.until(lambda: queue.pause_state() == "paused", seconds=5)
+        print(f"Pause confirmée en {time.monotonic() - start:.3f} s ({len(workers)} moteur(s)).", flush=True)
+        for worker in workers:
+            stdout, stderr = worker.communicate(timeout=5)
+            self.assertEqual(worker.returncode, 0, (stdout, stderr))
+            if worker.args[0] == BIN / "kara":
+                self.assertEqual(json.loads(stdout.splitlines()[-1])["event"], "suspended")
+        for resource, capacity in ((".kara-transferts", DOWNLOADS), (".kara-traitements", PROCESSING)):
+            self.assertEqual(slot_count(self.inbox / resource, capacity), 0)
+
+    def test_pause_real_audio_preserves_ranges_and_resumes_after_restart(self):
+        original = self.temp / "transfert.opus"
+        subprocess.run([TOOLS["ffmpeg"], "-nostdin", "-v", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=12", "-c:a", "libopus",
+                        "-b:a", "192k", "-vbr", "off", str(original)], check=True)
+        audio = original.read_bytes()
+        self.config["fixed_transfer_buffer"] = True
+        for concurrent in (1, 2):
+            with self.subTest(concurrent=concurrent):
+                release = Event()
+                offsets = []
+
+                class ThrottledAudio(QuietHTTP):
+                    def do_GET(self):
+                        start = int(self.headers.get("Range", "bytes=0-").split("=")[1].split("-")[0])
+                        offsets.append(start)
+                        self.send_response(206 if self.headers.get("Range") else 200)
+                        if self.headers.get("Range"):
+                            self.send_header("Content-Range", f"bytes {start}-{len(audio) - 1}/{len(audio)}")
+                        self.send_header("Content-Length", str(len(audio) - start))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(audio[start:start + 196608])
+                            release.wait(12)
+                            self.wfile.write(audio[start + 196608:])
+                        except OSError:
+                            pass
+
+                with ThreadingHTTPServer(("127.0.0.1", 0), ThrottledAudio) as server:
+                    server_thread = Thread(target=server.serve_forever)
+                    server_thread.start()
+                    try:
+                        self.config["media"] = f"http://127.0.0.1:{server.server_port}/audio.opus"
+                        queue = ImportQueue(self.temp / "state", self.library)
+                        identities = []
+                        for number in range(concurrent):
+                            key = f"PLPAUSE{concurrent}{number}"
+                            self.config["playlists"][key] = {"title": key, "tracks": [
+                                {"id": f"pause{concurrent}{number:05d}", "title": key}]}
+                            identities.append(queue.enqueue([(key, playlist(key))]))
+                        self.update_config()
+                        workers = [self.launch_managed(queue, identity) for identity in identities]
+                        self.until(lambda: sum(file.stat().st_size > 0
+                                               for file in self.inbox.rglob("*.part")) == concurrent)
+                        self.assertEqual(slot_count(self.inbox / ".kara-transferts", DOWNLOADS), concurrent)
+                        self.await_pause(queue, *workers)
+                        parts = {part: part.read_bytes() for part in self.inbox.rglob("*.part")}
+                        self.assertEqual(len(parts), concurrent)
+                        time.sleep(.2)
+                        self.assertTrue(all(path.read_bytes() == data for path, data in parts.items()))
+                        restarted = ImportQueue(self.temp / "state", self.library)
+                        self.assertEqual(restarted.pause_state(), "paused")
+                        for identity in identities:
+                            self.assertFalse(restarted.claim(identity))
+                            self.assertEqual(restarted.job(identity)["state"], "queued")
+                            self.assertTrue(Path(restarted.job(identity)["journal"]).is_file())
+                        self.assertIsNone(restarted.enqueue_maintenance("automatic", "Auto", playlist("AUTO")))
+                        release.set()
+                        restarted.configure(paused=False)
+                        for identity in identities:
+                            worker = self.launch_managed(restarted, identity)
+                            stdout, stderr = worker.communicate(timeout=25)
+                            self.assertEqual(worker.returncode, 0, (stdout, stderr))
+                            outcome, = restarted.outcomes(identity).values()
+                            self.assertEqual(outcome["status"], "success")
+                            track, = self.check_tracks(outcome["title"], 1, enriched=False)
+                            self.assertEqual(pcm_digest(track), pcm_digest(original))
+                        self.assertEqual(sum(offset > 0 for offset in offsets), concurrent)
+                    finally:
+                        release.set()
+                        server.shutdown()
+                        server_thread.join()
+
+    def test_pause_during_ffmpeg_preserves_complete_staging_and_large_lot(self):
+        source = self.temp / "Source"
+        self.make_local_track(source / "01.flac", 1)
+        self.make_local_track(source / "02.flac", 2)
+        queue = ImportQueue(self.temp / "state", self.library)
+        first = self.temp / "Premier"
+        self.make_local_track(first / "01.flac", 1, album="Premier album")
+        targets = [("Premier", first.as_uri()), ("Source", source.as_uri())]
+        targets.extend((f"Album {i}", playlist(f"WAIT{i}")) for i in range(318))
+        identity = queue.enqueue(targets)
+        # Use known completed outcomes to keep this large-lot fixture short.
+        for title, url in targets[2:]:
+            queue.album(identity, dict(url=url, title=title, status="present", tracks=[]))
+        tools = self.temp / "slow"
+        tools.mkdir()
+        marker = self.temp / "ffmpeg-pid"
+        wrapper = tools / "ffmpeg"
+        wrapper.write_text("""#!/usr/bin/python3 -B
+import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if any(os.environ['PAUSE_STAGE'] in arg for arg in args) and 'pcm_f32le' in args and Path(os.environ['FFMPEG_ARMED']).exists():
+    Path(os.environ['FFMPEG_MARKER']).write_text(str(os.getpid()))
+    args.insert(args.index('-i'), '-re')
+os.execv(os.environ['REAL_FFMPEG'], [os.environ['REAL_FFMPEG'], *args])
+""")
+        wrapper.chmod(0o700)
+        armed = self.temp / "armed"
+        armed.touch()
+        self.env.update(PATH=str(tools) + os.pathsep + self.env["PATH"], REAL_FFMPEG=TOOLS["ffmpeg"],
+                        FFMPEG_ARMED=str(armed), FFMPEG_MARKER=str(marker),
+                        PAUSE_STAGE=digest("local:" + digest(source.as_uri())))
+        worker = self.launch_managed(queue, identity)
+        self.until(lambda: marker.exists() and bool(marker.read_text()))
+        pid = int(marker.read_text())
+        self.until(lambda: Path(f"/proc/{pid}/comm").exists() and
+                   Path(f"/proc/{pid}/comm").read_text().strip() == "ffmpeg")
+        original = queue.outcomes(identity)[first.as_uri()]
+        self.await_pause(queue, worker)
+        self.assertFalse(Path(f"/proc/{pid}").exists())
+        self.assertEqual(queue.outcomes(identity)[source.as_uri()]["status"], "suspended")
+        staged, = list(self.inbox.glob(".kara-local-*/*.flac"))
+        content = staged.read_bytes()
+        armed.unlink()
+        restarted = ImportQueue(self.temp / "state", self.library)
+        restarted.configure(paused=False)
+        worker = self.launch_managed(restarted, identity)
+        stdout, stderr = worker.communicate(timeout=25)
+        self.assertEqual(worker.returncode, 0, (stdout, stderr))
+        outcomes = restarted.outcomes(identity)
+        self.assertEqual(outcomes[first.as_uri()], original)
+        self.assertEqual(len(outcomes), len(targets))
+        tracks = sorted(Path(path) for path in outcomes[source.as_uri()]["tracks"])
+        self.assertEqual(len(tracks), 2)
+        self.assertIn(content, [track.read_bytes() for track in tracks])
+        self.assertEqual(len(list((self.library / self.config["artist"]).rglob("*.flac"))), 3)
+
+    def test_pause_during_import_lyrics_releases_maintenance_and_resumes(self):
+        from _parole_import_enrichment import schedule
+
+        marker = self.temp / "lyrics-active"
+        track = self.library / self.config["artist"] / "Pause paroles" / "01.flac"
+        self.make_local_track(track, 1, album="Pause paroles")
+        pcm = pcm_digest(track)
+        queue = ImportQueue(self.temp / "state", self.library)
+        index = Index(self.library, self.temp / "state")
+        subject, = schedule(index, [str(track)])["import_lyrics"]
+        self.config["lyric_wait"] = str(marker)
+        self.update_config()
+        script = """
+from pathlib import Path
+from time import time
+from types import SimpleNamespace
+from unittest.mock import patch
+from _kara_paths import STATE, music_library
+from _kara_import_queue import ImportQueue
+from _parole_maintenance import Maintenance
+maintenance = Maintenance(music_library(), Path('collection-fixture'), state=STATE, import_queue=ImportQueue())
+maintenance.current_settings = maintenance.index.settings()
+with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=50 * 1024 ** 3)):
+    assert maintenance.tick_import_enrichment(maintenance.current_settings, time())
+"""
+        env = dict(self.env, PYTHONPATH=str(BIN) + os.pathsep + str(FIXTURES))
+
+        def launch():
+            worker = subprocess.Popen([sys.executable, "-B", "-c", script], cwd=self.temp, env=env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(self.stop_worker, worker)
+            return worker
+
+        active = launch()
+        self.until(marker.exists)
+        self.await_pause(queue, active)
+        with index.db() as db:
+            task = db.execute("SELECT state,attempts FROM tasks WHERE subject=?", (subject,)).fetchone()
+            self.assertEqual(tuple(task), ("suspended", 0))
+        self.assertFalse(track.with_suffix(".lrc").exists())
+        del self.config["lyric_wait"]
+        self.update_config()
+        queue.configure(paused=False)
+        resumed = launch()
+        stdout, stderr = resumed.communicate(timeout=20)
+        self.assertEqual(resumed.returncode, 0, (stdout, stderr))
+        with index.db() as db:
+            self.assertEqual(db.execute("SELECT state FROM tasks WHERE subject=?", (subject,)).fetchone()[0], "done")
+        self.assertTrue(track.with_suffix(".lrc").is_file())
+        self.assertEqual(pcm_digest(track), pcm)
 
     def test_lost_worker_after_sort_starts_reuses_publication_receipt(self):
         self.config["transfer_failures"].clear()

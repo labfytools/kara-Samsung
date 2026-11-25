@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Suspendre les téléchargements et enrichissements actifs de la file d’import, conserver leurs reçus de reprise et partager l’état confirmé entre Parole et le mobile.
 - Publier l’audio des imports gérés avant les recherches de paroles et de pochettes. Confier l’enrichissement à la file de maintenance persistante.
 - Mutualiser les recherches de texte et de LRC, limiter les requêtes par fournisseur et conserver les résultats vérifiés et les absences confirmées.
 - Afficher la cadence mesurée des imports et de l’enrichissement, instrumenter les attentes et limiter les lectures sous le verrou de publication.

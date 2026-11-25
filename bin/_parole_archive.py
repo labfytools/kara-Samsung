@@ -160,11 +160,11 @@ def search(index, query):
 
 
 @contextmanager
-def open_original(index, inbox, album, file):
+def open_original(index, inbox, album, file, offset=0):
     url = f"{SITE}/download/{album.identifier}/{quote(file.name, safe='/')}"
     with resource_slot(inbox / ".kara-transferts", DOWNLOADS), open_audio(
             url, registry=index, provider=ARCHIVE, service=HOST, hosts=(HOST,), expected_size=file.size,
-            interval=INTERVAL) as stream:
+            interval=INTERVAL, **({"offset": offset} if offset else {})) as stream:
         yield stream
 
 
@@ -178,5 +178,6 @@ def entries(index, inbox, album):
         result[file.name] = Entry(file.name, file.size, [file.sha1, file.size],
                                  lambda file=file: open_original(index, inbox, album, file),
                                  sha1=file.sha1, external_id=f"{album.identifier}/{file.name}",
-                                 position=slot if all(slot) else None)
+                                 position=slot if all(slot) else None,
+                                 open_range=lambda offset, file=file: open_original(index, inbox, album, file, offset))
     yield result

@@ -412,6 +412,7 @@
     $("import-spin").hidden = failed;
     $("import-state").textContent = failed ? job.message : ({
       approval: "En attente de validation", queued: "En attente dans la file", running: "Importation de l’album",
+      suspending: "Suspension en cours…", suspended: "Import suspendu · reprise en attente",
       integrating: "Actualisation de la bibliothèque", stopping: "Fin de l’import en cours"
     })[job.state] || "Préparation de l’album";
     const measured = Number.isFinite(job.progress) && job.progress > 0;
@@ -456,8 +457,11 @@
           select.append(new Option(String(number), String(number)));
       }
       if (document.activeElement !== select) select.value = queue.batches;
-      $("import-pause").textContent = queue.paused ? "Reprendre la file" : "Mettre la file en pause";
-      $("import-pause").onclick = () => command(queue.paused ? "import-resume" : "import-pause");
+      const pause = $("import-pause");
+      const suspending = queue.pause_state === "suspending";
+      pause.textContent = suspending ? "Suspension en cours…" : queue.paused ? "Reprendre la file" : "Mettre la file en pause";
+      pause.disabled = suspending;
+      pause.onclick = () => command(queue.paused ? "import-resume" : "import-pause");
     }
     const key = JSON.stringify([party.imports, state.me.organizer]);
     if (key === importKey) return;
@@ -486,7 +490,7 @@
       row.append(info);
       if (state.me.organizer && job.state === "approval")
         row.append(button("Autoriser", () => command("import-approve", {job: job.id})));
-      if (state.me.organizer && ["approval", "queued", "running"].includes(job.state))
+      if (state.me.organizer && ["approval", "queued", "running", "suspended"].includes(job.state))
         row.append(button("Annuler", () => command("import-cancel", {job: job.id})));
       if (["failed", "partial"].includes(job.state))
         row.append(button("Relancer l’échec", () => state.me.organizer ? command("import-retry", {job: job.id}) :

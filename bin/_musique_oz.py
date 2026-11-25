@@ -8,12 +8,12 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-import subprocess
 import sys
 from unicodedata import combining, normalize
 from urllib.parse import parse_qs, urlsplit
 
 from _kara_paths import STATE, music_library
+from _kara_import_resources import lock_file, run_checked
 
 AUDIO = frozenset((".aac", ".aif", ".aiff", ".alac", ".flac", ".m4a", ".mp3",
                    ".ogg", ".oga", ".opus", ".wav", ".wma"))
@@ -42,7 +42,7 @@ def probe(path, *, include_duration=False, include_codec=False):
     command = ("ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-of", "json",
                "-show_entries", "format=duration:format_tags:stream=index,codec_type,codec_name:stream_disposition=attached_pic:stream_tags",
                str(path))
-    output = subprocess.run(command, capture_output=True, check=True, timeout=20)
+    output = run_checked(command, capture_output=True, check=True, timeout=20)
     info = json.loads(output.stdout)
     streams = info.get("streams", [])
     audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
@@ -332,7 +332,7 @@ def shared_mutation(root, enabled=True, *, wait=False):
     with (root / ".labfy-music.lock").open("a") as lock:
         if wait:
             # JSON import workers report through their own protocol.
-            flock(lock, LOCK_EX)
+            lock_file(lock)
             yield
             return
         try:
@@ -344,7 +344,7 @@ def shared_mutation(root, enabled=True, *, wait=False):
             message = ("KARA_ATTENTE_BIBLIOTHEQUE" if mode == "suivi"
                        else "Attente de l’accès à la bibliothèque partagée…")
             mutation_report(message)
-            flock(lock, LOCK_EX)
+            lock_file(lock)
             if mode == "suivi":
                 mutation_report("KARA_BIBLIOTHEQUE_DISPONIBLE")
         yield

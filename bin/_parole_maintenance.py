@@ -1,5 +1,6 @@
 """Ordonnanceur de maintenance rattaché au propriétaire GTK du service Kara."""
 from collections import deque
+from contextlib import nullcontext
 from logging import Logger
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
@@ -138,6 +139,7 @@ class Maintenance:
         self.night_lrc = (False, False)
         self.night_measures = {}
         self.owner = None
+        self.import_owner = None
         self.foreground = Event()
         if not background:
             self.foreground.set()
@@ -251,6 +253,8 @@ class Maintenance:
 
     def stopped(self):
         if self.shutdown.is_set() or self.interrupt.is_set():
+            return True
+        if self.import_owner is not None and self.import_queue.pause_requested():
             return True
         if self.active and self.active[0] == "prepare":
             now = monotonic()
@@ -542,7 +546,7 @@ class Maintenance:
         if self.night_running:
             env["KARA_DEMUCS_THREADS"] = "2"
         # All input paths are program arguments; no shell evaluates titles or paths.
-        retain = (self.owner,) if self.owner is not None else ()
+        retain = tuple(fd for fd in (self.owner, self.import_owner) if fd is not None)
         return run(command, stop=self.stopped, timeout=timeout, event=observer, env=env, maximum=maximum,
                    retain=retain)
 
@@ -579,22 +583,30 @@ class Maintenance:
     def tick_import_enrichment(self, settings, now):
         # Enrichment can run without a nocturnal resource sample. It needs
         # the library's free-space reserve and consumes no preparation cache.
-        if disk_usage(self.index.root).free <= settings["reserve_gib"] * 1024**3:
+        if ((self.import_queue is not None and self.import_queue.pause_requested())
+                or disk_usage(self.index.root).free <= settings["reserve_gib"] * 1024**3):
             return False
         # One owner alternates stages and keeps their claims separate from the
         # classic maintenance budget. Audio imports own their existing slots.
-        for _ in IMPORT_ENRICHMENT:
-            kind = IMPORT_ENRICHMENT[self.import_enrichment_turn]
-            self.import_enrichment_turn = (self.import_enrichment_turn + 1) % len(IMPORT_ENRICHMENT)
-            if not (settings["lyrics"] or settings["lrc"] if kind == IMPORT_LYRICS else settings["cover"]):
-                continue
-            task = self.index.claim((kind,), now)
-            if task is not None:
-                self.execute(task)
-                # Recheck available enrichment immediately. Supplier gates
-                # still control traffic, including after errors and retries.
-                self.wake.set()
-                return True
+        with (self.import_queue.activity() if self.import_queue is not None else nullcontext()) as owner:
+            if owner is not None and self.import_queue.pause_requested():
+                return False
+            for _ in IMPORT_ENRICHMENT:
+                kind = IMPORT_ENRICHMENT[self.import_enrichment_turn]
+                self.import_enrichment_turn = (self.import_enrichment_turn + 1) % len(IMPORT_ENRICHMENT)
+                if not (settings["lyrics"] or settings["lrc"] if kind == IMPORT_LYRICS else settings["cover"]):
+                    continue
+                task = self.index.claim((kind,), now)
+                if task is not None:
+                    # Hold the same lease through claim settlement and child
+                    # reaping. The global pause can now confirm both occurred.
+                    self.import_owner = owner
+                    try:
+                        self.execute(task)
+                    finally:
+                        self.import_owner = None
+                    self.wake.set()
+                    return True
         return False
 
     def night_reference(self, song, path):
@@ -852,6 +864,7 @@ class Maintenance:
         kind, subject = task["kind"], task["subject"]
         category = {"discography": "DISCOGRAPHIE", "prepare": "KARA", "source_probe": "SOURCE",
                     "cleanup": "CACHE", IMPORT_LYRICS: "LYRICS", IMPORT_COVER: "COVER"}.get(kind, kind.upper())
+        import_suspended = False
         with self.lock:
             self.interrupt.clear()
             if ((kind == "prepare" and (self.priority or monotonic() < self.priority_until))
@@ -916,8 +929,10 @@ class Maintenance:
                 else:
                     result = self.do_review(task, value)
         except Interrupted:
-            self.journal.emit(category, "Traitement interrompu · reprise différée")
-            result = ("suspended", "ressources libérées", 45)
+            import_suspended = self.import_owner is not None and self.import_queue.pause_requested()
+            result = ("suspended", "ressources libérées", 0 if import_suspended else 45)
+            if not import_suspended:
+                self.journal.emit(category, "Traitement interrompu · reprise différée")
             if nocturnal:
                 self.night.close()
                 if self.night.reason.startswith("Réouverture"):
@@ -952,12 +967,15 @@ class Maintenance:
                 pass
             stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
                          corrected=corrected, generated=generated, measurements=self.night_measures)
-        self.index.finish(task, *result, night=stats)
+        self.index.finish(task, *result, night=stats, refund_attempt=import_suspended)
+        if import_suspended:
+            self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
         self.revision += 1
 
     def authorized_imports(self, settings):
-        if (self.import_queue is None or not (settings["import_tracks"] or settings["import_albums"])
+        if (self.import_queue is None or self.import_queue.pause_requested()
+                or not (settings["import_tracks"] or settings["import_albums"])
                 or not self.index.source_enabled("YouTube Music")):
             return
         with self.index.db() as db:
@@ -984,6 +1002,8 @@ class Maintenance:
                 # the import queue commit and the Parole receipt commit.
                 request_id = encoded_key("parole", kind, subject, row["url"])
                 job = self.import_queue.enqueue_maintenance(request_id, row["title"], row["url"])
+                if job is None:
+                    return
                 db.execute("UPDATE import_permissions SET job=? WHERE kind=? AND subject=?", (job, kind, subject))
                 self.journal.emit("DOWNLOAD", f"Édition autorisée ajoutée à la file · {row['title']}")
 
@@ -1099,7 +1119,7 @@ class Maintenance:
             return
         if self.priority:
             return
-        if self.import_diagnostics:
+        if self.import_diagnostics and not self.import_queue.pause_requested():
             self.import_diagnostics.tick(settings, now)
         if self.tick_import_enrichment(settings, now):
             return
