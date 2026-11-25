@@ -39,25 +39,25 @@ def local_selection(value):
     if len(parts.query) > 1200:
         raise ImportIssue("path", "Provenance de téléchargement trop longue.")
     try:
-        query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+        query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
     except ValueError as error:
         raise ImportIssue("path", "Provenance de téléchargement invalide.") from error
-    if query.keys() - {"provider", "edition"} or any(len(values) != 1 for values in query.values()):
+    if query.keys() - {"provider", "edition", "license"} or any(len(values) != 1 for values in query.values()):
         raise ImportIssue("path", "Provenance de téléchargement invalide.")
     provider = query.get("provider", [LOCAL])[0]
     reference = query.get("edition", [""])[0]
     if provider in MANUAL:
-        return path, provider, MANUAL[provider].release_reference(reference) if reference else ""
+        return path, provider, *MANUAL[provider].provenance(reference, query.get("license", [""])[0])
     if provider != LOCAL or query:
         raise ImportIssue("path", "Fournisseur de téléchargement inconnu.")
-    return path, LOCAL, ""
+    return path, LOCAL, "", ""
 
 
-def local_target(uri, provider, reference):
+def local_target(uri, provider, reference, license_url=""):
     if provider not in MANUAL:
         return uri
-    canonical = MANUAL[provider].release_reference(reference) if reference else ""
-    return uri + "?" + urlencode({"provider": provider, "edition": canonical})
+    canonical, license_url = MANUAL[provider].provenance(reference, license_url)
+    return uri + "?" + urlencode({"provider": provider, "edition": canonical, "license": license_url})
 
 
 def stamp(stat):

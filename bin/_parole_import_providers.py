@@ -7,6 +7,13 @@ from _kara_import_result import ImportIssue
 
 ALL = "Toutes les sources"
 YOUTUBE = "YouTube Music"
+OPEN_LICENSES = {
+    "CC0 1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "CC BY 3.0": "https://creativecommons.org/licenses/by/3.0/",
+    "CC BY 4.0": "https://creativecommons.org/licenses/by/4.0/",
+    "CC BY-SA 3.0": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "CC BY-SA 4.0": "https://creativecommons.org/licenses/by-sa/4.0/",
+}
 
 
 @dataclass(frozen=True)
@@ -16,6 +23,7 @@ class ManualProvider:
     help: str
     album_hosts: re.Pattern
     album_path: re.Pattern
+    licenses: tuple = ()
 
     def release_reference(self, value):
         # Only the public edition URL is provenance. Account, payment and
@@ -28,6 +36,13 @@ class ManualProvider:
                 or not self.album_path.fullmatch(parts.path) or parts.query or parts.fragment):
             raise ImportIssue("path", "Indique la page publique de l’édition, sans paramètres ni lien temporaire.")
         return f"https://{parts.netloc}{parts.path.rstrip('/')}"
+
+    def provenance(self, reference, license_url):
+        if self.licenses and (license_url not in self.licenses or not reference):
+            raise ImportIssue("path", "Indique la page publique et la licence de téléchargement affichée.")
+        if license_url and license_url not in self.licenses:
+            raise ImportIssue("path", "Licence non prise en charge par ce fournisseur.")
+        return self.release_reference(reference) if reference else "", license_url
 
 
 MANUAL = {
@@ -46,4 +61,10 @@ MANUAL = {
         "https://help.soundcloud.com/hc/en-us/articles/115003448787-Downloading-tracks",
         re.compile(r"(?:www\.)?soundcloud\.com"),
         re.compile(r"/[a-z0-9][a-z0-9_-]{0,89}/(?:sets/)?[a-z0-9][a-z0-9_-]{0,159}/?")),
+    "Free Music Archive": ManualProvider(
+        "freemusicarchive.org", "https://freemusicarchive.org/",
+        "https://freemusicarchive.org/License_Guide",
+        re.compile(r"(?:www\.)?freemusicarchive\.org"),
+        re.compile(r"/music/(?:[A-Za-z0-9_%-]{1,90}/){1,2}[A-Za-z0-9_%-]{1,140}/?"),
+        tuple(OPEN_LICENSES.values())),
 }

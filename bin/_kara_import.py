@@ -15,7 +15,7 @@ from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check
 from _kara_import_result import CATEGORIES, ImportIssue
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY
 from _kara_paths import BIN, catalogue_command
-from _parole_import_providers import ALL, MANUAL, YOUTUBE
+from _parole_import_providers import ALL, MANUAL, OPEN_LICENSES, YOUTUBE
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
@@ -130,6 +130,9 @@ class AlbumImport(Gtk.Revealer):
         provider_row.append(self.official_download)
         self.download_help = Gtk.LinkButton(label="Aide du fournisseur", visible=False, uri="")
         provider_row.append(self.download_help)
+        self.download_license = Gtk.DropDown.new_from_strings(["Licence du titre", *OPEN_LICENSES])
+        self.download_license.set_visible(False)
+        provider_row.append(self.download_license)
         panel.append(provider_row)
 
         self.results_header = Gtk.Box(spacing=8, visible=False)
@@ -267,10 +270,14 @@ class AlbumImport(Gtk.Revealer):
         route = MANUAL.get(self.selected_provider())
         self.official_download.set_visible(route is not None)
         self.download_help.set_visible(route is not None)
+        self.download_license.set_visible(bool(route and route.licenses))
+        self.download_license.set_selected(0)
         if route:
             self.official_download.set_uri(route.downloads)
             self.download_help.set_uri(route.help)
-        self.link.set_placeholder_text("Page publique de l’édition (facultatif)" if route else "Lien d’album")
+        reference = ("Page publique de l’édition" if route and route.licenses else
+                     "Page publique de l’édition (facultatif)" if route else "Lien d’album")
+        self.link.set_placeholder_text(reference)
         self.submit.set_label("Importer" if route or self.selected_provider() == LOCAL else "Télécharger")
         self.refresh_controls()
 
@@ -480,6 +487,15 @@ class AlbumImport(Gtk.Revealer):
         popover.popdown()
         provider = self.selected_provider()
         reference = self.link.get_text().strip() if provider in MANUAL else ""
+        license_name = self.download_license.get_selected_item()
+        license_url = OPEN_LICENSES.get(license_name.get_string(), "")
+        route = MANUAL.get(provider)
+        if route:
+            try:
+                route.provenance(reference, license_url)
+            except ImportIssue as error:
+                self.message(str(error), failed=True)
+                return
         chooser = Gtk.FileChooserNative.new(
             {"folder": "Choisir un dossier d’album", "zip": "Choisir une archive ZIP",
              "audio": "Choisir un fichier audio"}[mode], self.get_root(),
@@ -496,7 +512,7 @@ class AlbumImport(Gtk.Revealer):
                 chosen = dialog.get_file()
                 if chosen is not None and chosen.is_native() and chosen.get_uri_scheme() == "file":
                     try:
-                        selected_uri = local_target(chosen.get_uri(), provider, reference)
+                        selected_uri = local_target(chosen.get_uri(), provider, reference, license_url)
                     except ImportIssue as error:
                         self.message(str(error), failed=True)
                     else:

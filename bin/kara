@@ -810,7 +810,7 @@ def local_sidecars(tracks, entries, root, progress):
 
 def import_local(item, root, inbox, previous, stop, seen, selection):
     progress = item.progress
-    path, item.provider, reference = selection
+    path, item.provider, reference, license_url = selection
     resolved = path.resolve()
     if resolved.is_relative_to(root) or root.is_relative_to(resolved):
         raise ImportIssue("path", "Sélectionne un dossier ou un ZIP en dehors de la bibliothèque.")
@@ -910,7 +910,8 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
                     item.provenance = [
                         {"provider": item.provider, "external_id": records[name]["sha256"], "member": name,
                          "source": reference or path.as_uri(), "path": str(track),
-                         "edition_ref": reference, "verification": "manual" if reference else "file"}
+                         "edition_ref": reference, "verification": "manual" if reference else "file",
+                         **({"license": license_url} if license_url else {})}
                         for name, track in sorted(targets.items())
                     ]
                     local_sidecars(targets, entries, root, progress)

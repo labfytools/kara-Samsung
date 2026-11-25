@@ -27,3 +27,4 @@
 - Proposer le téléchargement officiel Bandcamp et conserver sa provenance déclarée lors de l’import local de l’album.
 - Accepter les ZIP et dossiers FLAC des achats Qobuz et conserver la référence publique de l’édition.
 - Importer individuellement les pistes téléchargées via la fonction officielle SoundCloud, avec leur provenance déclarée.
+- Importer les téléchargements officiels de Free Music Archive avec une page publique et une licence compatible renseignées.

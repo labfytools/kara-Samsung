@@ -72,6 +72,10 @@ Sélectionner **Qobuz** après la récupération d’un album depuis **Mes achat
 
 Récupérer le fichier seulement si SoundCloud affiche **Télécharger le fichier** pour la piste. Après le téléchargement, sélectionner **SoundCloud** puis **Fichiers locaux → Choisir un fichier audio**. La page publique de la piste ou de l’ensemble d’origine peut être conservée avec l’import. Une piste dotée d’un titre et d’un artiste peut être classée dans **Sans album** lorsque son fichier n’indique aucun album. Les conditions de l’API de SoundCloud interdisent la conservation permanente des fichiers par une application. [Téléchargement officiel](https://help.soundcloud.com/hc/en-us/articles/115003448787-Downloading-tracks) · [Conditions de l’API](https://developers.soundcloud.com/docs/api/terms-of-use)
 
+### Free Music Archive
+
+Télécharger depuis la page officielle si elle propose le fichier. Dans Parole, sélectionner **Free Music Archive**, renseigner la page publique et choisir la licence affichée, puis importer le fichier. Le parcours accepte CC0 1.0, CC BY et CC BY-SA en versions 3.0 et 4.0. Il conserve le lien et la licence déclarée pour retrouver les conditions et les crédits. Pour un dossier, la page et la licence renseignées doivent s’appliquer à toutes ses pistes. Free Music Archive a fermé son API et réserve l’automatisation de son formulaire de recherche aux intégrations autorisées. [Guide des licences](https://freemusicarchive.org/License_Guide) · [Informations développeurs](https://freemusicarchive.org/app-developers)
+
 ## Diagnostic des échecs persistants
 
 La tentative initiale appartient au moteur d’import. Après l’enregistrement de son résultat et l’actualisation du catalogue, Parole peut planifier jusqu’à deux relances classiques pour un échec temporaire. Ces relances attendent 60 secondes puis 240 secondes au minimum, ou le délai signalé par le fournisseur s’il est plus long. Plusieurs échecs comparables peuvent différer leurs relances automatiques de 30 minutes. Les autres lots gardent les règles de la file. Les compteurs et échéances survivent à l’arrêt de Parole. La commande manuelle reste disponible dans l’import.
@@ -97,3 +101,5 @@ Le parcours Bandcamp est testé avec un FLAC de synthèse et une référence pub
 Le parcours Qobuz est testé avec un ZIP FLAC de synthèse et une référence d’édition au format Qobuz. Le test contrôle la conservation du PCM et de cette référence sans accéder à un compte ni à une commande.
 
 Le parcours SoundCloud est testé avec une piste de synthèse sans tag d’album. Seul le fichier sélectionné est classé, avec une provenance déclarée et le même PCM. Le test ne se connecte pas à SoundCloud.
+
+Le parcours Free Music Archive est testé avec un FLAC de synthèse. Le test vérifie la conservation de la provenance et de la licence CC BY et le refus d’une licence manquante ou CC BY-ND.

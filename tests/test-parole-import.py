@@ -26,6 +26,7 @@ from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index
+from _parole_import_providers import OPEN_LICENSES
 from _parole_sources import controls, seed
 
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
@@ -335,6 +336,23 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual(path.parent.name, "Sans album")
         self.assertEqual(pcm_digest(path), pcm_digest(track))
         self.assertEqual(track.read_bytes(), original)
+        self.assertEqual(self.requests.read_text(), "")
+
+    def test_free_music_archive_local_route_requires_and_keeps_compatible_license(self):
+        track = self.temp / "fma" / "01.flac"
+        self.make_local_track(track, 1)
+        release = "https://freemusicarchive.org/music/Artist/Album/Track/"
+        license_url = OPEN_LICENSES["CC BY 4.0"]
+        with self.assertRaises(ImportIssue):
+            local_target(track.as_uri(), "Free Music Archive", release)
+        with self.assertRaises(ImportIssue):
+            local_target(track.as_uri(), "Free Music Archive", release,
+                         "https://creativecommons.org/licenses/by-nd/4.0/")
+        _, items, _ = self.run_import(local_target(track.as_uri(), "Free Music Archive", release, license_url))
+        evidence = items[0]["provenance"][0]
+        self.assertEqual((evidence["provider"], evidence["license"], evidence["edition_ref"]),
+                         ("Free Music Archive", license_url, release.rstrip("/")))
+        self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(track))
         self.assertEqual(self.requests.read_text(), "")
 
     def test_search_import_and_album_already_present(self):
