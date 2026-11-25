@@ -28,8 +28,11 @@ from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index
 from _parole_import_metrics import LOOKUP, SUCCEEDED, TOTAL, snapshot
-from _parole_import_providers import ARTIST_SITES, JAMENDO, OPEN_LICENSES
+from _parole_import_providers import ARCHIVE, ARTIST_SITES, JAMENDO, OPEN_LICENSES
 from _parole_sources import controls, seed
+from _parole_offer import create_plan
+from _parole_archive import parse_item as archive_item
+from _parole_jamendo import parse_release as jamendo_edition
 
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
 
@@ -467,6 +470,58 @@ class AlbumImportTests(unittest.TestCase):
         for evidence in outcomes[0]["provenance"]:
             self.assertEqual(evidence["license"], license_url)
             self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(originals[evidence["external_id"]]))
+
+    def test_confirmed_equivalent_provider_fills_only_missing_position(self):
+        source = self.temp / "equivalent"
+        license_url = OPEN_LICENSES["CC BY 4.0"]
+        release_id = "b90181d2-ff52-4bfb-aeb5-f8c66c8fed25"
+        archive_files, jamendo_tracks = [], []
+        archive_originals, jamendo_originals = {}, {}
+        for number in (1, 2):
+            name, track_id = f"{number:02}.flac", str(39010 + number)
+            archive_audio, jamendo_audio = source / "archive" / name, source / "jamendo" / name
+            self.make_local_track(archive_audio, number, album="Édition commune")
+            self.make_local_track(jamendo_audio, number, album="EDITION COMMUNE")
+            code = f"FRABC190000{number}"
+            archive_files.append({"name": name, "size": str(archive_audio.stat().st_size),
+                                  "sha1": sha1(archive_audio.read_bytes(), usedforsecurity=False).hexdigest(),
+                                  "source": "original", "track": str(number), "length": "4",
+                                  "title": f"Son local {number}", "isrc": code, "artist": self.config["artist"]})
+            jamendo_tracks.append({"id": track_id, "position": str(number), "duration": "4", "name": f"Son local {number}",
+                                   "license_ccurl": license_url, "audiodownload_allowed": True, "isrc": code,
+                                   "audiodownload": f"https://storage.jamendo.com/download/track/{track_id}/flac/"})
+            archive_originals[name], jamendo_originals[track_id] = str(archive_audio), str(jamendo_audio)
+        metadata = {"identifier": "edition-fixture", "mediatype": "audio", "creator": self.config["artist"],
+                    "title": "Édition commune", "licenseurl": license_url, "musicbrainz_releaseid": release_id}
+        archive = {"metadata": metadata, "files": archive_files}
+        jamendo = {"id": "48123", "name": "EDITION COMMUNE", "artist_name": self.config["artist"],
+                   "zip_allowed": True, "tracks": jamendo_tracks, "musicbrainz_releaseid": release_id}
+        self.config.update(archive_item=archive, archive_originals=archive_originals, archive_failures=["02.flac"],
+                           jamendo_release=jamendo, jamendo_originals=jamendo_originals)
+        self.update_config()
+        index = Index(self.library, self.temp / "state")
+        seed(index)
+        index.configure(import_strategy="preferred", import_preferred=ARCHIVE)
+        target = create_plan(index, [
+            {"url": "https://archive.org/details/edition-fixture", "provider": ARCHIVE, "price": 0,
+             "formats": ["FLAC"], "facts": archive_item("edition-fixture", archive).facts},
+            {"url": "https://www.jamendo.com/album/48123", "provider": JAMENDO, "price": 0,
+             "formats": ["FLAC"], "facts": jamendo_edition("album", jamendo).facts},
+        ])
+        env = dict(self.env, KARA_JAMENDO_CLIENT_ID="fixtureid")
+        journal, partial, _ = self.run_import(target, env=env, expected=1)
+        self.assertEqual((partial[0]["status"], partial[0]["provider"]), ("partial", ARCHIVE))
+        first = Path(partial[0]["tracks"][0])
+        before = first.read_bytes()
+        _, done, _ = self.run_import(target, env=env, previous=journal)
+        self.assertEqual((done[0]["status"], done[0]["provider"], done[0]["added"]), ("success", JAMENDO, 1))
+        self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "02.flac", "39012"])
+        self.assertEqual({Path(path).parent for path in done[0]["tracks"]}, {first.parent})
+        self.assertEqual(first.read_bytes(), before)
+        self.assertEqual({proof["provider"] for proof in done[0]["provenance"]}, {ARCHIVE, JAMENDO})
+        _, replay, _ = self.run_import(target, env=env)
+        self.assertEqual((replay[0]["status"], replay[0]["processed"]), ("present", 0))
+        self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "02.flac", "39012"])
 
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]

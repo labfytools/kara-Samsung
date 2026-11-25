@@ -26,6 +26,7 @@ DEFAULTS = {
     "codex_model": "", "codex_effort": "low",
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
+    "import_strategy": "speed", "import_preferred": "",
     "gpu": 15, "disk_busy": 25, "network_interval": 20, "network_daily": 24, "network_timeout": 145, "heavy_daily": 3,
     "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
     "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,
@@ -112,6 +113,9 @@ class Index:
                 );
                 CREATE TABLE IF NOT EXISTS import_provider_limits (
                     source TEXT PRIMARY KEY, until REAL NOT NULL, status INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS import_offer_plans (
+                    id TEXT PRIMARY KEY, offers TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS exclusions (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(kind, subject)

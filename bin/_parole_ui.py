@@ -11,6 +11,7 @@ from _kara_party import Song
 from _kara_import import show_details
 from _parole_index import key, document, encoded_key, sidecar
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
+from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_sources import configure_limits, controls, provider_limits
 from _parole_resources import GIB
 from _parole_work import save_correction
@@ -854,6 +855,23 @@ class ParoleView:
                           ("import_albums", "Importer les albums absents autorisés")))
         number(general, "scan_minutes", "Fréquence des inventaires (minutes)", 1, 1440)
         number(general, "review_days", "Fréquence des vérifications éditoriales (jours)", 1, 365)
+        criteria = box(Gtk.Orientation.HORIZONTAL)
+        criteria.append(Gtk.Label(label="Stratégie d’import", xalign=0, hexpand=True))
+        codes = list(STRATEGIES)
+        strategy = Gtk.DropDown.new_from_strings(list(STRATEGIES.values()))
+        strategy.set_selected(codes.index(config["import_strategy"]) if config["import_strategy"] in codes else 0)
+        strategy.connect("notify::selected", lambda w, _: save("import_strategy", codes[w.get_selected()]))
+        criteria.append(strategy)
+        general.append(criteria)
+        preference = box(Gtk.Orientation.HORIZONTAL)
+        preference.append(Gtk.Label(label="Fournisseur préféré", xalign=0, hexpand=True))
+        names = ["Aucun", *AUTOMATIC]
+        provider = Gtk.DropDown.new_from_strings(names)
+        provider.set_selected(names.index(config["import_preferred"]) if config["import_preferred"] in AUTOMATIC else 0)
+        provider.connect("notify::selected", lambda w, _: save(
+            "import_preferred", names[w.get_selected()] if w.get_selected() else ""))
+        preference.append(provider)
+        general.append(preference)
         categories = box(Gtk.Orientation.HORIZONTAL, 5)
         for kind, title in (("Album", "Studio"), ("EP", "EP"), ("Mixtape/Street", "Mixtapes"),
                             ("Live", "Live"), ("Compilation", "Compilations"), ("Single", "Singles"),

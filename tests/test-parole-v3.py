@@ -429,6 +429,23 @@ class GtkTests(Fixture):
             self.assertFalse(imports.can_search_jamendo())
             self.assertTrue(imports.official_download.get_visible())
             self.assertTrue(imports.download_license.get_visible())
+        imports.provider.set_selected(names.index("Toutes les sources"))
+        facts = {"title": "Album de qualification", "artist": "Atelier", "count": 1,
+                 "release_id": "b90181d2-ff52-4bfb-aeb5-f8c66c8fed25",
+                 "tracks": [{"title": "Piste", "disc": 1, "number": 1, "duration": 120, "isrc": "FRABC1900001"}]}
+        offer = {"title": facts["title"], "artist": facts["artist"], "tracks": 1, "formats": ["FLAC"],
+                 "license": "https://creativecommons.org/licenses/by/4.0/", "price": 0, "facts": facts}
+        arch = offer | {"provider": "Internet Archive", "url": "https://archive.org/details/album"}
+        jam = offer | {"provider": "Jamendo", "url": "https://www.jamendo.com/album/48123"}
+        with patch.object(imports, "search_next_catalogue", return_value=False):
+            imports.remote_results([arch], arch["provider"], "Atelier")
+            imports.remote_results([jam], jam["provider"], "Atelier")
+        candidate_row = imports.results.get_first_child()
+        self.assertIsNone(candidate_row.get_next_sibling())
+        self.assertIn("Jamendo", candidate_row.get_child().get_first_child().get_label())
+        with patch.object(imports, "start_queue") as queued:
+            imports.start_offer((arch["title"], arch["url"]))
+        self.assertTrue(queued.call_args.args[0][0][1].startswith("parole://edition/"))
         for page in ("general", "sources", "codex", "storage", "resources", "night"):
             view.settings(page)
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)

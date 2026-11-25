@@ -10,6 +10,7 @@ from _kara_import_resources import DOWNLOADS, resource_slot
 from _kara_import_result import ImportIssue
 from _musique_oz import AUDIO
 from _parole_import_providers import ARCHIVE, ARCHIVE_ID as IDENTIFIER, license_for
+from _parole_music_identity import position
 from _parole_sources import ProviderUnavailable, fetch, open_audio
 
 HOST = "archive.org"
@@ -171,7 +172,11 @@ def open_original(index, inbox, album, file):
 def entries(index, inbox, album):
     # A SHA-1 from the item manifest keys a staged download and verifies
     # transport integrity. Local proof and cache reuse still use PCM and SHA-256.
-    yield {file.name: Entry(file.name, file.size, [file.sha1, file.size],
-                           lambda file=file: open_original(index, inbox, album, file),
-                           sha1=file.sha1, external_id=f"{album.identifier}/{file.name}")
-           for file in album.originals}
+    result = {}
+    for file in album.originals:
+        slot = tuple(position(file.facts.get(key)) for key in ("disc", "number"))
+        result[file.name] = Entry(file.name, file.size, [file.sha1, file.size],
+                                 lambda file=file: open_original(index, inbox, album, file),
+                                 sha1=file.sha1, external_id=f"{album.identifier}/{file.name}",
+                                 position=slot if all(slot) else None)
+    yield result

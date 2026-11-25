@@ -189,5 +189,5 @@ def entries(index, inbox, release):
     yield {f"{track.position:03d}-{track.identifier}.flac": Entry(
         track.title, None, [track.identifier, track.duration, "flac", release.revision],
         lambda track=track: open_track(index, inbox, track),
-        external_id=track.identifier, format="flac", license=track.license)
+        external_id=track.identifier, format="flac", license=track.license, position=(1, track.position))
         for track in release.tracks}

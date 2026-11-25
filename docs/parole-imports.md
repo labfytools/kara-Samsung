@@ -116,6 +116,14 @@ Les comparaisons réduisent les variations Unicode, de casse, d’accents, d’a
 
 Une correspondance confirmée demande une preuve d’édition complétée par les enregistrements ou les minutages comparables. Une piste locale manquante peut laisser l’édition confirmée si les autres positions portent les preuves nécessaires. Les rapprochements insuffisants sont présentés comme **Édition à vérifier**. Le journal indique la raison de la comparaison.
 
+### Sélection du fournisseur pour une édition équivalente
+
+Dans **Toutes les sources**, une édition complète confirmée et actuellement proposée par plusieurs fournisseurs automatiques apparaît sur une seule ligne. Le lot enregistre cette édition avant de rejoindre la file. Le moteur revérifie les autorisations et l’inventaire du fournisseur choisi avant de commencer la récupération. Les sources automatiques comparables sont actuellement Internet Archive et Jamendo. Les téléchargements officiels manuels et les résultats insuffisamment identifiés gardent leur parcours propre.
+
+Dans **Paramètres → Général**, **Vitesse maximale** estime le temps de récupération d’après les mesures disponibles et le nombre de pistes encore manquantes. **Qualité audio maximale** classe d’abord les formats disponibles et la présence d’un fichier original. **Fournisseur préféré** utilise la source choisie si elle peut servir cette édition. Un fournisseur neuf peut être essayé sur un import demandé, une fois le groupe d’équivalence établi. Le moteur ne commande aucun achat et ne lance pas un second téléchargement pour établir un classement.
+
+Le motif, le débit observé et le délai estimé, quand ils existent, figurent dans la console. Après un échec persistant, une indisponibilité signalée ou une piste inaccessible, une autre offre confirmée peut reprendre les positions manquantes. La reprise conserve les fichiers intégrés dans le dossier de la première édition et les tags d’origine de chaque piste. Une interruption conserve le fournisseur actif et ses reçus pour vérifier ses publications avant de basculer.
+
 ## Validation
 
 ```bash
@@ -149,3 +157,5 @@ Les tests de mesures contrôlent la pondération récente, la persistance des co
 Une mesure réelle isolée sur l’introduction de *Electric Funeral* a confirmé la somme de contrôle des 1 325 388 octets reçus. Sur ce transfert unique, le premier bloc est arrivé en 1,80 s et le débit après ce bloc était de 1,51 Mio/s. [Fiche et crédits officiels](https://archive.org/details/electric-funeral)
 
 Les tests d’identité ont confirmé les cas concordants avec variations de présentation et un album incomplet. Les 16 variantes construites pour représenter des éditions, artistes, positions ou enregistrements différents ont produit zéro confirmation. Il s’agit d’un contrôle sur des cas construits.
+
+Les stratégies et le basculement sont validés avec deux catalogues simulés. Après deux échecs sur la seconde piste Internet Archive, Jamendo a fourni cette seule position dans le même dossier. La première piste est restée identique et une relance n’a rien retéléchargé. La comparaison en ligne entre deux fournisseurs reste à qualifier avec un identifiant Jamendo autorisé et une édition commune confirmée.

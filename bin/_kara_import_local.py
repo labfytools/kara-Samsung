@@ -125,6 +125,7 @@ class Entry:
     external_id: str = ""
     format: str = ""
     license: str = ""
+    position: tuple[int, int] | None = None
 
 
 def directory_entries(fd):

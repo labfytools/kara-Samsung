@@ -21,6 +21,7 @@ from _parole_import_providers import (ALL, ARCHIVE, JAMENDO, MANUAL, OPEN_LICENS
 from _parole_jamendo import client_id as jamendo_client
 from _parole_import_metrics import LOOKUP, observe
 from _parole_music_identity import CONFIRMED, PROBABLE, compare as compare_editions, from_catalogue, normalized
+from _parole_offer import create_plan, offers_are_equivalent, valid_offer
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
@@ -87,6 +88,8 @@ class AlbumImport(Gtk.Revealer):
         self.measure_index = None
         self.albums = []
         self.edition_facts = {}
+        self.offers = {}
+        self.offer_rows = {}
         self.by_id = {}
         self.imports_snapshot = ([], {})
         self.next_poll = 0
@@ -340,6 +343,8 @@ class AlbumImport(Gtk.Revealer):
     def clear_results(self):
         self.albums = []
         self.edition_facts.clear()
+        self.offers.clear()
+        self.offer_rows.clear()
         while row := self.results.get_first_child():
             self.results.remove(row)
         self.results_header.set_visible(False)
@@ -530,7 +535,19 @@ class AlbumImport(Gtk.Revealer):
             comparison = self.compare_result(source, album)
             text = " · ".join(part for part in (source, album["artist"], album["title"],
                               f"{album['tracks']} piste(s)", quality, "Gratuit", license_name, comparison) if part)
-            self.add_row(text, "Télécharger", lambda _button, selected=target: self.start_queue([selected]))
+            related = self.equivalent_offers(album)
+            self.offers[target[1]] = album
+            if self.measure_index is not None and related:
+                existing = self.offer_rows[related[0]["url"]]
+                label = existing.get_first_child()
+                text = (f"{album['artist']} · {album['title']} · {album['tracks']} piste(s) · Gratuit · "
+                        + " / ".join(f"{offer['provider']} ({', '.join(offer['formats'])})" for offer in [*related, album]))
+                label.set_label(text)
+                label.set_tooltip_text(text)
+                self.offer_rows[target[1]] = existing
+            else:
+                self.offer_rows[target[1]] = self.add_row(
+                    text, "Télécharger", lambda _button, selected=target: self.start_offer(selected))
         if self.albums:
             self.results_title.set_text(f"{len(self.albums)} résultat(s)")
             self.results_header.set_visible(True)
@@ -561,6 +578,23 @@ class AlbumImport(Gtk.Revealer):
             return "Édition confirmée"
         return "Édition à vérifier" if PROBABLE in verdicts else ""
 
+    def equivalent_offers(self, candidate):
+        if self.selected_provider() != ALL or not valid_offer(candidate):
+            return []
+        return [other for other in self.offers.values() if valid_offer(other) and offers_are_equivalent(other, candidate)]
+
+    def start_offer(self, target):
+        title, url = target
+        offer = self.offers[url]
+        candidates = self.equivalent_offers(offer)
+        if self.measure_index is not None and candidates:
+            try:
+                url = create_plan(self.measure_index, [offer, *candidates])
+            except (ValueError, OSError, sqlite3.Error) as error:
+                self.message("Impossible d’enregistrer l’édition multisource.", failed=True, detail=str(error))
+                return
+        self.start_queue([(title, url)])
+
     def add_row(self, text, action, handler):
         row = Gtk.Box(spacing=8, margin_start=8, margin_end=8, margin_top=4, margin_bottom=4)
         label = Gtk.Label(label=text, xalign=0.0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
@@ -570,6 +604,7 @@ class AlbumImport(Gtk.Revealer):
         button.connect("clicked", handler)
         row.append(button)
         self.results.append(row)
+        return row
 
     def start_all(self, _widget):
         self.start_queue(self.albums)
