@@ -543,6 +543,8 @@ class ParoleView:
         with self.index.db() as db:
             checks = db.execute("""SELECT kind,state,attempts,detail,due FROM tasks WHERE subject=?
                                    ORDER BY kind""", (identity,)).fetchall()
+            identification = db.execute("SELECT value FROM reviews WHERE kind='metadata' AND subject=? AND state='identified'",
+                                        (identity,)).fetchone()
         coverage = (f"{report.get('coverage', 0):.0%} mots · {report.get('line_coverage', 0):.0%} lignes"
                     if "coverage" in report else "Non mesurée")
         updated = datetime.fromtimestamp(row["checked"]).strftime("%d/%m/%Y à %H:%M")
@@ -603,6 +605,11 @@ class ParoleView:
         save = button("Enregistrer", commit)
         editbar.append(edit)
         editbar.append(save)
+        if identification:
+            found = json.loads(identification[0])
+            if found.pop("token", None) == row["token"]:
+                editbar.append(button("Identification", lambda widget: show_details(
+                    widget, "Identification MusicBrainz", json.dumps(found, indent=2, ensure_ascii=False))))
         editbar.append(button("Rechercher avec Codex",
                               lambda *_: self.manual_codex("lrc" if forms.get_selected() else "lyrics", identity, status)))
         song = Song(path, row["title"], row["artist"], row["album"], row["duration"] or None)
@@ -792,7 +799,7 @@ class ParoleView:
         toggles(general, (("startup", "Inventaire automatique au lancement"), ("lyrics", "Rechercher les paroles manquantes"),
                           ("lrc", "Rechercher les LRC"), ("generate", "Générer un LRC depuis les paroles"),
                           ("albums", "Vérifier les albums"), ("discography", "Vérifier les discographies"),
-                          ("cover", "Rechercher progressivement les pochettes"),
+                          ("cover", "Rechercher progressivement les pochettes"), ("metadata", "Vérifier les métadonnées manquantes"),
                           ("import_tracks", "Importer les pistes des éditions vérifiées autorisées"),
                           ("import_albums", "Importer les albums absents autorisés")))
         number(general, "scan_minutes", "Fréquence des inventaires (minutes)", 1, 1440)

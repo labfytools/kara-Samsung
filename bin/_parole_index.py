@@ -21,7 +21,7 @@ from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 DEFAULTS = {
     "startup": True, "paused": False, "lyrics": True, "lrc": True, "generate": True,
-    "albums": True, "discography": True, "cover": True, "autoprepare": True, "import_tracks": False, "import_albums": False,
+    "albums": True, "discography": True, "cover": True, "metadata": True, "autoprepare": True, "import_tracks": False, "import_albums": False,
     "codex": False, "codex_auto": True, "codex_daily": 2, "codex_timeout": 120,
     "codex_model": "", "codex_effort": "low",
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
@@ -273,7 +273,7 @@ def collection_reader(database, root):
             yield lambda paths: {}
             return
         columns = ("url title artist album albumartist lyrics length track disc year mtime filesize playcount "
-                   "musicbrainz_album_id musicbrainz_album_artist_id").split()
+                   "musicbrainz_album_id musicbrainz_album_artist_id musicbrainz_recording_id").split()
         selected = ",".join(c if c in available else f"NULL AS {c}" for c in columns)
         where = " WHERE unavailable=0" if "unavailable" in available else ""
         catalog = {}
@@ -429,6 +429,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     tags = dict(strawberry)
                     tags["albumid"] = strawberry["musicbrainz_album_id"]
                     tags["artistid"] = strawberry["musicbrainz_album_artist_id"]
+                    tags["recordingid"] = strawberry["musicbrainz_recording_id"]
                 else:
                     try:
                         tags, _ = reader(path)

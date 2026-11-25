@@ -13,7 +13,7 @@ from _kara_audio_identity import pcm_digest
 from _kara_paths import BIN, music_library
 from _kara_prepare import file_token
 from _musique_oz import shared_mutation
-from _parole_catalogue import check_album, check_discography, MBID
+from _parole_catalogue import check_album, check_discography, check_recording, MBID
 from _parole_index import Index, document, key, sidecar
 from _parole_sources import ProviderUnavailable, LyricsEndpoint, validate_endpoint, record, fetch
 from _paroles_lrc import parse_lrc
@@ -187,13 +187,30 @@ def main():
     else:
         began = monotonic()
         try:
-            state, value = (edition(index, subject) if kind == "album" else
-                            discography(index, subject, index.settings()))
+            if kind == "album":
+                state, value = edition(index, subject)
+            elif kind == "metadata":
+                song = index.song(subject)
+                if song:
+                    from re import sub
+
+                    parts = Path(song["path"]).relative_to(index.root).parts
+                    tags = json.loads(song["info"])["tags"]
+                    title = tags.get("title") or sub(r"^\d{1,3}\s*-\s*", "", song["title"])
+                    artist = tags.get("artist") or (parts[0] if len(parts) >= 3 else "")
+                    album = tags.get("album") or (parts[1] if len(parts) >= 3 else "")
+                    state, value = check_recording(tags, title, artist, album, song["duration"])
+                    if state == "identified":
+                        value["token"] = song["token"]
+                else:
+                    state, value = "excluded", {}
+            else:
+                state, value = discography(index, subject, index.settings())
         except ProviderUnavailable:
             record(index, "MusicBrainz", "error", monotonic() - began)
             result = {"state": "temporary"}
         else:
-            record(index, "MusicBrainz", "found" if state in ("complete", "incomplete", "checked", "partial")
+            record(index, "MusicBrainz", "found" if state in ("complete", "incomplete", "checked", "partial", "identified")
                    else "absent", monotonic() - began)
             result = {"state": state, "value": value}
     print(document(result))

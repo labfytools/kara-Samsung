@@ -145,3 +145,45 @@ def check_discography(identifier, group_ids, local_titles, categories, lookup=re
         if offset >= page.get("release-group-count", 0) or not groups:
             return "checked", {"missing": result, "partial": False}
     return "partial", {"missing": result, "partial": True}
+
+
+def check_recording(tags, title, artist, album, duration, lookup=request):
+    """Return an identification candidate without mutating an existing credit."""
+    identity = tags.get("recordingid") or tags.get("musicbrainzrecordingid") or ""
+    tagged_identity = bool(MBID.fullmatch(identity))
+    if tagged_identity:
+        value = lookup("recording/" + identity, inc="artist-credits+releases")
+        candidates = [value] if value else []
+    else:
+        # Folder names can narrow an initial query but cannot replace tags.
+        # An untagged file needs independent catalogue or user evidence.
+        known = sum(bool(tags.get(name)) for name in ("title", "artist", "album"))
+        if known < 2 or not title or not artist or not album or not duration:
+            return "ambiguous", {"reason": "Identité locale insuffisante"}
+        query = f'recording:{quoted(title)} AND artist:{quoted(artist)} AND release:{quoted(album)}'
+        payload = lookup("recording", query=query, limit=8)
+        if payload.get("count", 0) > 8:
+            return "ambiguous", {"reason": "Plusieurs enregistrements de même identité"}
+        candidates = payload.get("recordings", [])
+    matching = []
+    for item in candidates:
+        code, name, length = item.get("id", ""), item.get("title", ""), item.get("length")
+        artists = credits(item)
+        if (not MBID.fullmatch(code) or not name or type(length) not in (int, float)
+                or not duration or abs(length / 1000 - duration) > 2):
+            continue
+        if (tags.get("title") or not tagged_identity) and key(name) != key(title):
+            continue
+        names = {key(n) for _, n in artists} | {key(", ".join(n for _, n in artists))}
+        if (tags.get("artist") or not tagged_identity) and key(artist) not in names:
+            continue
+        official = [{"title": r["title"], "id": r["id"]} for r in item.get("releases", [])
+                    if r.get("status") == "Official" and r.get("title") and MBID.fullmatch(r.get("id", ""))
+                    and (not album or key(r["title"]) == key(album))]
+        if album and not official:
+            continue
+        matching.append({"recording_id": code, "title": name, "artists": artists[:8], "releases": official[:8],
+                         "duration": length / 1000})
+    if len(matching) != 1:
+        return ("ambiguous" if matching else "not_found"), {"candidates": len(matching)}
+    return "identified", matching[0]

@@ -29,7 +29,7 @@ from _parole_sources import discover, seed, controls
 CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
               "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "IDLE", "CACHE",
               "SUCCESS", "WARNING", "ERROR")
-NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "codex", "source", "source_probe")
+NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata", "codex", "source", "source_probe")
 HOUR = 3600
 DAY = 24 * HOUR
 PHASES = {"cache": "Vérification du cache", "lyrics": "Paroles de référence",
@@ -42,7 +42,7 @@ PHASES = {"cache": "Vérification du cache", "lyrics": "Paroles de référence",
 
 
 LOG_PRIVATE = re.compile(r"https?://[^\s]+|(?i:\b(?:authorization|password|cookie|token|secret|"
-                         r"api[-_ ]?key|bearer)\b)\s*[:=]?[^\n]*|eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]+")
+                         r"api[-_ ]?key)\b)\s*[:=][^\n]*|(?i:\bbearer\s+)[A-Za-z0-9._-]+|eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]+")
 
 
 def event_text(message):
@@ -255,7 +255,10 @@ class Maintenance:
                 if song["owner"] in blocked:
                     db.execute("UPDATE tasks SET state='excluded' WHERE subject=? AND state!='running'", (subject,))
                     continue
+                tags = json.loads(song["info"])["tags"]
+                missing_tags = any(not tags.get(field) for field in ("title", "artist", "album"))
                 for kind, missing in (("lyrics", song["lyrics"] == "absent"), ("lrc", song["lrc"] in ("absent", "intégré")),
+                                      ("metadata", missing_tags),
                                       ("prepare", song["kara"] != "prêt" and song["lyrics"] != "instrumental")):
                     if not missing:
                         db.execute("UPDATE tasks SET state='done' WHERE kind=? AND subject=? "
@@ -286,7 +289,7 @@ class Maintenance:
                         continue
                     revision = encoded_key(row["revision"], row["tracks"], settings["releases"])
                     self.index.enqueue(kind, subject, revision, 42 if kind == "album" else 46 if kind == "cover" else 45, db=db)
-            db.execute("""UPDATE tasks SET state='excluded' WHERE kind IN ('lyrics','lrc','prepare')
+            db.execute("""UPDATE tasks SET state='excluded' WHERE kind IN ('lyrics','lrc','prepare','metadata')
                          AND NOT EXISTS(SELECT 1 FROM songs WHERE id=tasks.subject)""")
             db.execute("""UPDATE tasks SET state='excluded' WHERE kind IN ('album','cover')
                          AND NOT EXISTS(SELECT 1 FROM songs WHERE edition=tasks.subject)""")
@@ -295,19 +298,23 @@ class Maintenance:
 
     def query(self, kind, subject):
         with self.index.db() as db:
-            if kind in ("album", "cover", "discography"):
+            if kind in ("album", "cover", "discography", "track"):
                 prop = "owner" if kind == "discography" else "edition"
                 row = db.execute(f"SELECT * FROM songs WHERE {prop}=? LIMIT 1", (subject,)).fetchone()
             else:
                 row = db.execute("SELECT * FROM songs WHERE id=?", (subject,)).fetchone()
+            review = (db.execute("SELECT value FROM reviews WHERE kind='album' AND subject=?", (subject,)).fetchone()
+                      if kind == "track" else None)
         if row is None:
             return None
         revision = encoded_key(kind, subject, row["token"] if kind not in ("discography", "album", "cover") else "")
         return {"research_id": revision, "kind": kind, "artist": (row["owner"] if kind in ("discography", "album", "cover") else row["artist"])[:180],
-                "title": row["title"][:180] if kind not in ("discography", "album", "cover") else "",
-                "album": row["album"][:180] if kind != "discography" else "", "year": row["year"],
+                "title": event_text(row["title"])[:180] if kind not in ("discography", "album", "cover") else "",
+                "album": event_text(row["album"])[:180] if kind != "discography" else "", "year": row["year"],
                 "duration": round(row["duration"]), "disc": row["disc"], "track": row["track"],
-                "release_id": row["release_id"][:100], "artist_id": row["artist_id"][:100]}
+                "release_id": (release.get("id") or row["release_id"])[:100], "artist_id": row["artist_id"][:100],
+                **({"missing_tracks": [[disc, track, event_text(title)[:180]] for disc, track, title in release.get("missing", [])[:15]]}
+                   if kind == "track" else {})}
 
     def queue_codex(self, kind, subject, failure="manuel", *, manual=False):
         query = self.query(kind, subject)
@@ -417,9 +424,16 @@ class Maintenance:
             return "temporary", state, min(DAY, 600 * 2**min(task["attempts"], 7))
         self.index.review(kind, subject, state, result.get("value", {}))
         self.revision += 1
-        if state in ("not_found", "ambiguous", "partial") or state == "incomplete":
+        if state in ("not_found", "ambiguous", "partial"):
             self.queue_codex(kind, subject, state)
+        if kind == "metadata" and state == "identified":
+            self.journal.emit("METADATA", "Identification documentée dans les détails du morceau")
         if state == "incomplete":
+            with self.index.db() as db:
+                permitted = db.execute("SELECT 1 FROM import_permissions WHERE kind='album' AND subject=?",
+                                       (subject,)).fetchone()
+            if not permitted and result["value"]["missing"]:
+                self.queue_codex("track", subject, state)
             self.journal.emit("ALBUM", f"{len(result['value']['missing'])} pistes manquantes · {result['value']['title']}")
         if kind == "discography" and "missing" in result.get("value", {}):
             self.journal.emit("DISCOGRAPHIE", f"{len(result['value']['missing'])} publications absentes · {subject}")
@@ -578,7 +592,7 @@ class Maintenance:
                                         "album": "Vérification d’une édition", "discography": f"Vérification · {subject}",
                                         "source": "Vérification des conditions et des correspondances",
                                         "source_probe": "Vérification de la documentation fournisseur",
-                                        "cover": "Recherche de pochette", "cleanup": "Nettoyage des brouillons"}[kind]
+                                        "cover": "Recherche de pochette", "metadata": "Vérification de l’identification", "cleanup": "Nettoyage des brouillons"}[kind]
                               + (f" · {song['title']}" if song is not None else ""))
         try:
             if kind == "prepare":
@@ -764,7 +778,7 @@ class Maintenance:
             return
         # Stagger task classes so a large burst of missing LRC never starves
         # album checks or source validation for the entire library.
-        turn = ("lrc", "lyrics", "album", "lrc", "discography", "lyrics", "cover", "codex", "source", "source_probe")
+        turn = ("lrc", "lyrics", "album", "lrc", "discography", "lyrics", "cover", "metadata", "codex", "source", "source_probe")
         for _ in turn:
             kind = turn[self.network_cursor]
             self.network_cursor = (self.network_cursor + 1) % len(turn)

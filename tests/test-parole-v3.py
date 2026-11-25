@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "bin"))
 
 from _kara_audio_identity import pcm_digest
 from _kara_prepare import lrc_token
-from _parole_catalogue import check_album, check_discography, compare
+from _parole_catalogue import check_album, check_discography, check_recording, compare
 from _parole_codex import authenticate, daily_slot, validate
 from _parole_index import Index, inventory, encoded_key
 from _parole_maintenance import Journal, Maintenance
@@ -185,6 +185,19 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(details["missing"], [[2, 1, "Final"]])
         self.assertEqual(len(details["duplicates"]), 1)
         self.assertEqual(compare([{**self.first, "disc": 0}], official())[0], "ambiguous")
+
+    def test_recording_requires_edition_duration_and_unambiguous_credit(self):
+        expected = {"id": OTHER, "title": "Titre", "length": 45_100,
+                    "artist-credit": [{"name": "Groupe", "artist": {"id": ARTIST}}],
+                    "releases": [{"title": "Album", "id": RELEASE, "status": "Official"}]}
+        tags = {"artist": "Groupe", "album": "Album"}
+        def lookup(*_args, **_kwargs):
+            return {"count": 1, "recordings": [expected]}
+        state, found = check_recording(tags, "Titre", "Groupe", "Album", 45, lookup)
+        self.assertEqual((state, found["recording_id"]), ("identified", OTHER))
+        self.assertEqual(check_recording(tags, "Homonyme", "Groupe", "Album", 45, lookup)[0], "not_found")
+        self.assertEqual(check_recording(tags, "Titre", "Groupe", "Album", 60, lookup)[0], "not_found")
+        self.assertEqual(check_recording(tags, "Titre", "Groupe", "Deluxe", 45, lookup)[0], "not_found")
 
     def test_edition_verification_homonymous_discography(self):
         status, details = check_album([self.first], (), lambda path, **_: official())
