@@ -7,6 +7,7 @@ from _kara_import_result import ImportIssue
 
 ALL = "Toutes les sources"
 YOUTUBE = "YouTube Music"
+ARTIST_SITES = "Sites d’artistes et de labels"
 OPEN_LICENSES = {
     "CC0 1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
     "CC BY 3.0": "https://creativecommons.org/licenses/by/3.0/",
@@ -24,6 +25,8 @@ class ManualProvider:
     album_hosts: re.Pattern
     album_path: re.Pattern
     licenses: tuple = ()
+    require_reference: bool = False
+    require_license: bool = False
 
     def release_reference(self, value):
         # Only the public edition URL is provenance. Account, payment and
@@ -35,11 +38,15 @@ class ManualProvider:
         if (len(value) > 400 or parts.scheme != "https" or not self.album_hosts.fullmatch(parts.netloc)
                 or not self.album_path.fullmatch(parts.path) or parts.query or parts.fragment):
             raise ImportIssue("path", "Indique la page publique de l’édition, sans paramètres ni lien temporaire.")
+        if parts.netloc.endswith((".local", ".localhost", ".internal", ".test", ".onion", ".arpa")):
+            raise ImportIssue("path", "Utilise la page publique de l’artiste ou du label.")
         return f"https://{parts.netloc}{parts.path.rstrip('/')}"
 
     def provenance(self, reference, license_url):
-        if self.licenses and (license_url not in self.licenses or not reference):
-            raise ImportIssue("path", "Indique la page publique et la licence de téléchargement affichée.")
+        if self.require_reference and not reference:
+            raise ImportIssue("path", "Indique la page publique du téléchargement officiel.")
+        if self.require_license and not license_url:
+            raise ImportIssue("path", "Indique la licence affichée sur la page publique.")
         if license_url and license_url not in self.licenses:
             raise ImportIssue("path", "Licence non prise en charge par ce fournisseur.")
         return self.release_reference(reference) if reference else "", license_url
@@ -66,5 +73,9 @@ MANUAL = {
         "https://freemusicarchive.org/License_Guide",
         re.compile(r"(?:www\.)?freemusicarchive\.org"),
         re.compile(r"/music/(?:[A-Za-z0-9_%-]{1,90}/){1,2}[A-Za-z0-9_%-]{1,140}/?"),
-        tuple(OPEN_LICENSES.values())),
+        tuple(OPEN_LICENSES.values()), require_reference=True, require_license=True),
+    ARTIST_SITES: ManualProvider(
+        "", "", "",
+        re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}"),
+        re.compile(r"/[A-Za-z0-9_~.%+/-]{1,290}"), tuple(OPEN_LICENSES.values()), require_reference=True),
 }

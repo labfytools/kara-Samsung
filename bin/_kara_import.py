@@ -268,14 +268,12 @@ class AlbumImport(Gtk.Revealer):
         self.clear_results()
         self.hide_message()
         route = MANUAL.get(self.selected_provider())
-        self.official_download.set_visible(route is not None)
-        self.download_help.set_visible(route is not None)
+        self.download_help.set_visible(bool(route and route.help))
         self.download_license.set_visible(bool(route and route.licenses))
         self.download_license.set_selected(0)
         if route:
-            self.official_download.set_uri(route.downloads)
             self.download_help.set_uri(route.help)
-        reference = ("Page publique de l’édition" if route and route.licenses else
+        reference = ("Page publique de l’édition" if route and route.require_reference else
                      "Page publique de l’édition (facultatif)" if route else "Lien d’album")
         self.link.set_placeholder_text(reference)
         self.submit.set_label("Importer" if route or self.selected_provider() == LOCAL else "Télécharger")
@@ -287,6 +285,16 @@ class AlbumImport(Gtk.Revealer):
         self.results.set_sensitive(idle)
         provider = self.selected_provider()
         url = self.link.get_text().strip()
+        route = MANUAL.get(provider)
+        download = route.downloads if route else ""
+        if route and not download and url:
+            try:
+                download = route.release_reference(url)
+            except ImportIssue:
+                pass
+        self.official_download.set_visible(bool(download))
+        if download:
+            self.official_download.set_uri(download)
         self.submit.set_sensitive(self.queue is not None and (provider in MANUAL or provider == LOCAL
                                   or bool(url) and (self.can_search_youtube() or local_url(url))))
         self.download_all.set_sensitive(idle and bool(self.albums))

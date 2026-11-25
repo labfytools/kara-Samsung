@@ -76,6 +76,10 @@ Récupérer le fichier seulement si SoundCloud affiche **Télécharger le fichie
 
 Télécharger depuis la page officielle si elle propose le fichier. Dans Parole, sélectionner **Free Music Archive**, renseigner la page publique et choisir la licence affichée, puis importer le fichier. Le parcours accepte CC0 1.0, CC BY et CC BY-SA en versions 3.0 et 4.0. Il conserve le lien et la licence déclarée pour retrouver les conditions et les crédits. Pour un dossier, la page et la licence renseignées doivent s’appliquer à toutes ses pistes. Free Music Archive a fermé son API et réserve l’automatisation de son formulaire de recherche aux intégrations autorisées. [Guide des licences](https://freemusicarchive.org/License_Guide) · [Informations développeurs](https://freemusicarchive.org/app-developers)
 
+### Sites d’artistes et de labels
+
+Sélectionner **Sites d’artistes et de labels** et indiquer la page HTTPS publique où le site officiel propose le téléchargement. Le bouton ouvre cette page dans le navigateur. Choisir ensuite le fichier reçu, le dossier ou le ZIP. Parole conserve le lien, la licence renseignée si elle figure dans le sélecteur et les crédits des fichiers. Le parcours n’interroge pas automatiquement des sites arbitraires.
+
 ## Diagnostic des échecs persistants
 
 La tentative initiale appartient au moteur d’import. Après l’enregistrement de son résultat et l’actualisation du catalogue, Parole peut planifier jusqu’à deux relances classiques pour un échec temporaire. Ces relances attendent 60 secondes puis 240 secondes au minimum, ou le délai signalé par le fournisseur s’il est plus long. Plusieurs échecs comparables peuvent différer leurs relances automatiques de 30 minutes. Les autres lots gardent les règles de la file. Les compteurs et échéances survivent à l’arrêt de Parole. La commande manuelle reste disponible dans l’import.
@@ -103,3 +107,5 @@ Le parcours Qobuz est testé avec un ZIP FLAC de synthèse et une référence d�
 Le parcours SoundCloud est testé avec une piste de synthèse sans tag d’album. Seul le fichier sélectionné est classé, avec une provenance déclarée et le même PCM. Le test ne se connecte pas à SoundCloud.
 
 Le parcours Free Music Archive est testé avec un FLAC de synthèse. Le test vérifie la conservation de la provenance et de la licence CC BY et le refus d’une licence manquante ou CC BY-ND.
+
+Le parcours des sites d’artistes a été vérifié en bibliothèque isolée avec le MP3 officiel de *This Too Shall Pass* par Scott Buckley, sous licence CC BY 4.0. Le fichier audio a été classé avec un PCM identique, son format et sa provenance. L’enrichissement en ligne était simulé et l’absence de pochette a laissé le lot partiel. Le test automatisé couvre aussi un lot qui se termine et le refus des références privées. [Fichier et crédits officiels](https://www.scottbuckley.com.au/library/this-too-shall-pass/)

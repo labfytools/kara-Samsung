@@ -28,3 +28,4 @@
 - Accepter les ZIP et dossiers FLAC des achats Qobuz et conserver la référence publique de l’édition.
 - Importer individuellement les pistes téléchargées via la fonction officielle SoundCloud, avec leur provenance déclarée.
 - Importer les téléchargements officiels de Free Music Archive avec une page publique et une licence compatible renseignées.
+- Conserver la page publique de téléchargement et la licence déclarée pour les fichiers remis par les artistes et labels.

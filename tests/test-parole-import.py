@@ -26,7 +26,7 @@ from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index
-from _parole_import_providers import OPEN_LICENSES
+from _parole_import_providers import ARTIST_SITES, OPEN_LICENSES
 from _parole_sources import controls, seed
 
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
@@ -354,6 +354,19 @@ class AlbumImportTests(unittest.TestCase):
                          ("Free Music Archive", license_url, release.rstrip("/")))
         self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(track))
         self.assertEqual(self.requests.read_text(), "")
+
+    def test_artist_site_retains_public_download_reference(self):
+        track = self.temp / "label" / "original.flac"
+        self.make_local_track(track, 1)
+        release = "https://records.example.org/musique/album-test/"
+        for invalid in ("", "https://127.0.0.1/album", "https://records.example.org/music?signature=secret"):
+            with self.assertRaises(ImportIssue):
+                local_target(track.as_uri(), ARTIST_SITES, invalid)
+        _, items, _ = self.run_import(local_target(track.as_uri(), ARTIST_SITES, release))
+        self.assertEqual((items[0]["provider"], items[0]["status"]), (ARTIST_SITES, "success"))
+        evidence = items[0]["provenance"][0]
+        self.assertEqual((evidence["source"], evidence["verification"]), (release.rstrip("/"), "manual"))
+        self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(track))
 
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]
