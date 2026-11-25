@@ -18,12 +18,25 @@ import time
 from _kara_import_result import ImportIssue
 from _kara_paths import STATE
 
-DOWNLOADS = 3
 DEFAULT_DOWNLOADS = 10
 MAX_DOWNLOADS = 20
-# YouTube's existing access profile remains three concurrent transfers.
-# Direct downloads keep their existing host gates and provider quotas.
-AUDIO_PROVIDERS = {"youtube": (DOWNLOADS, 60), "archive.org": (MAX_DOWNLOADS, 5),
+MEMORY_PRESSURE_SLOTS = 3
+YOUTUBE_DEFAULT_SLOTS = 3
+
+
+def youtube_audio_slots(value):
+    # This is the local access profile. Installations with documented
+    # automated access can supply their allowed concurrency independently
+    # of the global ceiling. Invalid values keep the conservative profile.
+    if 0 < len(value) <= 2 and value.isascii() and value.isdecimal():
+        slots = int(value)
+        if 1 <= slots <= MAX_DOWNLOADS:
+            return slots
+    return YOUTUBE_DEFAULT_SLOTS
+
+
+AUDIO_PROVIDERS = {"youtube": (youtube_audio_slots(os.environ.get("KARA_YOUTUBE_AUDIO_SLOTS", "")), 60),
+                   "archive.org": (MAX_DOWNLOADS, 5),
                    "api.jamendo.com": (MAX_DOWNLOADS, 5)}
 CATALOGUE = 2
 PROCESSING = 2
@@ -285,12 +298,12 @@ def memory_download_limit():
                          if line.startswith("MemAvailable:")) // 1024
         pressure = float(Path("/proc/pressure/memory").read_text().splitlines()[0].split()[1].split("=")[1])
     except (OSError, ValueError, StopIteration, IndexError):
-        return DOWNLOADS, "Mesure de la mémoire indisponible"
+        return MEMORY_PRESSURE_SLOTS, "Mesure de la mémoire indisponible"
     # Leave memory for Strawberry, desktop and video. Each admitted track
     # may own a downloader and its conversion subprocess at the same time.
     limit = max(1, min(MAX_DOWNLOADS, (available - 1280) // 192))
     if pressure >= 1:
-        limit = min(limit, DOWNLOADS)
+        limit = min(limit, MEMORY_PRESSURE_SLOTS)
     return limit, "Pression mémoire" if limit < MAX_DOWNLOADS else ""
 
 
@@ -330,7 +343,7 @@ def pending_downloads(directory):
 
 
 @contextmanager
-def audio_slot(directory, service, interval=0., notice=None, *, admitted=None):
+def audio_slot(directory, service, interval=0., notice=None):
     # Acquisition across competing processes is serialized. The leases
     # themselves outlive admission and are inherited by an external worker.
     # A capped or cooling provider cannot hold a global transfer slot.
@@ -396,20 +409,23 @@ def audio_slot(directory, service, interval=0., notice=None, *, admitted=None):
                 wait(.025)
         finally:
             path.unlink(missing_ok=True)
-        if admitted:
-            admitted()
         download_event("audio-started")
         yield global_fd, provider_fd
 
 
 def download_limitations(directory):
-    if not (directory / "waiting").is_dir():
+    if not directory.is_dir():
         return []
     with lease(directory / "admission.lock", wait=False) as fd:
         hosts = {host for _, host in pending_downloads(directory)} if fd is not None else set()
-    return [(service, delay, AUDIO_PROVIDERS[service][0]) for service in sorted(hosts & AUDIO_PROVIDERS.keys())
-            if (delay := service_delay(service)) > 2 or
-            slot_count(directory / service, AUDIO_PROVIDERS[service][0]) >= AUDIO_PROVIDERS[service][0]]
+    result = []
+    for service, (cap, _) in AUDIO_PROVIDERS.items():
+        # A provider pool can be full before any worker has a waiting ticket.
+        # The absence of tickets alone cannot hide that local profile.
+        delay = service_delay(service) if service in hosts else 0.
+        if delay > 2 or (cap < MAX_DOWNLOADS and slot_count(directory / service, cap) >= cap):
+            result.append((service, delay, cap))
+    return result
 
 
 def check_space(path, *, state=False, extra=0):

@@ -26,7 +26,7 @@ from _kara_audio_identity import pcm_digest
 from _kara_import_local import local_target
 from _kara_mobile_imports import MobileImports
 from _kara_import_queue import ImportQueue, digest
-from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
+from _kara_import_resources import MAX_DOWNLOADS, PROCESSING, YOUTUBE_DEFAULT_SLOTS, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index, inventory
 from _parole_import_metrics import LOOKUP, SUCCEEDED, TOTAL, snapshot
@@ -703,13 +703,15 @@ class AlbumImportTests(unittest.TestCase):
         before = first.read_bytes()
         _, done, _ = self.run_import(target, env=env, previous=journal)
         self.assertEqual((done[0]["status"], done[0]["provider"], done[0]["added"]), ("success", JAMENDO, 1))
-        self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "02.flac", "39012"])
+        requests = self.requests.read_text().splitlines()
+        self.assertCountEqual(requests[:2], ["01.flac", "02.flac"])
+        self.assertEqual(requests[2:], ["02.flac", "39012"])
         self.assertEqual({Path(path).parent for path in done[0]["tracks"]}, {first.parent})
         self.assertEqual(first.read_bytes(), before)
         self.assertEqual({proof["provider"] for proof in done[0]["provenance"]}, {ARCHIVE, JAMENDO})
         _, replay, _ = self.run_import(target, env=env)
         self.assertEqual((replay[0]["status"], replay[0]["processed"]), ("present", 0))
-        self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "02.flac", "39012"])
+        self.assertEqual(self.requests.read_text().splitlines(), requests)
 
     def test_confirmed_plan_reuses_existing_release_before_any_transfer(self):
         index, offers, env = self.equivalent_catalogues()
@@ -977,7 +979,7 @@ class AlbumImportTests(unittest.TestCase):
             self.assertEqual(worker.returncode, 0, (stdout, stderr))
             if worker.args[0] == BIN / "kara":
                 self.assertEqual(json.loads(stdout.splitlines()[-1])["event"], "suspended")
-        for resource, capacity in ((".kara-transferts", DOWNLOADS), (".kara-traitements", PROCESSING)):
+        for resource, capacity in ((".kara-transferts", MAX_DOWNLOADS), (".kara-traitements", PROCESSING)):
             self.assertEqual(slot_count(self.inbox / resource, capacity), 0)
 
     def test_pause_real_audio_preserves_ranges_and_resumes_after_restart(self):
@@ -1024,7 +1026,7 @@ class AlbumImportTests(unittest.TestCase):
                         workers = [self.launch_managed(queue, identity) for identity in identities]
                         self.until(lambda: sum(file.stat().st_size > 0
                                                for file in self.inbox.rglob("*.part")) == concurrent)
-                        self.assertEqual(slot_count(self.inbox / ".kara-transferts", DOWNLOADS), concurrent)
+                        self.assertEqual(slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS), concurrent)
                         self.await_pause(queue, *workers)
                         parts = {part: part.read_bytes() for part in self.inbox.rglob("*.part")}
                         self.assertEqual(len(parts), concurrent)
@@ -1215,7 +1217,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         # startup variance while the three independent transfers overlap.
         self.config["transfer_delay"] = 6
         targets = []
-        for number in range(DOWNLOADS):
+        for number in range(YOUTUBE_DEFAULT_SLOTS):
             key = f"PLPARALLEL{number}"
             self.config["playlists"][key] = {"title": key, "tracks": [
                 {"id": f"parallel{number:03d}", "title": key}]}
@@ -1224,12 +1226,28 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         queue = ImportQueue(self.temp / "state", self.library)
         identity = queue.enqueue(targets)
         worker = self.launch_managed(queue, identity)
-        self.until(lambda: slot_count(self.inbox / ".kara-transferts", DOWNLOADS) == DOWNLOADS)
+        self.until(lambda: slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS) == YOUTUBE_DEFAULT_SLOTS)
         stdout, stderr = worker.communicate(timeout=35)
         self.assertEqual(worker.returncode, 0, (stdout, stderr))
-        self.assertEqual(queue.totals(), (DOWNLOADS, DOWNLOADS, DOWNLOADS, DOWNLOADS))
+        self.assertEqual(queue.totals(), (YOUTUBE_DEFAULT_SLOTS,) * 4)
         self.assertEqual(Counter(self.requests.read_text().splitlines()),
-                         {f"parallel{number:03d}": 1 for number in range(DOWNLOADS)})
+                         {f"parallel{number:03d}": 1 for number in range(YOUTUBE_DEFAULT_SLOTS)})
+
+    def test_single_cli_album_uses_configured_track_profile(self):
+        self.config["transfer_delay"] = 6
+        name = "PLCLISLOTS"
+        self.config["playlists"][name] = {"title": "Album CLI", "tracks": [
+            {"id": f"cli{number:08d}", "title": f"Piste {number}"} for number in range(5)]}
+        self.update_config()
+        env = dict(self.env, KARA_YOUTUBE_AUDIO_SLOTS="5")
+        worker = subprocess.Popen([str(BIN / "kara"), "--suivi-json", "--", playlist(name)], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop_worker, worker)
+        self.until(lambda: slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS) == 5)
+        stdout, stderr = worker.communicate(timeout=35)
+        self.assertEqual(worker.returncode, 0, (stdout, stderr))
+        album, = (row for row in map(json.loads, stdout.splitlines()) if row["event"] == "album")
+        self.assertEqual(album["added"], 5)
 
     def test_four_lots_share_download_slots_and_finish_after_client_exit(self):
         self.config["transfer_delay"] = 2
@@ -1249,7 +1267,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
             self.assertTrue(queue.claim(identity))
             with lease(queue.directory / f"{identity}.lock") as fd:
                 workers.append(self.managed_worker(queue, identity, fd))
-        self.until(lambda: slot_count(self.inbox / ".kara-transferts", DOWNLOADS) == DOWNLOADS)
+        self.until(lambda: slot_count(self.inbox / ".kara-transferts", MAX_DOWNLOADS) == YOUTUBE_DEFAULT_SLOTS)
         self.assertEqual(queue.count(), {"running": 4})
         # Closing the progress pipes models GTK going away without stopping
         # the workers. Journals and SQLite results remain available on restart.

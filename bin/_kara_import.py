@@ -866,7 +866,7 @@ class AlbumImport(Gtk.Revealer):
         return job
 
     def changed(self, job, kind, payload):
-        if kind in MEASURED_AUDIO:
+        if kind in MEASURED_AUDIO and (kind != "audio-error" or payload.get("network") is True):
             amount = payload.get("size", 0) if kind == "audio-bytes" else payload.get("added", 0) if kind == "album" else 1
             if type(amount) is int and 0 < amount <= 512 * 1024**2:
                 index = MEASURED_AUDIO[kind]
@@ -1017,6 +1017,8 @@ class AlbumImport(Gtk.Revealer):
                 resource_reason=memory_reason if memory <= storage else "Réserve disque")
             if proposed != effective:
                 self.queue.set_download_limit(proposed)
+                reason = self.download_controller.reason or "essai du palier supérieur"
+                self.on_update(None, "queue", {"message": f"Concurrence audio · {effective} → {proposed} · {reason}"})
                 effective = proposed
         reasons = [limitation] if limitation else []
         if memory < ceiling and waiting_tracks:
@@ -1026,9 +1028,9 @@ class AlbumImport(Gtk.Revealer):
         if self.download_controller.reason and self.download_controller.reason not in reasons:
             reasons.append(self.download_controller.reason)
         labels = {"youtube": YOUTUBE, "archive.org": ARCHIVE, "api.jamendo.com": JAMENDO}
-        for source, delay, maximum in download_limitations(transfers):
+        for source, delay, maximum in download_limitations(transfers) if waiting_tracks else ():
             reasons.append(f"{labels[source]} · temporisation {delay:.0f} s" if delay > 2 else
-                           f"{labels[source]} · {maximum} transferts autorisés par le profil")
+                           f"{labels[source]} · profil local de {maximum} créneaux")
         progressed = sum(job.album_fraction for job in running)
         progress = min(1., (settled + progressed) / planned) if planned else 0.
         owner_rows = [job.snapshot() for job in reversed(self.imports)]

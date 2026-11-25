@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Supprimer le plafond local de 512 Kio/s, partager les travailleurs audio entre les parcours CLI et Parole et permettre au régulateur de remonter avant la fin de publication d’un album.
+
 - Distinguer les pistes qui reçoivent des octets des créneaux occupés par une connexion ou une conversion.
 
 - Appliquer l’accent Lavender aux barres d’import avec un thème GTK local qui impose une autre couleur.

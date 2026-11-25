@@ -127,49 +127,68 @@ class DownloadConcurrency:
         self.window = window
         self.sample = None
         self.trial = None
+        self.last_saturation = 0.
         self.retry_at = 0.
         self.reason = ""
         self.failures = 0
 
     def update(self, now, ceiling, limit, resources, active, waiting, counters, *, resource_reason="Pression mémoire"):
-        # Cohorts compare verified audio completions, actual transferred
-        # bytes and published tracks. Low demand cannot qualify a higher cap.
+        # The backlog and occupied slots establish whether a cap is binding.
+        # Actual bytes and completed tracks establish whether raising it
+        # helped. Commit cadence is compared once the baseline has published.
         failures = counters[3] - self.failures
         self.failures = counters[3]
         if resources < limit or failures:
             self.sample = self.trial = None
             self.retry_at = now + 30.
             self.reason = resource_reason if resources < limit else "Erreurs de transfert récentes"
-            return min(resources, ceiling, limit, max(3, limit // 2) if failures else limit)
+            return min(resources, ceiling, limit, max(1, (limit + 1) // 2) if failures else limit)
         if now < self.retry_at:
             return limit
         self.reason = ""
-        if waiting < 2 or active < max(1, limit - 1):
+        if waiting < 2:
             self.sample = None
             if self.trial:
-                stable, _ = self.trial
+                stable, _, _ = self.trial
                 self.trial = None
-                return min(stable, ceiling)
+                return min(stable, ceiling, resources)
             return limit
+        if active < max(1, limit - 1):
+            if now - self.last_saturation > 3.:
+                self.sample = None
+            if self.trial and now - self.trial[2] >= 2 * self.window:
+                return self.rollback(now, ceiling, resources, "Palier supérieur sous-utilisé")
+            return limit
+        self.last_saturation = now
         if self.sample is None or self.sample[1] != limit:
             self.sample = now, limit, counters
             return limit
         started, _, initial = self.sample
         elapsed = now - started
         transferred, downloaded, integrated = (current - before for current, before in zip(counters[:3], initial[:3]))
-        if elapsed < self.window or downloaded < 3 or integrated < 1 or transferred <= 0:
+        if elapsed < self.window:
+            return limit
+        if downloaded < 3 or transferred <= 0 or (self.trial and self.trial[1][2] > 0 and not integrated):
+            if self.trial and now - self.trial[2] >= 3 * self.window:
+                return self.rollback(now, ceiling, resources, "Cadence du palier supérieur non confirmée")
             return limit
         rates = transferred / elapsed, downloaded / elapsed, integrated / elapsed
         self.sample = None
         if self.trial:
-            stable, previous = self.trial
-            self.trial = None
+            _, previous, _ = self.trial
             if (rates[0] < previous[0] * 1.05 or rates[1] < previous[1] * .95
                     or rates[2] < previous[2] * .95):
-                self.reason = "Cadence insuffisante au plafond supérieur"
-                self.retry_at = now + 120.
-                return min(stable, ceiling)
-        effective = min(ceiling, resources, limit + 5)
+                return self.rollback(now, ceiling, resources, "Cadence insuffisante au plafond supérieur")
+            self.trial = None
+        next_step = next((value for value in (5, 10, 15, 20) if value > limit), limit)
+        effective = min(ceiling, resources, next_step)
         if effective > limit:
-            self.trial = limit, rates
+            self.trial = limit, rates, now
         return effective
+
+    def rollback(self, now, ceiling, resources, reason):
+        stable, _, _ = self.trial
+        self.sample = self.trial = None
+        self.reason = reason
+        self.retry_at = now + 120.
+        return min(stable, ceiling, resources)

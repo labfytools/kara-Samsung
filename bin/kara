@@ -48,7 +48,6 @@ from _parole_offer import load_plan, plan_id, rank as rank_offers
 import _parole_archive as archive
 import _parole_jamendo as jamendo
 
-DOWNLOAD_WORKERS = 2
 ALBUM_WINDOW = MAX_DOWNLOADS + CATALOGUE + PROCESSING
 # Both Parole and the CLI use this engine. A Kara-local update can fix the
 # extractor independently of the system package and other yt-dlp callers.
@@ -344,7 +343,9 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
             category, reason = abort[0]
             detail = f"{reason}\n{detail}"
         if download and category == "network":
-            defer_service("youtube", 60 if "429" in detail else 12)
+            rate_limited = "429" in detail
+            defer_service("youtube", 60 if rate_limited else 12)
+            progress.audio_event("audio-error", network=not rate_limited)
         progress.issue(label, category, detail, returncode=result, tool=command[0])
     return result
 
@@ -669,7 +670,9 @@ def download_track(source, folder, progress):
     command = [
         *YT_COMMAND, "--no-playlist", "--continue", "--abort-on-error", "--retries", "2", "--extractor-retries", "1",
         "--retry-sleep", "http:exp=2:15", "--retry-sleep", "extractor:exp=2:15",
-        "--limit-rate", "512K", "--concurrent-fragments", "1",
+        # Each admitted track owns one media stream. The fragment option
+        # enforces that budget even with a user yt-dlp configuration.
+        "--concurrent-fragments", "1",
         "--max-filesize", str(MAX_MEDIA), "--postprocessor-args", "ffmpeg:-threads 1",
         "-f", "bestaudio", "-x", "--audio-format", "best", "--embed-metadata", *metadata,
         "-P", str(folder), "-P", f"temp:{folder / '.download'}",
@@ -678,8 +681,7 @@ def download_track(source, folder, progress):
     ]
     directory = folder.parent / ".kara-transferts"
     waiting = monotonic()
-    with audio_slot(directory, "youtube", .5, lambda: progress.emit("En attente d’un téléchargement…"),
-                    admitted=lambda: progress.audio_event("audio-started")) as slots:
+    with audio_slot(directory, "youtube", .5, lambda: progress.emit("En attente d’un téléchargement…")) as slots:
         progress.measured(label, "download_queue", monotonic() - waiting)
         check_space(folder, extra=WORKING_RESERVE)
         # yt-dlp's counters include a previously saved prefix. The stage is
@@ -703,8 +705,6 @@ def download_track(source, folder, progress):
                 progress.transfer_offsets.pop(position, None)
         if not result and position in progress.finished_positions:
             progress.audio_event("audio-complete")
-        elif result:
-            progress.audio_event("audio-error")
         if transfer.first is not None:
             progress.measured(label, "first_byte", transfer.first - transfer.started)
             progress.measured(label, "transfer", transfer.last - transfer.first, bytes=transfer.bytes)
@@ -1158,7 +1158,11 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                         return checksum, None
                     except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
                         if transfer:
-                            progress.audio_event("audio-error")
+                            # Provider cooldowns already gate that provider.
+                            # Global feedback uses I/O failures after admission.
+                            network = (started and isinstance(error, ImportIssue) and error.category == "network"
+                                       and not error.stage and not re.search(r"\bHTTP (?:429|5\d\d)\b", str(error)))
+                            progress.audio_event("audio-error", network=network)
                         return None, error
                     finally:
                         if transfer and not started:
@@ -1561,25 +1565,32 @@ def import_album(item, root, inbox, previous, stop, seen):
 
                 def transfer(source):
                     if stop.is_set():
+                        progress.audio_event("audio-dropped")
                         return
+                    admitted = False
+
+                    def observed(event, **fields):
+                        nonlocal admitted
+                        admitted = admitted or event == "audio-started"
+                        progress.audio_event(event, **fields)
+
                     try:
-                        code = download_track(source, folder, progress)
+                        with watch_download(observed):
+                            code = download_track(source, folder, progress)
                         if not code and source.position not in progress.finished_positions:
                             raise ImportIssue("download", "Le téléchargeur n’a publié aucun fichier pour cette piste.")
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         record_error(progress, f"Téléchargement · piste {source.position}", error, "download")
-                        progress.audio_event("audio-error")
                     finally:
+                        if not admitted:
+                            progress.audio_event("audio-dropped")
                         with progress.download_lock:
                             item.processed += 1
                             progress.track_status("Piste traitée", source.position, 1.0)
 
                 if tasks:
                     progress.audio_event("audio-queued", amount=len(tasks))
-                    with ExitStack() as workers:
-                        pool = progress.track_pools.get("youtube") or workers.enter_context(
-                            ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS))
-                        results = workers.enter_context(track_results(pool, transfer, tasks))
+                    with track_results(progress.track_pools["youtube"], transfer, tasks) as results:
                         for _ in results:
                             pass
                 if any(audio_files(folder)):
@@ -1788,11 +1799,10 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
                     future.cancel()
 
     with ExitStack() as workers:
-        if progress.managed:
-            # A provider waiting for its own quota cannot occupy the threads
-            # that feed another provider. Audio leases remain global.
-            progress.track_pools = {service: workers.enter_context(ThreadPoolExecutor(max_workers=capacity))
-                                    for service, (capacity, _) in AUDIO_PROVIDERS.items()}
+        # Batch and CLI share the same track admission. Separate dispatch
+        # pools prevent one provider's cooldown from starving another.
+        progress.track_pools = {service: workers.enter_context(ThreadPoolExecutor(max_workers=capacity))
+                                for service, (capacity, _) in AUDIO_PROVIDERS.items()}
         results = album_results()
         workers.callback(results.close)
         for result in results:

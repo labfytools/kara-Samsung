@@ -156,6 +156,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_youtube_local_profile_is_bounded(self):
+        self.assertEqual([resources.youtube_audio_slots(value) for value in ("", "0", "-1", "21", "٥", "a")],
+                         [3] * 6)
+        self.assertEqual([resources.youtube_audio_slots(str(value)) for value in (1, 5, 10, 15, 20)],
+                         [1, 5, 10, 15, 20])
+
     def test_memory_pressure_caps_actual_admission(self):
         with TemporaryDirectory() as temp, patch.object(resources, "RATE_DIRECTORY", Path(temp) / "rates"), patch.object(
                 resources, "memory_download_limit", return_value=(1, "Pression mémoire")):
@@ -186,7 +192,22 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(sample(24, 20, 20, (2500, 25, 25, 0)), 20)
         self.assertEqual(sample(35, 20, 20, (3300, 42, 31, 0)), 15)
         self.assertEqual(sample(36, 15, 15, (3300, 42, 31, 0), resources=3), 3)
-        self.assertEqual(sample(37, 3, 3, (3300, 42, 31, 1)), 3)
+        self.assertEqual(sample(37, 3, 3, (3300, 42, 31, 1)), 2)
+
+    def test_trial_recovers_without_waiting_for_album_publication(self):
+        controller = DownloadConcurrency(window=10)
+        def sample(now, limit, active, counters):
+            return controller.update(now, 20, limit, 20, active, 20, counters)
+        self.assertEqual(sample(0, 5, 5, (0, 0, 0, 1)), 3)
+        self.assertEqual(sample(29, 3, 3, (500, 5, 0, 1)), 3)
+        self.assertEqual(sample(31, 3, 3, (500, 5, 0, 1)), 3)
+        self.assertEqual(sample(42, 3, 3, (1000, 10, 0, 1)), 5)
+        # Starting another socket can take time, or the provider can cap
+        # usage below the global trial. Never treat that as a gain.
+        self.assertEqual(sample(43, 5, 3, (1100, 11, 0, 1)), 5)
+        self.assertEqual(sample(50, 5, 3, (1400, 14, 0, 1)), 5)
+        self.assertEqual(sample(62, 5, 3, (1700, 17, 0, 1)), 3)
+        self.assertIn("sous-utilisé", controller.reason)
 
     def test_provider_cooldown_priority_and_ticket_names(self):
         with TemporaryDirectory() as temp, patch.object(resources, "RATE_DIRECTORY", Path(temp) / "rates"):
@@ -377,9 +398,14 @@ class FullEngineTests(unittest.TestCase):
 
     def test_one_batch_231_albums_keeps_feeding_the_global_slots(self):
         with self.server() as server:
-            server.delay = 1.15
+            server.release = Event()
             case = self.case(20, [f"edition-{number:03d}" for number in range(231)])
             with self.worker(case, server) as (process, output):
+                # Hold the first bodies until enough catalogue workers have
+                # supplied all twenty slots. Startup timing on a busy host
+                # should not decide whether the single batch can feed them.
+                self.until(lambda: server.peak == 20 and server.prefixes == 20)
+                server.release.set()
                 self.result(process, output, timeout=100)
             outcomes = case[2].outcomes(case[3])
             self.assertEqual(len(outcomes), 231)
@@ -395,8 +421,11 @@ class FullEngineTests(unittest.TestCase):
             server.fail_first = True
             case = self.case(1, ["concurrence"])
             with self.worker(case, server) as (process, output):
-                self.result(process, output, code=1)
+                events = self.result(process, output, code=1)
             self.assertEqual(server.offsets, {0: 1})
+            errors = [row for row in events if row["event"] == "audio-error"]
+            self.assertTrue(errors)
+            self.assertTrue(all(row["network"] is False for row in errors))
             self.assertEqual(case[2].job(case[3])["state"], "failed")
 
 
