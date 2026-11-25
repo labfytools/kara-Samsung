@@ -86,11 +86,21 @@ def album_associations(path, _revision):
 
     try:
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=.4)) as db:
-            return {(old, album): new for old, album, new in db.execute(
-                """SELECT old_artist,album,min(new_artist) FROM associations
-                   GROUP BY old_artist,album HAVING count(DISTINCT new_artist)=1""")}
+            rules = {}
+            for old, album, new in db.execute("SELECT old_artist,album,new_artist FROM associations"):
+                rules.setdefault((old, album), set()).add(new)
+                rules.setdefault((artist_spelling(old), artist_spelling(album)), set()).add(new)
+            return {pair: next(iter(names)) for pair, names in rules.items() if len(names) == 1}
     except sqlite3.Error:
         return {}
+
+
+def artist_spelling(value):
+    folded = "".join(c for c in normalize("NFKD", value or "").casefold() if not combining(c))
+    # Compare spellings inside a confirmed album association. Keep each
+    # collaborator in the key so a shared lead credit never creates an alias.
+    credits = re.split(r"[,/&]|\s+(?:and|et|y|avec|feat\.?|ft\.?)\s+", folded)
+    return tuple("".join(c for c in credit if c.isalnum()) for credit in credits)
 
 
 def album_group(credit, album):
@@ -107,7 +117,8 @@ def album_group(credit, album):
         revision = stamp, wal.stat().st_mtime_ns
     except OSError:
         revision = stamp, 0
-    return album_associations(path, revision).get((credit, album))
+    rules = album_associations(path, revision)
+    return rules.get((credit, album)) or rules.get((artist_spelling(credit), artist_spelling(album)))
 
 
 def canonical_album_artist(credit, album=None):

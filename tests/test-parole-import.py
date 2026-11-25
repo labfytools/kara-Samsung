@@ -33,6 +33,7 @@ from _parole_sources import controls, seed
 from _parole_offer import create_plan
 from _parole_archive import parse_item as archive_item
 from _parole_jamendo import parse_release as jamendo_edition
+from _musique_oz import artist_spelling, probe
 
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
 
@@ -52,6 +53,16 @@ class QuietHTTP(SimpleHTTPRequestHandler):
 
 
 class QueueTests(unittest.TestCase):
+    def test_spelling_keys_preserve_collaborator_boundaries(self):
+        for a, b in (("Bob Marley & The Wailers", "Bob Marley and the Wailers"),
+                     ("Guy2bezbar", "GUY2BEZBAR"), ("R.E.M.", "R E M"),
+                     ("Mafia K’1 Fry", "Mafia K'1 Fry"), ("Váld", "Vald"),
+                     ("Kurupt", " KURUPT "), ("L2B", "L2b")):
+            self.assertEqual(artist_spelling(a), artist_spelling(b))
+        self.assertNotEqual(artist_spelling("R.E.M. & Vald"), artist_spelling("R.E.M."))
+        self.assertNotEqual(artist_spelling("Bob Marley, Neville Willoughby"),
+                            artist_spelling("Bob Marley & The Wailers"))
+
     def test_manual_bandcamp_reference_accepts_only_public_release_pages(self):
         local = "file:///tmp/album.zip"
         release = "https://label.bandcamp.com/album/album-test"
@@ -628,6 +639,7 @@ class AlbumImportTests(unittest.TestCase):
         artists = json.loads(subprocess.check_output([*command, "artistes", "Atelier"], cwd=self.temp, env=self.env))
         albums = json.loads(subprocess.check_output(
             [*command, "albums", artists["data"][0]["id"]], cwd=self.temp, env=self.env))
+        self.assertEqual(albums["data"]["artist_id"], artists["data"][0]["id"])
         release = albums["data"]["albums"][0]
         edition = json.loads(subprocess.check_output(
             [*command, "edition", release["id"]], cwd=self.temp, env=self.env))["data"]
@@ -644,6 +656,28 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual(Counter(self.requests.read_text().splitlines()),
                          {"soundGOOD01": 1, "soundGOOD02": 1})
         self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_discography_route_survives_restart_and_preserves_supplier_credits(self):
+        queue = ImportQueue(self.temp / "state", self.library)
+        url = "https://music.youtube.com/browse/MPREb_FIXTURE"
+        routes = {url: ("Artiste de référence", "UC" + "a" * 22, "MPREb_FIXTURE"),
+                  playlist("PLPART"): ("Album hors sélection", "UC" + "a" * 22, "MPREb_FIXTURE")}
+        identity = queue.enqueue([("Signal", url)], artist_routes=routes)
+        restarted = ImportQueue(self.temp / "state", self.library)
+        self.assertEqual(restarted.routes(identity), {url: routes[url]})
+        self.assertTrue(restarted.claim(identity))
+        with lease(restarted.directory / f"{identity}.lock") as fd:
+            worker = self.managed_worker(restarted, identity, fd)
+        output, error = worker.communicate(timeout=30)
+        self.assertEqual(worker.returncode, 0, (output, error))
+        album = restarted.outcomes(identity)[url]
+        self.assertEqual(len(album["tracks"]), 2)
+        for value in album["tracks"]:
+            path = Path(value)
+            self.assertEqual(path.relative_to(self.library).parts[0], "Artiste de référence")
+            tags, _ = probe(path)
+            self.assertEqual(tags["artist"], self.config["artist"])
+            self.assertEqual(tags["albumartist"], self.config["artist"])
 
     def test_kara_local_downloader_is_used_for_playlist_and_transfer(self):
         directory = self.temp / "data/kara/tools"

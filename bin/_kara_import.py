@@ -90,6 +90,7 @@ class AlbumImport(Gtk.Revealer):
         self.provider_enabled = lambda _: True
         self.measure_index = None
         self.albums = []
+        self.artist_routes = {}
         self.edition_facts = {}
         self.edition_reviews = {}
         self.offers = {}
@@ -346,6 +347,7 @@ class AlbumImport(Gtk.Revealer):
 
     def clear_results(self):
         self.albums = []
+        self.artist_routes.clear()
         self.edition_facts.clear()
         self.edition_reviews.clear()
         self.offers.clear()
@@ -511,6 +513,8 @@ class AlbumImport(Gtk.Revealer):
         self.hide_message()
         for album in data["albums"]:
             job = (album["title"], album["url"])
+            if data.get("artist_id"):
+                self.artist_routes[job[1]] = artist, data["artist_id"], album["id"]
             self.edition_facts[job[1]] = (YOUTUBE, from_catalogue({**album, "artist": artist}))
             text = " · ".join(str(part) for part in (album["title"], album["year"]) if part)
             self.add_row(f"{YOUTUBE} · {text}", "Télécharger", lambda _button, selected=job: self.start_queue([selected]))
@@ -712,7 +716,8 @@ class AlbumImport(Gtk.Revealer):
             if self.queue is None:
                 raise OSError(self.queue_error)
             check_space(self.queue.directory, state=True)
-            identity = self.queue.enqueue(jobs, journal=journal, option=option, request=request)
+            routes = {url: self.artist_routes[url] for _, url in jobs if url in self.artist_routes}
+            identity = self.queue.enqueue(jobs, journal=journal, option=option, request=request, artist_routes=routes)
         except (ValueError, OSError, sqlite3.Error) as error:
             self.message("Impossible d’enregistrer l’import.", failed=True, detail=str(error))
             return None

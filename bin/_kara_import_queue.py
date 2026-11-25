@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 import sqlite3
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
@@ -90,6 +91,11 @@ class ImportQueue:
                 CREATE TABLE IF NOT EXISTS requests (
                     id TEXT PRIMARY KEY, payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS artist_routes (
+                    job TEXT NOT NULL REFERENCES jobs(id), url TEXT NOT NULL,
+                    artist TEXT NOT NULL, artist_id TEXT NOT NULL, album_id TEXT NOT NULL,
+                    PRIMARY KEY(job,url)
+                );
             """)
             db.execute("INSERT OR IGNORE INTO settings VALUES (1, 0, ?)", (DEFAULT_BATCHES,))
 
@@ -123,10 +129,11 @@ class ImportQueue:
             db.execute("UPDATE settings SET paused=coalesce(?,paused), batches=coalesce(?,batches) WHERE id=1",
                        (paused, batches))
 
-    def enqueue(self, targets, *, option=None, journal=None, request=None, db=None):
+    def enqueue(self, targets, *, option=None, journal=None, request=None, artist_routes=None, db=None):
         if db is None:
             with self.connect(write=True) as transaction:
-                return self.enqueue(targets, option=option, journal=journal, request=request, db=transaction)
+                return self.enqueue(targets, option=option, journal=journal, request=request,
+                                    artist_routes=artist_routes, db=transaction)
         unique = {}
         for title, url in targets:
             if local_url(url):
@@ -148,7 +155,25 @@ class ImportQueue:
         if request is not None:
             request["task_id"] = identity
             self.save_request(request, db=db)
+        if artist_routes:
+            targets_in_job = {url for _, url in json.loads(db.execute(
+                "SELECT targets FROM jobs WHERE id=?", (identity,)).fetchone()[0])}
+            for url, (name, artist_id, album_id) in artist_routes.items():
+                if (url not in targets_in_job or not name.strip() or len(name) > 180
+                        or not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", artist_id)
+                        or not re.fullmatch(r"MPRE[A-Za-z0-9_-]{5,120}", album_id)
+                        or url != f"https://music.youtube.com/browse/{album_id}"):
+                    continue
+                # A running import already owns its routing decision.
+                db.execute("""INSERT OR IGNORE INTO artist_routes
+                              SELECT id,?,?,?,? FROM jobs WHERE id=? AND state='queued'""",
+                           (url, name, artist_id, album_id, identity))
         return identity
+
+    def routes(self, identity):
+        with self.connect() as db:
+            return {url: (artist, artist_id, album_id) for url, artist, artist_id, album_id in db.execute(
+                "SELECT url,artist,artist_id,album_id FROM artist_routes WHERE job=?", (identity,))}
 
     def enqueue_maintenance(self, receipt, title, url):
         # Deduplication against desktop/mobile uses the existing queue. A

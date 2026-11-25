@@ -88,11 +88,11 @@ def releases(yt, identifier):
         albums = shelf.get("results") or []
     result = {}
     for album in albums:
-        identifier = album.get("browseId") or ""
-        if ALBUM.fullmatch(identifier) and album.get("title"):
-            result[identifier] = {"id": identifier, "title": album["title"], "year": album.get("year") or "",
-                                  "url": f"https://music.youtube.com/browse/{identifier}"}
-    return {"name": artist.get("name") or "", "albums": list(result.values())}
+        album_id = album.get("browseId") or ""
+        if ALBUM.fullmatch(album_id) and album.get("title"):
+            result[album_id] = {"id": album_id, "title": album["title"], "year": album.get("year") or "",
+                                "url": f"https://music.youtube.com/browse/{album_id}"}
+    return {"name": artist.get("name") or "", "artist_id": identifier, "albums": list(result.values())}
 
 
 def names(row):
@@ -218,7 +218,7 @@ def prepare_album(yt, url, root):
     title = album.get("title") or ""
     artists = [artist["name"] for artist in (album.get("artists") or []) if artist.get("name")]
     credit = canonical_album_artist(", ".join(artists), title)
-    return {"title": title, "artist": credit, "present": bool(tracks) and all(track["path"] for track in tracks),
+    return {"id": identifier, "title": title, "artist": credit, "present": bool(tracks) and all(track["path"] for track in tracks),
             "tracks": tracks, "url": f"https://music.youtube.com/playlist?list={playlist}"}
 
 

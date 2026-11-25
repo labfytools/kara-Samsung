@@ -26,6 +26,12 @@ Sur ArchASP, un essai isolé avec deux albums synthétiques et quatre transferts
 
 Le second essai utilise seize pistes de synthèse, des réponses contrôlées et les vrais créneaux du moteur. Quatre recherches restent le réglage par défaut. Les deux plafonds plus élevés ont presque les mêmes durées globales, davantage de requêtes et des textes différés.
 
+## Classement d’une discographie
+
+Lors de la sélection d’un artiste YouTube Music, Parole conserve l’identité de l’artiste et les identifiants d’album obtenus depuis sa discographie. La file garde cette provenance après redémarrage. L’import vérifie l’identifiant d’album pendant la résolution et utilise le nom sélectionné pour le dossier. Le crédit d’album du catalogue et les crédits complets des pistes sont conservés indépendamment.
+
+La comparaison des graphies ignore certaines différences de casse, accents et ponctuation dans le cadre d’une association déjà validée pour un album. Elle garde les collaborateurs dans la comparaison. Les offres voisines proposées par une recherche textuelle nécessitent leurs propres preuves.
+
 ## Déplacement du dépôt sur ArchASP
 
 Le commit `2201869` a déplacé `kara` dans le dépôt dédié. Les appels de tri et de recherche de pochette utilisaient déjà le répertoire de `kara`, mais `musique-tri` et `musique-pochettes` sont restés dans `~/.dotfiles/bin/.local/bin`, accessible sur ArchASP par `~/.local/bin`. Ces deux exécutables n’avaient pas d’historique dans Git. Les copies datées du 22 novembre dans `~/.local/state/kara-tri-paroles-*` corroborent l’origine du script de tri. Les scripts locaux ont été repris dans `bin/`, avec des adaptations ciblées pour les chemins et la reprise.

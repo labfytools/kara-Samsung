@@ -92,6 +92,7 @@ class ImportProgress:
         self.announce_provider = lambda *_: None
         self.transfers = {}
         self.telemetry = None
+        self.artist_route = None
 
     def emit(self, message, fraction=None, *, event="progress", **fields):
         if self.report is not None:
@@ -665,17 +666,18 @@ def download_track(source, folder, progress):
         return result
 
 
-def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, folder_hint=None):
+def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, folder_hint=None, filing_artist=None):
     if not any(audio_files(batch)):
         return 0, []
     with TemporaryDirectory(prefix="kara-rapport-") as temporary:
         report = Path(temporary) / "pistes.json"
         credit = ["--artiste-album", album_artist] if album_artist else []
         destination = ["--dossier-import", *folder_hint] if folder_hint else []
+        filing = ["--classement-artiste", filing_artist] if filing_artist else []
         code = run("Tri dans l’audiothèque",
                    [str(BIN / "musique-tri"), "--bibliotheque", str(SHARED_LIBRARY),
                     "--rapport", str(report), "--rapport-detaille", "--reprise-interne", str(receipt),
-                    *credit, *(["--garder-tags-import"] if preserve_tags else ()), *destination, "--", str(batch)],
+                    *credit, *(["--garder-tags-import"] if preserve_tags else ()), *destination, *filing, "--", str(batch)],
                    progress=progress, fraction=0.76, resource="processing")
         if not report.is_file():
             if not code:
@@ -1371,6 +1373,14 @@ def import_album(item, root, inbox, previous, stop, seen):
     if not playlist and parsed.path.startswith("/browse/"):
         album = album_preflight(item.url, root, progress)
         _, playlist = checked_link(album["url"])
+    filing_artist = None
+    if album and progress.artist_route:
+        artist, artist_id, album_id = progress.artist_route
+        if album.get("id") == album_id:
+            # The exact browse ID came from the selected artist's catalogue
+            # shelf. Keep the supplier's actual credits independently.
+            filing_artist = artist
+            progress.log("Classement de la discographie", f"{album['title']} → {artist} ({artist_id})")
     if playlist:
         item.identity = f"playlist:{playlist}"
     else:
@@ -1450,7 +1460,7 @@ def import_album(item, root, inbox, previous, stop, seen):
                         list(pool.map(transfer, tasks))
                 if any(audio_files(folder)):
                     check_space(folder, extra=MAX_MEDIA * PROCESSING)
-                    item.added, sorted_tracks = sort_audio(folder, progress, item.artist, receipt)
+                    item.added, sorted_tracks = sort_audio(folder, progress, item.artist, receipt, filing_artist=filing_artist)
                     item.tracks = sorted(set(item.tracks).union(sorted_tracks))
                 if not item.tracks and not progress.failures:
                     raise ImportIssue("download", "Aucune piste complète n’a été reçue.")
@@ -1474,7 +1484,7 @@ def import_album(item, root, inbox, previous, stop, seen):
                 progress.guard = progress.guard[:-1]
 
 
-def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None):
+def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None, routes=None):
     root = SHARED_LIBRARY
     inbox = root / INBOX
     if not root.is_dir() or not inbox.is_dir() or inbox.is_symlink():
@@ -1498,6 +1508,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
             break
         child = ImportProgress(journal=progress.journal, json_output=progress.json_output, url=url)
         child.defer_enrichment = progress.managed
+        child.artist_route = (routes or {}).get(url)
         child.guard = progress.guard
         child.download_lock = RLock()
         child.measure_index = metrics
@@ -1732,6 +1743,7 @@ def main():
                         progress.emit("Les albums du lot sont déjà terminés.", 1., event="skip")
                         return 0
                 return prepare_batch(urls, progress, stop, previous, titles=titles,
+                                     routes=queue.routes(job["id"]) if job else None,
                                      on_album=(lambda outcome: queue.album(job["id"], outcome)) if job else None)
             except ImportIssue as error:
                 progress.finish_issue(error)
