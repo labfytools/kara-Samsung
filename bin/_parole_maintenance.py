@@ -786,6 +786,7 @@ class Maintenance:
                 self.night.close()
                 if self.night.reason.startswith("Réouverture"):
                     self.resources.close()
+                self.recover_night_drafts()
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
             result = ("temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8)))
@@ -875,6 +876,7 @@ class Maintenance:
                 self.owner = owner
                 if self.index.recover():
                     self.journal.emit("IDLE", "Préparation nocturne interrompue avant le redémarrage", "WARNING")
+                    self.recover_night_drafts()
                 self.journal.emit("SYSTEM", "Maintenance de Parole démarrée")
                 while not self.shutdown.is_set():
                     try:
@@ -912,6 +914,17 @@ class Maintenance:
                     count += 1
         self.resources.collect_storage(monotonic(), force=True)
         return count
+
+    def recover_night_drafts(self):
+        # The interrupted process group has exited. The existing cleanup
+        # takes the Demucs lease before deleting marked scratch directories.
+        try:
+            removed = self.cleanup_interrupted()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.journal.emit("CACHE", "Nettoyage des brouillons reporté", "WARNING")
+        else:
+            if removed:
+                self.journal.emit("CACHE", f"{removed} brouillons interrompus retirés")
 
     def tick(self):
         settings = self.current_settings = self.index.settings()

@@ -54,6 +54,10 @@ class NightTests(unittest.TestCase):
         root = Path(temporary.name)
         self.owner = Maintenance(root, None, state=root / "state")
         self.addCleanup(self.owner.close)
+        self.stems = root / "stems"
+        stem_directory = patch("_parole_maintenance.STEM_ROOT", self.stems)
+        stem_directory.start()
+        self.addCleanup(stem_directory.stop)
         self.night = self.owner.night
         self.addCleanup(self.night.close)
         self.state = Desktop(True, True, True, False, False)
@@ -148,6 +152,19 @@ class NightTests(unittest.TestCase):
         self.assertEqual((report["ready"], report["interrupted"], report["corrected"], report["seconds"]), (1, 1, 1, 30.))
         self.assertEqual((report["cache_baseline"], report["cache_bytes"]), (20, 42))
         self.assertIsNone(report["pending"])
+
+    def test_recovery_removes_only_owned_drafts(self):
+        stage = self.stems / "processing-interrupted"
+        stage.mkdir(parents=True)
+        (stage / ".parole-stage").touch()
+        other = self.stems / "processing-other"
+        other.mkdir()
+        ready = self.stems / "valid"
+        ready.mkdir()
+        self.owner.recover_night_drafts()
+        self.assertFalse(stage.exists())
+        self.assertTrue(other.exists())
+        self.assertTrue(ready.exists())
 
     def test_real_subprocess_stops_on_power_loss_sleep_heat_space_and_kara(self):
         cases = ("Demucs", "Turbo", "veille", "température", "stockage", "Kara", "activité", "désactivation")

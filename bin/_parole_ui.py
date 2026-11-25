@@ -802,7 +802,7 @@ class ParoleView:
             if name == "night_enabled":
                 # Opt-in replaces legacy automatic preparation. Switching
                 # off night must not immediately restart that same heavy work.
-                self.index.configure(night_enabled=value, autoprepare=False)
+                self.index.configure(night_enabled=value)
                 if value:
                     self.maintenance.rescan()
             else:

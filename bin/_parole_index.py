@@ -201,6 +201,8 @@ class Index:
             return ready, remaining, self.read_night_report(db)
 
     def configure(self, **changes):
+        if "night_enabled" in changes:
+            changes.setdefault("autoprepare", False)
         with self.db() as db:
             db.executemany("INSERT OR REPLACE INTO settings VALUES(?,?)",
                            ((name, document(value)) for name, value in changes.items() if name in DEFAULTS))
