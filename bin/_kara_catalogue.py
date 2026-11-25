@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from _kara_import_resources import defer_service, wait_service
+from _kara_import_resources import defer_service, observe_youtube, wait_service
 from _kara_import_result import ImportIssue
 from _musique_oz import canonical_album_artist, INBOX, audio_files, component, probe, source_video
 
@@ -56,6 +56,11 @@ def client():
                     delay = max(delay, requested)
                 except (TypeError, ValueError, OverflowError):
                     pass
+                if response.status_code == 429:
+                    # A catalogue 429 gates the same provider as a media
+                    # 429, including when Retry-After is an HTTP date.
+                    observe_youtube(retry_after=delay)
+                    raise ImportIssue("rate", f"HTTP 429 · Retry-After: {int(delay + 1)}", stage="catalogue")
                 defer_service("youtube", delay)
                 response.raise_for_status()
             return response

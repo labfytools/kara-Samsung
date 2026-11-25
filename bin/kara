@@ -27,12 +27,14 @@ from zipfile import BadZipFile
 from _kara_audio_identity import pcm_digest
 from _kara_import_local import LOCAL, local_entries, local_selection, local_url, publish_sidecar, read_entry, stamp
 
-from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_category, retry_albums
+from _kara_import_result import (CATEGORIES, YOUTUBE_HOLD_MESSAGE, ImportIssue, ImportLog, failure_category,
+                                 provider_rate_delay, retry_albums)
 from _kara_import_queue import COMPLETE, ImportQueue, digest
 from _kara_import_resources import (AUDIO_PROVIDERS, CATALOGUE, MAX_DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE,
-                                   YOUTUBE_INTERVAL, ImportPause, ImportSuspended, check_space, checkpoint as pause_checkpoint,
+                                   YOUTUBE_INTERVAL, ImportPause, ImportSuspended, check_space, check_youtube,
+                                   checkpoint as pause_checkpoint,
                                    current_pause, defer_service, download_admission, download_event, download_scope, lease, resource_slot, terminate_group,
-                                   memory_download_limit, track_results, wait_service, watch_download)
+                                   memory_download_limit, observe_youtube, track_results, wait_service, watch_download)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
                          shared_mutation, source_video)
@@ -142,7 +144,8 @@ class ImportProgress:
         if tool:
             diagnostic["tool"] = Path(tool).name
         with self.download_lock:
-            self.failures.append(diagnostic)
+            if category != "provider_hold" or not any(entry["category"] == category for entry in self.failures):
+                self.failures.append(diagnostic)
         return diagnostic
 
     def track_status(self, verb, index, finished=0.0):
@@ -344,11 +347,19 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
         if abort:
             category, reason = abort[0]
             detail = f"{reason}\n{detail}"
+        elif download and phase in {None, "resolution", "transfer"}:
+            hold = observe_youtube(detail=detail)
+            if provider_rate_delay(detail):
+                category = "rate"
+            elif hold:
+                category = "provider_hold"
+                detail = f"{YOUTUBE_HOLD_MESSAGE} · {hold}."
         if download and phase in {"resolution", "transfer"} and category == "network":
-            rate_limited = "429" in detail
-            defer_service("youtube", 60 if rate_limited else 12)
-            progress.audio_event("audio-error", network=phase == "transfer" and not rate_limited)
+            defer_service("youtube", 12)
+            progress.audio_event("audio-error", network=phase == "transfer")
         progress.issue(label, category, detail, returncode=result, tool=command[0])
+    elif download and phase in {"transfer", "conversion-wait", "conversion"}:
+        observe_youtube(extracted=True)
     return result
 
 
@@ -465,14 +476,19 @@ def youtube_metadata(command, progress, timeout):
     with resource_slot(directory, CATALOGUE) as slot:
         if command[0] == YT_EXECUTABLE:
             wait_service("youtube", YOUTUBE_INTERVAL)
+        check_youtube()
         try:
             result = bounded_metadata(command, progress.guard + (slot,), timeout)
         except subprocess.TimeoutExpired:
             defer_service("youtube", 12)
             raise
         detail = result.stderr + (result.stdout if result.returncode else "")
+        if provider_rate_delay(detail):
+            observe_youtube(detail=detail)
+            progress.log("Limitation YouTube", detail, command=command[0])
+            raise ImportIssue("rate", detail, returncode=result.returncode, tool=command[0])
         if failure_category(detail, "processing") == "network":
-            defer_service("youtube", 60 if "429" in detail else 12)
+            defer_service("youtube", 12)
         return result
 
 
@@ -660,6 +676,7 @@ def literal_metadata(value, field):
 
 
 def download_track(source, folder, progress):
+    check_youtube()
     position = source.position
     label = f"Téléchargement · piste {position}"
     metadata = ["--parse-metadata", f"{position}:%(kara_index)s",
@@ -723,6 +740,7 @@ def download_track(source, folder, progress):
         # lease so a parent exit cannot admit another process prematurely.
         workers = min(AUDIO_PROVIDERS["youtube"][0], memory_download_limit()[0]) + PROCESSING
         with resource_slot(folder.parent / ".kara-youtube-travailleurs", workers) as worker:
+            check_youtube()
             result = run(label, command, progress=progress, download=True, announce=False, disk=folder,
                          resource=(worker,), download_context=progress.download_context, phase_changed=phase_changed)
     finally:
@@ -822,7 +840,10 @@ def record_error(progress, stage, error, default="processing"):
 
 
 def album_diagnostics(item):
-    return sorted(item.progress.failures, key=lambda entry: (entry["stage"], entry["detail"]))
+    # Preserve the provider reason when a lot also contains individual
+    # failures and only a bounded prefix enters the recovery diagnosis.
+    return sorted(item.progress.failures, key=lambda entry: (
+        entry["category"] not in {"provider_hold", "rate"}, entry["stage"], entry["detail"]))
 
 
 STAGED_TRACK = re.compile(r"^(\d+) - .* \[([A-Za-z0-9_-]{11})\]\.[^.]+$")
@@ -1523,6 +1544,7 @@ def import_album(item, root, inbox, previous, stop, seen):
     item.tracks = available_tracks(known, root)
     item.title = previous.get("title") or item.title
     item.identity = previous.get("identity", "")
+    item.artist = previous.get("artist") or None
     if previous.get("audio_complete") and item.tracks and len(item.tracks) == len(known):
         item.audio_complete = True
         enrich_tracks(item.tracks, progress)
@@ -1773,13 +1795,18 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
         diagnostics = album_diagnostics(item)
         category = ("partial" if item.status == "partial" else diagnostics[0]["category"] if diagnostics
                     else "present" if item.status == "present" else None)
+        remaining = str(item.remaining) if item.remaining else None
+        if item.folder is None and any(entry["category"] == "provider_hold" for entry in diagnostics):
+            # A gated catalogue lookup may exit before discovering the staging
+            # directory. Keep the last durable reference to any draft.
+            remaining = previous.get(url, {}).get("remaining")
         message = CATEGORIES.get(category) or {
             "success": "Audio complet" if enrichment else "Import terminé",
             "duplicate": "Lien en double", "pending": "Arrêté avant téléchargement",
         }[item.status]
         outcome = dict(url=url, title=item.title, status=item.status, category=category, diagnostics=diagnostics,
                        added=item.added, tracks=item.tracks, audio_complete=item.audio_complete,
-                       remaining=str(item.remaining) if item.remaining else None, identity=item.identity,
+                       remaining=remaining, identity=item.identity,
                        processed=item.processed, message=message, artist=item.artist or "")
         if item.provenance:
             outcome["provenance"] = item.provenance

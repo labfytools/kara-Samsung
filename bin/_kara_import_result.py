@@ -10,11 +10,16 @@ from time import time
 from _kara_paths import STATE
 
 IMPORT_LOGS = STATE / "kara/imports"
+YOUTUBE_HOLD_MESSAGE = "Admission YouTube suspendue"
+YOUTUBE_RATE = "limitation confirmée par le fournisseur"
+YOUTUBE_AVAILABILITY = "série de réponses de disponibilité ambiguës"
 CATEGORIES = {
     "dependency": "Dépendance manquante",
     "path": "Chemin invalide",
     "playlist": "Playlist indisponible",
     "network": "Erreur réseau",
+    "rate": "Limitation du fournisseur",
+    "provider_hold": "Fournisseur suspendu · à vérifier",
     "space": "Espace disque insuffisant",
     "audio_unavailable": "Format audio indisponible sur YouTube",
     "download": "Échec de téléchargement",
@@ -22,6 +27,23 @@ CATEGORIES = {
     "present": "Album déjà présent",
     "partial": "Importation partielle",
 }
+
+
+def youtube_rate_message(text):
+    return ("rate-limited by youtube" in text or "rate limited by youtube" in text
+            or "this content isn't available, try again later" in text)
+
+
+def provider_rate_delay(detail):
+    text = detail.casefold()
+    if youtube_rate_message(text):
+        minimum = 3600
+    elif re.search(r"\bhttp(?: error)?[ :]+429\b|\btoo many requests\b", text):
+        minimum = 60
+    else:
+        return 0
+    retry_after = re.search(r"\bretry-after\s*[:=]\s*([0-9]{1,9})\b", text)
+    return max(minimum, int(retry_after[1])) if retry_after else minimum
 
 
 class ImportIssue(ValueError):
@@ -35,6 +57,12 @@ class ImportIssue(ValueError):
 
 def failure_category(detail, default):
     text = detail.casefold()
+    # The extractor may prefix an explicit rate limit with "Video unavailable".
+    # Detect the provider-wide decision before interpreting a track's status.
+    if youtube_rate_message(text):
+        return "rate"
+    if YOUTUBE_HOLD_MESSAGE.casefold() in text:
+        return "provider_hold"
     if any(term in text for term in ("modulenotfounderror", "not installed", "ffmpeg not found",
                                      "no supported javascript runtime", "python dependencies")):
         return "dependency"

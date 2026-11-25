@@ -3,6 +3,7 @@
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from email.utils import formatdate
 from hashlib import sha1
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -16,12 +17,13 @@ from threading import Event, Lock, Thread
 from time import monotonic, sleep
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import unquote, urlsplit
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN))
 import _kara_import_resources as resources
+import _kara_catalogue as catalogue
 from _kara_import_queue import ImportQueue
 from _kara_import_result import ImportIssue
 from _parole_import_metrics import DownloadConcurrency
@@ -156,6 +158,56 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_catalogue_429_with_http_date_stops_the_next_request(self):
+        request = Mock(return_value=SimpleNamespace(
+            status_code=429, headers={"Retry-After": formatdate(10_120, usegmt=True)}))
+        modules = {
+            "requests": SimpleNamespace(Session=type("Session", (), {"request": request}),
+                                        exceptions=SimpleNamespace(Timeout=TimeoutError, ConnectionError=ConnectionError)),
+            "ytmusicapi": SimpleNamespace(YTMusic=lambda *, requests_session, **_: requests_session),
+        }
+        with TemporaryDirectory() as temp, patch.dict(sys.modules, modules), patch.dict(
+                os.environ, KARA_PAROLE_COVER="0"), patch.object(resources, "RATE_DIRECTORY", Path(temp)), patch.object(
+                resources.time, "time", return_value=10_000) as now:
+            session = catalogue.client()
+            with self.assertRaisesRegex(ImportIssue, "HTTP 429"):
+                session.request("GET", "https://music.youtube.com/")
+            now.return_value += 119
+            with self.assertRaisesRegex(ImportIssue, resources.YOUTUBE_RATE):
+                session.request("GET", "https://music.youtube.com/")
+            request.assert_called_once()
+            now.return_value += 1
+            resources.check_youtube()
+
+    def test_youtube_gate_counts_distinct_ambiguous_failures_and_honors_provider_delay(self):
+        with TemporaryDirectory() as temp, patch.object(resources, "RATE_DIRECTORY", Path(temp)), patch.object(
+                resources.time, "time", return_value=10_000) as now:
+            def fail(video):
+                return resources.observe_youtube(detail=f"ERROR: [youtube] {video:011d}: Video unavailable. "
+                                                        "This video is not available")
+
+            for _ in range(8):
+                fail(0)
+            resources.observe_youtube(detail="ERROR: [youtube] 11111111111: Video unavailable. Private video")
+            for video in range(1, 5):
+                fail(video)
+            resources.check_youtube()
+            resources.observe_youtube(extracted=True)
+            fail(5)
+            resources.check_youtube()
+            for video in range(5):
+                fail(video)
+            with self.assertRaisesRegex(ImportIssue, resources.YOUTUBE_AVAILABILITY):
+                resources.check_youtube()
+            resources.observe_youtube(detail="HTTP Error 429: Too Many Requests; Retry-After: 7200")
+            resources.observe_youtube(extracted=True)
+            now.return_value += 7199
+            with self.assertRaisesRegex(ImportIssue, resources.YOUTUBE_RATE):
+                resources.wait_service("youtube", 0)
+            resources.wait_service("archive.org", 0)
+            now.return_value += 1
+            resources.check_youtube()
+
     def test_archive_can_take_a_fourth_slot_with_youtube_profile_occupied(self):
         with TemporaryDirectory() as temp, ExitStack() as leases:
             folder = Path(temp) / "slots"

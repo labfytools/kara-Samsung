@@ -12,7 +12,7 @@ from yt_dlp.utils import PostProcessingError
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 from _kara_import_queue import read_transfer_settings
 from _kara_import_resources import (AUDIO_PROVIDERS, PROCESSING, YOUTUBE_INTERVAL, audio_slot,
-                                   download_scope, resource_slot, wait_service)
+                                   check_youtube, download_scope, resource_slot, wait_service)
 from _kara_import_result import ImportIssue
 
 
@@ -35,6 +35,7 @@ class KaraAdmissionPP(PostProcessor):
                 self.report("resolution-wait")
                 self.provider = self.network.enter_context(resource_slot(self.transfers / "youtube", capacity))
                 wait_service("youtube", YOUTUBE_INTERVAL, max_wait=max_wait)
+                check_youtube()
                 self.report("resolution")
             except (ImportIssue, OSError) as error:
                 raise PostProcessingError(str(error)) from error
@@ -55,6 +56,7 @@ class KaraAdmissionPP(PostProcessor):
                     # Admission still respects cooldowns before opening the body.
                     self.network.enter_context(audio_slot(
                         self.transfers, "youtube", provider_fd=self.provider))
+                check_youtube()
                 self.report("transfer")
             else:
                 # yt-dlp runs this postprocessor before its FFmpeg stages.

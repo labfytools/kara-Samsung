@@ -4,8 +4,10 @@ from collections import Counter, deque
 from concurrent.futures import wait as wait_futures
 from contextvars import ContextVar, copy_context
 from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, flock
+import json
 import os
 from pathlib import Path
+import re
 from shutil import disk_usage
 import signal
 import socket
@@ -15,7 +17,8 @@ from tempfile import NamedTemporaryFile
 from threading import Event, Lock, Thread
 import time
 
-from _kara_import_result import ImportIssue
+from _kara_import_result import (YOUTUBE_AVAILABILITY, YOUTUBE_HOLD_MESSAGE, YOUTUBE_RATE,
+                                 ImportIssue, provider_rate_delay)
 from _kara_paths import STATE
 
 DEFAULT_DOWNLOADS = 10
@@ -47,6 +50,12 @@ STATE_RESERVE = 64 * 1024**2
 MAX_MEDIA = 256 * 1024**2
 WORKING_RESERVE = MAX_MEDIA * 2
 RATE_DIRECTORY = STATE / "kara" / "import-rates"
+YOUTUBE_AMBIGUOUS = re.compile(
+    r"^ERROR: \[youtube\] ([A-Za-z0-9_-]{11}): Video unavailable\.?\s*"
+    r"(?:This video is not available\.?)?$", re.MULTILINE | re.IGNORECASE)
+YOUTUBE_FAILURE_LIMIT = 6
+YOUTUBE_FAILURE_WINDOW = 120
+YOUTUBE_AMBIGUOUS_PAUSE = 1800
 _pause = ContextVar("import_pause", default=None)
 _downloads = ContextVar("import_downloads", default=None)
 _download_observer = ContextVar("import_download_observer", default=None)
@@ -322,6 +331,73 @@ def service_delay(service):
         return max(0., rate_record(fd) - time.time())
 
 
+def read_youtube_gate(path):
+    try:
+        with path.open("rb") as stream:
+            return json.loads(stream.read(2048))
+    except FileNotFoundError:
+        return {"until": 0, "reason": "", "recent": {}}
+
+
+def check_youtube():
+    path = RATE_DIRECTORY / "youtube-gate.json"
+    if path.exists():
+        with lease(RATE_DIRECTORY / "youtube-gate.lock", shared=True):
+            gate = read_youtube_gate(path)
+        if gate["until"] > time.time():
+            raise ImportIssue("provider_hold", f"{YOUTUBE_HOLD_MESSAGE} · {gate['reason']}.")
+
+
+def observe_youtube(*, detail="", extracted=False, retry_after=0):
+    delay = max(retry_after, provider_rate_delay(detail))
+    ambiguous = YOUTUBE_AMBIGUOUS.search(detail) if not delay and not extracted else None
+    if not (delay or ambiguous or extracted):
+        return
+    path = RATE_DIRECTORY / "youtube-gate.json"
+    if extracted and not path.exists():
+        return
+    # Resolution and transfer processes share this state. An explicit
+    # provider delay can extend a hold. Success only clears the ambiguous
+    # predecessors, so a process already in flight cannot reopen admission.
+    with lease(RATE_DIRECTORY / "youtube-gate.lock"):
+        gate = read_youtube_gate(path)
+        now = time.time()
+        if delay:
+            if gate["reason"] != YOUTUBE_RATE or now + delay > gate["until"]:
+                gate.update(until=max(gate["until"], now + delay), reason=YOUTUBE_RATE, recent={})
+            else:
+                return
+        elif gate["until"] > now:
+            return gate["reason"]
+        elif extracted:
+            if not gate["recent"]:
+                return
+            gate["recent"] = {}
+        else:
+            recent = {video: stamp for video, stamp in gate["recent"].items() if stamp > now - YOUTUBE_FAILURE_WINDOW}
+            recent[ambiguous[1]] = now
+            if len(recent) >= YOUTUBE_FAILURE_LIMIT:
+                gate.update(until=now + YOUTUBE_AMBIGUOUS_PAUSE, reason=YOUTUBE_AVAILABILITY, recent={})
+            else:
+                gate["recent"] = recent
+        # Replace the bounded record atomically without replacing the inode
+        # locked by other workers. A killed writer leaves the last valid gate.
+        temporary = path.with_suffix(".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            json.dump(gate, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        if gate["until"] > now:
+            return gate["reason"]
+
+
 def pending_downloads(directory):
     # Tickets exist only while a living worker waits. A killed owner leaves
     # an unlocked file which the next observer can safely discard.
@@ -370,6 +446,8 @@ def audio_slot(directory, service, interval=0., notice=None, *, provider_fd=None
         try:
             while True:
                 checkpoint()
+                if service == "youtube":
+                    check_youtube()
                 with lease(mutex, poll_interval=.01), ExitStack() as claim:
                     effective, manual = settings()
                     if manual and path.name.startswith("1"):
@@ -463,6 +541,8 @@ def wait_service(service, interval, *, max_wait=60):
     path = RATE_DIRECTORY / service
     deadline = time.monotonic() + max_wait
     while True:
+        if service == "youtube":
+            check_youtube()
         with lease(path) as fd:
             now = time.time()
             delay = rate_record(fd) - now

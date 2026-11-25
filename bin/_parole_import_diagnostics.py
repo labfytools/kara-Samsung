@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from _kara_import_local import LOCAL as LOCAL_PROVIDER, local_url
 from _kara_import_queue import import_key
+from _kara_import_result import YOUTUBE_AVAILABILITY, provider_rate_delay
 from _kara_paths import catalogue_command
 from _parole_index import encoded_key
 from _parole_import_providers import ARCHIVE, JAMENDO, archive_identifier, jamendo_identifier
@@ -17,7 +18,7 @@ from _parole_process import Interrupted
 HOUR = 3600
 DAY = 24 * HOUR
 TEMPORARY = {"network", "provider", "rate"}
-LOCAL = {"space", "permissions", "interrupted", "local_file", "authorization"}
+LOCAL = {"space", "permissions", "interrupted", "local_file", "authorization", "youtube_hold"}
 BEARING = {"playlist", "track", "edition", "metadata", "format", "engine"}
 LABELS = {
     "network": "Erreur réseau temporaire", "provider": "Fournisseur indisponible", "rate": "Limitation du fournisseur",
@@ -28,6 +29,8 @@ LABELS = {
     "dependency": "Dépendance ou version incompatible", "api": "Réponse fournisseur incompatible",
     "engine": "Échec du moteur sans cause confirmée", "local_file": "Sélection locale à vérifier",
     "authorization": "Autorisation de téléchargement à vérifier",
+    "youtube_hold": "YouTube suspendu après une limitation confirmée",
+    "availability": "Réponses YouTube ambiguës sur plusieurs pistes",
 }
 SECRET = re.compile(r"https?://\S+|(?:~|/)(?:[a-z0-9_.-]+/)+\S+|"
                     r"(?i:\b(?:token|cookie|bearer|authorization|password|secret|apikey|api_key|credential)\b).*")
@@ -75,6 +78,7 @@ def classify(entry, outcome):
     provider = "YouTube Music" if host in YTHOSTS else ARCHIVE if from_archive else JAMENDO if from_jamendo else "Local"
     http_match = re.search(r"\bhttp(?: error)?[ :]+([1-5][0-9]{2})\b", detail)
     http = int(http_match[1]) if http_match else None
+    delay = provider_rate_delay(detail)
     stage = next((identifier for fragment, identifier in (
         ("integrat", "strawberry"), ("indexation", "strawberry"), ("tri", "tri"),
         ("paroles", "paroles"), ("pochettes", "pochettes"), ("playlist", "playlist"),
@@ -91,7 +95,10 @@ def classify(entry, outcome):
         cause = "local_file"
     elif (from_archive or from_jamendo) and category == "path":
         cause = "authorization"
-    elif http == 429 or re.search(r"too many requests|retry-after|rate.limit|limitation de requêtes", detail):
+    elif category == "provider_hold":
+        cause = "availability" if YOUTUBE_AVAILABILITY in detail else "youtube_hold"
+        stage = "fournisseur"
+    elif category == "rate" or delay or re.search(r"retry-after|rate.limit|limitation de requêtes", detail):
         cause = "rate"
     elif http and http >= 500:
         cause = "provider"
@@ -127,7 +134,7 @@ def classify(entry, outcome):
         # Local paths and archive member names are confined to the private journal.
         return Failure(cause, stage, LOCAL_PROVIDER, "", http, None, 0, (), "", "")
     return Failure(cause, stage, provider, source, http, code if type(code) is int and -255 <= code <= 255 else None,
-                   min(86400, int(after[1])) if after else 0, tracks, label(outcome.get("artist")),
+                   max(delay, int(after[1]) if after else 0), tracks, label(outcome.get("artist")),
                    label(outcome.get("title")))
 
 
@@ -297,8 +304,10 @@ class ImportDiagnostics:
             findings = self.collect(row)
             # A local/authorization gate must take precedence over retries.
             order = {"interrupted": 0, "space": 1, "permissions": 2, "authorization": 3, "local_file": 4,
-                     "rate": 5, "provider": 6, "network": 7}
-            failure = min(findings, key=lambda f: (order.get(f.cause, 8), f.stage))
+                     "youtube_hold": 5, "rate": 6, "availability": 7, "provider": 8, "network": 9}
+            # A provider-level diagnosis takes precedence over individual
+            # track errors from the same wave of requests.
+            failure = min(findings, key=lambda f: (order.get(f.cause, 10), f.stage))
             signature = signatures(failure, self.known_versions)
             if row["recovery_phase"] not in ("retry_wait", "codex_wait"):
                 self.log(f"Échec · {LABELS[failure.cause]} · {failure.stage}", "WARNING")

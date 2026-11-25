@@ -29,6 +29,9 @@ with Path(config["requests"]).open("a", encoding="utf-8") as handle:
     handle.write(video + "\n")
 if config.get("transfer_delay"):
     time.sleep(config["transfer_delay"])
+if failure := config.get("transfer_errors", {}).get(video):
+    print(f"ERROR: [youtube] {video}: {failure}", file=sys.stderr)
+    sys.exit(1)
 if video in config["transfer_failures"]:
     scratch = next(value.removeprefix("temp:") for value in arguments if value.startswith("temp:"))
     Path(scratch).mkdir(parents=True, exist_ok=True)

@@ -113,6 +113,21 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.queue.job(stopped)["state"], "review")
         self.assertEqual(self.dumped_task(), [])
 
+    def test_confirmed_youtube_hold_is_reviewed_and_ambiguous_responses_share_codex(self):
+        confirmed = self.fail(PLAYLIST, {"category": "provider_hold", "stage": "catalogue",
+                                        "detail": "Admission YouTube suspendue · limitation confirmée par le fournisseur."})
+        self.tick(100)
+        self.assertEqual(self.queue.job(confirmed)["state"], "review")
+        self.assertEqual(self.dumped_task(), [])
+        ambiguous = {"category": "provider_hold", "stage": "Téléchargement · piste 5",
+                     "detail": "Admission YouTube suspendue · série de réponses de disponibilité ambiguës."}
+        self.fail(OTHER, ambiguous)
+        self.fail("https://www.youtube.com/watch?v=abcdefghijk", dict(ambiguous, stage="catalogue"))
+        self.tick(106)
+        _, task = self.dumped_task()[0]
+        self.assertEqual(len(self.dumped_task()), 1)
+        self.assertEqual(json.loads(task)["failure"], "availability")
+
     def test_similar_outages_delay_retries_without_stopping_manual_imports(self):
         issue = {"category": "network", "stage": "playlist", "detail": "HTTP Error 503"}
         jobs = [self.fail(f"https://music.youtube.com/playlist?list=OLAK5uy_fixture{n}", issue)

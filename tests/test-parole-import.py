@@ -912,6 +912,28 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual(Counter(self.requests.read_text().splitlines()),
                          {"soundGOOD01": 1, "soundGOOD02": 1, "soundPART01": 1, "soundPART02": 2, "soundDOWN01": 1})
 
+    def test_youtube_limit_stops_a_new_batch_without_blocking_a_local_import(self):
+        self.config["transfer_errors"] = {"soundLRC001":
+            "Video unavailable. This content isn't available, try again later. "
+            "Your account has been rate-limited by YouTube for up to an hour."}
+        self.update_config()
+        blocked = playlist("PLENRICH")
+        _, albums, _ = self.run_import(blocked, expected=1)
+        self.assertEqual(albums[0]["category"], "rate")
+        self.assertEqual(self.requests.read_text().splitlines(), ["soundLRC001"])
+
+        queue = ImportQueue(self.temp / "state", self.library)
+        local = self.temp / "source.flac"
+        self.make_local_track(local, 1)
+        identity = queue.enqueue([("Autre album", playlist("OLAK5uy_FIXTURE")), ("Local", local.as_uri())])
+        worker = self.launch_managed(queue, identity)
+        _, stderr = worker.communicate(timeout=25)
+        self.assertEqual(worker.returncode, 1, stderr)
+        outcomes = queue.outcomes(identity)
+        self.assertEqual(outcomes[playlist("OLAK5uy_FIXTURE")]["category"], "provider_hold")
+        self.assertEqual(outcomes[local.as_uri()]["status"], "success")
+        self.assertEqual(self.requests.read_text().splitlines(), ["soundLRC001"])
+
     def test_enrichment_retry_uses_published_tracks_without_downloading(self):
         self.config["lyric_failures"] = ["Enrich"]
         self.update_config()

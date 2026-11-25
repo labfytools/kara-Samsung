@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Mettre en pause les nouvelles requêtes YouTube dès une limitation explicite ou une série de réponses ambiguës, conserver la temporisation après redémarrage et regrouper les diagnostics des demandes à vérifier. Les autres sources restent éligibles.
+
 - Déclencher la fin de mesure yt-dlp uniquement à la fin du corps audio ou à l’entrée en conversion, y compris lorsque yt-dlp exécute des postprocesseurs avant le téléchargement.
 
 - À la reprise d’un lot, préparer en priorité les albums encore en attente et conserver les tentatives interrompues ou en échec pour la suite du même lot.
