@@ -12,6 +12,8 @@ Chaque lot d’enrichissement des paroles utilise une seule lecture initiale des
 
 Le propriétaire de maintenance admet quatre recherches de pistes à la fois par défaut et ramène ce plafond à deux en cas de limitation HTTP ou de pression sur les ressources. Les créneaux HTTP, les quotas et les temporisations des fournisseurs restent mutualisés. La sélection exploite les mesures récentes du registre quand suffisamment de réponses ont été observées.
 
+Les profils séparent texte et LRC. Ils utilisent les tags de langue et de genre disponibles, sur cinq observations ou plus. Les pistes sans ces tags utilisent les mesures générales. Des réponses HTTP répétées déclenchent une temporisation croissante. Le délai demandé par le fournisseur est toujours respecté.
+
 Les journaux d’import horodatent les mesures de démarrage, de transfert, de traitement et d’attente. Les durées de sous-processus sont inclusives. Les temps de créneau, d’attente du verrou et de premier octet décrivent des sous-étapes et ne s’additionnent pas au total. La console montre les transferts et recherches actifs et les mesures du dernier lot de paroles. Le débit direct représente les transferts qui ont signalé des octets récemment.
 
 Le trieur lit les tags avant le verrou et vérifie la version de l’entrée sous le verrou. Les pochettes sont décodées et redimensionnées avant la publication. L’actualisation de petites listes de pistes interroge Strawberry par URL et en lecture seule.

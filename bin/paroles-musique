@@ -30,7 +30,8 @@ from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_art
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _kara_import_resources import PROCESSING, RATE_DIRECTORY, defer_service, resource_slot, wait_service
 from _kara_import_result import ImportIssue
-from _parole_lyrics_lookup import KeepAlive, cache_identity, cached, remember
+from _parole_lyrics_lookup import (KeepAlive, backoff, cache_identity, cached, contexts, provider_profiles,
+                                   record_profile, remember)
 
 
 LIBRARY = SHARED_LIBRARY
@@ -119,11 +120,12 @@ class RequestGate:
 
     def defer(self, host, delay, status=429):
         if self.provider is not None or os.environ.get("KARA_IMPORT_PROCESSING"):
-            defer_service(host, delay)
             if self.provider:
                 from _parole_import_metrics import limited
 
+                delay = backoff(*self.provider, delay)
                 limited(*self.provider, delay, status)
+            defer_service(host, delay)
             return
         with self.lock:
             if delay > 30:
@@ -660,7 +662,7 @@ class LyricsSources:
                 client.opener.close()
 
     def find(self, title, artist, album, duration, album_artist, *, synced, local_text="",
-             registry=None, strict=False):
+             registry=None, strict=False, context=()):
         signature = (title, artist, album, duration, album_artist)
         if registry:
             from _parole_import_metrics import LOOKUP, SUCCEEDED, observe, snapshot
@@ -678,12 +680,17 @@ class LyricsSources:
             ("LyricDown", self.lyricdown, None) if synced else ("Genius", self.genius, {}),
         ]
         if providers is not None:
+            profiles = provider_profiles(registry, (name for name, _, _ in clients if name in providers),
+                                         synced, context)
             def rank(i):
                 name = clients[i][0]
                 row = providers.get(name)
                 sample = measured.get(name, {}).get(LOOKUP)
                 if name == "LRCLIB" and self.lrc.answers:
                     return 0, 0, i
+                if evidence := profiles.get(name):
+                    costs = [m["seconds"] / max(.1, m["rate"]) for m in evidence]
+                    return 1, sum(costs) / len(costs), i
                 if row is None or not sample or sample["samples"] < 5:
                     return 1, i + 2., i
                 success = (row["successes"] + 2) / (row["attempts"] + 4)
@@ -739,6 +746,7 @@ class LyricsSources:
                     elapsed = time.monotonic() - started
                     record(registry, name, "found" if value is not None else "error" if error else "absent", elapsed)
                     observe(registry, name, {LOOKUP: elapsed, SUCCEEDED: int(value is not None)})
+                    record_profile(registry, name, synced, context, elapsed, value is not None)
             if value:
                 return value, name
             if value == "":
@@ -1093,6 +1101,7 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
     lrc_present = bool(catalog_transcript(lrc_text, duration, synced=True))
     plain_present = bool(local_text.strip()) or lrc_present
     signature = (title, artist, album, duration, owner)
+    context = contexts(tags)
     # The owner may process copies of the same recording in one batch.
     # Only the lookup is shared. Each publication checks its own file version.
     lock = locks[int.from_bytes(sha256(document(signature).encode()).digest()[:4]) % len(locks)]
@@ -1103,7 +1112,7 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
             activity(synced, 1)
             try:
                 value, _ = client.find(*signature, synced=synced, local_text=local_text,
-                                       registry=index, strict=True)
+                                       registry=index, strict=True, context=context)
             except ServiceUnavailable:
                 return "temporary", None
             except AmbiguousLyrics:

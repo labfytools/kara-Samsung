@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, WEEK, limited, observe, snapshot
 from _parole_index import Index
+from _parole_lyrics_lookup import backoff, contexts, provider_profiles, record_profile
 from _parole_sources import controls, seed
 
 
@@ -53,6 +54,26 @@ class Measurements(unittest.TestCase):
         clock.received(2 * 1024**2 + 8192, 12.5)
         clock.received(4, 13.)
         self.assertEqual(clock.measurements(), {STARTUP: 2., THROUGHPUT: 4 * 1024**2})
+
+    def test_lyrics_profiles_use_observed_context_and_form(self):
+        tags = contexts({"language": "fr-FR", "genre": "Rap"})
+        self.assertEqual(contexts({}), ())
+        for _ in range(4):
+            record_profile(self.index, "LRCLIB", False, tags, 2., True)
+        self.assertEqual(provider_profiles(self.index, ["LRCLIB"], False, tags), {})
+        record_profile(self.index, "LRCLIB", False, tags, 4., False)
+        reopened = Index(self.root, self.state)
+        saved = provider_profiles(reopened, ["LRCLIB"], False, tags)["LRCLIB"]
+        self.assertEqual(len(saved), 2)
+        self.assertTrue(all(sample["observations"] == 5 and sample["rate"] == .8 for sample in saved))
+        self.assertEqual(provider_profiles(reopened, ["LRCLIB"], True, tags), {})
+        self.assertEqual(provider_profiles(reopened, ["LRCLIB"], False, contexts({"language": "es"})), {})
+
+    def test_http_cooldown_grows_and_respects_the_providers_delay(self):
+        self.assertEqual(backoff(self.index, "LRCLIB", 1.), 5.)
+        self.assertEqual(backoff(Index(self.root, self.state), "LRCLIB", 2.), 10.)
+        self.assertEqual(backoff(self.index, "LRCLIB", 123.), 123.)
+        self.assertEqual(backoff(self.index, "NetEase", 1.), 5.)
 
 
 if __name__ == "__main__":
