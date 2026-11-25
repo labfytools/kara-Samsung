@@ -323,7 +323,13 @@ class GtkTests(Fixture):
                 app_module, "Maintenance", side_effect=lambda root, collection, **kwargs: Maintenance(
                     root, None, state=self.base / "state", **kwargs)):
             window = app_module.LyricsWindow(app)
+            window.start_maintenance(background=True)
+            background = window.maintenance
+            self.assertIsNone(window.parole_ui)
+            self.assertFalse(background.foreground.is_set())
             window.open_parole()
+        self.assertIs(window.maintenance, background)
+        self.assertTrue(background.foreground.is_set())
         view = window.parole_ui
         self.addCleanup(window.destroy)
         self.addCleanup(window.close_window, window)
@@ -344,7 +350,7 @@ class GtkTests(Fixture):
         window.open_import()
         self.assertTrue(window.album_import.get_reveal_child())
         self.assertEqual(window.album_import.get_root(), window.import_window)
-        for page in ("general", "sources", "codex", "storage", "resources"):
+        for page in ("general", "sources", "codex", "storage", "resources", "night"):
             view.settings(page)
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)
         window.maintenance.journal.emit("SCAN", "Fixture")

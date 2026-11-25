@@ -26,11 +26,21 @@ Le propriétaire GTK existant garde les priorités des joueurs, de l’organisat
 | Inventaire | Au lancement, puis toutes les 15 min |
 | Vérifications éditoriales | Tous les 30 jours après une vérification |
 | Opérations réseau classiques | 24 par jour, à 20 s ou plus d’intervalle entre tâches |
-| Préparations anticipées | 3 admissions par jour, une à la fois |
+| Préparations anticipées | 3 admissions par jour hors mode nocturne, une à la fois |
 | Inactivité Sway | 300 s, sur secteur par défaut |
 | Admission lourde | CPU <25 %, GPU ≤15 %, activité disque <25 %, température <78 °C, mémoire disponible ≥4 Gio |
 | Surveillance en cours | Événement de reprise Sway, alimentation, activité multimédia, partie ou import prioritaire, pression mémoire, réserve mémoire de 1,5 Gio, température et stockage |
-| Stockage | 50 Gio de cache et 10 Gio libres sur chaque partition utile, avec marge temporaire par morceau |
+| Stockage | 50 Gio de cache et au moins 20 Gio libres sur chaque partition utile, avec marge temporaire par morceau |
+
+### Préparation nocturne
+
+La section **Paramètres → Préparation nocturne** active un traitement à la fois dans la file existante, sans limite quotidienne. En mode service, le propriétaire de Kara démarre la maintenance même sans fenêtre. Le mode exige une source secteur système confirmée par le noyau. Les périphériques USB alimentés par le portable et le pourcentage de batterie ne servent pas de preuve. La durée d’inactivité initiale est de 420 s, puis le maintien éveillé est limité à 120 min par période d’inactivité. Un redémarrage du service ne recrédite pas cette durée.
+
+Sur ArchASP, `swayidle.service` lance le verrou QuickShell à 300 s, coupe les écrans à 360 s et règle le signal logind d’inactivité à 420 s. La maintenance confirme le verrou du compositeur et lit l’état de l’écran par IPC Sway. Elle ne pilote pas le verrou ni l’écran. logind gère les actions du capot. Parole emprunte un verrou `idle` uniquement pendant une série de préparations admises. Si le refroidissement capot fermé a été vérifié sur la machine et que l’utilisateur active cette option, le verrou prend aussi `handle-lid-switch`, acquis capot ouvert. Une demande manuelle de veille reste possible. Le verrou `sleep` est en mode `delay` et sert au seul arrêt des moteurs avant la veille. La libération des descripteurs rétablit la politique logind en vigueur, y compris après un plantage.
+
+Les seuils initiaux capot ouvert sont de 78 °C CPU et 75 °C GPU. Le seuil capot fermé ne dépasse jamais 70 °C et requiert une qualification thermique préalable sur le Vivobook. Demucs limite ses fils de calcul à deux. Si le service de profils est disponible, Parole demande temporairement le profil Économie via sa connexion D-Bus. TLP le libère à la déconnexion, y compris après un plantage. Les protections thermiques matérielles restent sous contrôle du système. Au moindre retour d’activité, à la reprise de Kara, au débranchement, à la réouverture du capot ou en cas de mesure requise indisponible, le traitement est interrompu et les résultats déjà validés restent réutilisables.
+
+Le fichier d’unité livré est [kara.service](../contrib/systemd/user/kara.service). Son installation dans le gestionnaire utilisateur est nécessaire pour démarrer au login sans ouvrir Parole. Elle ne requiert aucun changement de `logind.conf`, de la configuration swayidle ou du verrou QuickShell. Sur ArchASP, l’unité livrée n’était pas installée au moment du relevé.
 
 Les interruptions terminent le groupe de processus et les moteurs libèrent leurs ressources. Les fichiers déjà publiés sont réutilisables. Une préparation interrompue pendant Demucs peut reprendre avec des pistes séparées si leur génération a été validée. Une partie et les sélections mobiles conservent leur chemin prioritaire. La suspension globale ne modifie pas la file d’importation ni une partie Kara.
 
@@ -55,6 +65,7 @@ Les fixtures vérifient aussi que la reprise d’activité ou une demande Kara i
 ```sh
 python3 -B tests/test-parole-v3.py -v
 python3 -B tests/test-parole-resources.py -v
+python3 -B tests/test-parole-night.py -v
 python3 -B tests/test-parole-import.py -v
 python3 -B tests/test-kara-preparation.py -v
 KARA_SILENT=1 python3 -B tests/test-kara-v1.py -v

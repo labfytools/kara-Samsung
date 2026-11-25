@@ -13,10 +13,14 @@ class Interrupted(Exception):
     pass
 
 
-def run(command, *, stop, timeout, env=None, maximum=1_048_576, event=None):
+def run(command, *, stop, timeout, env=None, maximum=1_048_576, event=None, retain=()):
+    if stop():
+        raise Interrupted
     guard = Path(__file__).with_name("_parole_guard.py")
+    # A guard retains the maintenance owner lease until it reaps the engine.
+    # No logind FD is passed, so a dead owner cannot leave policy inhibited.
     with subprocess.Popen([sys.executable, "-B", str(guard), str(os.getpid()), *command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, start_new_session=True, env=env) as process:
+                          stderr=subprocess.DEVNULL, start_new_session=True, env=env, pass_fds=retain) as process:
         deadline = monotonic() + timeout
         output = bytearray()
         pending = bytearray()

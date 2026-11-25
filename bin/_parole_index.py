@@ -27,7 +27,10 @@ DEFAULTS = {
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
     "gpu": 15, "disk_busy": 25, "network_interval": 20, "network_daily": 24, "heavy_daily": 3,
-    "reserve_gib": 10, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
+    "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
+    "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,
+    "night_idle": 420, "night_cpu_temperature": 78, "night_gpu_temperature": 75,
+    "night_closed_temperature": 70, "night_minutes": 120,
     "releases": ["Album", "EP", "Mixtape/Street"],
 }
 LYRIC_KEYS = ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
@@ -148,11 +151,34 @@ class Index:
             db.row_factory = sqlite3.Row
             yield db
 
-    def settings(self):
-        with self.db() as db:
+    def settings(self, *, wait=3):
+        with self.db(wait=wait) as db:
             result = dict(DEFAULTS)
             result.update((row["key"], json.loads(row["value"])) for row in db.execute("SELECT * FROM settings"))
+            result["reserve_gib"] = max(DEFAULTS["reserve_gib"], result["reserve_gib"])
             return result
+
+    def night_budget(self, since=...):
+        # CLOCK_BOOTTIME values survive a service restart on this boot only.
+        # Store them beside the other maintenance settings without a migration.
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        with self.db(wait=.15) as db:
+            if since is None:
+                db.execute("DELETE FROM settings WHERE key='night_budget'")
+            elif since is not ...:
+                db.execute("INSERT OR REPLACE INTO settings VALUES('night_budget',?)", (document([boot, since]),))
+            else:
+                row = db.execute("SELECT value FROM settings WHERE key='night_budget'").fetchone()
+                if row:
+                    saved_boot, started = json.loads(row[0])
+                    if saved_boot == boot:
+                        return started
+        return None
+
+    def preparation_due(self, now):
+        with self.db(wait=.15) as db:
+            return db.execute("""SELECT 1 FROM tasks WHERE kind='prepare' AND due<=?
+                                 AND state IN ('queued','suspended','temporary') LIMIT 1""", (now,)).fetchone() is not None
 
     def configure(self, **changes):
         with self.db() as db:

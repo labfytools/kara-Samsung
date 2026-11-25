@@ -385,16 +385,22 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if https_configured():
             self.tv_toggle.set_active(True)
 
-    def open_parole(self):
-        if not self.parole_ui:
+    def start_maintenance(self, *, background=False):
+        if not self.maintenance:
             self.maintenance = Maintenance(LIBRARY, COLLECTION, import_queue=self.album_import.queue,
-                                           cache=self.references)
+                                           cache=self.references, background=background)
             self.maintenance.set_priority(self.maintenance_busy())
+            self.maintenance.start()
+        elif not background:
+            self.maintenance.show()
+
+    def open_parole(self):
+        self.start_maintenance()
+        if not self.parole_ui:
             self.parole_ui = ParoleView(self, self.maintenance)
             self.set_titlebar(self.parole_ui.header())
             self.set_child(self.parole_ui.root)
             self.timers.append(GLib.timeout_add(850, self.parole_ui.refresh))
-            self.maintenance.start()
         self.present()
 
     def open_import(self, _button=None):
@@ -2151,6 +2157,9 @@ class App(Gtk.Application):
                     window.destroy()
                     return 1
                 self.service_owner = True
+                # The graphical-session service keeps the existing owner and
+                # its maintenance queue alive before the first window is shown.
+                window.start_maintenance(background=True)
 
                 def hide(widget):
                     widget.set_visible(False)
@@ -2182,7 +2191,9 @@ class App(Gtk.Application):
     def service_finalized(self):
         # Keep the owner alive until BlackBox finishes its disk verification.
         # Systemd still puts a deadline on an unresponsive storage device.
-        if self.window.blackbox.status()["finalizing"]:
+        maintenance = self.window.maintenance
+        if (self.window.blackbox.status()["finalizing"]
+                or maintenance and maintenance.thread and maintenance.thread.is_alive()):
             return GLib.SOURCE_CONTINUE
         self.window.destroy()
         self.quit()

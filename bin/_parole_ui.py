@@ -776,7 +776,14 @@ class ParoleView:
         config = self.index.settings()
 
         def save(name, value):
-            self.index.configure(**{name: value})
+            if name == "night_enabled":
+                # Opt-in replaces legacy automatic preparation. Switching
+                # off night must not immediately restart that same heavy work.
+                self.index.configure(night_enabled=value, autoprepare=False)
+                if value:
+                    self.maintenance.rescan()
+            else:
+                self.index.configure(**{name: value})
             self.maintenance.wake.set()
 
         def toggles(area, specs):
@@ -827,7 +834,8 @@ class ParoleView:
             general.append(button("Synchroniser la bibliothèque sur USB", self.control.music_sync.open_settings))
         stack.add_titled(scroller(general), "general", "Maintenance")
         resources = new()
-        toggles(resources, (("autoprepare", "Préparer pour Kara pendant l’inactivité"), ("battery", "Autoriser une préparation sur batterie")))
+        toggles(resources, (("autoprepare", "Préparation anticipée hors mode nocturne"),
+                            ("battery", "Autoriser la préparation anticipée sur batterie")))
         for spec in (
             ("idle", "Inactivité Sway (secondes)", 30, 3600), ("cpu", "Charge CPU avant départ (%)", 1, 95),
             ("memory_mib", "Mémoire disponible au départ (Mio)", 512, 65536, 256),
@@ -841,6 +849,23 @@ class ParoleView:
             number(resources, *spec)
         resources.append(Gtk.Label(label="Un traitement de maintenance à la fois.", xalign=0, css_classes=["muted"]))
         stack.add_titled(scroller(resources), "resources", "Ressources")
+        night = new()
+        toggles(night, (("night_enabled", "Activer la préparation nocturne"),
+                        ("night_screen_off", "Préparer lorsque l’écran est éteint"),
+                        ("night_lid", "Préparer lorsque le capot est fermé"),
+                        ("night_lid_qualified", "Refroidissement capot fermé vérifié sur cet ordinateur")))
+        for spec in (
+            ("night_idle", "Inactivité minimale (secondes)", 30, 3600),
+            ("night_cpu_temperature", "Limite CPU (°C)", 45, 85),
+            ("night_gpu_temperature", "Limite GPU (°C)", 45, 85),
+            ("night_closed_temperature", "Limite capot fermé (°C)", 45, 70),
+            ("cache_gib", "Plafond du cache Kara (Gio)", 1, 1000),
+            ("night_minutes", "Maintien éveillé maximal par période d’inactivité (minutes)", 5, 360),
+        ):
+            number(night, *spec)
+        night.append(Gtk.Label(label="Secteur obligatoire. Le verrouillage et l’extinction restent gérés par Sway.",
+                               xalign=0, wrap=True, css_classes=["muted"]))
+        stack.add_titled(scroller(night), "night", "Préparation nocturne")
         codex = new()
         toggles(codex, (("codex", "Autoriser l’authentification ChatGPT existante dans l’espace isolé"),
                         ("codex_auto", "Rechercher automatiquement en dernier recours")))
@@ -876,7 +901,7 @@ class ParoleView:
         stack.add_titled(scroller(source), "sources", "Sources")
         storage = new()
         number(storage, "cache_gib", "Plafond du cache Kara (Gio)", 1, 1000)
-        number(storage, "reserve_gib", "Réserve libre par partition (Gio)", 2, 150)
+        number(storage, "reserve_gib", "Réserve libre par partition (Gio)", 20, 150)
         self.storage_controls(storage)
         stack.add_titled(scroller(storage), "storage", "Stockage")
         stack.set_visible_child_name(page)

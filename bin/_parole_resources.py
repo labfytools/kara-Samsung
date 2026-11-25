@@ -6,6 +6,7 @@ import selectors
 from shutil import disk_usage
 import signal
 import subprocess
+import sys
 from time import monotonic
 
 from _kara_prepare import CACHE_ROOT
@@ -67,6 +68,7 @@ class Resources:
         self.root = root
         self.listener = None
         self.idle = False
+        self.resumed = False
         self.threshold = None
         self.last_usage = 0
         self.disks = {}
@@ -99,7 +101,9 @@ class Resources:
             try:
                 # The commands are constant, write one byte to a private pipe
                 # and do not change display or logind settings.
-                self.listener = subprocess.Popen(["swayidle", "-C", "/dev/null", "-w", "timeout",
+                guard = Path(__file__).with_name("_parole_guard.py")
+                self.listener = subprocess.Popen([sys.executable, "-B", str(guard), str(os.getpid()),
+                                                  "swayidle", "-C", "/dev/null", "-w", "timeout",
                                                   str(seconds), "printf 1", "resume", "printf 0"],
                                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                                  stderr=subprocess.DEVNULL, start_new_session=True)
@@ -110,6 +114,7 @@ class Resources:
             selector.register(self.listener.stdout, selectors.EVENT_READ)
             if selector.select(0):
                 chunk = os.read(self.listener.stdout.fileno(), 64)
+                self.resumed |= b"0" in chunk
                 self.idle = bool(chunk and chunk[-1:] == b"1")
         return self.idle
 
@@ -148,7 +153,7 @@ class Resources:
         return (self.storage["bytes"] + working < settings["cache_gib"] * GIB
                 and min(self.storage["free"].values()) > settings["reserve_gib"] * GIB + working)
 
-    def check(self, settings, *, busy=False, running=False):
+    def check(self, settings, *, busy=False, running=False, nocturnal=False, lid=False):
         now = monotonic()
         if busy:
             self.can_start = self.can_continue = False
@@ -164,16 +169,20 @@ class Resources:
                 self.storage = {**self.storage, "free": {
                     name: disk_usage(nearest(path)).free for name, path in (
                         ("bibliothèque", self.root), ("références", CACHE_ROOT), ("pistes IA", STEM_ROOT))}}
-            idle = self.session_idle(settings["idle"])
-            supply = Path("/sys/class/power_supply")
-            batteries, external = [], []
-            for device in supply.iterdir():
-                kind = (device / "type").read_text().strip()
-                if kind == "Battery":
-                    batteries.append(device)
-                elif (device / "online").is_file():
-                    external.append((device / "online").read_text().strip() == "1")
-            power = settings["battery"] or not batteries or any(external)
+            idle = self.session_idle(settings["night_idle" if nocturnal else "idle"])
+            # Night.check reads the physical source at process-supervision
+            # cadence. This legacy policy remains available for daytime work.
+            power = True
+            if not nocturnal:
+                supply = Path("/sys/class/power_supply")
+                batteries, external = [], []
+                for device in supply.iterdir():
+                    kind = (device / "type").read_text().strip()
+                    if kind == "Battery":
+                        batteries.append(device)
+                    elif (device / "online").is_file():
+                        external.append((device / "online").read_text().strip() == "1")
+                power = settings["battery"] or not batteries or any(external)
             cpu_fields = [int(token) for token in Path("/proc/stat").read_text().splitlines()[0].split()[1:9]]
             cpu_sample = sum(cpu_fields), cpu_fields[3] + cpu_fields[4]
             cpu, self.cpu = self.cpu, cpu_sample
@@ -182,9 +191,22 @@ class Resources:
                                  if line.startswith("MemAvailable:"))) / 1024
             pressure = float(Path("/proc/pressure/memory").read_text().splitlines()[0].split()[1].split("=")[1])
             gpus = [int(p.read_text()) for p in Path("/sys/class/drm").glob("card[0-9]*/device/gpu_busy_percent")]
-            sensors = [int(p.read_text()) / 1000 for device in Path("/sys/class/hwmon").glob("hwmon*")
-                       if (device / "name").read_text().strip() in {"k10temp", "amdgpu", "coretemp", "zenpower"}
-                       for p in device.glob("temp*_input")]
+            sensors = {}
+            for device in Path("/sys/class/hwmon").glob("hwmon*"):
+                name = (device / "name").read_text().strip()
+                if name in {"k10temp", "amdgpu", "coretemp", "zenpower", "nouveau", "nvidia", "i915", "xe"}:
+                    sensors.setdefault(name, []).extend(int(p.read_text()) / 1000 for p in device.glob("temp*_input"))
+            cpu_t = [value for name in ("k10temp", "coretemp", "zenpower") for value in sensors.get(name, ())]
+            gpu_t = [value for name in ("amdgpu", "nouveau", "nvidia", "i915", "xe") for value in sensors.get(name, ())]
+            cpu_limit = settings["night_cpu_temperature" if nocturnal else "temperature"]
+            gpu_limit = settings["night_gpu_temperature" if nocturnal else "temperature"]
+            if nocturnal and lid:
+                closed = min(70, settings["night_closed_temperature"])
+                cpu_limit, gpu_limit = min(cpu_limit, closed), min(gpu_limit, closed)
+            temperatures = ((cpu_t or gpu_t) and all(0 < value < cpu_limit for value in cpu_t)
+                            and all(0 < value < gpu_limit for value in gpu_t))
+            if nocturnal:
+                temperatures = cpu_t and gpu_t and temperatures
             disk = self.disk_load(now)
             self.sample = now
             # During the task its own CPU/GPU/disk load is expected. User
@@ -194,7 +216,7 @@ class Resources:
             for ok, reason in (
                 (idle, "Session active"), (power, "Alimentation secteur requise"),
                 (available >= minimum and pressure < 1, "Mémoire ou pression mémoire"),
-                (sensors and max(sensors) < settings["temperature"], "Température indisponible ou trop élevée"),
+                (temperatures, "Température CPU/GPU indisponible ou trop élevée"),
                 (self.allowed_storage(settings), "Réserve disque ou plafond du cache"),
             ):
                 if not ok:

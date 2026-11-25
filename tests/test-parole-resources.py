@@ -18,9 +18,9 @@ from _parole_resources import GIB, Resources
 class ResourceTests(unittest.TestCase):
     def test_storage_checks_the_least_free_partition_and_working_margin(self):
         resources = Resources(Path("/fixture"))
-        resources.storage = {"bytes": GIB, "free": {"library": 12 * GIB, "cache": 10 * GIB}}
+        resources.storage = {"bytes": GIB, "free": {"library": 22 * GIB, "cache": 20 * GIB}}
         self.assertFalse(resources.allowed_storage(DEFAULTS, duration=200))
-        resources.storage["free"]["cache"] = 12 * GIB
+        resources.storage["free"]["cache"] = 22 * GIB
         self.assertTrue(resources.allowed_storage(DEFAULTS, duration=200))
         resources.storage["bytes"] = 50 * GIB - 10
         self.assertFalse(resources.allowed_storage(DEFAULTS, duration=200))

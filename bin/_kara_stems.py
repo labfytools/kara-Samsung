@@ -164,7 +164,10 @@ def separate_locked(song):
                    "-d", "cpu", "--shifts", "0", "--overlap", "0.1", "--segment", "7",
                    "--flac", "-j", "1", "-o", str(result_dir), str(original))
         env = os.environ.copy()
-        env.update({"OMP_NUM_THREADS": "6", "MKL_NUM_THREADS": "6", "OPENBLAS_NUM_THREADS": "1"})
+        # Background preparation uses the same model with a smaller CPU
+        # footprint. Parameters affecting the generated signal stay fixed.
+        threads = "2" if env.get("KARA_DEMUCS_THREADS") == "2" else "6"
+        env.update({"OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads, "OPENBLAS_NUM_THREADS": "1"})
         emit("progress", percent=2, status="Chargement du modèle de séparation")
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               env=env, bufsize=0) as process:

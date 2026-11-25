@@ -14,3 +14,4 @@
 - Ajouter un point d’accès local aux captures et rapports BlackBox dans `blackbox/`, sans déplacer les données privées ni les versionner.
 - Préparer les références Kara en arrière-plan à partir de LRC vérifiés ou de textes sans minutage, en conservant les originaux et en refusant les corrections sans appui acoustique.
 - Rétablir la recherche Web native de Codex dans l’environnement isolé et laisser l’automatisation désactivée par défaut.
+- Ajouter la préparation nocturne sur secteur, séquentielle et sans plafond quotidien, sous la supervision du service Kara. Porter la réserve de disque à 20 Gio.
