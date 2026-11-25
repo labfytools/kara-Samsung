@@ -25,6 +25,7 @@ from _parole_import_diagnostics import ImportDiagnostics
 from _parole_process import Interrupted, run
 from _parole_resources import Resources
 from _parole_sources import discover, seed, controls
+from _paroles_lrc import MAX_LRC_BYTES
 
 CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
               "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "IDLE", "CACHE",
@@ -203,7 +204,8 @@ class Maintenance:
             report = {"instrumental": bool(stems), "voice": bool(stems)}
             if item:
                 report.update(coverage=item["report"]["word_coverage"], line_coverage=item["report"]["line_coverage"],
-                              source=item["source"].get("provider", "bibliothèque"))
+                              source=item["source"].get("provider", "bibliothèque"),
+                              corrected=item["report"].get("changed", 0))
             negative = self.cache.cached(path, verify=False, insufficient=True) if rt and model and not item else None
             if negative:
                 report.update(coverage=negative["report"]["word_coverage"],
@@ -447,7 +449,46 @@ class Maintenance:
         # All input paths are program arguments; no shell evaluates titles or paths.
         return run(command, stop=self.stopped, timeout=timeout, event=observer, env=env, maximum=maximum)
 
-    def prepare(self, task):
+    def night_reference(self, song, path):
+        settings = self.current_settings
+        # Retain a verified provider response across Demucs/Turbo cancellation.
+        # Audio/sidecar edits and changed enabled sources invalidate that reply.
+        local_text = sidecar(path, ".txt")[1] or json.loads(song["info"]).get("plain", "")
+        with self.index.db() as db:
+            sources = [tuple(row) for row in db.execute(
+                "SELECT id,config FROM sources WHERE state='active' ORDER BY id")]
+            revision = encoded_key(song["token"], song["side"], local_text,
+                                   settings["lrc"], settings["lyrics"], settings["generate"], sources)
+            receipt = db.execute("SELECT checked,value FROM reviews WHERE kind='prepare_reference' AND subject=?",
+                                 (song["id"],)).fetchone()
+        if receipt and time() - receipt["checked"] < DAY:
+            saved = json.loads(receipt["value"])
+            if saved.pop("revision", None) == revision:
+                return saved
+
+        def lookup(kind):
+            _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]], 145,
+                                  maximum=6 * MAX_LRC_BYTES + 1024)
+            return json.loads(data)
+
+        result = {"state": "not_found"}
+        if settings["lrc"]:
+            self.journal.emit("LRC", f"Dernière recherche de minutage · {song['title']}")
+            result = lookup("prepare_lrc")
+            if result["state"] == "found":
+                result["mode"] = "timed"
+        if result["state"] in ("not_found", "ambiguous", "invalid") and settings["generate"]:
+            if local_text.strip() and len(local_text.encode()) <= MAX_LRC_BYTES:
+                result = {"state": "found", "lyrics": local_text, "source": "bibliothèque"}
+            elif settings["lyrics"]:
+                result = lookup("prepare_plain")
+            if result["state"] == "found":
+                result["mode"] = "plain"
+        if result["state"] in ("found", "not_found", "ambiguous", "invalid", "instrumental"):
+            self.index.review("prepare_reference", song["id"], result["state"], dict(result, revision=revision))
+        return result
+
+    def prepare(self, task, *, nocturnal=False):
         identity = task["subject"]
         song = self.index.song(identity)
         if song is None:
@@ -458,15 +499,34 @@ class Maintenance:
         if document(file_token(path)) != song["token"]:
             self.refresh_song(song)
             return "temporary", "modification détectée", 10
-        with self.index.db() as db:
-            pending = db.execute("""SELECT state,detail,updated FROM tasks WHERE kind='lrc' AND subject=?""", (identity,)).fetchone()
         info = json.loads(song["info"])
         plain = sidecar(path, ".txt")[1] or info.get("plain")
         source_lrc = path.with_suffix(".lrc")
-        local = song["lrc"] in ("local", "externe", "généré")
+        try:
+            rejected = lrc_token(source_lrc)
+        except ValueError:
+            return "review", "LRC original non ordinaire", 0
+        local = rejected is not None and song["lrc"] in ("local", "externe", "généré")
         saved = self.cache.cached(path, verify=False)
-        generating = not saved and not local
-        if generating:
+        reference_option, provider = None, "Strawberry"
+        if not saved and not local and nocturnal:
+            if json.loads(song["side"]) != [sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]:
+                self.refresh_song(song)
+                return "temporary", "paroles modifiées", 10
+            result = self.night_reference(song, path)
+            if result["state"] == "instrumental":
+                self.index.update(identity, lyrics="instrumental", checked=time())
+                return "excluded", "instrumental", 0
+            if result["state"] in ("temporary", "network", "unavailable", "limited", "rescan"):
+                return "temporary", "dernière recherche indisponible", 300
+            if result["state"] != "found":
+                return "review", "référence fiable absente", 0
+            reference_option = "--timed-reference" if result["mode"] == "timed" else "--plain-reference"
+            plain, provider = result["lyrics"], result["source"]
+        elif not saved and not local:
+            with self.index.db() as db:
+                pending = db.execute("""SELECT state,detail,updated FROM tasks
+                                        WHERE kind='lrc' AND subject=?""", (identity,)).fetchone()
             if source_lrc.is_symlink() or source_lrc.exists():
                 return "review", "LRC existant à vérifier", 0
             if not self.current_settings["generate"] or not plain or not self.current_settings["lrc"]:
@@ -483,6 +543,7 @@ class Maintenance:
                                           (research["research_id"],)).fetchone() if research else None
                 if awaiting and awaiting["state"] in ("queued", "running") and time() - task["due"] < 300:
                     return "temporary", "recherche approfondie en attente", 300
+            reference_option = "--plain-reference"
         duration = song["duration"]
         if not duration:
             from _kara_stems import duration as media_duration
@@ -504,31 +565,46 @@ class Maintenance:
                         self.metrics["turbo_seconds"] = seconds
             return receive
 
-        began = monotonic()
-        self.journal.emit("DEMUCS", f"Vérification des pistes séparées · {song['title']}")
-        rc, _ = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path)],
-                            1800, status("DEMUCS"))
-        self.metrics["demucs_seconds"] = monotonic() - began
-        if rc:
-            return "temporary", "séparation indisponible", 6 * HOUR
-        self.journal.emit("TURBO", f"Vérification de la référence · {song['title']}")
-        with tempfile.TemporaryDirectory(prefix="prepare-", dir=self.index.folder) as workspace:
-            (Path(workspace) / ".parole-stage").touch()
-            command = ["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_prepare.py"),
-                       "--cache", str(self.cache.root), "--local-only"]
-            if song["previous"]:
-                command.extend(("--previous-path", song["previous"]))
-            if generating:
-                reference = Path(workspace) / "reference.txt"
-                reference.write_text(plain, encoding="utf-8")
-                command.extend(("--plain-reference", str(reference)))
-            self.output([*command, "--", str(path)], 1800, status("TURBO"))
+        if not cached_stems(path):
+            began = monotonic()
+            self.journal.emit("DEMUCS", f"Séparation voix / accompagnement · {song['title']}")
+            rc, _ = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path)],
+                                1800, status("DEMUCS"))
+            self.metrics["demucs_seconds"] = monotonic() - began
+            if rc:
+                return "temporary", "séparation indisponible", 6 * HOUR
+        analyzed = not saved or saved.get("refinement", {}).get("version") != REFINEMENT_VERSION
+        if analyzed:
+            self.journal.emit("TURBO", f"Analyse Turbo{' Vulkan' if nocturnal else ''} · {song['title']}")
+            with tempfile.TemporaryDirectory(prefix="prepare-", dir=self.index.folder) as workspace:
+                (Path(workspace) / ".parole-stage").touch()
+                command = ["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_prepare.py"),
+                           "--cache", str(self.cache.root), "--local-only"]
+                if nocturnal:
+                    command.extend(("--device", "gpu", "--observed-corrections-only"))
+                if song["previous"] and not reference_option:
+                    command.extend(("--previous-path", song["previous"]))
+                if reference_option:
+                    reference = Path(workspace) / "reference.txt"
+                    reference.write_text(plain, encoding="utf-8")
+                    command.extend((reference_option, str(reference), "--reference-provider", provider))
+                    if rejected:
+                        command.extend(("--rejected-lrc", document(rejected)))
+                rc, _ = self.output([*command, "--", str(path)], 1800, status("TURBO"))
+                if rc and not self.cache.cached(path, verify=False, insufficient=True):
+                    return "temporary", "analyse Turbo indisponible", 6 * HOUR
         reference = self.cache.cached(path, verify=False)
-        if reference and cached_stems(path):
+        if (reference and reference.get("refinement", {}).get("version") == REFINEMENT_VERSION
+                and cached_stems(path)):
             updated = {"audio": reference["audio"].get("pcm_sha256", ""), "kara": "prêt"}
-            if generating and reference["source"].get("plain_sha256"):
+            origin = reference["source"]
+            if origin.get("plain_sha256") and origin["kind"] == "local":
                 updated["lrc"] = "généré"
-                updated["provenance"] = {"lrc_provider": "Turbo · Strawberry"}
+                updated["provenance"] = {"lrc_provider": f"Turbo · {origin['provider']}"}
+            if origin.get("plain_sha256") and reference_option == "--plain-reference":
+                self.journal.emit("LRC", f"LRC généré et validé · {song['title']}")
+            if reference["report"].get("changed") and analyzed:
+                self.journal.emit("LRC", f"Minutage corrigé dans Kara · {song['title']}")
             self.refresh_song(song, **updated)
             self.journal.emit("KARA", f"Chanson prête · {song['title']}")
             return "done", "prêt", 0

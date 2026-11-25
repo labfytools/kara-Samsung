@@ -12,3 +12,4 @@
 - Vérifier la libération du groupe de processus lors d’une sélection Kara ou d’un retour d’activité. Documenter l’essai Vulkan réel qui refuse une publication sans repères suffisants.
 - Vérifier les identifications associées aux métadonnées incomplètes et transmettre à Codex les positions manquantes d’une édition vérifiée.
 - Ajouter un point d’accès local aux captures et rapports BlackBox dans `blackbox/`, sans déplacer les données privées ni les versionner.
+- Préparer les références Kara en arrière-plan à partir de LRC vérifiés ou de textes sans minutage, en conservant les originaux et en refusant les corrections sans appui acoustique.

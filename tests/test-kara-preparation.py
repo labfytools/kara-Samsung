@@ -277,6 +277,35 @@ class CacheTests(unittest.TestCase):
         self.worker.prepare(self.song, force=True)
         self.worker.reader.assert_called_once_with(self.song)
 
+    def test_unusable_lrc_preserved_with_verified_timed_fallback(self):
+        bad = b"[99:59]Unrelated timing\n"
+        self.lrc.write_bytes(bad)
+        rejected = prepare.lrc_token(self.lrc)
+        self.assertTrue(self.worker.prepare(self.song, timed=self.original, provider="fixture",
+                                            rejected=rejected, observed_corrections=True)[0])
+        self.assertEqual(self.lrc.read_bytes(), bad)
+        for verify in (True, False):
+            self.assertEqual(self.cache.cached(self.song, verify=verify)["source"]["kind"], "fallback")
+        self.assertTrue(self.worker.prepare(self.song)[0])
+        self.worker.transcribe.assert_called_once()
+        self.lrc.write_bytes(self.original)
+        self.assertIsNone(self.cache.cached(self.song))
+        with self.assertRaises(ValueError):
+            self.worker.prepare(self.song, timed=self.original, rejected=rejected)
+
+    def test_night_rejects_display_changes_without_acoustic_evidence(self):
+        deepen = self.worker.deepen
+
+        def unobserved(song, item, progress):
+            ready = deepen(song, item, progress)
+            item["report"]["display_only_changes"] = 1
+            return ready
+
+        with patch.object(self.worker, "deepen", side_effect=unobserved):
+            self.assertFalse(self.worker.prepare(self.song, observed_corrections=True)[0])
+        self.assertIsNone(self.cache.cached(self.song))
+        self.assertEqual(self.lrc.read_bytes(), self.original)
+
     def test_legacy_ready_migrates_without_rescanning_good_anchors(self):
         self.worker.prepare(self.song)
         generation = self.cache.cached(self.song)

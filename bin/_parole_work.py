@@ -16,7 +16,7 @@ from _musique_oz import shared_mutation
 from _parole_catalogue import check_album, check_discography, check_recording, MBID
 from _parole_index import Index, document, key, sidecar
 from _parole_sources import ProviderUnavailable, LyricsEndpoint, validate_endpoint, record, fetch
-from _paroles_lrc import parse_lrc
+from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 
 def lyrics_engine():
@@ -29,7 +29,7 @@ def lyrics_engine():
     return module
 
 
-def lookup_song(index, identity, synced):
+def lookup_song(index, identity, synced, *, read_only=False):
     os.environ["KARA_IMPORT_PROCESSING"] = "1"
     engine = lyrics_engine()
     song = index.song(identity)
@@ -45,9 +45,14 @@ def lookup_song(index, identity, synced):
     tags, _ = engine.probe(path)
     stored = json.loads(song["info"])
     text = next((tags[k] for k in engine.LYRICS_TAGS if tags.get(k)), "") or stored.get("plain", "")
-    if not synced and (text or sidecar(path, ".txt")[1] or song["lrc"] in ("local", "externe", "généré")):
+    local_text = sidecar(path, ".txt")[1] or text
+    if read_only and not synced and local_text.strip():
+        if len(local_text.encode()) <= MAX_LRC_BYTES:
+            return {"state": "found", "source": "bibliothèque", "lyrics": local_text}
+        return {"state": "invalid"}
+    if not synced and (local_text or song["lrc"] in ("local", "externe", "généré")):
         return {"state": "present"}
-    if synced and (path.with_suffix(".lrc").exists() or path.with_suffix(".lrc").is_symlink()):
+    if synced and not read_only and (path.with_suffix(".lrc").exists() or path.with_suffix(".lrc").is_symlink()):
         return {"state": "present" if song["lrc"] != "à vérifier" else "invalid"}
     title, artist = tags.get("title"), tags.get("artist")
     duration = engine.duration_seconds(path)
@@ -60,7 +65,7 @@ def lookup_song(index, identity, synced):
         try:
             lyrics, provider = engine.LyricsSources().find(
                 title, artist, tags.get("album"), duration, tags.get("albumartist"),
-                synced=synced, local_text=text or sidecar(path, ".txt")[1], registry=index, strict=True)
+                synced=synced, local_text=local_text, registry=index, strict=True)
         except engine.AmbiguousLyrics:
             return {"state": "ambiguous"}
         except engine.ServiceUnavailable as error:
@@ -69,6 +74,10 @@ def lookup_song(index, identity, synced):
         return {"state": "not_found"}
     if not lyrics:
         return {"state": "instrumental", "source": provider}
+    if read_only:
+        if len(lyrics.encode()) > MAX_LRC_BYTES:
+            return {"state": "invalid"}
+        return {"state": "found", "source": provider, "lyrics": lyrics}
     root = index.root
     if synced:
         with shared_mutation(root):
@@ -171,6 +180,10 @@ def main():
     index = Index(music_library())
     if kind in ("lyrics", "lrc"):
         result = lookup_song(index, subject, kind == "lrc")
+    elif kind in ("prepare_plain", "prepare_lrc"):
+        # A nocturnal lookup can supply a candidate to Turbo. It never
+        # retags audio or publishes any provider text to the library.
+        result = lookup_song(index, subject, kind == "prepare_lrc", read_only=True)
     elif kind == "cover":
         result = {"state": cover(index, subject)}
     elif kind == "source_probe":
