@@ -216,7 +216,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.album_import = AlbumImport()
         self.album_import.can_launch = lambda: not (self.validating or self.party.active or self.game_score.requested
                                                    or self.remote_party.phase == "preparing")
-        self.album_import.on_update = self.mobile_imports.update
+        self.album_import.on_update = self.report_import_update
         self.mobile_imports.bind_queue(self.album_import.queue)
         self.import_refresh_timer = None
         self.import_refresh_active = False
@@ -596,6 +596,16 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_refresh_tasks[task.identity] = (task, jobs)
         if self.import_refresh_timer is None and not self.import_refresh_active:
             self.import_refresh_timer = GLib.timeout_add(250, self.reload_after_import)
+
+    def report_import_update(self, job, kind, payload):
+        self.mobile_imports.update(job, kind, payload)
+        if getattr(self, "maintenance", None) and payload.get("provider"):
+            if kind == "provider":
+                self.maintenance.journal.emit("DOWNLOAD", payload["message"])
+            elif kind == "album":
+                level = "WARNING" if payload["status"] in {"failure", "partial"} else "INFO"
+                self.maintenance.journal.emit(
+                    "DOWNLOAD", f"{payload['provider']} · {payload['title']} · {payload['message']}", level)
 
     def reload_after_import(self):
         self.import_refresh_timer = None

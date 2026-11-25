@@ -7,6 +7,7 @@ import subprocess
 from time import time
 from urllib.parse import parse_qs, urlsplit
 
+from _kara_import_local import LOCAL as LOCAL_PROVIDER, local_url
 from _kara_import_queue import import_key
 from _kara_paths import catalogue_command
 from _parole_index import encoded_key
@@ -15,7 +16,7 @@ from _parole_process import Interrupted
 HOUR = 3600
 DAY = 24 * HOUR
 TEMPORARY = {"network", "provider", "rate"}
-LOCAL = {"space", "permissions", "interrupted"}
+LOCAL = {"space", "permissions", "interrupted", "local_file"}
 BEARING = {"playlist", "track", "edition", "metadata", "format", "engine"}
 LABELS = {
     "network": "Erreur réseau temporaire", "provider": "Fournisseur indisponible", "rate": "Limitation du fournisseur",
@@ -24,7 +25,7 @@ LABELS = {
     "lyrics": "Échec du traitement des paroles", "sort": "Échec du tri", "integration": "Indexation Strawberry",
     "permissions": "Permissions de la bibliothèque", "space": "Espace insuffisant", "interrupted": "Import interrompu",
     "dependency": "Dépendance ou version incompatible", "api": "Réponse fournisseur incompatible",
-    "engine": "Échec du moteur sans cause confirmée",
+    "engine": "Échec du moteur sans cause confirmée", "local_file": "Sélection locale à vérifier",
 }
 SECRET = re.compile(r"https?://\S+|(?:~|/)(?:[a-z0-9_.-]+/)+\S+|"
                     r"(?i:\b(?:token|cookie|bearer|authorization|password|secret|apikey|api_key|credential)\b).*")
@@ -59,6 +60,7 @@ def classify(entry, outcome):
     stage_text = str(entry.get("stage", "")).casefold()[:180]
     category = entry.get("category")
     source = (outcome.get("url") or "")[:4000]
+    local_input = local_url(source)
     try:
         host = urlsplit(source).hostname
     except ValueError:
@@ -78,6 +80,8 @@ def classify(entry, outcome):
         cause = "interrupted"
     elif re.search(r"permission denied|permission refusée|read-only file system|accès refusé", detail):
         cause = "permissions"
+    elif local_input and category == "path":
+        cause = "local_file"
     elif http == 429 or re.search(r"too many requests|retry-after|rate.limit|limitation de requêtes", detail):
         cause = "rate"
     elif http and http >= 500:
@@ -110,6 +114,9 @@ def classify(entry, outcome):
     positions = re.search(r"\bpiste\s+(\d{1,4})\b", stage_text)
     tracks = (f"position {positions[1]}",) if positions else ()
     code = entry.get("returncode")
+    if local_input:
+        # Local paths and archive member names are confined to the private journal.
+        return Failure(cause, stage, LOCAL_PROVIDER, "", http, None, 0, (), "", "")
     return Failure(cause, stage, provider, source, http, code if type(code) is int and -255 <= code <= 255 else None,
                    min(86400, int(after[1])) if after else 0, tracks, label(outcome.get("artist")),
                    label(outcome.get("title")))
@@ -280,7 +287,8 @@ class ImportDiagnostics:
                 self.known_versions, self.checked = self.versions(), now
             findings = self.collect(row)
             # A local/authorization gate must take precedence over retries.
-            order = {"interrupted": 0, "space": 1, "permissions": 2, "rate": 3, "provider": 4, "network": 5}
+            order = {"interrupted": 0, "space": 1, "permissions": 2, "local_file": 3,
+                     "rate": 4, "provider": 5, "network": 6}
             failure = min(findings, key=lambda f: (order.get(f.cause, 8), f.stage))
             signature = signatures(failure, self.known_versions)
             if row["recovery_phase"] not in ("retry_wait", "codex_wait"):

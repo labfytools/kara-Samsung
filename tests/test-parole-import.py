@@ -14,11 +14,13 @@ import time
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
+from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 FIXTURES = ROOT / "tests/fixtures/parole"
 sys.path.insert(0, str(BIN))
+from _kara_audio_identity import pcm_digest
 from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 
@@ -188,6 +190,84 @@ class AlbumImportTests(unittest.TestCase):
             self.assertEqual(tags["track"], str(index))
             self.assertEqual(tags["lyrics"], "Son créé pour le test.")
         return tracks
+
+    def make_local_track(self, path, number, *, album="Album local"):
+        path.parent.mkdir(exist_ok=True, parents=True)
+        subprocess.run([TOOLS["ffmpeg"], "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                        f"sine=frequency={220 + 110 * number}:duration=4", "-c:a", "flac",
+                        "-metadata", f"artist={self.config['artist']}", "-metadata", f"album={album}",
+                        "-metadata", f"title=Son local {number}", "-metadata", f"track={number}", str(path)],
+                       check=True)
+
+    def test_local_directory_managed_job_resumes_one_missing_track(self):
+        source = self.temp / "Édition d’origine"
+        first, second = (source / name for name in ("01.flac", "02.flac"))
+        self.make_local_track(first, 1)
+        second.write_text("piste incomplète")
+        original = first.read_bytes()
+        queue = ImportQueue(self.temp / "state", self.library)
+        url = source.as_uri()
+        identity = queue.enqueue([("Album local", url)])
+
+        def run_job(code):
+            self.assertTrue(queue.claim(identity))
+            with lease(queue.directory / f"{identity}.lock") as guard:
+                done = subprocess.run([str(BIN / "kara"), "--suivi-json", "--import-file", identity,
+                                       "--import-lease", str(guard)], env=self.env, pass_fds=(guard,),
+                                      capture_output=True, text=True, timeout=75)
+            self.assertEqual(done.returncode, code, (done.stdout, done.stderr))
+            return queue.outcomes(identity)[url]
+
+        partial = run_job(1)
+        self.assertEqual((partial["provider"], partial["status"], partial["audio_complete"]),
+                         ("Fichiers locaux", "partial", False))
+        published = Path(partial["tracks"][0])
+        self.assertEqual(pcm_digest(published), pcm_digest(first))
+        before = published.read_bytes()
+        second.unlink()
+        self.make_local_track(second, 2)
+        queue.transition(identity, "partial", "queued", "Relance du dossier")
+        complete = run_job(0)
+        self.assertEqual((complete["status"], complete["added"], complete["processed"]), ("success", 1, 1))
+        self.assertEqual([row["member"] for row in complete["provenance"]], ["01.flac", "02.flac"])
+        self.assertEqual(complete["provenance"][0]["external_id"], partial["provenance"][0]["external_id"])
+        self.assertEqual(first.read_bytes(), original)
+        self.assertEqual(published.read_bytes(), before)
+        self.assertEqual(pcm_digest(complete["tracks"][1]), pcm_digest(second))
+        _, items, _ = self.run_import(url)
+        self.assertEqual((items[0]["status"], items[0]["processed"]), ("present", 0))
+        self.assertEqual(self.requests.read_text(), "")
+
+    def test_local_archive_preserves_pcm_and_supplied_assets(self):
+        track = self.temp / "manifest" / "01.flac"
+        self.make_local_track(track, 1, album="Album ZIP")
+        lyrics = "[00:00.20]Paroles synchronisées d’origine.\n".encode()
+        archive = self.temp / "Édition ZIP + #1.zip"
+        with ZipFile(archive, "w") as output:
+            output.write(track, "Album ZIP/01.flac")
+            output.write(self.cover, "Album ZIP/cover.jpg")
+            output.writestr("Album ZIP/01.lrc", lyrics)
+        original = archive.read_bytes()
+        _, items, _ = self.run_import(archive.as_uri())
+        outcome = items[0]
+        self.assertEqual((outcome["status"], outcome["added"]), ("success", 1))
+        published = Path(outcome["tracks"][0])
+        self.assertEqual(pcm_digest(published), pcm_digest(track))
+        self.assertEqual(published.with_suffix(".lrc").read_bytes(), lyrics)
+        self.assertEqual((published.parent / "cover.jpg").read_bytes(), self.cover.read_bytes())
+        self.assertEqual(archive.read_bytes(), original)
+
+    def test_local_archive_rejects_unsafe_paths_before_publication(self):
+        track = self.temp / "manifest" / "01.flac"
+        self.make_local_track(track, 1)
+        archive = self.temp / "archive.zip"
+        with ZipFile(archive, "w") as output:
+            output.write(track, "Album/01.flac")
+            output.writestr("../sortie.flac", b"fichier interdit")
+        _, items, _ = self.run_import(archive.as_uri(), expected=1)
+        self.assertEqual((items[0]["category"], items[0]["tracks"]), ("path", []))
+        self.assertFalse(list(self.library.rglob("*.flac")))
+        self.assertFalse((self.temp / "sortie.flac").exists())
 
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]

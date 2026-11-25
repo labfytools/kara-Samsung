@@ -50,6 +50,13 @@ Dans Parole, **Détails** ouvre le diagnostic sélectionnable et donne accès à
 
 **Historique** ouvre les lots clos après confirmation du catalogue. Les détails d’un lot partiel présentent les albums en échec ou en attente. Une erreur d’indexation conserve la demande dans la file et ses reçus permettent de relancer la vérification.
 
+### Dossiers et archives ZIP
+
+Dans **Importer un album → Fichiers locaux**, choisir un dossier contenant des fichiers audio déjà téléchargés, ou une archive ZIP. Ce parcours accepte les sous-dossiers de disques et demande des tags de titre, d’album et d’artiste. Les sources doivent rester accessibles pendant l’import et sa reprise. En ligne de commande, `bin/kara -- file:///chemin/edition.zip` utilise le même moteur de traitement.
+
+La file copie les pistes dans le dossier de réception, vérifie qu’elles se décodent, puis les classe sans réencodage. Les sources restent intactes. Un LRC UTF-8 utilisable, nommé comme son fichier audio, et un `cover.jpg` non ambigu sont publiés avant la recherche en ligne si la bibliothèque n’en a pas déjà. L’enrichissement et l’actualisation Strawberry suivent le parcours partagé. Le résultat du lot conserve la provenance locale, le membre d’archive ou chemin relatif et la somme SHA-256 du fichier source.
+
+Les reçus vérifient le contenu audio publié avant de sauter une piste lors d’une reprise depuis la même sélection. Une erreur sur une piste laisse les autres disponibles. Les liens symboliques, noms ZIP qui sortent de l’archive, entrées chiffrées et répertoires ZIP trop volumineux sont écartés. Les limites de lecture sont de 4 096 entrées et 2 Gio par piste. La réserve disque de l’import s’applique aux copies. Les défauts de la sélection locale restent à vérifier localement.
 
 ## Diagnostic des échecs persistants
 
@@ -68,3 +75,5 @@ PAROLE_TEST_GTK=1 python3 tests/test-parole-import.py -v
 ```
 
 La suite crée une bibliothèque temporaire avec un son de synthèse. Elle utilise `yt-dlp` et FFmpeg sur une source HTTP locale et contrôle les réponses du catalogue, des pochettes et des paroles. Elle couvre 100 lots totalisant 500 albums, quatre lots actifs, le verrou de tri, la reprise après interruption, les doublons et le manque d’espace. Les tests GTK facultatifs utilisent une session GTK et D-Bus. Ils exercent le journal, la relance sélective, la file commune avec la salle mobile et l’actualisation de la bibliothèque.
+
+Les essais locaux vérifient l’identité PCM de pistes FLAC, le maintien des sources, la conservation octet pour octet du LRC et de la pochette fournis, le refus d’un membre ZIP hors chemin et la reprise d’une seule piste dans un lot partiellement publié.

@@ -224,11 +224,16 @@ def share_file(draft, destination):
 
 
 @contextmanager
-def shared_mutation(root, enabled=True):
+def shared_mutation(root, enabled=True, *, wait=False):
     if not enabled or root != SHARED_LIBRARY:
         yield
         return
     with (root / ".labfy-music.lock").open("a") as lock:
+        if wait:
+            # JSON import workers report through their own protocol.
+            flock(lock, LOCK_EX)
+            yield
+            return
         try:
             flock(lock, LOCK_EX | LOCK_NB)
         except BlockingIOError as error:

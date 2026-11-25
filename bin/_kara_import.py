@@ -9,6 +9,7 @@ from time import monotonic
 
 from gi.repository import Gio, GLib, Gtk, Pango
 
+from _kara_import_local import LOCAL
 from _kara_import_queue import COMPLETE, ImportQueue, MAX_BATCHES, import_key
 from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space, lease, slot_count
 from _kara_import_result import CATEGORIES, ImportIssue
@@ -101,13 +102,23 @@ class AlbumImport(Gtk.Revealer):
         self.artist.connect("icon-press", self.search_artists)
         self.artist_changed_handler = self.artist.connect("changed", self.artist_changed)
         form.append(self.artist)
-        self.link = Gtk.Entry(placeholder_text="Lien d’album YouTube Music", hexpand=True, max_length=4096)
+        self.link = Gtk.Entry(placeholder_text="Lien d’album", hexpand=True, max_length=4096)
         self.link.connect("changed", self.refresh_controls)
         self.link.connect("activate", self.start)
         form.append(self.link)
         self.submit = Gtk.Button(label="Télécharger", sensitive=False, css_classes=["fetch"])
         self.submit.connect("clicked", self.start)
         form.append(self.submit)
+        local_menu = Gtk.MenuButton(label=LOCAL, sensitive=self.queue is not None)
+        local_popover = Gtk.Popover()
+        local_choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        for caption, folder in (("Choisir un dossier d’album", True), ("Choisir une archive ZIP", False)):
+            button = Gtk.Button(label=caption)
+            button.connect("clicked", lambda _button, folder=folder: self.choose_local(local_popover, folder))
+            local_choices.append(button)
+        local_popover.set_child(local_choices)
+        local_menu.set_popover(local_popover)
+        form.append(local_menu)
 
         self.results_header = Gtk.Box(spacing=8, visible=False)
         self.results_title = Gtk.Label(xalign=0.0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
@@ -401,6 +412,28 @@ class AlbumImport(Gtk.Revealer):
             self.link.set_text("")
             self.link.grab_focus()
 
+    def choose_local(self, popover, folder):
+        popover.popdown()
+        chooser = Gtk.FileChooserNative.new(
+            "Choisir un dossier d’album" if folder else "Choisir une archive ZIP", self.get_root(),
+            Gtk.FileChooserAction.SELECT_FOLDER if folder else Gtk.FileChooserAction.OPEN, "Importer", "Annuler")
+        if not folder:
+            archives = Gtk.FileFilter(name="Archives ZIP")
+            archives.add_suffix("zip")
+            chooser.add_filter(archives)
+
+        def selected(dialog, response):
+            if response == Gtk.ResponseType.ACCEPT:
+                chosen = dialog.get_file()
+                if chosen is not None and chosen.is_native() and chosen.get_uri_scheme() == "file":
+                    self.start_queue([(chosen.get_basename(), chosen.get_uri())])
+                else:
+                    self.message("Sélectionne un dossier ou une archive sur le disque local.", failed=True)
+            dialog.destroy()
+
+        chooser.connect("response", selected)
+        chooser.show()
+
     def start_queue(self, jobs, *, journal=None):
         return self.enqueue(jobs, journal=journal) is not None
 
@@ -448,7 +481,7 @@ class AlbumImport(Gtk.Revealer):
     def changed(self, job, kind, payload):
         if kind == "progress":
             self.on_update(job, kind, payload)
-        elif kind in {"finished", "album", "running"}:
+        elif kind in {"finished", "album", "running", "provider"}:
             self.on_update(job, kind, payload)
             self.next_poll = 0
 

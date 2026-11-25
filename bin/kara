@@ -4,6 +4,7 @@ import argparse
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from hashlib import file_digest
 import json
 import os
 from pathlib import Path
@@ -18,13 +19,17 @@ from threading import Event, Lock, RLock, Thread
 from time import monotonic
 from unicodedata import normalize
 from urllib.parse import parse_qs, urlsplit
+from zipfile import BadZipFile
+
+from _kara_audio_identity import pcm_digest
+from _kara_import_local import LOCAL, local_entries, local_path, local_url, publish_sidecar, read_entry, stamp
 
 from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_category, retry_albums
 from _kara_import_queue import COMPLETE, ImportQueue, digest
 from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE, check_space,
                                    defer_service, lease, resource_slot, wait_service)
 from _kara_paths import BIN, DATA, catalogue_command
-from _musique_oz import INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, source_video
+from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, shared_mutation, source_video
 
 DOWNLOAD_WORKERS = 2
 # Both Parole and the CLI use this engine. A Kara-local update can fix the
@@ -609,7 +614,7 @@ def download_track(source, folder, progress):
         return run(label, command, progress=progress, download=True, announce=False, resource=(slot,), disk=folder)
 
 
-def sort_audio(batch, progress, album_artist, receipt):
+def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False):
     if not any(audio_files(batch)):
         return 0, []
     with TemporaryDirectory(prefix="kara-rapport-") as temporary:
@@ -618,7 +623,8 @@ def sort_audio(batch, progress, album_artist, receipt):
         code = run("Tri dans l’audiothèque",
                    [str(BIN / "musique-tri"), "--bibliotheque", str(SHARED_LIBRARY),
                     "--rapport", str(report), "--rapport-detaille", "--reprise-interne", str(receipt),
-                    *credit, "--", str(batch)], progress=progress, fraction=0.76, resource="processing")
+                    *credit, *(["--garder-tags-import"] if preserve_tags else ()), "--", str(batch)],
+                   progress=progress, fraction=0.76, resource="processing")
         if not report.is_file():
             if not code:
                 progress.issue("Tri dans l’audiothèque", "processing", "Rapport du tri absent.")
@@ -661,6 +667,7 @@ class BatchAlbum:
     status: str = ""
     processed: int = 0
     remaining: Path | None = None
+    provenance: list[dict] = field(default_factory=list)
 
 
 def record_error(progress, stage, error, default="processing"):
@@ -736,7 +743,182 @@ def checkpoint_tracks(path, root):
     return (tracks if len(tracks) == len(data["tracks"]) else []), data.get("title")
 
 
+def local_receipts(receipt):
+    published = {}
+    if receipt.is_file():
+        with receipt.open(encoding="utf-8") as source:
+            for line in source:
+                try:
+                    filename, destination, _, _, _ = json.loads(line)
+                    published.setdefault(filename, []).append(destination)
+                except (TypeError, ValueError):
+                    continue
+    return published
+
+
+def file_sha(path):
+    with Path(path).open("rb") as source:
+        return file_digest(source, "sha256").hexdigest()
+
+
+def local_destination(record, candidates, root):
+    # The sorter journals the intended target before publishing with an
+    # exclusive link. An occupied name or a torn publication proves nothing.
+    # Check exact file bytes on first recovery and exact PCM after enrichment.
+    for value in reversed(candidates):
+        if not available_tracks([value], root):
+            continue
+        target = Path(value)
+        try:
+            revision = stamp(target.stat())
+            known = value == record.get("path")
+            if known and revision == record.get("published_revision"):
+                return target
+            matches = file_sha(target) == record["sha256"]
+            if known and not matches:
+                with resource_slot(root / INBOX / ".kara-traitements", PROCESSING):
+                    matches = pcm_digest(target) == record["pcm"]
+            if matches:
+                record.update(path=value, published_revision=revision)
+                return target
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def local_sidecars(tracks, entries, root, progress):
+    albums = {}
+    for name, track in tracks.items():
+        albums.setdefault(Path(name).parent, set()).add(track.parent)
+    with shared_mutation(root, wait=True):
+        for name, track in tracks.items():
+            if not available_tracks([str(track)], root):
+                continue
+            source = Path(name)
+            assets = [(str(source.with_suffix(".lrc")), track.with_suffix(".lrc"))]
+            if albums[source.parent] == {track.parent}:
+                assets.append((str(source.parent / "cover.jpg"), track.parent / "cover.jpg"))
+            for member, destination in assets:
+                if member in entries:
+                    try:
+                        publish_sidecar(entries[member], destination)
+                    except (OSError, ValueError, BadZipFile, RuntimeError) as error:
+                        record_error(progress, f"Fichier local associé · {member}",
+                                     ImportIssue("path", str(error)))
+
+
+def import_local(item, root, inbox, previous, stop, seen):
+    progress = item.progress
+    path = local_path(item.url)
+    resolved = path.resolve()
+    if resolved.is_relative_to(root) or root.is_relative_to(resolved):
+        raise ImportIssue("path", "Sélectionne un dossier ou un ZIP en dehors de la bibliothèque.")
+    item.identity = "local:" + digest(path.as_uri())
+    item.title = path.stem if path.suffix.lower() == ".zip" else path.name
+    item.tracks = available_tracks(previous.get("tracks", []), root)
+    if item.identity in seen:
+        item.status = "duplicate"
+        return
+    progress.log("Fournisseur", LOCAL)
+    workspace = inbox / ".kara-reprises" / digest(item.identity)
+    receipt = workspace / "publications.jsonl"
+    manifest = workspace / "originaux.json"
+    folder = inbox / f".kara-local-{digest(item.identity)}"
+    with lease(workspace / "verrou") as guard:
+        progress.guard += (guard,)
+        try:
+            with local_entries(path) as entries:
+                audio = sorted(entry for entry in entries if Path(entry).suffix.lower() in AUDIO)
+                if not audio:
+                    raise ImportIssue("path", "Aucun fichier audio pris en charge dans la sélection.")
+                records = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
+                published = local_receipts(receipt)
+                targets = {}
+                active = {}
+                for number, name in enumerate(audio, 1):
+                    if stop.is_set():
+                        break
+                    entry = entries[name]
+                    # Each revision has a different staging name. The source
+                    # only becomes eligible once a full read and PCM check end.
+                    stage = digest(json.dumps([name, entry.revision])) + Path(name).suffix.lower()
+                    record = records.get(name, {})
+                    if record.get("stage") == stage:
+                        target = local_destination(record, published.get(stage, []), root)
+                        if target:
+                            targets[name] = target
+                            continue
+                    progress.emit(f"Copie locale · piste {number}/{len(audio)}", 0.72 * (number - 1) / len(audio))
+                    draft = None
+                    try:
+                        if folder.is_symlink():
+                            raise ImportIssue("path", "Dossier de réception symbolique.")
+                        folder.mkdir(mode=0o770, exist_ok=True)
+                        item.folder = folder
+                        draft = folder / stage
+                        if draft.is_symlink():
+                            raise ImportIssue("path", "Fichier de réception symbolique.")
+                        checksum = file_sha(draft) if draft.is_file() else read_entry(entry, draft, stop)
+                        if not checksum:
+                            break
+                        with resource_slot(inbox / ".kara-traitements", PROCESSING):
+                            tags, _ = probe(draft)
+                            if not (tags.get("title") and tags.get("album")
+                                    and (tags.get("albumartist") or tags.get("artist"))):
+                                raise ImportIssue("path", "Métadonnées titre, album ou artiste manquantes.")
+                            records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft)}
+                        active[stage] = name
+                        item.processed += 1
+                    except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
+                        if draft is not None and not draft.is_symlink():
+                            draft.unlink(missing_ok=True)
+                        record_error(progress, f"Lecture locale · piste {number} · {name}",
+                                     error if isinstance(error, ImportIssue) else ImportIssue("path", str(error)))
+                        if progress.failures[-1]["category"] == "space":
+                            break
+                if active:
+                    # Store source proof before sorting so a restart after an
+                    # audio publication can recover its exact destination.
+                    write_checkpoint(manifest, records)
+                    # The shared sorter sees only the current selection.
+                    # Old staging from a different revision stays out of it.
+                    for candidate in audio_files(folder):
+                        if candidate.parent == folder and candidate.name not in active:
+                            candidate.unlink()
+                    check_space(folder, extra=MAX_MEDIA * PROCESSING)
+                    item.added, _ = sort_audio(folder, progress, None, receipt, preserve_tags=True)
+                    published = local_receipts(receipt)
+                    for stage, name in active.items():
+                        record = records[name]
+                        target = local_destination(record, published.get(stage, []), root)
+                        if target:
+                            targets[name] = target
+                        else:
+                            progress.issue("Tri local", "processing", f"Publication non vérifiée : {name}")
+                if targets:
+                    write_checkpoint(manifest, records)
+                    item.tracks = sorted(set(item.tracks).union(map(str, targets.values())))
+                    item.provenance = [
+                        {"provider": LOCAL, "external_id": records[name]["sha256"], "member": name,
+                         "source": item.url, "path": str(track)}
+                        for name, track in sorted(targets.items())
+                    ]
+                    local_sidecars(targets, entries, root, progress)
+                    enrich_tracks(item.tracks, progress)
+                item.audio_complete = len(targets) == len(audio)
+                if item.audio_complete and not progress.failures:
+                    seen.add(item.identity)
+        except BadZipFile as error:
+            raise ImportIssue("path", str(error), stage="Archive ZIP") from error
+        finally:
+            if item.folder is not None:
+                item.remaining = close_batch(item.folder)
+            progress.guard = progress.guard[:-1]
+
+
 def import_album(item, root, inbox, previous, stop, seen):
+    if local_url(item.url):
+        return import_local(item, root, inbox, previous, stop, seen)
     progress = item.progress
     parsed, playlist = checked_link(item.url)
     known = previous.get("tracks", [])
@@ -881,6 +1063,8 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
 
         child.report = report
         if not stop.is_set():
+            if local_url(url):
+                progress.emit(f"{LOCAL} · import de la sélection", event="provider", provider=LOCAL)
             report("Vérification dans la collection", 0)
             try:
                 import_album(item, root, inbox, previous.get(url, {}), stop, seen)
@@ -903,6 +1087,10 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
                        added=item.added, tracks=item.tracks, audio_complete=item.audio_complete,
                        remaining=str(item.remaining) if item.remaining else None, identity=item.identity,
                        processed=item.processed, message=message, artist=item.artist or "")
+        if item.provenance:
+            outcome["provenance"] = item.provenance
+        if local_url(url):
+            outcome["provider"] = LOCAL
         if on_album is not None:
             on_album(outcome)
         progress.emit(fraction=index / len(urls), event="album", **outcome)
@@ -945,7 +1133,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("url", nargs="?", help="lien de l’album ou de sa playlist YouTube Music")
+    mode.add_argument("url", nargs="?", help="lien d’album ou URI file:// d’un dossier ou ZIP local")
     mode.add_argument("--lot", nargs="+", help=argparse.SUPPRESS)
     mode.add_argument("--import-file", metavar="LOT", help=argparse.SUPPRESS)
     parser.add_argument("--import-lease", type=int, help=argparse.SUPPRESS)

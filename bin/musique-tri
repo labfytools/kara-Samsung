@@ -176,14 +176,15 @@ def target_parts(source, tags, artist, album):
 
 
 def classify(source, tags, album_artist, album_title, root, preview, reserved, importing, known_sources,
-             receipt=None):
+             receipt=None, preserve_tags=False):
     artist, album, name, extension = target_parts(source, tags, album_artist, album_title)
     updates = {}
     if album_title != tags.get("album"):
         if extension not in TAG_WRITABLE:
             raise ValueError("renommage de l’album indisponible pour ce format")
         updates["album"] = album_title
-    if album_artist and album_title and extension in TAG_WRITABLE and tags.get("albumartist") != album_artist:
+    if (not preserve_tags and album_artist and album_title and extension in TAG_WRITABLE
+            and tags.get("albumartist") != album_artist):
         updates["albumartist"] = album_artist
     artist_dir = root / artist
     folder = artist_dir / album
@@ -191,7 +192,7 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
         raise ValueError("dossier de destination symbolique")
     if not preview:
         folder.mkdir(parents=True, exist_ok=True)
-    video = source_video(tags.get("purl")) if importing and not preview else ""
+    video = source_video(tags.get("purl")) if importing and not preview and not preserve_tags else ""
     position = (number(tags.get("disc") or tags.get("discnumber")) or 1,
                 number(tags.get("track") or tags.get("tracknumber")))
     identity = (video, position, None if position[1] else name)
@@ -237,7 +238,8 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
                 print(f"{source.name} · tags de l’album : {album_artist} / {album_title}")
             return target, False
         if target in reserved or target.exists() or target.is_symlink():
-            if importing and not preview and (same_content(source, target) or same_import_track(source, target, tags)):
+            if importing and not preview and (same_content(source, target)
+                    or not preserve_tags and same_import_track(source, target, tags)):
                 remember(target)
                 source.unlink()
                 print(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
@@ -276,6 +278,7 @@ def main():
     parser.add_argument("--rapport", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--rapport-detaille", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reprise-interne", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--garder-tags-import", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     for option, value in (("--artiste-album", args.artiste_album), ("--nom-album", args.nom_album)):
         if value is not None and (not args.sources or not value.strip()):
@@ -315,7 +318,8 @@ def main():
                 if importing and args.artiste_album:
                     artist = canonical_album_artist(artist, album)
                 target, moved = classify(track, tags, artist, album, root, args.apercu, reserved, importing,
-                                         known_sources, args.reprise_interne if importing else None)
+                                         known_sources, args.reprise_interne if importing else None,
+                                         preserve_tags=args.garder_tags_import)
                 if target is not None:
                     destinations.add(str(target))
                 added += moved
