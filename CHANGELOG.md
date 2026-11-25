@@ -26,3 +26,4 @@
 - Importer les dossiers et les archives ZIP dans la file Parole, avec provenance, préservation des originaux et reprise des seules pistes manquantes.
 - Proposer le téléchargement officiel Bandcamp et conserver sa provenance déclarée lors de l’import local de l’album.
 - Accepter les ZIP et dossiers FLAC des achats Qobuz et conserver la référence publique de l’édition.
+- Importer individuellement les pistes téléchargées via la fonction officielle SoundCloud, avec leur provenance déclarée.

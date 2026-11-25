@@ -13,7 +13,7 @@ from _kara_import_local import LOCAL, local_target, local_url
 from _kara_import_queue import COMPLETE, ImportQueue, MAX_BATCHES, import_key
 from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space, lease, slot_count
 from _kara_import_result import CATEGORIES, ImportIssue
-from _musique_oz import INBOX, SHARED_LIBRARY
+from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY
 from _kara_paths import BIN, catalogue_command
 from _parole_import_providers import ALL, MANUAL, YOUTUBE
 
@@ -114,9 +114,10 @@ class AlbumImport(Gtk.Revealer):
         self.local_menu = Gtk.MenuButton(label=LOCAL, sensitive=self.queue is not None)
         local_popover = Gtk.Popover()
         local_choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        for caption, folder in (("Choisir un dossier d’album", True), ("Choisir une archive ZIP", False)):
+        for caption, mode in (("Choisir un dossier d’album", "folder"), ("Choisir une archive ZIP", "zip"),
+                              ("Choisir un fichier audio", "audio")):
             button = Gtk.Button(label=caption)
-            button.connect("clicked", lambda _button, folder=folder: self.choose_local(local_popover, folder))
+            button.connect("clicked", lambda _button, mode=mode: self.choose_local(local_popover, mode))
             local_choices.append(button)
         local_popover.set_child(local_choices)
         self.local_menu.set_popover(local_popover)
@@ -475,17 +476,20 @@ class AlbumImport(Gtk.Revealer):
             self.link.set_text("")
             self.link.grab_focus()
 
-    def choose_local(self, popover, folder):
+    def choose_local(self, popover, mode):
         popover.popdown()
         provider = self.selected_provider()
         reference = self.link.get_text().strip() if provider in MANUAL else ""
         chooser = Gtk.FileChooserNative.new(
-            "Choisir un dossier d’album" if folder else "Choisir une archive ZIP", self.get_root(),
-            Gtk.FileChooserAction.SELECT_FOLDER if folder else Gtk.FileChooserAction.OPEN, "Importer", "Annuler")
-        if not folder:
-            archives = Gtk.FileFilter(name="Archives ZIP")
-            archives.add_suffix("zip")
-            chooser.add_filter(archives)
+            {"folder": "Choisir un dossier d’album", "zip": "Choisir une archive ZIP",
+             "audio": "Choisir un fichier audio"}[mode], self.get_root(),
+            Gtk.FileChooserAction.SELECT_FOLDER if mode == "folder" else Gtk.FileChooserAction.OPEN,
+            "Importer", "Annuler")
+        if mode != "folder":
+            allowed = Gtk.FileFilter(name="Archives ZIP" if mode == "zip" else "Fichiers audio")
+            for suffix in ("zip",) if mode == "zip" else sorted(ext[1:] for ext in AUDIO):
+                allowed.add_suffix(suffix)
+            chooser.add_filter(allowed)
 
         def selected(dialog, response):
             if response == Gtk.ResponseType.ACCEPT:
@@ -498,7 +502,7 @@ class AlbumImport(Gtk.Revealer):
                     else:
                         self.start_queue([(chosen.get_basename(), selected_uri)])
                 else:
-                    self.message("Sélectionne un dossier ou une archive sur le disque local.", failed=True)
+                    self.message("Sélectionne des fichiers sur le disque local.", failed=True)
             dialog.destroy()
 
         chooser.connect("response", selected)

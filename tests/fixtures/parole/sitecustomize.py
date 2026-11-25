@@ -34,7 +34,7 @@ if "PAROLE_TEST_CONFIG" in os.environ:
             if url.hostname == "coverartarchive.org":
                 return response(Path(config["cover"]).read_bytes(), "image/jpeg")
             if url.hostname == "lrclib.net" and url.path == "/api/get":
-                album = parameters["album_name"][0]
+                album = parameters.get("album_name", [""])[0]
                 if album in config["lyric_failures"]:
                     return response("Fixture: le serveur des paroles ne répond pas en JSON.".encode(), "text/plain")
                 return response({"trackName": parameters["track_name"][0], "artistName": config["artist"],

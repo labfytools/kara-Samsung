@@ -214,7 +214,8 @@ class AlbumImportTests(unittest.TestCase):
         path.parent.mkdir(exist_ok=True, parents=True)
         subprocess.run([TOOLS["ffmpeg"], "-nostdin", "-v", "error", "-f", "lavfi", "-i",
                         f"sine=frequency={220 + 110 * number}:duration=4", "-c:a", "flac",
-                        "-metadata", f"artist={self.config['artist']}", "-metadata", f"album={album}",
+                        "-metadata", f"artist={self.config['artist']}",
+                        *(["-metadata", f"album={album}"] if album else []),
                         "-metadata", f"title=Son local {number}", "-metadata", f"track={number}", str(path)],
                        check=True)
 
@@ -318,6 +319,22 @@ class AlbumImportTests(unittest.TestCase):
         evidence = items[0]["provenance"][0]
         self.assertEqual(evidence["edition_ref"], release)
         self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(track))
+        self.assertEqual(self.requests.read_text(), "")
+
+    def test_soundcloud_single_download_does_not_import_its_neighbors(self):
+        source = self.temp / "soundcloud"
+        track = source / "original.flac"
+        self.make_local_track(track, 1, album=None)
+        self.make_local_track(source / "autre.flac", 2)
+        original = track.read_bytes()
+        release = "https://soundcloud.com/atelier-test/son-local"
+        _, items, _ = self.run_import(local_target(track.as_uri(), "SoundCloud", release))
+        self.assertEqual((items[0]["status"], items[0]["provider"], items[0]["added"]), ("success", "SoundCloud", 1))
+        path = Path(items[0]["tracks"][0])
+        self.assertEqual(items[0]["provenance"][0]["edition_ref"], release)
+        self.assertEqual(path.parent.name, "Sans album")
+        self.assertEqual(pcm_digest(path), pcm_digest(track))
+        self.assertEqual(track.read_bytes(), original)
         self.assertEqual(self.requests.read_text(), "")
 
     def test_search_import_and_album_already_present(self):

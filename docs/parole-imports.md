@@ -52,7 +52,7 @@ Dans Parole, **Détails** ouvre le diagnostic sélectionnable et donne accès à
 
 ### Dossiers et archives ZIP
 
-Dans **Importer un album → Fichiers locaux**, choisir un dossier contenant des fichiers audio déjà téléchargés, ou une archive ZIP. Ce parcours accepte les sous-dossiers de disques et demande des tags de titre, d’album et d’artiste. Les sources doivent rester accessibles pendant l’import et sa reprise. En ligne de commande, `bin/kara -- file:///chemin/edition.zip` utilise le même moteur de traitement.
+Dans **Importer un album → Fichiers locaux**, choisir un fichier audio, un dossier contenant des fichiers déjà téléchargés ou une archive ZIP. Ce parcours accepte les sous-dossiers de disques et demande des tags de titre et d’artiste. La sélection de plusieurs pistes demande aussi le tag d’album. Les sources doivent rester accessibles pendant l’import et sa reprise. En ligne de commande, `bin/kara -- file:///chemin/edition.zip` utilise le même moteur de traitement.
 
 La file copie les pistes dans le dossier de réception, vérifie qu’elles se décodent, puis les classe sans réencodage. Les sources restent intactes. Un LRC UTF-8 utilisable, nommé comme son fichier audio, et un `cover.jpg` non ambigu sont publiés avant la recherche en ligne si la bibliothèque n’en a pas déjà. L’enrichissement et l’actualisation Strawberry suivent le parcours partagé. Le résultat du lot conserve la provenance locale, le membre d’archive ou chemin relatif et la somme SHA-256 du fichier source.
 
@@ -67,6 +67,10 @@ Dans le sélecteur de sources, **Bandcamp** propose le site officiel et son aide
 ### Qobuz
 
 Sélectionner **Qobuz** après la récupération d’un album depuis **Mes achats**. Le téléchargement depuis le navigateur peut fournir un ZIP FLAC que Parole ouvre directement. Un dossier de fichiers FLAC déjà téléchargés fonctionne aussi. Qobuz propose plusieurs résolutions sans DRM pour les achats. La sélection de la résolution et la récupération des achats se font sur le site officiel. La page publique de l’album peut être enregistrée avec l’import. [Télécharger depuis le navigateur](https://help.qobuz.com/en/articles/369151-tutorial-how-to-download-without-qobuz-downloader) · [Formats des achats](https://help.qobuz.com/en/articles/10167-what-are-the-different-audio-formats-available-for-download)
+
+### SoundCloud
+
+Récupérer le fichier seulement si SoundCloud affiche **Télécharger le fichier** pour la piste. Après le téléchargement, sélectionner **SoundCloud** puis **Fichiers locaux → Choisir un fichier audio**. La page publique de la piste ou de l’ensemble d’origine peut être conservée avec l’import. Une piste dotée d’un titre et d’un artiste peut être classée dans **Sans album** lorsque son fichier n’indique aucun album. Les conditions de l’API de SoundCloud interdisent la conservation permanente des fichiers par une application. [Téléchargement officiel](https://help.soundcloud.com/hc/en-us/articles/115003448787-Downloading-tracks) · [Conditions de l’API](https://developers.soundcloud.com/docs/api/terms-of-use)
 
 ## Diagnostic des échecs persistants
 
@@ -91,3 +95,5 @@ Les essais locaux vérifient l’identité PCM de pistes FLAC, le maintien des s
 Le parcours Bandcamp est testé avec un FLAC de synthèse et une référence publique représentative. Le test vérifie la provenance et la désactivation du fournisseur. Il ne se connecte pas à un compte Bandcamp.
 
 Le parcours Qobuz est testé avec un ZIP FLAC de synthèse et une référence d’édition au format Qobuz. Le test contrôle la conservation du PCM et de cette référence sans accéder à un compte ni à une commande.
+
+Le parcours SoundCloud est testé avec une piste de synthèse sans tag d’album. Seul le fichier sélectionné est classé, avec une provenance déclarée et le même PCM. Le test ne se connecte pas à SoundCloud.

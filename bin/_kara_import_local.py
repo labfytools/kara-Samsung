@@ -33,7 +33,7 @@ def local_selection(value):
     parts = urlsplit(value)
     path = Path(unquote(parts.path, errors="strict"))
     if parts.scheme != "file" or parts.netloc or parts.fragment or not path.is_absolute():
-        raise ImportIssue("path", "Un dossier ou un ZIP local est attendu.")
+        raise ImportIssue("path", "Un fichier audio, dossier ou ZIP local est attendu.")
     if "\0" in str(path) or ".." in path.parts or path == path.parent:
         raise ImportIssue("path", "Le chemin de l’album local est invalide.")
     if len(parts.query) > 1200:
@@ -175,8 +175,25 @@ def local_entries(path):
         finally:
             os.close(fd)
         return
+    if path.suffix.lower() in AUDIO and path.is_file():
+        fd = os.open(path.parent, os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            entries = {}
+            # Selecting a single file cannot implicitly select the rest of its folder.
+            for name in (path.name, path.with_suffix(".lrc").name):
+                try:
+                    metadata = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if S_ISREG(metadata.st_mode):
+                    entries[name] = Entry(name, metadata.st_size, stamp(metadata),
+                                          lambda name=name: open_member(fd, name))
+            yield entries
+        finally:
+            os.close(fd)
+        return
     if path.suffix.lower() != ".zip" or not path.is_file():
-        raise ImportIssue("path", "Dossier ou archive ZIP introuvable.")
+        raise ImportIssue("path", "Fichier audio, dossier ou archive ZIP introuvable.")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as source:
         metadata = os.fstat(source.fileno())

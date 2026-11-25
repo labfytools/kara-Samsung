@@ -815,7 +815,7 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
     if resolved.is_relative_to(root) or root.is_relative_to(resolved):
         raise ImportIssue("path", "Sélectionne un dossier ou un ZIP en dehors de la bibliothèque.")
     item.identity = "local:" + digest(path.as_uri())
-    item.title = path.stem if path.suffix.lower() == ".zip" else path.name
+    item.title = path.stem if path.suffix.lower() in (AUDIO | {".zip"}) else path.name
     item.tracks = available_tracks(previous.get("tracks", []), root)
     if item.identity in seen:
         item.status = "duplicate"
@@ -872,7 +872,7 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
                             break
                         with resource_slot(inbox / ".kara-traitements", PROCESSING):
                             tags, _ = probe(draft)
-                            if not (tags.get("title") and tags.get("album")
+                            if not (tags.get("title") and (tags.get("album") or len(audio) == 1)
                                     and (tags.get("albumartist") or tags.get("artist"))):
                                 raise ImportIssue("path", "Métadonnées titre, album ou artiste manquantes.")
                             records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft)}
@@ -1146,7 +1146,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("url", nargs="?", help="lien d’album ou URI file:// d’un dossier ou ZIP local")
+    mode.add_argument("url", nargs="?", help="lien d’album ou URI file:// d’un fichier, dossier ou ZIP local")
     mode.add_argument("--lot", nargs="+", help=argparse.SUPPRESS)
     mode.add_argument("--import-file", metavar="LOT", help=argparse.SUPPRESS)
     parser.add_argument("--import-lease", type=int, help=argparse.SUPPRESS)

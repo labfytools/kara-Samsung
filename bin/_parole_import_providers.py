@@ -41,4 +41,9 @@ MANUAL = {
         "https://help.qobuz.com/en/articles/369151-tutorial-how-to-download-without-qobuz-downloader",
         re.compile(r"(?:www\.|open\.)?qobuz\.com"),
         re.compile(r"/(?:[a-z]{2}-[a-z]{2}/)?album/(?:[a-z0-9][a-z0-9-]{0,159}/)?[a-z0-9]{5,30}/?")),
+    "SoundCloud": ManualProvider(
+        "soundcloud.com", "https://soundcloud.com/",
+        "https://help.soundcloud.com/hc/en-us/articles/115003448787-Downloading-tracks",
+        re.compile(r"(?:www\.)?soundcloud\.com"),
+        re.compile(r"/[a-z0-9][a-z0-9_-]{0,89}/(?:sets/)?[a-z0-9][a-z0-9_-]{0,159}/?")),
 }
