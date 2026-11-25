@@ -230,7 +230,7 @@ def sizes(folder):
 def worker(workspace, case, mode, threads, stems_from=None):
     stems.ROOT = (stems_from or workspace) / "stems"
     base_song = next(path for path in (workspace / "input" / case).iterdir()
-                     if path.suffix in (".opus", ".mp3"))
+                     if path.suffix in (".opus", ".mp3", ".wav"))
     stem_song = base_song
     if stems_from is not None:
         stem_song = stems_from / "input" / case / base_song.name

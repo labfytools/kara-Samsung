@@ -24,7 +24,22 @@ Pour comparer une modification Turbo dans un nouveau dossier, utiliser `--phase 
 
 Le témoin privé retient trois enregistrements de JamendoLyrics MultiLang, révision `de188c9`. Il comprend *l’abandon* de Flo (français, CC BY), *Feel (Stripped)* de Cortez (anglais, BY) et *Te Recuerdo* de Wilson Way (espagnol, CC BY-SA). L’inférence reçoit les lignes de texte seules. Le banc ouvre ensuite les fichiers d’annotation manuelle pour la comparaison. Les débuts de ligne fournis par le jeu dérivent du premier mot de chaque ligne. Un mot scindé en plusieurs unités par Kara est exclu du calcul temporel par mot, car l’annotation ne donne pas de repère distinct à chaque unité. Les enregistrements et les paroles restent hors dépôt. [JamendoLyrics MultiLang](https://huggingface.co/datasets/jamendolyrics/jamendolyrics/tree/de188c9) · [Article de Durand, Stoller et Ewert](https://arxiv.org/abs/2306.07744)
 
-Pour rejouer, fournir un corpus JSON avec `id`, `song` (nom relatif d’un MP3), `language` et `annotated: true`. Placer les lignes sans minutage dans le fichier `.txt` de même nom que le MP3. Utiliser `--library` pour la racine privée de ce corpus, `--corpus` pour le JSON et `--phase annotated`. Donner ensuite au [comparateur](../tests/qualify-kara-reference-timing.py) le dossier d’annotations (`lines.csv`, `manual.csv` et `words.words.txt`) et le JSON des lignes observées dans `evidence/`. Il rapporte les repères acoustiques évaluables, les absences, la couverture, la médiane, le 95e percentile et la proportion dont l’écart absolu est au plus de 500 ms.
+Pour rejouer, fournir un corpus JSON avec `id`, `song` (nom relatif d’un MP3 ou WAV), `language` et `annotated: true`. Placer les lignes sans minutage dans le fichier `.txt` de même nom que l’audio. Utiliser `--library` pour la racine privée de ce corpus, `--corpus` pour le JSON et `--phase annotated`. Donner ensuite au [comparateur](../tests/qualify-kara-reference-timing.py) le dossier d’annotations (`lines.csv`, `manual.csv` et `words.words.txt`) et le JSON des lignes observées dans `evidence/`. Il rapporte les repères acoustiques évaluables, les absences, la couverture, la médiane, le 95e percentile et la proportion dont l’écart absolu est au plus de 500 ms.
+
+La qualification mesurée prend les huit premières lignes annotées de chaque titre. Chaque extrait WAV préserve le taux et les canaux du flux source. L’extraction ajoute jusqu’à deux secondes avant la première ligne et 450 ms après la dernière. Les temps de référence sont transformés sur la même horloge d’échantillons, avec trois extraits de 30,0 à 33,9 s. Les fichiers se trouvent sous `jamendo-excerpts/`. Le moteur F16 a travaillé sur le mix et les paroles sans minutage. Les temps d’inférence comprennent les reprises locales.
+
+| Langue | Repères | Mesurés / annotés | Médiane | P95 | À 500 ms ou moins |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Anglais | Mots | 42/44 | 289 ms | 537 ms | 88,1 % |
+| Anglais | Débuts de ligne | 7/8 | 280 ms | 558 ms | 85,7 % |
+| Espagnol | Mots | 72/75 | 130 ms | 419 ms | 97,2 % |
+| Espagnol | Débuts de ligne | 8/8 | 84 ms | 342 ms | 100 % |
+| Français | Mots | 52/59 | 131 ms | 430 ms | 100 % |
+| Français | Débuts de ligne | 5/8 | 39 ms | 130 ms | 100 % |
+| **Ensemble** | **Mots** | **166/178** | **178 ms** | **473 ms** | **95,8 %** |
+| **Ensemble** | **Débuts de ligne** | **20/24** | **114 ms** | **342 ms** | **95,0 %** |
+
+Vingt unités lexicales sont non évaluables par mot, car issues de la scission d’un mot court annoté en un seul temps. Douze mots et quatre débuts annotés restent sans repère acoustique. Le seuil de 500 ms est dépassé sur sept mots et un début de ligne parmi les observations comparables. Le seuil ne constitue donc pas une garantie individuelle sur ce témoin.
 
 ## Relevé ArchASP du 25 novembre 2026
 
@@ -32,7 +47,7 @@ Pour rejouer, fournir un corpus JSON avec `id`, `song` (nom relatif d’un MP3),
 | --- | --- |
 | Référence historique, deux morceaux complets | 4,43 chansons/h et 60,4 Mio par chanson. [Détail](parole-v3.md#essais-nocturnes-sur-archasp) |
 | Référence élargie | Les dix audios et LRC sont accessibles. Au seuil de 1 %, les essais Demucs ont été interrompus avant publication. Les trois premiers essais instrumentés ont atteint 1,16 à 1,29 % de pression mémoire. Après libération de mémoire et stabilisation du profil, un autre essai s’est arrêté à 1,52 %, avec 5,9 Gio encore disponibles. |
-| Témoin indépendant | La première analyse Vulkan a été arrêtée après 4,3 s de mesure, à 2,47 % de pression mémoire. Aucun écart temporel publiable sur ce témoin. |
+| Témoin indépendant | La première analyse intégrale à 1 % de PSI a été arrêtée après 4,3 s. La qualification F16 a ensuite terminé sur trois extraits annotés. |
 | Capot fermé | La réouverture a interrompu une première mesure après 4,3 s. La seconde séquence de charge s’est arrêtée après 29,0 s à 3,05 % de PSI, avec des maxima CPU/GPU de 64,9/58 °C. |
 
 Les journaux privés de cette campagne se trouvent sous `.runtime/preparation-perf/`. Les tentatives interrompues sont exclues du débit et des moyennes de traitement.
