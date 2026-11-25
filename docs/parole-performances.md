@@ -32,3 +32,25 @@ Pour rejouer, fournir un corpus JSON avec `id`, `song` (nom relatif d’un MP3),
 | Capot fermé | Qualification prolongée sous charge en attente. Les mesures historiques portent sur une fermeture sans calcul lourd. |
 
 Les journaux privés de cette campagne se trouvent sous `.runtime/preparation-perf/`. Les tentatives interrompues sont exclues du débit et des moyennes de traitement.
+
+### Stockage et coût d’ouverture
+
+Le relevé du cache de production donne 160,82 Mio d’instrumentaux FLAC, 145,67 Mio de voix FLAC, 0,047 Mio de métadonnées Demucs et 0,645 Mio de références Turbo et LRC. Les tailles sont allouées et les liens physiques déjà dédupliqués par inode. Les pistes existantes sont en FLAC stéréo. Les deux fichiers représentent plus de 99 % de l’espace mesuré.
+
+Sur cinq paires de pistes complètes déjà validées, le [banc de stockage](../tests/benchmark-kara-stem-storage.py) a réencodé des copies au niveau FLAC 8 avec FFmpeg. Les dix fichiers ont passé la vérification PCM intégrale, y compris le taux, le nombre d’échantillons par canal et l’origine à zéro des deux pistes. La prélecture est celle du pipeline Kara avec sortie silencieuse, répétée dix fois par variante et par paire. Elle exclut le périphérique de sortie, Strawberry et la latence du premier son physique.
+
+| Mesure | FLAC actuel | FLAC niveau 8 |
+| --- | ---: | ---: |
+| Espace pour cinq paires | 204,88 Mio | 203,74 Mio |
+| Moyenne par paire | 40,98 Mio | 40,75 Mio |
+| Médiane de prélecture | 3,82 ms | 3,72 ms |
+| 95e percentile de prélecture | 5,92 ms | 4,39 ms |
+| Réencodage supplémentaire d’une paire | — | 1,38 s |
+
+Le gain de 1,14 Mio sur cinq paires représente 0,55 %. Le réencodage supplémentaire est écarté. Les brouillons Demucs sont déjà temporaires et les réassociations PCM utilisent des liens physiques. Sur ce relevé, une compression des manifestes Turbo viserait moins d’un Mio au total.
+
+Le manifeste Turbo et ses repères sont déjà persistés séparément des pistes. Il est possible d’enrichir une référence à partir du mix, ou d’employer une piste vocale disponible pour les reprises. Quand les pistes manquent, une référence acceptée donne une préparation partielle. Au plafond actuel, la politique d’admission protège l’ensemble des préparations et ne crée pas de nouvelle tâche de référence seule. Un éventuel traitement au plafond devra mesurer séparément son espace de travail et ses références publiées. Il devra aussi limiter la taille d’une nouvelle publication au budget disponible.
+
+### Compatibilité du moteur de séparation
+
+L’environnement installé associe Demucs 4.0.1 à PyTorch et Torchaudio 2.6.0 `+cpu`. Il déclare `cuda=None` et `hip=None`. Le Vulkan de whisper.cpp équipe Turbo. Demucs utilise le modèle `htdemucs`, des segments de 7 s, un chevauchement de 10 %, zéro décalage aléatoire et une tâche de segment. Le traitement produit les deux stems FLAC. Demucs expose un parallélisme de segments sur CPU et plusieurs modèles. Leur coût mémoire, leur vitesse et la qualité nécessitent des comparaisons sur des morceaux terminés. [Implémentation Demucs](https://github.com/facebookresearch/demucs/blob/main/demucs/apply.py) · [Matrice AMD ROCm](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html)
