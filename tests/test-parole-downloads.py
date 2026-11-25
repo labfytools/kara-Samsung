@@ -2,7 +2,7 @@
 """Qualification des créneaux d'import avec des originaux FLAC et un serveur local."""
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from hashlib import sha1
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -156,6 +156,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_archive_can_take_a_fourth_slot_with_youtube_profile_occupied(self):
+        with TemporaryDirectory() as temp, ExitStack() as leases:
+            folder = Path(temp) / "slots"
+            leases.enter_context(patch.object(resources, "RATE_DIRECTORY", Path(temp) / "rates"))
+            leases.enter_context(patch.dict(resources.AUDIO_PROVIDERS, youtube=(3, 60)))
+            leases.enter_context(patch.object(resources, "memory_download_limit", return_value=(20, "")))
+            leases.enter_context(patch.object(resources, "storage_download_limit", return_value=20))
+            for _ in range(3):
+                provider = leases.enter_context(resources.resource_slot(folder / "youtube", 3))
+                leases.enter_context(resources.audio_slot(folder, "youtube", provider_fd=provider))
+            with resources.audio_slot(folder, "archive.org"):
+                self.assertEqual(resources.slot_count(folder, 20), 4)
+                self.assertEqual(resources.slot_count(folder / "youtube", 3), 3)
+
     def test_youtube_local_profile_is_bounded(self):
         self.assertEqual([resources.youtube_audio_slots(value) for value in ("", "0", "-1", "21", "٥", "a")],
                          [3] * 6)

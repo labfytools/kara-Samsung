@@ -1,6 +1,7 @@
 """Registre des fournisseurs et transport HTTPS."""
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date
 from email.utils import parsedate_to_datetime
 from hashlib import sha256
 import http.client
@@ -12,10 +13,10 @@ import ssl
 from time import monotonic, time
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
-from _kara_import_resources import checkpoint, current_pause, defer_service, download_event, wait_service
+from _kara_import_resources import AUDIO_INTERVALS, checkpoint, current_pause, defer_service, download_event, wait_service
 from _kara_import_result import ImportIssue
 from _parole_index import document
-from _parole_import_providers import ARCHIVE, JAMENDO, MANUAL
+from _parole_import_providers import ARCHIVE, AUDIO_HOSTS, JAMENDO, MANUAL, YOUTUBE
 from _parole_import_metrics import Transfer, limited, observe
 
 BUILTINS = {
@@ -76,6 +77,27 @@ def provider_policy(index, identity, *, validation=False):
     if not daily:
         raise ProviderUnavailable("Limite quotidienne du fournisseur atteinte")
     return daily, configured
+
+
+def audio_policies(index, *, now=None):
+    """Read the configured request budgets and observed provider signals."""
+    now = time() if now is None else now
+    with index.db(wait=.1) as db:
+        rows = db.execute("""SELECT s.id, s.state, s.config, coalesce(u.used,0) AS used,
+                                    p.until, p.status
+                             FROM sources s
+                             LEFT JOIN daily_usage u ON u.bucket='provider:' || s.id AND u.day=?
+                             LEFT JOIN import_provider_limits p ON p.source=s.id AND p.until>?
+                             WHERE s.id IN (?,?,?)""",
+                          (date.fromtimestamp(now).isoformat(), now, *AUDIO_HOSTS)).fetchall()
+    result = {}
+    for row in rows:
+        source = row["id"]
+        daily, interval = provider_limits(json.loads(row["config"])) if source != YOUTUBE else (None, 0.)
+        result[source] = dict(enabled=row["state"] == "active", daily=daily, used=row["used"],
+                              interval=max(AUDIO_INTERVALS[AUDIO_HOSTS[source]], interval),
+                              hold=max(0., (row["until"] or 0.) - now), status=row["status"])
+    return result
 
 
 def retry_delay(value):

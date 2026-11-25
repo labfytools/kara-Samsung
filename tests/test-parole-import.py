@@ -29,10 +29,10 @@ from _kara_import_queue import ImportQueue, digest
 from _kara_import_resources import MAX_DOWNLOADS, PROCESSING, YOUTUBE_DEFAULT_SLOTS, lease, slot_count
 from _kara_import_result import ImportIssue
 from _parole_index import Index, inventory
-from _parole_import_metrics import LOOKUP, SUCCEEDED, TOTAL, snapshot
+from _parole_import_metrics import LOOKUP, SUCCEEDED, TOTAL, observe, snapshot
 from _parole_import_providers import ARCHIVE, ARTIST_SITES, JAMENDO, OPEN_LICENSES
 from _parole_sources import controls, seed
-from _parole_offer import create_plan
+from _parole_offer import create_plan, rank, source_order
 from _parole_archive import parse_item as archive_item
 from _parole_jamendo import parse_release as jamendo_edition
 from _musique_oz import artist_spelling, probe
@@ -55,6 +55,13 @@ class QuietHTTP(SimpleHTTPRequestHandler):
 
 
 class QueueTests(unittest.TestCase):
+    def test_mixed_album_window_keeps_other_sources_eligible(self):
+        youtube = [playlist(f"PREMIER{i}") for i in range(231)]
+        archive = "https://archive.org/details/audit-autorise"
+        jamendo = "https://www.jamendo.com/album/48123"
+        order = list(source_order([*youtube, archive, jamendo]))
+        self.assertEqual(order[:4], [(1, youtube[0]), (232, archive), (233, jamendo), (2, youtube[1])])
+        self.assertEqual(sorted(url for _, url in order), sorted([*youtube, archive, jamendo]))
     def test_mobile_discography_approval_keeps_the_selected_artist(self):
         private = Path(self.enterContext(TemporaryDirectory()))
         queue = ImportQueue(private / "state", private)
@@ -737,6 +744,18 @@ class AlbumImportTests(unittest.TestCase):
         _, replay, _ = self.run_import(target, env=env)
         self.assertEqual((replay[0]["status"], replay[0]["processed"]), ("present", 0))
         self.assertEqual(self.requests.read_text().splitlines(), requests)
+
+    def test_speed_strategy_accounts_for_admission_on_verified_offers(self):
+        index, offers, _ = self.equivalent_catalogues()
+        index.configure(import_strategy="speed")
+        for source in (ARCHIVE, JAMENDO):
+            observe(index, source, {TOTAL: 3., SUCCEEDED: 1})
+        waits = {ARCHIVE: 12., JAMENDO: 0.}
+        fast, queued = rank(index, offers, admission_waits=waits)
+        self.assertEqual((fast.offer["provider"], fast.estimate), (JAMENDO, 3.))
+        self.assertEqual((queued.offer["provider"], queued.estimate), (ARCHIVE, 15.))
+        index.configure(import_strategy="preferred", import_preferred=ARCHIVE)
+        self.assertEqual(rank(index, offers, admission_waits=waits)[0].offer["provider"], ARCHIVE)
 
     def test_confirmed_plan_reuses_existing_release_before_any_transfer(self):
         index, offers, env = self.equivalent_catalogues()

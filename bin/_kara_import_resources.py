@@ -1,6 +1,6 @@
 """Cross-process admission and cooldowns for the import engine."""
 from contextlib import ExitStack, contextmanager
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import wait as wait_futures
 from contextvars import ContextVar, copy_context
 from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, flock
@@ -39,6 +39,7 @@ def youtube_audio_slots(value):
 AUDIO_PROVIDERS = {"youtube": (youtube_audio_slots(os.environ.get("KARA_YOUTUBE_AUDIO_SLOTS", "")), 60),
                    "archive.org": (MAX_DOWNLOADS, 5),
                    "api.jamendo.com": (MAX_DOWNLOADS, 5)}
+AUDIO_INTERVALS = {"youtube": YOUTUBE_INTERVAL, "archive.org": 1.2, "api.jamendo.com": 1.2}
 CATALOGUE = 2
 PROCESSING = 2
 DISK_RESERVE = 2 * 1024**3
@@ -420,19 +421,14 @@ def audio_slot(directory, service, interval=0., notice=None, *, provider_fd=None
         yield global_fd, provider_fd
 
 
-def download_limitations(directory):
+def download_admission(directory):
+    """Inspect provider tickets, occupied leases and gates without waiting for admission."""
     if not directory.is_dir():
-        return []
+        return {}
     with lease(directory / "admission.lock", wait=False) as fd:
-        hosts = {kind.partition("+")[0] for _, kind in pending_downloads(directory)} if fd is not None else set()
-    result = []
-    for service, (cap, _) in AUDIO_PROVIDERS.items():
-        # A provider pool can be full before any worker has a waiting ticket.
-        # The absence of tickets alone cannot hide that local profile.
-        delay = service_delay(service) if service in hosts else 0.
-        if delay > 2 or (cap < MAX_DOWNLOADS and slot_count(directory / service, cap) >= cap):
-            result.append((service, delay, cap))
-    return result
+        waiting = Counter(kind.partition("+")[0] for _, kind in pending_downloads(directory)) if fd is not None else {}
+    return {service: (waiting.get(service, 0), slot_count(directory / service, cap), service_delay(service))
+            for service, (cap, _) in AUDIO_PROVIDERS.items()}
 
 
 def check_space(path, *, state=False, extra=0):
@@ -480,4 +476,6 @@ def wait_service(service, interval, *, max_wait=60):
 
 def defer_service(service, delay):
     with lease(RATE_DIRECTORY / service) as fd:
-        rate_record(fd, time.time() + delay)
+        # A later failure can request a shorter retry. It cannot cancel the
+        # longer delay already in force for other workers of this source.
+        rate_record(fd, max(rate_record(fd), time.time() + delay))

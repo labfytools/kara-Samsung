@@ -1317,7 +1317,9 @@ class ParoleView:
                     stats["Échecs de récupération"] = value["samples"] - int(value["total"])
                 if "limited_until" in metrics:
                     expiry = datetime.fromtimestamp(metrics["limited_until"]).strftime("%d/%m %H:%M")
-                    stats["Limite temporaire"] = f"HTTP {metrics['last_http']} · jusqu’à {expiry}"
+                    status = metrics["last_http"]
+                    signal = "code API 6" if status == 6 else f"HTTP {status}"
+                    stats["Limite temporaire"] = f"{signal} · jusqu’à {expiry}"
                 show_details(widget, source["name"], json.dumps({**source, "config": config, "historique": history,
                                                                   "mesures d’import": stats},
                                                                 ensure_ascii=False, indent=2))

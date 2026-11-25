@@ -31,12 +31,12 @@ from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_cate
 from _kara_import_queue import COMPLETE, ImportQueue, digest
 from _kara_import_resources import (AUDIO_PROVIDERS, CATALOGUE, MAX_DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE,
                                    YOUTUBE_INTERVAL, ImportPause, ImportSuspended, check_space, checkpoint as pause_checkpoint,
-                                   current_pause, defer_service, download_event, download_scope, lease, resource_slot, terminate_group,
+                                   current_pause, defer_service, download_admission, download_event, download_scope, lease, resource_slot, terminate_group,
                                    memory_download_limit, track_results, wait_service, watch_download)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
                          shared_mutation, source_video)
-from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
+from _parole_import_providers import ARCHIVE, AUDIO_HOSTS, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_import_enrichment import schedule as schedule_enrichment
 from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as compare_music, duration_ms,
@@ -44,7 +44,8 @@ from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as comp
 from _parole_music_registry import (acoustic_evidence, original_tags, possible_duplicates, registered_positions,
                                     store_import, stored_fingerprint)
 from _parole_fingerprint import executable as fingerprint_tool, read as fingerprint
-from _parole_offer import load_plan, plan_id, rank as rank_offers
+from _parole_offer import load_plan, plan_id, rank as rank_offers, source_order
+from _parole_sources import audio_policies
 import _parole_archive as archive
 import _parole_jamendo as jamendo
 
@@ -1403,7 +1404,19 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
                 seen.add(item.identity)
             return
         usable = [offer for offer in plans if offer["provider"] != JAMENDO or jamendo.client_id()]
-        ranked = rank_offers(index, usable, remaining=len(positions) - len(prior))
+        admission = download_admission(inbox / ".kara-transferts")
+        policies = audio_policies(index)
+        admission_waits = {}
+        for source in (ARCHIVE, JAMENDO):
+            host = AUDIO_HOSTS[source]
+            pending, occupied, delay = admission.get(host, (0, 0, 0.))
+            # Queue estimates only affect verified equivalent offers under
+            # the speed strategy. Provider cooldowns are checked by rank().
+            admission_waits[source] = delay + (pending + (occupied >= AUDIO_PROVIDERS[host][0])) * policies.get(
+                source, {}).get("interval", 0.)
+        usable = [offer for offer in usable if (
+            (policy := policies.get(offer["provider"])) is None or policy["used"] < policy["daily"])]
+        ranked = rank_offers(index, usable, remaining=len(positions) - len(prior), admission_waits=admission_waits)
         if not ranked:
             raise ImportIssue("network", "Les fournisseurs autorisés sont temporairement indisponibles.")
         if pending := saved.get("active"):
@@ -1799,13 +1812,13 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
         return item, diagnostics
 
     def album_results():
-        targets = iter(enumerate(urls, 1))
         if not progress.managed or len(urls) == 1:
-            for index, url in targets:
+            for index, url in enumerate(urls, 1):
                 if stop.is_set() or storage_limited.is_set():
                     break
                 yield process_album(index, url)
             return
+        targets = iter(source_order(urls))
         # Leave room for albums in catalogue resolution and publication
         # while the remaining albums keep all audio slots supplied.
         with ThreadPoolExecutor(max_workers=min(ALBUM_WINDOW, len(urls))) as albums:

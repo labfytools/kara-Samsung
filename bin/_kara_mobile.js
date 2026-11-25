@@ -461,6 +461,7 @@
         `${queue.albums} album(s) terminé(s)`, `${queue.tracks} piste(s) traitée(s)`,
         `${queue.downloads} piste(s) en réception`,
         `${queue.download_slots}/${queue.download_ceiling} créneau(x) occupé(s)`, `${queue.processing} traitement(s)`,
+        `${queue.resolving_tracks ?? 0} résolution(s) YouTube`, `${queue.integrated_per_minute ?? 0} intégrée(s)/min`,
         `${queue.errors} erreur(s)`, queue.limitation
       ].filter(Boolean).join(" · ");
       $("import-controls").hidden = !state.me.organizer;

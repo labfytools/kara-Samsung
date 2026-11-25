@@ -2,6 +2,7 @@
 from collections import Counter, deque
 from dataclasses import asdict
 import json
+from math import ceil
 import os
 from pathlib import Path
 import signal
@@ -13,24 +14,26 @@ from gi.repository import Gio, GLib, Gtk, Pango
 
 from _kara_import_local import LOCAL, local_target, local_url
 from _kara_import_queue import COMPLETE, HISTORY_DAYS, ImportQueue, MAX_BATCHES, import_key
-from _kara_import_resources import (MAX_DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space,
-                                   download_limitations, lease, memory_download_limit, slot_count, storage_download_limit)
+from _kara_import_resources import (AUDIO_PROVIDERS, MAX_DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space,
+                                   download_admission, lease, memory_download_limit, slot_count, storage_download_limit)
 from _kara_import_result import CATEGORIES, ImportIssue
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY
 from _kara_paths import BIN, catalogue_command
-from _parole_import_providers import (ALL, ARCHIVE, JAMENDO, MANUAL, OPEN_LICENSES, YOUTUBE,
-                                      archive_identifier, jamendo_identifier)
+from _parole_import_providers import (ALL, ARCHIVE, AUDIO_HOSTS, JAMENDO, MANUAL, OPEN_LICENSES, YOUTUBE,
+                                      archive_identifier, audio_source, jamendo_identifier, license_for)
 from _parole_jamendo import client_id as jamendo_client
 from _parole_import_metrics import LOOKUP, DownloadConcurrency, observe
 from _parole_index import encoded_key
 from _parole_music_identity import CONFIRMED, PROBABLE, compare as compare_editions, from_catalogue, normalized
 from _parole_music_registry import approved_aliases
-from _parole_offer import create_plan, offers_are_equivalent, valid_offer
+from _parole_offer import create_plan, offers_are_equivalent, plan_id, valid_offer
+from _parole_sources import audio_policies
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
-AUDIO_EVENTS = ("audio-queued", "audio-started", "audio-first-byte", "audio-bytes",
+AUDIO_EVENTS = ("audio-queued", "audio-started", "audio-phase", "audio-first-byte", "audio-bytes",
                 "audio-transfer-ended", "audio-complete", "audio-error", "audio-dropped")
+YOUTUBE_PHASES = {"resolution-wait", "resolution", "transfer-wait", "transfer", "conversion-wait", "conversion"}
 NETWORK_FRESHNESS = 3.
 MEASURED_AUDIO = {"audio-bytes": 0, "audio-complete": 1, "album": 2, "audio-error": 3}
 
@@ -195,7 +198,9 @@ class AlbumImport(Gtk.Revealer):
         controls.append(self.concurrency)
         controls.append(Gtk.Label(label="Téléchargements simultanés"))
         self.download_concurrency = Gtk.SpinButton.new_with_range(1, MAX_DOWNLOADS, 1)
-        self.download_concurrency.set_tooltip_text("Plafond global des pistes audio téléchargées simultanément")
+        self.download_concurrency.set_tooltip_text(
+            "Plafond global des transferts. Chaque source applique aussi son profil local, "
+            "ses autorisations et les temporisations indiquées par le fournisseur.")
         self.download_concurrency_handler = self.download_concurrency.connect(
             "value-changed", lambda spin: self.configure(downloads=spin.get_value_as_int()))
         controls.append(self.download_concurrency)
@@ -465,6 +470,7 @@ class AlbumImport(Gtk.Revealer):
         self.results_header.set_visible(False)
         self.results_view.set_visible(False)
         self.download_all.set_visible(False)
+        self.download_all.set_label("Tout télécharger")
 
     def artist_changed(self, _entry):
         if self.lookup is not None and not self.lookup_live:
@@ -674,7 +680,9 @@ class AlbumImport(Gtk.Revealer):
             self.results_title.set_text(f"{len(self.albums)} résultat(s)")
             self.results_header.set_visible(True)
             self.results_view.set_visible(True)
-            self.download_all.set_visible(self.selected_provider() != ALL)
+            all_sources = self.selected_provider() == ALL
+            self.download_all.set_label("Importer les résultats libres" if all_sources else "Tout télécharger")
+            self.download_all.set_visible(not all_sources or bool(self.offers))
             self.hide_message()
         else:
             self.message("Aucune édition à licence compatible trouvée.")
@@ -749,7 +757,31 @@ class AlbumImport(Gtk.Revealer):
         return row
 
     def start_all(self, _widget):
-        self.start_queue(self.albums)
+        if self.selected_provider() != ALL:
+            self.start_queue(self.albums)
+            return
+        allowed = ({ARCHIVE} if self.can_search_archive() else set()) | ({JAMENDO} if self.can_search_jamendo() else set())
+        targets, included = [], set()
+        try:
+            for title, url in self.albums:
+                offer = self.offers.get(url)
+                if (url in included or not offer or offer["provider"] not in allowed
+                        or not license_for(offer.get("license"))):
+                    continue
+                counterpart = next((candidate for candidate in self.equivalent_offers(offer)
+                                    if candidate["url"] not in included and candidate["provider"] in allowed
+                                    and license_for(candidate.get("license"))), None)
+                if counterpart:
+                    included.update((url, counterpart["url"]))
+                    url = create_plan(self.measure_index, [offer, counterpart])
+                targets.append((title, url))
+        except (ValueError, OSError, sqlite3.Error) as error:
+            self.message("Impossible d’enregistrer l’édition multisource.", failed=True, detail=str(error))
+            return
+        if targets:
+            self.start_queue(targets)
+        else:
+            self.message("Aucun téléchargement libre disponible dans ces résultats.", failed=True)
 
     def start(self, _widget):
         url = self.link.get_text().strip()
@@ -1003,6 +1035,9 @@ class AlbumImport(Gtk.Revealer):
         downloaded = sum(amount for _, index, amount in self.audio_samples if index == 1)
         integrated = sum(amount for _, index, amount in self.audio_samples if index == 2)
         waiting_tracks = sum(job.waiting_transfers.total() for job in running)
+        phases = Counter(phase for job in running for phase in job.audio_phases.values())
+        admission = download_admission(transfers) if running else {}
+        ready_tracks = sum(pending for pending, _, _ in admission.values())
         active_albums = sum(len(job.active_albums) for job in running)
         lyrics, lrc, enrichments = self.enrichment_activity()
         ceiling, effective = self.queue.download_limits()
@@ -1013,7 +1048,7 @@ class AlbumImport(Gtk.Revealer):
         storage = storage_download_limit(inbox) if inbox.is_dir() else MAX_DOWNLOADS
         if pause_state == "running":
             proposed = self.download_controller.update(
-                now, ceiling, effective, max(1, min(memory, storage)), reserved, waiting_tracks, self.audio_counters,
+                now, ceiling, effective, max(1, min(memory, storage)), reserved, ready_tracks, self.audio_counters,
                 resource_reason=memory_reason if memory <= storage else "Réserve disque")
             if proposed != effective:
                 self.queue.set_download_limit(proposed)
@@ -1021,16 +1056,20 @@ class AlbumImport(Gtk.Revealer):
                 self.on_update(None, "queue", {"message": f"Concurrence audio · {effective} → {proposed} · {reason}"})
                 effective = proposed
         reasons = [limitation] if limitation else []
-        if memory < ceiling and waiting_tracks:
-            reasons.append(memory_reason)
-        if 0 < storage < ceiling and waiting_tracks:
-            reasons.append("Réserve disque")
-        if self.download_controller.reason and self.download_controller.reason not in reasons:
+        if effective < ceiling:
+            decision = self.download_controller.reason or (
+                "essai de débit en cours" if self.download_controller.trial else "palier retenu par le régulateur")
+            reasons.append(f"Plafond appliqué {effective}/{ceiling} · {decision}")
+        elif self.download_controller.reason:
             reasons.append(self.download_controller.reason)
-        labels = {"youtube": YOUTUBE, "archive.org": ARCHIVE, "api.jamendo.com": JAMENDO}
-        for source, delay, maximum in download_limitations(transfers) if waiting_tracks else ():
-            reasons.append(f"{labels[source]} · temporisation {delay:.0f} s" if delay > 2 else
-                           f"{labels[source]} · profil local de {maximum} créneaux")
+        if memory < ceiling and running:
+            reasons.append(f"{memory_reason} · {memory} transferts autorisés")
+        if storage < ceiling and running:
+            reasons.append(f"Réserve disque · {storage} transferts autorisés")
+        if phases["conversion-wait"]:
+            reasons.append(f"File FFmpeg · {phases['conversion-wait']} piste(s) attendent un traitement")
+        if running:
+            reasons.extend(self.provider_admission_reasons(running, admission))
         progressed = sum(job.album_fraction for job in running)
         progress = min(1., (settled + progressed) / planned) if planned else 0.
         owner_rows = [job.snapshot() for job in reversed(self.imports)]
@@ -1038,7 +1077,8 @@ class AlbumImport(Gtk.Revealer):
                                                   errors=errors, downloads=downloads, download_slots=reserved,
                                                   processing=processing,
                                                   download_ceiling=ceiling, download_limit=effective,
-                                                  waiting_tracks=waiting_tracks, active_albums=active_albums,
+                                                  waiting_tracks=ready_tracks, active_albums=active_albums,
+                                                  resolving_tracks=phases["resolution"],
                                                   downloaded_per_minute=downloaded, integrated_per_minute=integrated,
                                                   audio_bytes_per_second=rate, enrichments=enrichments,
                                                   import_lyrics_active=lyrics, import_lrc_active=lrc,
@@ -1048,16 +1088,56 @@ class AlbumImport(Gtk.Revealer):
                                                   limitation=" · ".join(reasons),
                                                   max_batches=MAX_BATCHES))
         summary = (f"{downloads} pistes en réception · {reserved}/{ceiling} créneaux occupés · {active} lots actifs · "
-                   f"{rate / 1024**2:.2f} Mio/s · {waiting_tracks} pistes prêtes en attente\n"
+                   f"{rate / 1024**2:.2f} Mio/s · {ready_tracks} pistes prêtes pour un créneau\n"
                    f"{downloaded} pistes reçues/min · {integrated} intégrées/min · "
                    f"{active_albums} albums en cours · {albums} audio complets · {waiting} lots en attente\n"
+                   f"{phases['resolution']} résolutions YouTube · {max(0, waiting_tracks - ready_tracks)} pistes à préparer · "
                    f"{processing}/{PROCESSING} traitements · {enrichments} enrichissements · "
                    f"{lyrics} recherches de texte · {lrc} LRC · {errors} lots en échec")
-        if effective < ceiling:
-            reasons.insert(0, f"Plafond appliqué · {effective}")
-        self.queue_status.set_text(f"{summary}\n{' · '.join(reasons)}" if reasons else summary)
+        self.queue_status.set_text("\n".join((summary, *reasons)))
         self.overall.set_fraction(progress)
         self.overall.set_text(f"Progression globale · {progress:.0%}")
+
+    def provider_admission_reasons(self, running, admission):
+        try:
+            policies = audio_policies(self.measure_index) if self.measure_index else {}
+        except (OSError, ValueError, sqlite3.Error):
+            policies = {}
+        targets = {url for job in running if job.option is None for _, url in job.jobs
+                   if job.outcomes.get(url, {}).get("status") not in COMPLETE}
+        sources = {audio_source(url) for url in targets}
+        has_plan = any(plan_id(url) for url in targets)
+        reasons = []
+        if targets and sources == {YOUTUBE}:
+            reasons.append("Cibles audio du lot en cours · YouTube Music uniquement")
+        jamendo_ready = bool(jamendo_client())
+        if targets and not jamendo_ready:
+            reasons.append("Jamendo · identifiant d’application absent")
+        for source, host in AUDIO_HOSTS.items():
+            pending, occupied, delay = admission.get(host, (0, 0, 0.))
+            if not (pending or occupied or source in sources or has_plan and source in {ARCHIVE, JAMENDO}):
+                continue
+            cap, _ = AUDIO_PROVIDERS[host]
+            policy = policies.get(source, {})
+            if source == JAMENDO and not jamendo_ready:
+                continue
+            if policy and not policy["enabled"]:
+                reasons.append(f"{source} · source désactivée dans Parole")
+                continue
+            if policy.get("daily") is not None and policy["used"] >= policy["daily"]:
+                reasons.append(f"{source} · quota local épuisé ({policy['used']}/{policy['daily']} requêtes)")
+            if policy.get("hold", 0.) > 0:
+                status = policy["status"]
+                signal = "code API 6" if status == 6 else f"HTTP {status}"
+                reasons.append(f"{source} · délai fournisseur ({signal}) · {ceil(policy['hold'])} s restantes")
+            elif delay > policy.get("interval", 2.) + .25:
+                reasons.append(f"{source} · temporisation réseau · {ceil(delay)} s restantes")
+            if occupied >= cap or source == YOUTUBE:
+                unit = "opérations réseau" if source == YOUTUBE else "transferts"
+                reasons.append(f"{source} · profil local · {occupied}/{cap} {unit}")
+            if pending and source != YOUTUBE and policy.get("interval"):
+                reasons.append(f"{source} · départs espacés de {policy['interval']:g} s (profil local)")
+        return reasons
 
     def import_finished(self, job):
         # A normal worker already committed. A failed spawn or an abrupt
@@ -1153,6 +1233,7 @@ class ImportJob(Gtk.Box):
         self.outcomes = {}
         self.waiting_transfers = Counter()
         self.network_transfers = {}
+        self.audio_phases = {}
         self.active_albums = set()
         self.unstructured = deque(maxlen=32)
         self.failed_jobs = []
@@ -1307,6 +1388,12 @@ class ImportJob(Gtk.Box):
                     self.network_transfers.pop(key, None)
                 elif event in ("audio-first-byte", "audio-bytes"):
                     self.network_transfers[key] = monotonic()
+                elif event == "audio-phase":
+                    phase = payload.get("phase")
+                    if phase == "done":
+                        self.audio_phases.pop(key, None)
+                    elif isinstance(phase, str) and phase in YOUTUBE_PHASES:
+                        self.audio_phases[key] = phase
             self.on_update(self, event, payload)
             return
         if event == "album-started":
@@ -1358,6 +1445,7 @@ class ImportJob(Gtk.Box):
             self.stop.set_sensitive(False)
             self.waiting_transfers.clear()
             self.network_transfers.clear()
+            self.audio_phases.clear()
             self.active_albums.clear()
             self.album_fraction = 0.
             self.message(text)
@@ -1375,6 +1463,7 @@ class ImportJob(Gtk.Box):
     def finish_import(self, event, text, fraction, detail, *, notify=True, history=False):
         self.process = None
         self.network_transfers.clear()
+        self.audio_phases.clear()
         if self.timer is not None:
             GLib.source_remove(self.timer)
             self.timer = None

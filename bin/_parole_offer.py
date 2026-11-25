@@ -1,12 +1,12 @@
 """Verified equivalent offers, persisted before a managed job can claim them."""
 from dataclasses import dataclass
-from itertools import combinations
+from itertools import combinations, zip_longest
 from math import isfinite
 from time import time
 from urllib.parse import urlsplit
 
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot
-from _parole_import_providers import ARCHIVE, JAMENDO, archive_identifier, jamendo_identifier
+from _parole_import_providers import ARCHIVE, JAMENDO, archive_identifier, audio_source, jamendo_identifier
 from _parole_index import document, encoded_key
 from _parole_music_identity import CONFIRMED, compare, from_catalogue
 from _parole_music_registry import approved_aliases
@@ -27,6 +27,16 @@ def plan_id(url):
         return None
     value = url.removeprefix(GROUP_PREFIX)
     return value if len(value) == 64 and all(ch in "0123456789abcdef" for ch in value) else None
+
+
+def source_order(urls):
+    # Keep intra-source order and the original ordinal, while bringing
+    # each requested source into the bounded album window from the start.
+    lanes = {}
+    for ordinal, url in enumerate(urls, 1):
+        lane = "edition" if plan_id(url) else audio_source(url)
+        lanes.setdefault(lane, []).append((ordinal, url))
+    return (item for group in zip_longest(*lanes.values()) for item in group if item is not None)
 
 
 def offers_are_equivalent(left, right, *, index=None):
@@ -130,7 +140,7 @@ class Ranked:
     reason: str
 
 
-def rank(index, offers, *, remaining=None, now=None):
+def rank(index, offers, *, remaining=None, now=None, admission_waits=None):
     now = time() if now is None else now
     config = index.settings()
     strategy = config["import_strategy"]
@@ -174,8 +184,11 @@ def rank(index, offers, *, remaining=None, now=None):
             reason = "qualité audio disponible puis délai estimé"
         else:
             trial = explore and samples == 0
-            priority = (0, not trial, eta, -quality[0], -int(quality[1]))
-            reason = ("premier transfert sur une source équivalente" if trial else
+            wait = (admission_waits or {}).get(offer["provider"], 0.) if strategy == "speed" else 0.
+            priority = (0, not trial, eta + wait, -quality[0], -int(quality[1]))
+            estimate = eta + wait if estimate is not None or wait else None
+            reason = ("délai estimé avec attente de créneau" if wait else
+                      "premier transfert sur une source équivalente" if trial else
                       "délai de récupération estimé" if estimate is not None else "débit encore inconnu")
         order.append((priority, offer["provider"], offer["url"], Ranked(offer, estimate, throughput, reason)))
     return [value[-1] for value in sorted(order, key=lambda value: value[:3])]

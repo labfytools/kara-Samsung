@@ -3,6 +3,8 @@ from math import exp, isfinite
 import sqlite3
 from time import time
 
+from _parole_import_providers import JAMENDO
+
 LOOKUP = "lookup"
 STARTUP = "startup"
 THROUGHPUT = "throughput"
@@ -42,7 +44,8 @@ def observe(index, source, values, *, now=None):
 
 
 def limited(index, source, seconds, status, *, now=None):
-    if index is None or not source or status != 429 and not 500 <= status < 600:
+    provider_limit = status == 429 or 500 <= status < 600 or source == JAMENDO and status == 6
+    if index is None or not source or not provider_limit:
         return
     deadline = (time() if now is None else now) + max(0, seconds)
     try:

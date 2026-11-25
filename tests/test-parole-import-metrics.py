@@ -1,15 +1,20 @@
 #!/usr/bin/python3 -B
 """Provider observations use real units and durable, per-source admission state."""
 from pathlib import Path
+import os
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, WEEK, limited, observe, snapshot
 from _parole_index import Index
+from _kara_import_result import ImportIssue
+import _kara_import_resources as resources
+import _parole_jamendo as jamendo
 from _parole_lyrics_lookup import backoff, contexts, provider_profiles, record_profile
-from _parole_sources import controls, seed
+from _parole_sources import audio_policies, configure_limits, controls, seed
 
 
 class Measurements(unittest.TestCase):
@@ -54,6 +59,23 @@ class Measurements(unittest.TestCase):
         clock.received(2 * 1024**2 + 8192, 12.5)
         clock.received(4, 13.)
         self.assertEqual(clock.measurements(), {STARTUP: 2., THROUGHPUT: 4 * 1024**2})
+
+    def test_local_quota_and_jamendo_api_limit_have_distinct_origins(self):
+        seed(self.index)
+        configure_limits(self.index, "Internet Archive", 1, 5)
+        self.assertTrue(self.index.reserve_daily("provider:Internet Archive", 1))
+        with patch.dict(os.environ, KARA_JAMENDO_CLIENT_ID="fixtureid"), patch.object(
+                resources, "RATE_DIRECTORY", self.state / "rates"), patch.object(jamendo, "fetch", return_value={
+                    "headers": {"status": "failed", "code": 6}}):
+            with self.assertRaisesRegex(ImportIssue, "code API 6"):
+                jamendo.api_results(self.index, "albums")
+            self.assertGreater(resources.service_delay("api.jamendo.com"), 110)
+            resources.defer_service("api.jamendo.com", 2)
+            self.assertGreater(resources.service_delay("api.jamendo.com"), 110)
+        policies = audio_policies(self.index)
+        archive = policies["Internet Archive"]
+        self.assertEqual((archive["daily"], archive["used"], archive["interval"], archive["hold"]), (1, 1, 5, 0))
+        self.assertEqual(policies["Jamendo"]["status"], 6)
 
     def test_audio_body_events_exclude_setup_and_finish_once(self):
         events = []

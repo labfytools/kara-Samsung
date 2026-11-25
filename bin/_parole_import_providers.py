@@ -10,6 +10,7 @@ YOUTUBE = "YouTube Music"
 ARTIST_SITES = "Sites d’artistes et de labels"
 ARCHIVE = "Internet Archive"
 JAMENDO = "Jamendo"
+AUDIO_HOSTS = {YOUTUBE: "youtube", ARCHIVE: "archive.org", JAMENDO: "api.jamendo.com"}
 ARCHIVE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 JAMENDO_ID = re.compile(r"[1-9][0-9]{0,11}")
 OPEN_LICENSES = {
@@ -37,6 +38,18 @@ def jamendo_identifier(parts):
         return None
     match = re.fullmatch(r"/(track|album)/([1-9][0-9]{0,11})(?:/[A-Za-z0-9_-]{1,160})?/?", parts.path)
     return (match[1], match[2]) if match else None
+
+
+def audio_source(url):
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    if archive_identifier(parts):
+        return ARCHIVE
+    if jamendo_identifier(parts):
+        return JAMENDO
+    return YOUTUBE if parts.hostname in {"music.youtube.com", "www.youtube.com", "youtube.com", "youtu.be"} else ""
 
 
 def license_for(value):

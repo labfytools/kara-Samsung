@@ -6,15 +6,17 @@ import re
 from urllib.parse import urlencode, urlsplit
 
 from _kara_import_local import Entry
-from _kara_import_resources import audio_slot
+from _kara_import_resources import AUDIO_INTERVALS, audio_slot, defer_service
 from _kara_import_result import ImportIssue
+from _parole_import_metrics import limited
 from _parole_import_providers import JAMENDO, JAMENDO_ID, license_for
 from _parole_sources import ProviderUnavailable, download_interval, fetch, open_audio
 
 API = "https://api.jamendo.com/v3.0"
 DOMAIN = "jamendo.com"
 CLIENT = re.compile(r"[A-Za-z0-9]{6,64}")
-INTERVAL = 1.2
+HOST = "api.jamendo.com"
+INTERVAL = AUDIO_INTERVALS[HOST]
 
 
 def client_id():
@@ -42,6 +44,12 @@ def api_results(index, endpoint, **params):
         raise ImportIssue("processing", "Réponse Jamendo invalide.")
     if headers.get("status") != "success" or headers.get("code") != 0:
         code = headers.get("code")
+        if code == 6:
+            # Jamendo can signal rate limiting in a successful HTTP reply.
+            # Reuse the provider cooldown used for throttled HTTP responses.
+            defer_service(HOST, 120)
+            limited(index, JAMENDO, 120, 6)
+            raise ImportIssue("network", "Limitation Jamendo (code API 6).", stage="Catalogue Jamendo")
         message = f"Accès au catalogue Jamendo refusé (code {code})." if type(code) is int else "Accès Jamendo refusé."
         raise ImportIssue("path", message, stage="Catalogue Jamendo")
     results = value.get("results")
@@ -178,8 +186,8 @@ def open_track(index, inbox, track):
     query = urlencode(dict(client_id=identity, id=track.identifier, audioformat="flac", action="download"))
     url = f"{API}/tracks/file/?{query}"
     interval = download_interval(index, JAMENDO, INTERVAL)
-    with audio_slot(inbox / ".kara-transferts", "api.jamendo.com", interval), open_audio(
-            url, registry=index, provider=JAMENDO, service="api.jamendo.com", hosts=(DOMAIN,),
+    with audio_slot(inbox / ".kara-transferts", HOST, interval), open_audio(
+            url, registry=index, provider=JAMENDO, service=HOST, hosts=(DOMAIN,),
             interval=INTERVAL, paced=True) as stream:
         yield stream
 

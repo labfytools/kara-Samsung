@@ -6,7 +6,7 @@ import re
 from urllib.parse import quote, urlencode
 
 from _kara_import_local import Entry, MAX_AUDIO, MAX_ENTRIES
-from _kara_import_resources import audio_slot
+from _kara_import_resources import AUDIO_INTERVALS, audio_slot
 from _kara_import_result import ImportIssue
 from _musique_oz import AUDIO
 from _parole_import_providers import ARCHIVE, ARCHIVE_ID as IDENTIFIER, license_for
@@ -14,10 +14,10 @@ from _parole_music_identity import position
 from _parole_sources import ProviderUnavailable, download_interval, fetch, open_audio
 
 HOST = "archive.org"
+INTERVAL = AUDIO_INTERVALS[HOST]
 SITE = "https://archive.org"
 DOCS = SITE + "/developers/md-read.html"
 SHA1 = re.compile(r"[0-9a-f]{40}")
-INTERVAL = 1.2
 
 
 def release_url(value):
