@@ -50,11 +50,21 @@ La quantification Q5_0 a été comparée sur les trois mêmes extraits, avec la 
 | Référence historique, deux morceaux complets | 4,43 chansons/h et 60,4 Mio par chanson. [Détail](parole-v3.md#essais-nocturnes-sur-archasp) |
 | Référence élargie | Les dix audios et LRC sont accessibles. Au seuil de 1 %, les essais Demucs ont été interrompus avant publication. Les trois premiers essais instrumentés ont atteint 1,16 à 1,29 % de pression mémoire. Après libération de mémoire et stabilisation du profil, un autre essai s’est arrêté à 1,52 %, avec 5,9 Gio encore disponibles. |
 | Témoin indépendant | La première analyse intégrale à 1 % de PSI a été arrêtée après 4,3 s. La qualification F16 a ensuite terminé sur trois extraits annotés. |
-| Capot fermé | La réouverture a interrompu une première mesure après 4,3 s. La seconde séquence de charge s’est arrêtée après 29,0 s à 3,05 % de PSI, avec des maxima CPU/GPU de 64,9/58 °C. |
+| Capot fermé | Un parcours physique complet a terminé en 318,4 s, après deux essais interrompus. |
 
 Les journaux privés de cette campagne se trouvent sous `.runtime/preparation-perf/`. Les tentatives interrompues sont exclues du débit et des moyennes de traitement.
 
-La qualification physique utilise `--closed-lid` dans un dossier séparé. Démarrer sur secteur et capot ouvert. Le banc prend un inhibiteur logind temporaire pour l’action du capot, annonce sa disponibilité et attend la fermeture physique. Il garde le plafond de 70 °C sur chacun des deux capteurs. La réouverture et une demande de mise en veille interrompent les moteurs. À la sortie des deux essais, l’inhibiteur a disparu et le profil Performance initial a été rétabli. La qualification prolongée reste en attente.
+La qualification physique utilise `--closed-lid` dans un dossier séparé. Démarrer sur secteur et capot ouvert. Le banc prend un inhibiteur logind temporaire pour l’action du capot, annonce sa disponibilité et attend la fermeture physique. Il garde le plafond de 70 °C sur chacun des deux capteurs. La réouverture et une demande de mise en veille interrompent les moteurs. La première réouverture a arrêté le banc après 4,3 s. Le deuxième essai s’est arrêté après 29,0 s à 3,05 % de PSI, avec des maxima CPU/GPU de 64,9/58 °C.
+
+| Même titre de Joe Dassin, profil Économie | Capot ouvert | Capot fermé |
+| --- | ---: | ---: |
+| Demucs | 155,4 s | 150,2 s |
+| Turbo | 162,4 s | 168,1 s |
+| Total | 317,8 s | 318,4 s |
+| Maxima CPU / GPU | 74,9 / 68 °C | 62,6 / 56 °C |
+| Couverture mots / débuts de ligne | 95,2 / 97,0 % | 95,2 / 97,0 % |
+
+Le PCM des deux pistes, le LRC et les observations par ligne sont identiques sur les deux passages. Le maximum de PSI du parcours capot fermé est de 0,79 %, sous le seuil de production de 1 %. La mesure valide un morceau complet sous ces conditions. La comparaison thermique dépend de la charge de fond et de la température au départ. Une période nocturne entière sous charge reste à observer. L’inhibiteur a disparu, le capot a été rouvert et le profil initial Performance est rétabli. L’option capot fermé du service reste désactivée. Les mesures physiques se trouvent sous `lid-closed/` et `lid-closed-final/`.
 
 ### Premier parcours complet du comparatif manuel
 
@@ -140,6 +150,8 @@ Le manifeste Turbo et ses repères sont déjà persistés séparément des piste
 ### Compatibilité du moteur de séparation
 
 L’environnement installé associe Demucs 4.0.1 à PyTorch et Torchaudio 2.6.0 `+cpu`. Il déclare `cuda=None` et `hip=None`. Le Vulkan de whisper.cpp équipe Turbo. Demucs utilise le modèle `htdemucs`, des segments de 7 s, un chevauchement de 10 %, zéro décalage aléatoire et une tâche de segment. Le traitement produit les deux stems FLAC. Demucs expose un parallélisme de segments sur CPU et plusieurs modèles. Leur coût mémoire, leur vitesse et la qualité nécessitent des comparaisons sur des morceaux terminés. [Implémentation Demucs](https://github.com/facebookresearch/demucs/blob/main/demucs/apply.py) · [Matrice AMD ROCm](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html)
+
+La CLI charge et traite un morceau à la fois. Son lot de calcul contient un seul mix stéréo. `-j` augmente le nombre de segments pouvant être évalués en parallèle sur CPU et peut accroître l’occupation mémoire. Le modèle HTDemucs fixe un contexte maximal proche de 7,8 s. Les variantes `htdemucs_ft`, `htdemucs_6s` et MDX sont exposées par Demucs, mais le cache local contient uniquement les poids `htdemucs` utilisés au banc. Le chronométrage des dix titres place le décodage et l’encodage FLAC loin derrière le calcul de séparation. Le banc a fait varier les fils CPU en conservant le segment, le lot et les poids de référence. Aucun changement de segment, de lot ou de modèle n’a été qualifié.
 
 ### Demucs à six fils CPU
 
