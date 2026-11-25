@@ -10,6 +10,7 @@ from _parole_import_metrics import STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, WEEK, 
 from _parole_import_providers import ARCHIVE, JAMENDO
 from _parole_index import Index
 from _parole_offer import create_plan, load_plan, plan_id, rank
+from _parole_music_registry import approved_aliases, set_alias
 from _parole_sources import seed
 
 MIB = 1024**2
@@ -73,6 +74,18 @@ class OfferTests(unittest.TestCase):
         later = 1000 + 12 * WEEK
         observe(self.index, JAMENDO, {TOTAL: 3., SUCCEEDED: 1}, now=later)
         self.assertEqual(rank(self.index, self.offers, now=later)[0].offer["provider"], JAMENDO)
+
+    def test_manual_artist_alias_is_scoped_and_revocable(self):
+        left, right = self.offers
+        alternate = right | {"facts": right["facts"] | {"artist": "L’Atelier"}}
+        with self.assertRaises(ValueError):
+            create_plan(self.index, [left, alternate])
+        set_alias(self.index, "Album", "Atelier", "L’Atelier", enabled=True)
+        self.assertEqual(approved_aliases(self.index, "Autre album"), ())
+        identifier = plan_id(create_plan(self.index, [left, alternate]))
+        self.assertTrue(load_plan(self.index, identifier))
+        set_alias(self.index, "Album", "L’Atelier", "Atelier", enabled=False)
+        self.assertFalse(load_plan(self.index, identifier))
 
 
 if __name__ == "__main__":

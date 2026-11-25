@@ -12,6 +12,7 @@ from _kara_import import show_details
 from _parole_index import key, document, encoded_key, sidecar
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_offer import AUTOMATIC, STRATEGIES
+from _parole_music_registry import set_alias
 from _parole_sources import configure_limits, controls, provider_limits
 from _parole_resources import GIB
 from _parole_work import save_correction
@@ -896,6 +897,7 @@ class ParoleView:
             categories.append(widget)
         general.append(categories)
         general.append(button("Regroupements et exclusions", self.associations))
+        general.append(button("Alias d’artiste pour une édition", self.comparison_aliases))
         general.append(button("Liste de lecture Strawberry", self.control.show_library))
         general.append(button("Rechercher les pochettes manquantes", lambda b: self.control.search_missing(
             b, "--pochettes-manquantes", "Pochettes manquantes")))
@@ -986,9 +988,38 @@ class ParoleView:
         with self.index.db() as db:
             associations = db.execute("SELECT * FROM associations ORDER BY new_artist,album").fetchall()
             exclusions = db.execute("SELECT * FROM exclusions ORDER BY kind,subject").fetchall()
+            aliases = db.execute("SELECT * FROM canonical_aliases ORDER BY album,first_key").fetchall()
         lines = [f"{r['old_artist']} → {r['new_artist']} · {r['album']} · {r['provenance']}" for r in associations]
+        lines += [f"{r['first_name']} / {r['second_name']} · {r['album']} · alias de comparaison" for r in aliases]
         lines += [f"Exclusion · {r['kind']} · {r['subject']}" for r in exclusions]
         show_details(widget, "Regroupements validés et exclusions", "\n".join(lines))
+
+    def comparison_aliases(self, widget):
+        window = Gtk.Window(title="Alias d’artiste pour une édition", transient_for=widget.get_root(),
+                            modal=True, destroy_with_parent=True, default_width=490)
+        fields = [Gtk.Entry(placeholder_text=label, max_length=180) for label in
+                  ("Album", "Première graphie de l’artiste", "Autre graphie de l’artiste")]
+        area = box(css_classes=["panel-content"])
+        for entry in fields:
+            area.append(entry)
+        status = Gtk.Label(wrap=True, xalign=0)
+        actions = box(Gtk.Orientation.HORIZONTAL)
+
+        def change(_button, enabled):
+            try:
+                set_alias(self.index, *(entry.get_text() for entry in fields), enabled=enabled)
+            except (sqlite3.Error, ValueError) as error:
+                status.set_text(str(error))
+            else:
+                status.set_text("Alias de comparaison enregistré." if enabled else "Association retirée.")
+                self.maintenance.journal.emit("ALBUM", status.get_text())
+
+        actions.append(button("Enregistrer l’alias", lambda w: change(w, True)))
+        actions.append(button("Retirer l’alias", lambda w: change(w, False)))
+        area.append(actions)
+        area.append(status)
+        window.set_child(area)
+        window.present()
 
     def codex_controls(self, area):
         store = Gio.ListStore(item_type=Row)

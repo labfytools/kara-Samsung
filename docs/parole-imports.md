@@ -128,6 +128,8 @@ Le motif, le débit observé et le délai estimé, quand ils existent, figurent 
 
 L’index de maintenance contient les identités locales de l’édition et de l’enregistrement ainsi que les références de fournisseur. Il conserve les identifiants d’œuvre, de groupe de publications et de catalogue lorsqu’ils sont disponibles. **Détails → Provenance** présente les tags d’origine utiles à l’identification et les preuves, séparément des tags fournis par les catalogues. Un renommage établi par l’inventaire conserve l’identité et déplace la référence vers le chemin actuel.
 
+Les rapprochements de recherches portent un niveau de confiance et des preuves consultables via **Comparer**. Pour approuver deux graphies d’un artiste sur une édition, utiliser **Paramètres → Général → Alias d’artiste pour une édition**. L’alias est révocable et s’applique au titre d’album renseigné. Les regroupements validés précédemment restent disponibles. Le formulaire n’écrit aucun tag ni fichier musical.
+
 Le tri peut réutiliser un fichier déjà publié si son original est identique octet pour octet, ou si l’identité PCM concorde dans une édition et à une position établies. Le fichier en bibliothèque est revérifié. Les crédits, fichiers associés et préparations existants sont conservés. Une édition distincte peut contenir le même enregistrement. La correspondance du PCM seule ne fusionne donc pas ses éditions.
 
 ## Validation

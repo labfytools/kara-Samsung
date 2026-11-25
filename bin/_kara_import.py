@@ -1,5 +1,6 @@
 """Recherche et import d’albums dans la fenêtre de paroles."""
 from collections import deque
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,9 @@ from _parole_import_providers import (ALL, ARCHIVE, JAMENDO, MANUAL, OPEN_LICENS
                                       archive_identifier, jamendo_identifier)
 from _parole_jamendo import client_id as jamendo_client
 from _parole_import_metrics import LOOKUP, observe
+from _parole_index import encoded_key
 from _parole_music_identity import CONFIRMED, PROBABLE, compare as compare_editions, from_catalogue, normalized
+from _parole_music_registry import approved_aliases
 from _parole_offer import create_plan, offers_are_equivalent, valid_offer
 
 KARA = BIN / "kara"
@@ -88,6 +91,7 @@ class AlbumImport(Gtk.Revealer):
         self.measure_index = None
         self.albums = []
         self.edition_facts = {}
+        self.edition_reviews = {}
         self.offers = {}
         self.offer_rows = {}
         self.by_id = {}
@@ -343,6 +347,7 @@ class AlbumImport(Gtk.Revealer):
     def clear_results(self):
         self.albums = []
         self.edition_facts.clear()
+        self.edition_reviews.clear()
         self.offers.clear()
         self.offer_rows.clear()
         while row := self.results.get_first_child():
@@ -546,8 +551,13 @@ class AlbumImport(Gtk.Revealer):
                 label.set_tooltip_text(text)
                 self.offer_rows[target[1]] = existing
             else:
-                self.offer_rows[target[1]] = self.add_row(
+                row = self.offer_rows[target[1]] = self.add_row(
                     text, "Télécharger", lambda _button, selected=target: self.start_offer(selected))
+                if comparisons := self.edition_reviews.get(target[1]):
+                    detail = Gtk.Button(label="Comparer")
+                    detail.connect("clicked", lambda widget, values=comparisons: show_details(
+                        widget, "Correspondances d’édition", json.dumps(values, ensure_ascii=False, indent=2)))
+                    row.append(detail)
         if self.albums:
             self.results_title.set_text(f"{len(self.albums)} résultat(s)")
             self.results_header.set_visible(True)
@@ -563,17 +573,33 @@ class AlbumImport(Gtk.Revealer):
         facts = from_catalogue(offer.get("facts"))
         if facts is None:
             return ""
+        try:
+            aliases = approved_aliases(self.measure_index, facts.title)
+        except sqlite3.Error:
+            aliases = ()
         verdicts = set()
-        for existing_source, existing in self.edition_facts.values():
+        reviews = []
+        for url, (existing_source, existing) in self.edition_facts.items():
             if existing_source == source or existing is None or normalized(existing.title) != normalized(facts.title):
                 continue
-            result = compare_editions(existing, facts)
+            result = compare_editions(existing, facts, aliases)
             verdicts.add(result.confidence)
+            data = {"confiance": result.confidence, "preuves": result.reasons, "positions": result.positions,
+                    "sources": [{"fournisseur": existing_source, "lien": url, "édition": asdict(existing)},
+                                {"fournisseur": source, "lien": offer["url"], "édition": asdict(facts)}]}
+            reviews.append(data)
+            if self.measure_index is not None:
+                try:
+                    identity = encoded_key("comparison-edition", sorted((url, offer["url"])))
+                    self.measure_index.review("identity", identity, result.confidence, data)
+                except sqlite3.Error:
+                    pass
             self.on_update(None, "provider", {
                 "provider": source, "message": f"{existing_source} / {source} · {facts.title} · {result.confidence} · "
                                               + ", ".join(result.reasons),
             })
         self.edition_facts[offer["url"]] = (source, facts)
+        self.edition_reviews[offer["url"]] = reviews
         if CONFIRMED in verdicts:
             return "Édition confirmée"
         return "Édition à vérifier" if PROBABLE in verdicts else ""
@@ -581,7 +607,11 @@ class AlbumImport(Gtk.Revealer):
     def equivalent_offers(self, candidate):
         if self.selected_provider() != ALL or not valid_offer(candidate):
             return []
-        return [other for other in self.offers.values() if valid_offer(other) and offers_are_equivalent(other, candidate)]
+        try:
+            return [other for other in self.offers.values()
+                    if valid_offer(other) and offers_are_equivalent(other, candidate, index=self.measure_index)]
+        except sqlite3.Error:
+            return []
 
     def start_offer(self, target):
         title, url = target

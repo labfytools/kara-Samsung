@@ -9,6 +9,7 @@ from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL
 from _parole_import_providers import ARCHIVE, JAMENDO, archive_identifier, jamendo_identifier
 from _parole_index import document, encoded_key
 from _parole_music_identity import CONFIRMED, compare, from_catalogue
+from _parole_music_registry import approved_aliases
 
 STRATEGIES = {
     "speed": "Vitesse maximale",
@@ -28,9 +29,12 @@ def plan_id(url):
     return value if len(value) == 64 and all(ch in "0123456789abcdef" for ch in value) else None
 
 
-def offers_are_equivalent(left, right):
+def offers_are_equivalent(left, right, *, index=None):
+    first, second = from_catalogue(left.get("facts")), from_catalogue(right.get("facts"))
+    if first is None or second is None:
+        return False
     return (left["provider"] != right["provider"]
-            and compare(from_catalogue(left.get("facts")), from_catalogue(right.get("facts"))).confidence == CONFIRMED)
+            and compare(first, second, approved_aliases(index, first.title)).confidence == CONFIRMED)
 
 
 def valid_offer(offer):
@@ -62,7 +66,7 @@ def create_plan(index, offers):
     if not 2 <= len(offers) <= len(AUTOMATIC) or not all(valid_offer(offer) for offer in offers):
         raise ValueError("Deux offres de téléchargement d’édition vérifiables sont nécessaires.")
     offers = sorted(offers, key=lambda offer: (offer["provider"], offer["url"]))
-    if any(not offers_are_equivalent(a, b) for a, b in combinations(offers, 2)):
+    if any(not offers_are_equivalent(a, b, index=index) for a, b in combinations(offers, 2)):
         raise ValueError("Les offres ne désignent pas toutes la même édition confirmée.")
     if len(document(offers).encode()) > 1_000_000:
         raise ValueError("Descriptif d’édition trop volumineux.")
@@ -98,7 +102,7 @@ def load_plan(index, identity):
     if not 2 <= len(offers) <= len(AUTOMATIC) or not all(valid_offer(offer) for offer in offers):
         return []
     if (stable_plan_id(offers) != identity or
-            any(not offers_are_equivalent(a, b) for a, b in combinations(offers, 2))):
+            any(not offers_are_equivalent(a, b, index=index) for a, b in combinations(offers, 2))):
         return []
     return offers
 

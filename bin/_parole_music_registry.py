@@ -48,6 +48,33 @@ def comparison_tags(proof):
     return {**proof.get("catalogue_tags", {}), **proof.get("tags", {})}
 
 
+def set_alias(index, album, first, second, *, enabled):
+    title = normalized(album)
+    names = sorted((normalized(value), value.strip()) for value in (first, second))
+    if (not title or not all(key for key, _ in names) or names[0][0] == names[1][0]
+            or any(len(value) > 180 for value in (album, first, second))):
+        raise ValueError("Indique deux graphies distinctes et leur album commun.")
+    (left, first_name), (right, second_name) = names
+    with index.db() as db:
+        if enabled:
+            db.execute("INSERT OR IGNORE INTO canonical_aliases VALUES(?,?,?,?,?)",
+                       (title, left, right, first_name, second_name))
+        else:
+            db.execute("DELETE FROM canonical_aliases WHERE album=? AND first_key=? AND second_key=?", (title, left, right))
+
+
+def approved_aliases(index, album):
+    if index is None:
+        return ()
+    with index.db() as db:
+        # Legacy artist regroupements already approved for the same album
+        # remain evidence. New aliases are comparison-only and never move it.
+        return tuple(tuple(row) for row in db.execute("""
+            SELECT first_name,second_name FROM canonical_aliases WHERE album=?
+            UNION SELECT old_artist,new_artist FROM associations WHERE album=? ORDER BY 1,2 LIMIT 100
+        """, (normalized(album), album)))
+
+
 def track_metadata(tags, pcm=""):
     metadata = recording_metadata(tags, pcm)
     title, artist = tags.get("title") or "", tags.get("artist") or tags.get("albumartist") or ""

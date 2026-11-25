@@ -139,6 +139,11 @@ class Index:
                 CREATE INDEX IF NOT EXISTS canonical_reference_recording ON canonical_references(recording);
                 CREATE INDEX IF NOT EXISTS canonical_reference_path ON canonical_references(path);
                 CREATE INDEX IF NOT EXISTS canonical_reference_song ON canonical_references(song);
+                CREATE TABLE IF NOT EXISTS canonical_aliases (
+                    album TEXT NOT NULL, first_key TEXT NOT NULL, second_key TEXT NOT NULL,
+                    first_name TEXT NOT NULL, second_name TEXT NOT NULL,
+                    PRIMARY KEY(album, first_key, second_key)
+                );
                 CREATE TABLE IF NOT EXISTS exclusions (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(kind, subject)
                 );
