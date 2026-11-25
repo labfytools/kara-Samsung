@@ -529,9 +529,11 @@ class Maintenance:
             return {"state": "limited"}
 
         def lookup(kind):
-            _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]],
-                                  settings["network_timeout"],
-                                  maximum=6 * MAX_LRC_BYTES + 1024)
+            try:
+                _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]],
+                                      settings["network_timeout"], maximum=6 * MAX_LRC_BYTES + 1024)
+            except TimeoutError:
+                return {"state": "unavailable"}
             return json.loads(data)
 
         result = {"state": "not_found"}
@@ -540,7 +542,10 @@ class Maintenance:
             result = lookup("prepare_lrc")
             if result["state"] == "found":
                 result["mode"] = "timed"
-        if result["state"] in ("not_found", "ambiguous", "invalid") and settings["generate"]:
+        if result["state"] not in ("found", "instrumental", "rescan") and settings["generate"]:
+            # Provider timeouts and HTTP limits do not invalidate a known
+            # lyric text. The completed lookup attempt may therefore fall
+            # back to acoustically observed timestamps from that text.
             if local_text.strip() and len(local_text.encode()) <= MAX_LRC_BYTES:
                 result = {"state": "found", "lyrics": local_text, "source": "bibliothèque"}
             elif settings["lyrics"]:

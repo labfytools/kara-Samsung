@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
+from _parole_index import document
 from _parole_maintenance import Maintenance
 from _parole_night import Desktop, Login, mains_online
 
@@ -165,6 +166,16 @@ class NightTests(unittest.TestCase):
         self.assertFalse(stage.exists())
         self.assertTrue(other.exists())
         self.assertTrue(ready.exists())
+
+    def test_last_lrc_attempt_can_fall_back_to_local_text_and_is_reused(self):
+        song = {"id": "fixture", "token": "audio", "side": "side", "title": "Chanson",
+                "info": document({"plain": "Paroles locales vérifiées"})}
+        self.owner.output = Mock(return_value=(0, b'{"state":"unavailable"}'))
+        path = self.owner.index.root / "song.opus"
+        result = self.owner.night_reference(song, path)
+        self.assertEqual((result["mode"], result["lyrics"]), ("plain", "Paroles locales vérifiées"))
+        self.assertEqual(self.owner.night_reference(song, path), result)
+        self.owner.output.assert_called_once()
 
     def test_real_subprocess_stops_on_power_loss_sleep_heat_space_and_kara(self):
         cases = ("Demucs", "Turbo", "veille", "température", "stockage", "Kara", "activité", "désactivation")
