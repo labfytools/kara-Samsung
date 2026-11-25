@@ -80,13 +80,29 @@ Diminuer la concurrence laisse les lots actifs se terminer. Le panneau d’impor
 
 La liste d’import occupe l’espace disponible entre les statistiques et le bouton **Historique**. Agrandir la fenêtre affiche davantage de lots. Les résultats de recherche gardent leur propre zone de défilement.
 
-Chaque lot géré prépare une fenêtre glissante de 20 albums au plus et partage ses travailleurs de transfert par fournisseur. Toutes les pistes prêtes passent par la même admission de la bibliothèque, avec priorité aux demandes manuelles éligibles et ordre d’arrivée à priorité égale. Deux créneaux restent dédiés à la préparation du catalogue et deux au traitement des métadonnées. L’enrichissement des paroles, des LRC et des pochettes passe par la maintenance persistante.
+Chaque lot géré prépare une fenêtre glissante de 24 albums au plus et partage ses travailleurs de transfert par fournisseur. La fenêtre laisse de la place aux albums en résolution ou en publication pendant les transferts. Toutes les pistes prêtes passent par la même admission de la bibliothèque, avec priorité aux demandes manuelles éligibles et ordre d’arrivée à priorité égale. Deux créneaux restent dédiés à la préparation du catalogue et deux au traitement des métadonnées. L’enrichissement des paroles, des LRC et des pochettes passe par la maintenance persistante.
 
 **Téléchargements simultanés** règle le plafond par bibliothèque, de 1 à 20. La valeur initiale est 10. Au-delà de 10, Parole essaie des paliers supplémentaires lorsqu’il y a assez de pistes prêtes, que les créneaux sont occupés et qu’un échantillon de durée suffisante a produit des téléchargements et des publications. Si la hausse ne gagne pas de débit ou réduit la cadence des pistes reçues ou publiées, le palier précédent est rétabli. Les erreurs et la pression sur les ressources réduisent l’admission suivante. Les créneaux déjà occupés se libèrent progressivement.
 
 Le profil de YouTube limite cette source à trois transferts concurrentiels, un fragment par piste et 512 Kio/s par transfert. Internet Archive et Jamendo partagent l’admission globale et conservent leurs intervalles entre requêtes, quotas, contrôles de licence et temporisations HTTP. Une source en temporisation ne bloque pas les pistes éligibles d’une autre source. Les statistiques affichent le plafond appliqué, les pistes prêtes en attente, les octets réellement reçus sur cinq secondes et les pistes reçues et publiées sur une minute.
 
 La file exige 64 Mio libres dans l’espace d’état. L’admission conserve 2 Gio libres dans la bibliothèque et prévoit une marge par transfert pour la piste et ses fichiers temporaires. Le moteur surveille l’espace pendant les transferts et limite la taille annoncée d’une piste à 256 Mio. Les lots en attente restent enregistrés lorsque la bibliothèque manque d’espace.
+
+### Qualification des créneaux audio
+
+`python3 -B tests/test-parole-downloads.py -v` passe par la file persistante, l’admission des pistes, les réponses HTTP avec plages, la validation d’originaux FLAC et le tri. Le serveur local définit une cadence et des quotas propres à la fixture. Les mesures couvrent la durée jusqu’à la publication des 36 pistes sur disque. La maintenance des paroles reste en attente au moment où l’audio est disponible.
+
+| Plafond global | Pic observé | Durée | Débit de bout en bout | Pistes publiées/min |
+| ---: | ---: | ---: | ---: | ---: |
+| 3 | 3 | 14,24 s | 0,263 Mio/s | 151,7 |
+| 5 | 5 | 9,73 s | 0,384 Mio/s | 221,9 |
+| 10 | 10 | 7,68 s | 0,487 Mio/s | 281,3 |
+| 15 | 15 | 7,58 s | 0,494 Mio/s | 285,0 |
+| 20 | 20 | 7,58 s | 0,494 Mio/s | 285,0 |
+
+Dans cette exécution sur ArchASP, le gain au-delà de 10 reste sous le seuil de 5 % utilisé pour conserver un palier supérieur. Le banc vérifie aussi la pause à vingt, la reprise des plages validées, un lot de 231 éditions, la priorité manuelle, une réponse HTTP 429 et les réductions d’admission sous pression mémoire ou disque.
+
+Le 25 novembre 2026, six originaux d’Internet Archive sous CC0, soit 29,2 Mio, ont été publiés dans deux bibliothèques d’essai indépendantes avec les intervalles et quotas habituels. La révision `bb1fd97` a pris 26,27 s pour les six pistes, soit 1,11 Mio/s et 13,7 pistes/min. Le moteur à file globale a pris 11,65 s, soit 2,50 Mio/s et 30,9 pistes/min. Il s’agit d’un passage par version sur le réseau réel, mesuré jusqu’à la publication sur disque. [Fiche de la collection audio](https://archive.org/details/ILOOSE) · [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
 
 ### Reprise et diagnostics
 

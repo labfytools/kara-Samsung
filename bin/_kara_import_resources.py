@@ -217,14 +217,14 @@ def run_checked(args, *, timeout, check=False, capture_output=False, input=None,
 
 
 @contextmanager
-def lease(path, *, wait=True, shared=False):
+def lease(path, *, wait=True, shared=False, poll_interval=.1):
     path.parent.mkdir(mode=0o770, parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o660)
     try:
         try:
             operation = LOCK_SH if shared else LOCK_EX
             if wait:
-                lock_file(fd, operation)
+                lock_file(fd, operation, poll_interval=poll_interval)
             else:
                 flock(fd, operation | LOCK_NB)
         except BlockingIOError:
@@ -237,7 +237,7 @@ def lease(path, *, wait=True, shared=False):
         os.close(fd)
 
 
-def lock_file(fd, operation=LOCK_EX):
+def lock_file(fd, operation=LOCK_EX, *, poll_interval=.1):
     if current_pause() is None:
         flock(fd, operation)
         return
@@ -247,7 +247,7 @@ def lock_file(fd, operation=LOCK_EX):
             flock(fd, operation | LOCK_NB)
             return
         except BlockingIOError:
-            wait(.1)
+            wait(poll_interval)
 
 
 @contextmanager
@@ -343,7 +343,7 @@ def audio_slot(directory, service, interval=0., notice=None, *, admitted=None):
     _, manual = settings()
     prefix = f"{0 if manual else 1}_{time.monotonic_ns():020d}-"
     with ExitStack() as transferred:
-        with lease(mutex):
+        with lease(mutex, poll_interval=.01):
             ticket = transferred.enter_context(NamedTemporaryFile(
                 dir=waiting, prefix=prefix, suffix="_" + service, delete=False))
             flock(ticket.fileno(), LOCK_EX)
@@ -351,7 +351,7 @@ def audio_slot(directory, service, interval=0., notice=None, *, admitted=None):
         try:
             while True:
                 checkpoint()
-                with lease(mutex), ExitStack() as claim:
+                with lease(mutex, poll_interval=.01), ExitStack() as claim:
                     effective, manual = settings()
                     if manual and path.name.startswith("1"):
                         promoted = path.with_name("0" + path.name[1:])
@@ -391,7 +391,9 @@ def audio_slot(directory, service, interval=0., notice=None, *, admitted=None):
                 if notice:
                     notice()
                     notice = None
-                wait(.1)
+                # The mutex protects only local admission. A short wait
+                # prevents tickets from waking in slow lock-step batches.
+                wait(.025)
         finally:
             path.unlink(missing_ok=True)
         if admitted:

@@ -49,6 +49,7 @@ import _parole_archive as archive
 import _parole_jamendo as jamendo
 
 DOWNLOAD_WORKERS = 2
+ALBUM_WINDOW = MAX_DOWNLOADS + CATALOGUE + PROCESSING
 # Both Parole and the CLI use this engine. A Kara-local update can fix the
 # extractor independently of the system package and other yt-dlp callers.
 KARA_DOWNLOADER = DATA / "kara" / "tools" / "yt-dlp"
@@ -1740,9 +1741,9 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
                     break
                 yield process_album(index, url)
             return
-        # Albums own staging and publication. A rolling window feeds the
-        # shared track pool, while catalogue and metadata keep their own slots.
-        with ThreadPoolExecutor(max_workers=min(MAX_DOWNLOADS, len(urls))) as albums:
+        # Leave room for albums in catalogue resolution and publication
+        # while the remaining albums keep all audio slots supplied.
+        with ThreadPoolExecutor(max_workers=min(ALBUM_WINDOW, len(urls))) as albums:
             pending = set()
 
             def admit():
@@ -1752,7 +1753,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
                     pending.add(albums.submit(copy_context().run, process_album, index, url))
                     break
 
-            for _ in range(MAX_DOWNLOADS):
+            for _ in range(ALBUM_WINDOW):
                 admit()
             try:
                 while pending:
