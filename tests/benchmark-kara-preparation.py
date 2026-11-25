@@ -52,10 +52,11 @@ def record(path, data):
 
 
 class Monitor:
-    def __init__(self, workspace, library, profile):
+    def __init__(self, workspace, library, profile, max_psi=1.0):
         self.devices = {block_device(path) for path in (workspace, library)}
         self.workspace, self.library = workspace, library
         self.profile = profile
+        self.max_psi = max_psi
         self.login = Login() if profile else None
         self.cgroup = Path("/sys/fs/cgroup") / command(
             "systemctl", "--user", "show", "kara.service", "-p", "ControlGroup", "--value").lstrip("/")
@@ -92,7 +93,10 @@ class Monitor:
         mem = {key: int(value.split()[0]) for key, value in (
             line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())}
         pressure = float(Path("/proc/pressure/memory").read_text().split()[1].split("=")[1])
-        if mem["MemAvailable"] < 1536 * 1024 or pressure >= 1:
+        # The manual comparator can tolerate brief reclaim activity while
+        # enforcing a larger available-memory floor than the night worker.
+        memory_floor = (1536 if self.max_psi == 1 else 4096) * 1024
+        if mem["MemAvailable"] < memory_floor or pressure >= self.max_psi:
             self.reason = "Pression mémoire"
         busy = False
         procs = self.cgroup / "cgroup.procs"
@@ -103,8 +107,7 @@ class Monitor:
                 except FileNotFoundError:
                     continue
                 busy |= any(Path(arg.decode(errors="replace")).name in
-                            {"_kara_stems.py", "_kara_prepare.py", "_kara_voice.py", "_kara_voice_session.py",
-                             "yt-dlp", "ffmpeg"}
+                            {"_kara_stems.py", "_kara_prepare.py", "_kara_voice.py", "_kara_voice_session.py"}
                             for arg in args if arg)
         if busy or multimedia_active():
             self.reason = "Activité Kara ou multimédia prioritaire"
@@ -238,10 +241,18 @@ def worker(workspace, case, mode, threads):
             song.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             if not song.exists():
                 os.link(base_song, song)
+            generated = song.with_suffix(".lrc")
+            if generated.exists():
+                generated.rename(workspace / "evidence" / f"{case}-{mode}-{time_ns()}.interrupted.lrc")
             plain = (base_song.parent / "strawberry.txt").read_bytes()
             prepare.cached_stems = lambda _: stems.cached_stems(base_song)
         os.environ["KARA_MUSIC_LIBRARY"] = str(workspace)
         cache = prepare.PreparedCache(workspace / mode)
+        folder = cache.folder(song)
+        if folder.exists():
+            # An interruption after publication must not turn a fresh
+            # timing into a cache hit on resume. Preserve the private draft.
+            folder.rename(workspace / "evidence" / f"{case}-{mode}-{time_ns()}.interrupted-cache")
         for owner, name, label in (
             (prepare, "transcribe_file", "turbo"), (prepare, "choose_alignment", "alignment"),
             (prepare, "refine", "refinement"), (prepare, "validate", "reference_validation"),
@@ -268,7 +279,7 @@ def worker(workspace, case, mode, threads):
             ready, report, _, duration = engine.prepare(song, plain=plain, observed_corrections=True)
         finally:
             engine.close()
-        details = {"ready": ready, "report": report, "duration": duration, "storage": sizes(cache.folder(song))}
+        details = {"ready": ready, "report": report, "duration": duration, "storage": sizes(folder)}
         if observed:
             record(workspace / "evidence" / f"{case}-{mode}.json", observed)
     own, children = (resource.getrusage(who) for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN))
@@ -336,6 +347,7 @@ def bench(args):
         (workspace / "results").mkdir(exist_ok=True)
         sources = [*sorted((REPO / "bin").glob("_kara_*.py")), turbo.SOURCE, Path(__file__)]
         config = {"profile": args.profile, "demucs_threads": 2, "turbo_threads": args.threads,
+                  "memory_psi_limit_pct": args.memory_psi,
                   "turbo_weights_file": prepare.file_token(turbo.MODEL), "demucs": stems.model_signature(),
                   "kernel": os.uname().release,
                   "sources": {str(path.resolve().relative_to(REPO)): turbo.digest(path) for path in sources}}
@@ -355,7 +367,7 @@ def bench(args):
                     continue
                 if mode in ("timed", "plain") and not (workspace / "results" / f"{case_id}-demucs.json").exists():
                     raise ValueError("Le résultat Demucs est requis avant Turbo pour ce cas.")
-                monitor = Monitor(workspace, library, args.profile)
+                monitor = Monitor(workspace, library, args.profile, args.memory_psi)
                 print(f"{case_id} {mode}", flush=True)
                 deadline = monotonic() + 180
                 while (monitor.stop() and monotonic() < deadline and
@@ -400,6 +412,8 @@ def main():
     parser.add_argument("--library", type=Path, default=music_library())
     parser.add_argument("--corpus", type=Path, default=CASES)
     parser.add_argument("--profile", choices=("power-saver", "balanced", "performance"))
+    parser.add_argument("--memory-psi", choices=(1., 2., 3.), type=float, default=1.,
+                        help="Seuil PSI manuel. Au-dessus de 1 %% le banc réserve 4 Gio de RAM disponible.")
     parser.add_argument("--threads", type=int, choices=range(1, 33), default=4)
     parser.add_argument("--phase", choices=("demucs", "timed", "plain", "annotated"), nargs="+",
                         default=["demucs", "timed", "plain"])
