@@ -1060,11 +1060,11 @@ module = module_from_spec(spec)
 loader.exec_module(module)
 window = module.LyricsWindow
 catalogues = []
-room = SimpleNamespace(update_catalogue=catalogues.append)
+room = SimpleNamespace(update_catalogue=lambda rows, **_kwargs: catalogues.append(rows))
 control = SimpleNamespace(receiver=SimpleNamespace(room=room), closed=False, music_window=None,
                           blackbox=SimpleNamespace(emit=lambda *args, **kwargs: None),
                           remote_party=SimpleNamespace(locked=False), import_refresh_tasks={},
-                          import_refresh_timer=None, import_refresh_active=False)
+                          import_refresh_timer=None, import_refresh_active=False, import_published_paths=set())
 for name in ("refresh_after_import", "reload_after_import"):
     setattr(control, name, MethodType(getattr(window, name), control))
 
