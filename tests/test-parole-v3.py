@@ -390,6 +390,10 @@ class GtkTests(Fixture):
         imports.provider.set_selected(names.index("YouTube Music"))
         self.assertFalse(imports.official_download.get_visible())
         self.assertTrue(imports.artist.get_sensitive())
+        imports.provider.set_selected(names.index("Internet Archive"))
+        self.assertEqual(imports.artist.get_placeholder_text(), "Artiste ou album")
+        self.assertTrue(imports.can_search_archive())
+        self.assertFalse(imports.can_search_youtube())
         for page in ("general", "sources", "codex", "storage", "resources", "night"):
             view.settings(page)
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)

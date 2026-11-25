@@ -62,7 +62,7 @@ Les reçus vérifient le contenu audio publié avant de sauter une piste lors d�
 
 Dans le sélecteur de sources, **Bandcamp** propose le site officiel et son aide au téléchargement. Récupérer l’album gratuit ou déjà acheté avec les droits applicables, puis sélectionner le dossier ou le ZIP dans Parole. La page publique de l’édition peut être renseignée pour conserver sa référence dans le résultat. Il s’agit d’une provenance déclarée. Parole ne déclenche aucun achat. L’API publiée documente les comptes, ventes et commandes des partenaires. Le parcours auditeur utilise les fichiers remis directement par Bandcamp. [Documentation de l’API](https://bandcamp.com/developer) · [Récupération des achats](https://get.bandcamp.help/en/articles/15263192-can-i-re-download-my-purchases)
 
-**Toutes les sources** donne accès à la recherche YouTube Music et au choix de fichiers locaux. Sélectionner un fournisseur pour afficher son parcours officiel et conserver son nom dans la provenance. Les formats de sortie pris en charge par l’import local, dont le FLAC, restent inchangés pendant la copie.
+**Toutes les sources** donne accès aux recherches YouTube Music et Internet Archive ainsi qu’au choix de fichiers locaux. Sélectionner un fournisseur pour n’interroger que celui-ci ou afficher son parcours officiel. Les résultats YouTube Music et Internet Archive restent identifiés par leur source. Les formats de sortie pris en charge par l’import local, dont le FLAC, restent inchangés pendant la copie.
 
 ### Qobuz
 
@@ -79,6 +79,12 @@ Télécharger depuis la page officielle si elle propose le fichier. Dans Parole,
 ### Sites d’artistes et de labels
 
 Sélectionner **Sites d’artistes et de labels** et indiquer la page HTTPS publique où le site officiel propose le téléchargement. Le bouton ouvre cette page dans le navigateur. Choisir ensuite le fichier reçu, le dossier ou le ZIP. Parole conserve le lien, la licence renseignée si elle figure dans le sélecteur et les crédits des fichiers. Le parcours n’interroge pas automatiquement des sites arbitraires.
+
+### Internet Archive
+
+Rechercher par artiste ou titre, ou coller une fiche publique `https://archive.org/details/identifiant`. Parole confirme le type audio, la licence explicite et l’inventaire via l’API de la plateforme. Les éditions publiques avec CC0, CC BY ou CC BY-SA compatibles affichent le nombre de pistes originales, leurs formats et l’accès gratuit. Les résultats qui exigent une authentification, une licence différente ou un fichier marqué privé sont écartés.
+
+Chaque piste originale admissible est transférée avec les limites de la file commune. Le contrôle SHA-1 publié par la plateforme protège contre un transfert tronqué ou altéré. Les fichiers dérivés encodés par la plateforme ne sont pas téléchargés. La file conserve la licence, la fiche publique, l’identifiant du fichier et la somme SHA-256 calculée à la réception. Une piste déjà publiée est vérifiée et réutilisée lors d’une reprise. [API de lecture des fiches](https://archive.org/developers/md-read.html) · [Règles d’accès automatisé](https://archive.org/developers/bots.html)
 
 ## Diagnostic des échecs persistants
 
@@ -109,3 +115,5 @@ Le parcours SoundCloud est testé avec une piste de synthèse sans tag d’album
 Le parcours Free Music Archive est testé avec un FLAC de synthèse. Le test vérifie la conservation de la provenance et de la licence CC BY et le refus d’une licence manquante ou CC BY-ND.
 
 Le parcours des sites d’artistes a été vérifié en bibliothèque isolée avec le MP3 officiel de *This Too Shall Pass* par Scott Buckley, sous licence CC BY 4.0. Le fichier audio a été classé avec un PCM identique, son format et sa provenance. L’enrichissement en ligne était simulé et l’absence de pochette a laissé le lot partiel. Le test automatisé couvre aussi un lot qui se termine et le refus des références privées. [Fichier et crédits officiels](https://www.scottbuckley.com.au/library/this-too-shall-pass/)
+
+Internet Archive a renvoyé la fiche *Glow Wave* de La Machine de la Mort, sous licence CC BY 4.0. Les dix MP3 originaux totalisant 36 248 422 octets ont été téléchargés et les dix fichiers publiés sont identiques octet pour octet aux fichiers reçus. La relance n’a transféré aucune piste. L’enrichissement simulé a laissé la pochette à compléter. Les tests automatisés couvrent une reprise partielle, un fichier privé et la distinction entre fichier original et dérivé. [Fiche et crédits officiels](https://archive.org/details/glow-wave)

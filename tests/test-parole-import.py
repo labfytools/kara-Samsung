@@ -3,6 +3,7 @@
 from collections import Counter
 from functools import partial
 from fcntl import LOCK_EX, flock
+from hashlib import sha1
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -367,6 +368,57 @@ class AlbumImportTests(unittest.TestCase):
         evidence = items[0]["provenance"][0]
         self.assertEqual((evidence["source"], evidence["verification"]), (release.rstrip("/"), "manual"))
         self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(track))
+
+    def test_internet_archive_search_download_and_retry_preserve_originals(self):
+        # Each original has its own file identifier and API integrity checksum.
+        source = self.temp / "archives"
+        ids = {"01.flac": 1, "02.flac": 2}
+        originals = {}
+        files = []
+        for name, position in ids.items():
+            path = source / name
+            self.make_local_track(path, position, album="Album d’archive")
+            media = path.read_bytes()
+            files.append(dict(name=name, size=str(len(media)), sha1=sha1(media, usedforsecurity=False).hexdigest(),
+                              source="original", format="Flac"))
+            originals[name] = str(path)
+        files.append({"name": "02.mp3", "source": "derivative", "format": "VBR MP3"})
+        license_url = OPEN_LICENSES["CC BY 4.0"]
+        identifier = "controlled-archive-fixture"
+        metadata = dict(identifier=identifier, title="Album d’archive", creator=self.config["artist"],
+                        mediatype="audio", licenseurl=license_url)
+        self.config.update(archive_item={"metadata": metadata, "files": files},
+                           archive_originals=originals, archive_failures=["02.flac"])
+        self.update_config()
+        query = subprocess.check_output([str(BIN / "kara"), "--chercher-archives", self.config["artist"]], env=self.env)
+        release = json.loads(query)["data"][0]
+        self.assertEqual((release["formats"], release["tracks"], release["license"]), (["FLAC"], 2, license_url))
+        url = release["url"]
+        journal, results, _ = self.run_import(url, expected=1)
+        self.assertEqual((results[0]["status"], results[0]["added"]), ("partial", 1))
+        self.config["archive_failures"].clear()
+        self.update_config()
+        _, results, _ = self.run_import(url, previous=journal)
+        self.assertEqual((results[0]["status"], results[0]["added"], results[0]["processed"]), ("success", 1, 1))
+        self.assertEqual(Counter(self.requests.read_text().splitlines()), {"01.flac": 1, "02.flac": 2})
+        for record in results[0]["provenance"]:
+            self.assertEqual(record["external_id"], f"{identifier}/{record['member']}")
+            self.assertEqual(record["license"], license_url)
+            self.assertEqual(pcm_digest(record["path"]), pcm_digest(originals[record["member"]]))
+
+    def test_internet_archive_never_opens_a_restricted_file_or_license(self):
+        target = "https://archive.org/details/restricted-fixture"
+        metadata = dict(identifier="restricted-fixture", title="Archive", creator="Auteur", mediatype="audio",
+                        licenseurl=OPEN_LICENSES["CC0 1.0"])
+        media = {"name": "file.flac", "source": "original", "private": "true", "size": "4", "sha1": "a" * 40}
+        for case in [dict(metadata=metadata, files=[media]),
+                     dict(metadata=metadata | {"licenseurl": "https://creativecommons.org/licenses/by-nd/4.0/"},
+                          files=[media | {"private": "false"}])]:
+            self.config["archive_item"] = case
+            self.update_config()
+            _, results, _ = self.run_import(target, expected=1)
+            self.assertEqual((results[0]["category"], results[0]["tracks"]), ("path", []))
+        self.assertEqual(self.requests.read_text(), "")
 
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]

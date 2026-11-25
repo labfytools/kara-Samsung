@@ -1,7 +1,7 @@
 """Read explicitly selected albums without moving originals or extracting paths."""
 from contextlib import contextmanager
 from dataclasses import dataclass
-from hashlib import sha256
+from hashlib import sha1, sha256
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from stat import S_IFDIR, S_IFREG, S_IFMT, S_ISREG
@@ -121,6 +121,8 @@ class Entry:
     size: int
     revision: list
     open: object
+    sha1: str = ""
+    external_id: str = ""
 
 
 def directory_entries(fd):
@@ -235,6 +237,7 @@ def read_entry(entry, destination, stop):
         raise ImportIssue("path", "Taille audio locale hors limites.")
     check_space(destination.parent, extra=entry.size + MAX_MEDIA * PROCESSING)
     digest = sha256()
+    expected = sha1(usedforsecurity=False) if entry.sha1 else None
     with entry.open() as source, NamedTemporaryFile(dir=destination.parent, prefix=".local-") as draft:
         revision = entry.revision
         if len(revision) == 5 and stamp(os.fstat(source.fileno())) != revision:
@@ -245,12 +248,16 @@ def read_entry(entry, destination, stop):
                 return None
             data = source.read(min(remaining, BLOCK))
             if not data:
-                raise OSError("Fichier source incomplet.")
+                raise ImportIssue("network" if expected else "path", "Fichier source incomplet.")
             remaining -= len(data)
             digest.update(data)
+            if expected is not None:
+                expected.update(data)
             draft.write(data)
         if source.read(1) or (len(revision) == 5 and stamp(os.fstat(source.fileno())) != revision):
             raise OSError("Le fichier source a changé pendant la lecture.")
+        if expected is not None and expected.hexdigest() != entry.sha1:
+            raise ImportIssue("network", "Somme de contrôle du fichier distant incorrecte.")
         draft.flush()
         os.fsync(draft.fileno())
         os.link(draft.name, destination)

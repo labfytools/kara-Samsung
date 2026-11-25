@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from _kara_import_resources import defer_service, wait_service
 from _kara_import_result import ImportIssue
 from _parole_index import document
-from _parole_import_providers import MANUAL
+from _parole_import_providers import ARCHIVE, MANUAL
 
 BUILTINS = {
     "LRCLIB": ("lrclib.net", "lyrics,lrc", "https://lrclib.net/docs"),
@@ -23,6 +23,7 @@ BUILTINS = {
     "Genius": ("genius.com", "lyrics", ""),
     "LyricDown": ("lyricdown.com", "lrc", ""),
     "YouTube Music": ("music.youtube.com", "catalogue,cover,import", ""),
+    ARCHIVE: ("archive.org", "catalogue,import", "https://archive.org/developers/md-read.html"),
     "MusicBrainz": ("musicbrainz.org", "catalogue,discography", "https://musicbrainz.org/doc/MusicBrainz_API"),
     "Cover Art Archive": ("coverartarchive.org", "cover", ""),
     "Deezer": ("api.deezer.com", "cover", ""),
@@ -154,6 +155,8 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
             if len(data) > MAX_RESPONSE or monotonic() > deadline:
                 raise ProviderUnavailable("Réponse fournisseur hors limites")
         return json.loads(data) if accept == "application/json" else bytes(data)
+    except ProviderUnavailable:
+        raise
     except (OSError, http.client.HTTPException) as error:
         raise ProviderUnavailable("Source indisponible") from error
     finally:

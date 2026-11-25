@@ -8,6 +8,8 @@ from _kara_import_result import ImportIssue
 ALL = "Toutes les sources"
 YOUTUBE = "YouTube Music"
 ARTIST_SITES = "Sites d’artistes et de labels"
+ARCHIVE = "Internet Archive"
+ARCHIVE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 OPEN_LICENSES = {
     "CC0 1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
     "CC BY 3.0": "https://creativecommons.org/licenses/by/3.0/",
@@ -15,6 +17,16 @@ OPEN_LICENSES = {
     "CC BY-SA 3.0": "https://creativecommons.org/licenses/by-sa/3.0/",
     "CC BY-SA 4.0": "https://creativecommons.org/licenses/by-sa/4.0/",
 }
+
+
+def archive_identifier(parts):
+    if (parts.scheme != "https" or parts.netloc not in {"archive.org", "www.archive.org"}
+            or parts.query or parts.fragment):
+        return None
+    path = parts.path.removesuffix("/").split("/")
+    if len(path) == 3 and path[1] == "details" and ARCHIVE_ID.fullmatch(path[2]):
+        return path[2]
+    return None
 
 
 @dataclass(frozen=True)

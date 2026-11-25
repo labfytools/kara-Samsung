@@ -6,6 +6,7 @@ from pathlib import Path
 import signal
 import sqlite3
 from time import monotonic
+from urllib.parse import urlsplit
 
 from gi.repository import Gio, GLib, Gtk, Pango
 
@@ -15,7 +16,7 @@ from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check
 from _kara_import_result import CATEGORIES, ImportIssue
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY
 from _kara_paths import BIN, catalogue_command
-from _parole_import_providers import ALL, MANUAL, OPEN_LICENSES, YOUTUBE
+from _parole_import_providers import ALL, ARCHIVE, MANUAL, OPEN_LICENSES, YOUTUBE, archive_identifier
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
@@ -234,7 +235,7 @@ class AlbumImport(Gtk.Revealer):
         self.set_reveal_child(opened)
         if opened and self.lookup is None:
             self.refresh_providers()
-            (self.artist if self.can_search_youtube() else self.link).grab_focus()
+            (self.artist if self.can_search_youtube() or self.can_search_archive() else self.link).grab_focus()
         elif not opened:
             self.cancel_suggestions()
 
@@ -245,9 +246,9 @@ class AlbumImport(Gtk.Revealer):
     def refresh_providers(self):
         choices = [ALL, LOCAL]
         try:
-            choices.extend(name for name in (YOUTUBE, *MANUAL) if self.provider_enabled(name))
+            choices.extend(name for name in (YOUTUBE, ARCHIVE, *MANUAL) if self.provider_enabled(name))
         except (OSError, sqlite3.Error):
-            choices.extend((YOUTUBE, *MANUAL))
+            choices.extend((YOUTUBE, ARCHIVE, *MANUAL))
         model = self.provider.get_model()
         current = [model.get_string(i) for i in range(model.get_n_items())] if model else []
         if choices != current:
@@ -255,11 +256,18 @@ class AlbumImport(Gtk.Revealer):
             self.provider.set_model(Gtk.StringList.new(choices))
             self.provider.set_selected(choices.index(selected) if selected in choices else 0)
 
-    def can_search_youtube(self):
+    def can_search(self, source):
         provider = self.selected_provider()
+        if provider != ALL:
+            return provider == source
         model = self.provider.get_model()
-        names = [model.get_string(i) for i in range(model.get_n_items())] if model else []
-        return provider == YOUTUBE or provider == ALL and YOUTUBE in names
+        return bool(model and any(model.get_string(i) == source for i in range(model.get_n_items())))
+
+    def can_search_youtube(self):
+        return self.can_search(YOUTUBE)
+
+    def can_search_archive(self):
+        return self.can_search(ARCHIVE)
 
     def change_provider(self, *_args):
         self.cancel_search()
@@ -276,12 +284,13 @@ class AlbumImport(Gtk.Revealer):
         reference = ("Page publique de l’édition" if route and route.require_reference else
                      "Page publique de l’édition (facultatif)" if route else "Lien d’album")
         self.link.set_placeholder_text(reference)
+        self.artist.set_placeholder_text("Artiste ou album" if self.selected_provider() == ARCHIVE else "Artiste")
         self.submit.set_label("Importer" if route or self.selected_provider() == LOCAL else "Télécharger")
         self.refresh_controls()
 
     def refresh_controls(self, _widget=None):
         idle = self.lookup is None or self.lookup_live
-        self.artist.set_sensitive(idle and self.can_search_youtube())
+        self.artist.set_sensitive(idle and (self.can_search_youtube() or self.can_search_archive()))
         self.results.set_sensitive(idle)
         provider = self.selected_provider()
         url = self.link.get_text().strip()
@@ -296,7 +305,7 @@ class AlbumImport(Gtk.Revealer):
         if download:
             self.official_download.set_uri(download)
         self.submit.set_sensitive(self.queue is not None and (provider in MANUAL or provider == LOCAL
-                                  or bool(url) and (self.can_search_youtube() or local_url(url))))
+                                  or bool(url) and (self.can_search_youtube() or self.can_search_archive() or local_url(url))))
         self.download_all.set_sensitive(idle and bool(self.albums))
 
     def message(self, text, *, failed=False, detail=""):
@@ -355,12 +364,15 @@ class AlbumImport(Gtk.Revealer):
 
     def search_artists(self, _widget, *args):
         query = self.artist.get_text().strip()
-        if not query or not self.can_search_youtube():
+        if not query or not (self.can_search_youtube() or self.can_search_archive()):
             return
         self.cancel_suggestions()
         if self.lookup is not None:
             return
         self.clear_results()
+        if not self.can_search_youtube():
+            self.search_archive(query)
+            return
         if query == self.suggestion_query and self.suggestions:
             self.artists_found(self.suggestions)
             return
@@ -368,16 +380,20 @@ class AlbumImport(Gtk.Revealer):
         self.search("artistes", query, self.artists_found)
 
     def search(self, action, value, callback, *, live=False):
+        source = ARCHIVE if action == "archive" else YOUTUBE
         try:
-            self.lookup = Gio.Subprocess.new(catalogue_command(action, value), PIPE)
+            command = [str(KARA), "--chercher-archives", value] if source == ARCHIVE else catalogue_command(action, value)
+            self.lookup = Gio.Subprocess.new(command, PIPE)
         except (GLib.Error, ValueError) as error:
             if not live:
                 category = "path" if isinstance(error, ValueError) else "dependency"
                 self.message(CATEGORIES[category], failed=True, detail=str(error))
             return
         self.lookup_live = live
+        if not live:
+            self.on_update(None, "provider", {"provider": source, "message": f"{source} · recherche de catalogue"})
         self.refresh_controls()
-        self.lookup.communicate_utf8_async(None, None, self.search_finished, callback)
+        self.lookup.communicate_utf8_async(None, None, self.search_finished, (callback, source))
 
     def stop_lookup(self):
         if self.lookup is not None:
@@ -389,10 +405,11 @@ class AlbumImport(Gtk.Revealer):
         self.cancel_suggestions()
         self.stop_lookup()
 
-    def search_finished(self, process, result, callback):
+    def search_finished(self, process, result, call):
         if process != self.lookup:
             return
         live = self.lookup_live
+        callback, source = call
         self.lookup = None
         self.lookup_live = False
         self.refresh_controls()
@@ -404,12 +421,16 @@ class AlbumImport(Gtk.Revealer):
                 raise ValueError("Réponse du catalogue invalide.")
         except (GLib.Error, ValueError, TypeError) as error:
             if not live:
-                self.message("La recherche YouTube Music a échoué.", failed=True, detail=output or str(error))
+                self.message(f"La recherche {source} a échoué.", failed=True, detail=output or str(error))
+                if source == YOUTUBE and self.can_search_archive():
+                    self.search_archive(self.artist.get_text().strip())
             return
         if not process.get_successful() or "data" not in payload:
             if not live:
-                text = CATEGORIES.get(payload.get("category"), "La recherche YouTube Music a échoué.")
+                text = CATEGORIES.get(payload.get("category"), f"La recherche {source} a échoué.")
                 self.message(text, failed=True, detail=payload.get("error") or output)
+                if source == YOUTUBE and self.can_search_archive():
+                    self.search_archive(self.artist.get_text().strip())
             return
         callback(payload["data"])
 
@@ -420,7 +441,10 @@ class AlbumImport(Gtk.Revealer):
             self.get_albums((exact or artists)[0])
             return
         if not artists:
-            self.message("Aucun artiste trouvé.")
+            if self.can_search_archive():
+                self.search_archive(self.artist.get_text().strip())
+            else:
+                self.message("Aucun artiste trouvé.")
             return
         self.show_artist_choices(artists, "Choisir un artiste")
 
@@ -450,10 +474,13 @@ class AlbumImport(Gtk.Revealer):
     def albums_found(self, data):
         self.clear_results()
         self.albums = [(album["title"], album["url"]) for album in data["albums"]]
-        if not self.albums:
-            self.message("Aucun album trouvé pour cet artiste.")
-            return
         artist = data["name"] or self.artist.get_text().strip()
+        if not self.albums:
+            if self.can_search_archive():
+                self.search_archive(artist)
+            else:
+                self.message("Aucun album trouvé pour cet artiste.")
+            return
         self.results_title.set_text(f"{artist} · {len(self.albums)} album(s)")
         self.results_header.set_visible(True)
         self.results_view.set_visible(True)
@@ -462,7 +489,32 @@ class AlbumImport(Gtk.Revealer):
         for album in data["albums"]:
             job = (album["title"], album["url"])
             text = " · ".join(str(part) for part in (album["title"], album["year"]) if part)
-            self.add_row(text, "Télécharger", lambda _button, selected=job: self.start_queue([selected]))
+            self.add_row(f"{YOUTUBE} · {text}", "Télécharger", lambda _button, selected=job: self.start_queue([selected]))
+        self.refresh_controls()
+        if self.can_search_archive():
+            self.search_archive(artist)
+
+    def search_archive(self, query):
+        self.message(f"Recherche sur {ARCHIVE}…")
+        self.search("archive", query, self.archive_results)
+
+    def archive_results(self, albums):
+        for album in albums:
+            target = (album["title"], album["url"])
+            self.albums.append(target)
+            formats = ", ".join(album["formats"])
+            license_name = next((name for name, url in OPEN_LICENSES.items() if url == album["license"]), "")
+            text = (f"{ARCHIVE} · {album['artist']} · {album['title']} · {album['tracks']} piste(s) · "
+                    f"{formats} d’origine · Gratuit · {license_name}")
+            self.add_row(text, "Télécharger", lambda _button, selected=target: self.start_queue([selected]))
+        if self.albums:
+            self.results_title.set_text(f"{len(self.albums)} résultat(s)")
+            self.results_header.set_visible(True)
+            self.results_view.set_visible(True)
+            self.download_all.set_visible(not (albums and self.can_search_youtube()))
+            self.hide_message()
+        else:
+            self.message("Aucune édition à licence compatible trouvée.")
         self.refresh_controls()
 
     def add_row(self, text, action, handler):
@@ -487,6 +539,14 @@ class AlbumImport(Gtk.Revealer):
         if provider == YOUTUBE and local_url(url):
             self.message("Sélectionne Fichiers locaux pour importer ce chemin.", failed=True)
             return
+        if provider in (ARCHIVE, YOUTUBE) and url:
+            try:
+                from_archive = bool(archive_identifier(urlsplit(url)))
+            except ValueError:
+                from_archive = False
+            if (provider == ARCHIVE) != from_archive:
+                self.message(f"Sélectionne un lien du fournisseur {provider}.", failed=True)
+                return
         if url and self.start_queue([("", url)]):
             self.link.set_text("")
             self.link.grab_focus()

@@ -72,3 +72,29 @@ if "PAROLE_TEST_CONFIG" in os.environ:
     module = ModuleType("ytmusicapi")
     module.YTMusic = FixtureYTMusic
     sys.modules["ytmusicapi"] = module
+
+    if config.get("archive_item") and Path(sys.argv[0]).name == "kara":
+        from contextlib import contextmanager
+
+        sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
+        import _parole_archive as archive
+        from _kara_import_result import ImportIssue
+
+        def archive_fetch(url, **_kwargs):
+            parsed = urlsplit(url)
+            if parsed.path == "/advancedsearch.php":
+                metadata = config["archive_item"]["metadata"]
+                return {"response": {"docs": [{"identifier": metadata["identifier"], "licenseurl": metadata["licenseurl"]}]}}
+            return config["archive_item"]
+
+        @contextmanager
+        def open_archive_file(_index, _inbox, _album, file):
+            with Path(config["requests"]).open("a") as journal:
+                journal.write(file.name + "\n")
+            if file.name in config.get("archive_failures", []):
+                raise ImportIssue("network", "Serveur de stockage d’essai indisponible.")
+            with Path(config["archive_originals"][file.name]).open("rb") as stream:
+                yield stream
+
+        archive.fetch = archive_fetch
+        archive.open_original = open_archive_file

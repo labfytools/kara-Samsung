@@ -30,6 +30,8 @@ from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING,
                                    defer_service, lease, resource_slot, wait_service)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, shared_mutation, source_video
+from _parole_import_providers import ARCHIVE, YOUTUBE, archive_identifier
+import _parole_archive as archive
 
 DOWNLOAD_WORKERS = 2
 # Both Parole and the CLI use this engine. A Kara-local update can fix the
@@ -809,25 +811,52 @@ def local_sidecars(tracks, entries, root, progress):
 
 
 def import_local(item, root, inbox, previous, stop, seen, selection):
-    progress = item.progress
     path, item.provider, reference, license_url = selection
     resolved = path.resolve()
     if resolved.is_relative_to(root) or root.is_relative_to(resolved):
         raise ImportIssue("path", "Sélectionne un dossier ou un ZIP en dehors de la bibliothèque.")
     item.identity = "local:" + digest(path.as_uri())
     item.title = path.stem if path.suffix.lower() in (AUDIO | {".zip"}) else path.name
+    if item.provider != LOCAL:
+        import_provider_index(root, item.provider)
+    verification = "manual" if reference else "file"
+    import_entries(item, root, inbox, previous, stop, seen, local_entries(path),
+                   reference or path.as_uri(), reference, license_url, verification)
+
+
+def import_provider_index(root, provider):
+    from _parole_index import Index
+    from _parole_sources import seed
+
+    provider_index = Index(root)
+    seed(provider_index)
+    if not provider_index.source_enabled(provider):
+        raise ImportIssue("path", "Ce fournisseur est désactivé dans Parole.")
+    return provider_index
+
+
+def import_internet_archive(item, root, inbox, previous, stop, seen, identity):
+    item.provider = ARCHIVE
+    item.identity = "archive:" + identity
+    item.tracks = available_tracks(previous.get("tracks", []), root)
+    index = import_provider_index(root, item.provider)
+    if item.identity in seen:
+        item.status = "duplicate"
+        return
+    with resource_slot(inbox / ".kara-catalogue", CATALOGUE):
+        album = archive.item(index, identity)
+    item.title, item.artist = album.title, album.artist
+    source = archive.release_url(identity)
+    import_entries(item, root, inbox, previous, stop, seen, archive.entries(index, inbox, album),
+                   source, source, album.license, "catalogue")
+
+
+def import_entries(item, root, inbox, previous, stop, seen, reader, source, reference, license_url, verification):
+    progress = item.progress
     item.tracks = available_tracks(previous.get("tracks", []), root)
     if item.identity in seen:
         item.status = "duplicate"
         return
-    if item.provider != LOCAL:
-        from _parole_index import Index
-        from _parole_sources import seed
-
-        provider_index = Index(root)
-        seed(provider_index)
-        if not provider_index.source_enabled(item.provider):
-            raise ImportIssue("path", "Ce fournisseur est désactivé dans Parole.")
     progress.log("Fournisseur", item.provider)
     workspace = inbox / ".kara-reprises" / digest(item.identity)
     receipt = workspace / "publications.jsonl"
@@ -836,7 +865,7 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
     with lease(workspace / "verrou") as guard:
         progress.guard += (guard,)
         try:
-            with local_entries(path) as entries:
+            with reader as entries:
                 audio = sorted(entry for entry in entries if Path(entry).suffix.lower() in AUDIO)
                 if not audio:
                     raise ImportIssue("path", "Aucun fichier audio pris en charge dans la sélection.")
@@ -857,7 +886,9 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
                         if target:
                             targets[name] = target
                             continue
-                    progress.emit(f"Copie locale · piste {number}/{len(audio)}", 0.72 * (number - 1) / len(audio))
+                    action = "Téléchargement" if entry.external_id else "Copie locale"
+                    progress.emit(f"{item.provider} · {action} · piste {number}/{len(audio)}",
+                                  0.72 * (number - 1) / len(audio))
                     draft = None
                     try:
                         if folder.is_symlink():
@@ -881,7 +912,7 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
                     except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
                         if draft is not None and not draft.is_symlink():
                             draft.unlink(missing_ok=True)
-                        record_error(progress, f"Lecture locale · piste {number} · {name}",
+                        record_error(progress, f"{action} · piste {number} · {name}",
                                      error if isinstance(error, ImportIssue) else ImportIssue("path", str(error)))
                         if progress.failures[-1]["category"] == "space":
                             break
@@ -908,9 +939,9 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
                     write_checkpoint(manifest, records)
                     item.tracks = sorted(set(item.tracks).union(map(str, targets.values())))
                     item.provenance = [
-                        {"provider": item.provider, "external_id": records[name]["sha256"], "member": name,
-                         "source": reference or path.as_uri(), "path": str(track),
-                         "edition_ref": reference, "verification": "manual" if reference else "file",
+                        {"provider": item.provider, "external_id": entries[name].external_id or records[name]["sha256"],
+                         "sha256": records[name]["sha256"], "member": name, "source": source, "path": str(track),
+                         "edition_ref": reference, "verification": verification,
                          **({"license": license_url} if license_url else {})}
                         for name, track in sorted(targets.items())
                     ]
@@ -930,6 +961,7 @@ def import_local(item, root, inbox, previous, stop, seen, selection):
 def import_album(item, root, inbox, previous, stop, seen):
     progress = item.progress
     parsed, playlist = checked_link(item.url)
+    item.provider = YOUTUBE
     known = previous.get("tracks", [])
     item.tracks = available_tracks(known, root)
     item.title = previous.get("title") or item.title
@@ -1079,7 +1111,12 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
                     progress.emit(f"{provider} · import de la sélection", event="provider", provider=provider)
                     report("Vérification dans la collection", 0)
                     import_local(item, root, inbox, previous.get(url, {}), stop, seen, selection)
+                elif external := archive_identifier(urlsplit(url)):
+                    progress.emit(f"{ARCHIVE} · vérification de la fiche", event="provider", provider=ARCHIVE)
+                    report("Vérification dans la collection", 0)
+                    import_internet_archive(item, root, inbox, previous.get(url, {}), stop, seen, external)
                 else:
+                    progress.emit(f"{YOUTUBE} · vérification du lien", event="provider", provider=YOUTUBE)
                     report("Vérification dans la collection", 0)
                     import_album(item, root, inbox, previous.get(url, {}), stop, seen)
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
@@ -1150,6 +1187,7 @@ def main():
     mode.add_argument("url", nargs="?", help="lien d’album ou URI file:// d’un fichier, dossier ou ZIP local")
     mode.add_argument("--lot", nargs="+", help=argparse.SUPPRESS)
     mode.add_argument("--import-file", metavar="LOT", help=argparse.SUPPRESS)
+    mode.add_argument("--chercher-archives", metavar="ARTISTE_OU_ALBUM", help="recherche Internet Archive")
     parser.add_argument("--import-lease", type=int, help=argparse.SUPPRESS)
     mode.add_argument("--revision", action="store_true",
                       help="recherche les pochettes et les paroles manquantes dans toute la bibliothèque")
@@ -1160,6 +1198,18 @@ def main():
     parser.add_argument("--suivi-json", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reprendre", metavar="JOURNAL", help="relance les liens en échec depuis ce journal")
     args = parser.parse_args()
+    if args.chercher_archives is not None:
+        try:
+            provider_index = import_provider_index(SHARED_LIBRARY, ARCHIVE)
+            inbox = SHARED_LIBRARY / INBOX
+            if not inbox.is_dir() or inbox.is_symlink():
+                raise ImportIssue("path", "Dossier de réception absent ou symbolique.")
+            with resource_slot(inbox / ".kara-catalogue", CATALOGUE):
+                print(json.dumps({"data": archive.search(provider_index, args.chercher_archives)}, ensure_ascii=False))
+            return 0
+        except (OSError, ValueError) as error:
+            print(json.dumps({"category": getattr(error, "category", "network"), "error": str(error)}, ensure_ascii=False))
+            return 1
     maintenance = (find_missing_lyrics if args.paroles_manquantes else
                    find_missing_covers if args.pochettes_manquantes else revise if args.revision else None)
     if args.reprendre and maintenance:
