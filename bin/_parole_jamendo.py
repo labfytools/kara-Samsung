@@ -6,10 +6,10 @@ import re
 from urllib.parse import urlencode, urlsplit
 
 from _kara_import_local import Entry
-from _kara_import_resources import DOWNLOADS, resource_slot
+from _kara_import_resources import audio_slot
 from _kara_import_result import ImportIssue
 from _parole_import_providers import JAMENDO, JAMENDO_ID, license_for
-from _parole_sources import ProviderUnavailable, fetch, open_audio
+from _parole_sources import ProviderUnavailable, download_interval, fetch, open_audio
 
 API = "https://api.jamendo.com/v3.0"
 DOMAIN = "jamendo.com"
@@ -177,8 +177,10 @@ def open_track(index, inbox, track):
         raise ImportIssue("dependency", "L’identifiant d’application Jamendo est absent.")
     query = urlencode(dict(client_id=identity, id=track.identifier, audioformat="flac", action="download"))
     url = f"{API}/tracks/file/?{query}"
-    with resource_slot(inbox / ".kara-transferts", DOWNLOADS), open_audio(
-            url, registry=index, provider=JAMENDO, service="api.jamendo.com", hosts=(DOMAIN,), interval=INTERVAL) as stream:
+    interval = download_interval(index, JAMENDO, INTERVAL)
+    with audio_slot(inbox / ".kara-transferts", "api.jamendo.com", interval), open_audio(
+            url, registry=index, provider=JAMENDO, service="api.jamendo.com", hosts=(DOMAIN,),
+            interval=INTERVAL, paced=True) as stream:
         yield stream
 
 

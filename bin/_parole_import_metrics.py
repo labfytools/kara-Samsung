@@ -44,7 +44,7 @@ def observe(index, source, values, *, now=None):
 def limited(index, source, seconds, status, *, now=None):
     if index is None or not source or status != 429 and not 500 <= status < 600:
         return
-    deadline = (time() if now is None else now) + min(86_400, max(0, seconds))
+    deadline = (time() if now is None else now) + max(0, seconds)
     try:
         with index.db(wait=.25) as db:
             db.execute("""INSERT INTO import_provider_limits VALUES(?,?,?)
@@ -95,3 +95,58 @@ class Transfer:
             if rate <= 2 * 1024**3:
                 result[THROUGHPUT] = rate
         return result
+
+
+class DownloadConcurrency:
+    """Probe higher admission only with sustained, measured demand."""
+
+    def __init__(self, window=15.):
+        self.window = window
+        self.sample = None
+        self.trial = None
+        self.retry_at = 0.
+        self.reason = ""
+        self.failures = 0
+
+    def update(self, now, ceiling, limit, resources, active, waiting, counters, *, resource_reason="Pression mémoire"):
+        # Cohorts compare verified audio completions, actual transferred
+        # bytes and published tracks. Low demand cannot qualify a higher cap.
+        failures = counters[3] - self.failures
+        self.failures = counters[3]
+        if resources < limit or failures:
+            self.sample = self.trial = None
+            self.retry_at = now + 30.
+            self.reason = resource_reason if resources < limit else "Erreurs de transfert récentes"
+            return min(resources, ceiling, limit, max(3, limit // 2) if failures else limit)
+        if now < self.retry_at:
+            return limit
+        self.reason = ""
+        if waiting < 2 or active < max(1, limit - 1):
+            self.sample = None
+            if self.trial:
+                stable, _ = self.trial
+                self.trial = None
+                return min(stable, ceiling)
+            return limit
+        if self.sample is None or self.sample[1] != limit:
+            self.sample = now, limit, counters
+            return limit
+        started, _, initial = self.sample
+        elapsed = now - started
+        transferred, downloaded, integrated = (current - before for current, before in zip(counters[:3], initial[:3]))
+        if elapsed < self.window or downloaded < 3 or integrated < 1 or transferred <= 0:
+            return limit
+        rates = transferred / elapsed, downloaded / elapsed, integrated / elapsed
+        self.sample = None
+        if self.trial:
+            stable, previous = self.trial
+            self.trial = None
+            if (rates[0] < previous[0] * 1.05 or rates[1] < previous[1] * .95
+                    or rates[2] < previous[2] * .95):
+                self.reason = "Cadence insuffisante au plafond supérieur"
+                self.retry_at = now + 120.
+                return min(stable, ceiling)
+        effective = min(ceiling, resources, limit + 5)
+        if effective > limit:
+            self.trial = limit, rates
+        return effective

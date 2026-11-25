@@ -1,5 +1,5 @@
 """Recherche et import d’albums dans la fenêtre de paroles."""
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict
 import json
 import os
@@ -13,14 +13,15 @@ from gi.repository import Gio, GLib, Gtk, Pango
 
 from _kara_import_local import LOCAL, local_target, local_url
 from _kara_import_queue import COMPLETE, HISTORY_DAYS, ImportQueue, MAX_BATCHES, import_key
-from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space, lease, slot_count
+from _kara_import_resources import (MAX_DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space,
+                                   download_limitations, lease, memory_download_limit, slot_count, storage_download_limit)
 from _kara_import_result import CATEGORIES, ImportIssue
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY
 from _kara_paths import BIN, catalogue_command
 from _parole_import_providers import (ALL, ARCHIVE, JAMENDO, MANUAL, OPEN_LICENSES, YOUTUBE,
                                       archive_identifier, jamendo_identifier)
 from _parole_jamendo import client_id as jamendo_client
-from _parole_import_metrics import LOOKUP, observe
+from _parole_import_metrics import LOOKUP, DownloadConcurrency, observe
 from _parole_index import encoded_key
 from _parole_music_identity import CONFIRMED, PROBABLE, compare as compare_editions, from_catalogue, normalized
 from _parole_music_registry import approved_aliases
@@ -28,6 +29,8 @@ from _parole_offer import create_plan, offers_are_equivalent, valid_offer
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
+AUDIO_EVENTS = ("audio-queued", "audio-started", "audio-bytes", "audio-complete", "audio-error", "audio-dropped")
+MEASURED_AUDIO = {"audio-bytes": 0, "audio-complete": 1, "album": 2, "audio-error": 3}
 
 
 def show_details(widget, title, text, journal=None):
@@ -89,6 +92,10 @@ class AlbumImport(Gtk.Revealer):
         self.on_update = lambda *_: None
         self.provider_enabled = lambda _: True
         self.measure_index = None
+        self.enrichment_activity = lambda: (0, 0, 0)
+        self.download_controller = DownloadConcurrency()
+        self.audio_counters = [0, 0, 0, 0]
+        self.audio_samples = deque()
         self.albums = []
         self.artist_routes = {}
         self.edition_facts = {}
@@ -184,6 +191,12 @@ class AlbumImport(Gtk.Revealer):
         self.concurrency.set_tooltip_text("Nombre maximal de lots actifs")
         self.concurrency_handler = self.concurrency.connect("value-changed", self.configure_concurrency)
         controls.append(self.concurrency)
+        controls.append(Gtk.Label(label="Téléchargements simultanés"))
+        self.download_concurrency = Gtk.SpinButton.new_with_range(1, MAX_DOWNLOADS, 1)
+        self.download_concurrency.set_tooltip_text("Plafond global des pistes audio téléchargées simultanément")
+        self.download_concurrency_handler = self.download_concurrency.connect(
+            "value-changed", lambda spin: self.configure(downloads=spin.get_value_as_int()))
+        controls.append(self.download_concurrency)
         self.pause = Gtk.Button(label="Mettre la file en pause")
         self.pause.set_tooltip_text("Suspend les imports et leurs enrichissements en cours. Les données reprises sont conservées.")
         self.pause.connect("clicked", lambda _: self.configure(paused=not self.imports_snapshot[1].get("paused", False)))
@@ -195,6 +208,7 @@ class AlbumImport(Gtk.Revealer):
         if self.queue is None:
             self.pause.set_sensitive(False)
             self.concurrency.set_sensitive(False)
+            self.download_concurrency.set_sensitive(False)
             self.queue_status.set_text(f"File indisponible · {self.queue_error}")
         self.import_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         # The imports own the remaining height. Search results have their
@@ -850,6 +864,13 @@ class AlbumImport(Gtk.Revealer):
         return job
 
     def changed(self, job, kind, payload):
+        if kind in MEASURED_AUDIO:
+            amount = payload.get("size", 0) if kind == "audio-bytes" else payload.get("added", 0) if kind == "album" else 1
+            if type(amount) is int and 0 < amount <= 512 * 1024**2:
+                index = MEASURED_AUDIO[kind]
+                self.audio_counters[index] += amount
+                if index != 3:
+                    self.audio_samples.append((monotonic(), index, amount))
         if kind == "progress":
             self.on_update(job, kind, payload)
         elif kind in {"finished", "album", "running", "provider", "suspended"}:
@@ -887,7 +908,7 @@ class AlbumImport(Gtk.Revealer):
         self.concurrency.set_value(capacity)
         self.concurrency.handler_unblock(self.concurrency_handler)
         active = sum(row["state"] == "running" for row in rows)
-        for row in rows:
+        for row in sorted(rows, key=lambda r: (r["state"] == "queued", not r["manual"], r["seq"])):
             identity, state = row["id"], row["state"]
             if not row["visible"]:
                 # Clearing a lot hides the card immediately. The independently
@@ -968,26 +989,67 @@ class AlbumImport(Gtk.Revealer):
         albums, tracks, settled, planned = self.queue.totals()
         active, waiting = counts.get("running", 0), counts.get("queued", 0)
         errors = counts.get("failed", 0) + counts.get("partial", 0) + counts.get("review", 0)
-        downloads = slot_count(inbox / ".kara-transferts", DOWNLOADS)
+        transfers = inbox / ".kara-transferts"
+        downloads = slot_count(transfers, MAX_DOWNLOADS)
         processing = slot_count(inbox / ".kara-traitements", PROCESSING)
         running = [job for job in self.imports if job.process is not None]
         now = monotonic()
-        rates = [rate for job in running for stamp, rate in job.transfer_rates.values() if now - stamp <= 5.]
+        while self.audio_samples and now - self.audio_samples[0][0] > 60.:
+            self.audio_samples.popleft()
+        rate = sum(amount for stamp, index, amount in self.audio_samples if index == 0 and now - stamp <= 5.) / 5.
+        downloaded = sum(amount for _, index, amount in self.audio_samples if index == 1)
+        integrated = sum(amount for _, index, amount in self.audio_samples if index == 2)
+        waiting_tracks = sum(job.waiting_transfers.total() for job in running)
+        active_albums = sum(len(job.active_albums) for job in running)
+        lyrics, lrc, enrichments = self.enrichment_activity()
+        ceiling, effective = self.queue.download_limits()
+        self.download_concurrency.handler_block(self.download_concurrency_handler)
+        self.download_concurrency.set_value(ceiling)
+        self.download_concurrency.handler_unblock(self.download_concurrency_handler)
+        memory, memory_reason = memory_download_limit()
+        storage = storage_download_limit(inbox) if inbox.is_dir() else MAX_DOWNLOADS
+        if pause_state == "running":
+            proposed = self.download_controller.update(
+                now, ceiling, effective, max(1, min(memory, storage)), downloads, waiting_tracks, self.audio_counters,
+                resource_reason=memory_reason if memory <= storage else "Réserve disque")
+            if proposed != effective:
+                self.queue.set_download_limit(proposed)
+                effective = proposed
+        reasons = [limitation] if limitation else []
+        if memory < ceiling and waiting_tracks:
+            reasons.append(memory_reason)
+        if 0 < storage < ceiling and waiting_tracks:
+            reasons.append("Réserve disque")
+        if self.download_controller.reason and self.download_controller.reason not in reasons:
+            reasons.append(self.download_controller.reason)
+        labels = {"youtube": YOUTUBE, "archive.org": ARCHIVE, "api.jamendo.com": JAMENDO}
+        for source, delay, maximum in download_limitations(transfers):
+            reasons.append(f"{labels[source]} · temporisation {delay:.0f} s" if delay > 2 else
+                           f"{labels[source]} · {maximum} transferts autorisés par le profil")
         progressed = sum(job.album_fraction for job in running)
         progress = min(1., (settled + progressed) / planned) if planned else 0.
         owner_rows = [job.snapshot() for job in reversed(self.imports)]
         self.imports_snapshot = (owner_rows, dict(active=active, waiting=waiting, albums=albums, tracks=tracks,
                                                   errors=errors, downloads=downloads, processing=processing,
-                                                  audio_bytes_per_second=sum(rates) if rates else None,
+                                                  download_ceiling=ceiling, download_limit=effective,
+                                                  waiting_tracks=waiting_tracks, active_albums=active_albums,
+                                                  downloaded_per_minute=downloaded, integrated_per_minute=integrated,
+                                                  audio_bytes_per_second=rate, enrichments=enrichments,
+                                                  import_lyrics_active=lyrics, import_lrc_active=lrc,
                                                   progress=progress, paused=pause_state != "running",
                                                   pause_state=pause_state, batches=capacity,
                                                   history_revision=history_revision,
-                                                  limitation=CATEGORIES["space"] if limitation else "",
+                                                  limitation=" · ".join(reasons),
                                                   max_batches=MAX_BATCHES))
-        summary = (f"{active} lot(s) actif(s) · {waiting} en attente · {albums} album(s) audio complet(s) · "
-                   f"{tracks} piste(s) traitée(s) · {errors} erreur(s)\n"
-                   f"{downloads}/{DOWNLOADS} téléchargement(s) · {processing}/{PROCESSING} traitement(s)")
-        self.queue_status.set_text(f"{summary}\n{limitation}" if limitation else summary)
+        summary = (f"{downloads}/{ceiling} téléchargements · {active} lots actifs · "
+                   f"{rate / 1024**2:.2f} Mio/s · {waiting_tracks} pistes prêtes en attente\n"
+                   f"{downloaded} pistes reçues/min · {integrated} intégrées/min · "
+                   f"{active_albums} albums en cours · {albums} audio complets · {waiting} lots en attente\n"
+                   f"{processing}/{PROCESSING} traitements · {enrichments} enrichissements · "
+                   f"{lyrics} recherches de texte · {lrc} LRC · {errors} lots en échec")
+        if effective < ceiling:
+            reasons.insert(0, f"Plafond appliqué · {effective}")
+        self.queue_status.set_text(f"{summary}\n{' · '.join(reasons)}" if reasons else summary)
         self.overall.set_fraction(progress)
         self.overall.set_text(f"Progression globale · {progress:.0%}")
 
@@ -1083,7 +1145,8 @@ class ImportJob(Gtk.Box):
         self.measured = False
         self.result = None
         self.outcomes = {}
-        self.transfer_rates = {}
+        self.waiting_transfers = Counter()
+        self.active_albums = set()
         self.unstructured = deque(maxlen=32)
         self.failed_jobs = []
         self.detail_text = ""
@@ -1222,16 +1285,24 @@ class ImportJob(Gtk.Box):
         fraction = payload.get("fraction")
         if type(fraction) not in (float, int) or not 0 <= fraction <= 1:
             fraction = None
-        if event == "transfer":
-            rate, position = payload.get("bytes_per_second"), payload.get("position")
-            if type(rate) in (int, float) and 0 <= rate <= 2 * 1024**3 and type(position) is int:
-                self.transfer_rates[payload.get("url"), position] = monotonic(), rate
+        if event in AUDIO_EVENTS:
+            url = payload.get("url")
+            if event == "audio-queued":
+                amount = payload.get("amount")
+                if type(amount) is int and amount > 0:
+                    self.waiting_transfers[url] += amount
+            elif event in ("audio-started", "audio-dropped") and self.waiting_transfers[url] > 0:
+                self.waiting_transfers[url] -= 1
+            self.on_update(self, event, payload)
             return
-        if event == "journal":
+        if event == "album-started":
+            self.active_albums.add(payload.get("url"))
+        elif event == "journal":
             self.journal = payload.get("path")
         elif event == "album" and isinstance(payload.get("url"), str):
             self.outcomes[payload["url"]] = payload
-            self.transfer_rates = {key: rate for key, rate in self.transfer_rates.items() if key[0] != payload["url"]}
+            self.waiting_transfers.pop(payload["url"], None)
+            self.active_albums.discard(payload["url"])
             self.album_fraction = payload.get("album_fraction", 0.)
             if fraction is not None:
                 self.fraction = max(self.fraction, fraction)
@@ -1271,7 +1342,8 @@ class ImportJob(Gtk.Box):
             self.store_state = "queued"
             self.stopping = self.stop_ready = False
             self.stop.set_sensitive(False)
-            self.transfer_rates.clear()
+            self.waiting_transfers.clear()
+            self.active_albums.clear()
             self.album_fraction = 0.
             self.message(text)
             self.on_update(self, "suspended", {"message": text})

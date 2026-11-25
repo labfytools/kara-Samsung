@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Régler le plafond global des téléchargements audio entre 1 et 20, avec priorité manuelle, adaptation à la cadence et aux ressources, et statistiques de transfert mesurées.
+
 - Alimenter les créneaux de transfert par piste depuis plusieurs albums du même lot, avec publication audio et enrichissement indépendants.
 
 - Donner à la liste des imports toute la hauteur disponible et garder le bouton Historique au pied de la fenêtre.

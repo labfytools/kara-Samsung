@@ -6,12 +6,12 @@ import re
 from urllib.parse import quote, urlencode
 
 from _kara_import_local import Entry, MAX_AUDIO, MAX_ENTRIES
-from _kara_import_resources import DOWNLOADS, resource_slot
+from _kara_import_resources import audio_slot
 from _kara_import_result import ImportIssue
 from _musique_oz import AUDIO
 from _parole_import_providers import ARCHIVE, ARCHIVE_ID as IDENTIFIER, license_for
 from _parole_music_identity import position
-from _parole_sources import ProviderUnavailable, fetch, open_audio
+from _parole_sources import ProviderUnavailable, download_interval, fetch, open_audio
 
 HOST = "archive.org"
 SITE = "https://archive.org"
@@ -162,9 +162,10 @@ def search(index, query):
 @contextmanager
 def open_original(index, inbox, album, file, offset=0):
     url = f"{SITE}/download/{album.identifier}/{quote(file.name, safe='/')}"
-    with resource_slot(inbox / ".kara-transferts", DOWNLOADS), open_audio(
+    interval = download_interval(index, ARCHIVE, INTERVAL)
+    with audio_slot(inbox / ".kara-transferts", HOST, interval), open_audio(
             url, registry=index, provider=ARCHIVE, service=HOST, hosts=(HOST,), expected_size=file.size,
-            interval=INTERVAL, **({"offset": offset} if offset else {})) as stream:
+            interval=INTERVAL, paced=True, **({"offset": offset} if offset else {})) as stream:
         yield stream
 
 

@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from _kara_import_local import local_selection, local_url
-from _kara_import_resources import lease
+from _kara_import_resources import DEFAULT_DOWNLOADS, MAX_DOWNLOADS, lease
 from _kara_paths import STATE
 from _musique_oz import SHARED_LIBRARY
 from _parole_import_providers import archive_identifier, jamendo_identifier
@@ -67,6 +67,11 @@ class ImportQueue:
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     paused INTEGER NOT NULL, batches INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS download_settings (
+                    id INTEGER PRIMARY KEY CHECK (id=1),
+                    ceiling INTEGER NOT NULL CHECK (ceiling BETWEEN 1 AND 20),
+                    effective INTEGER NOT NULL CHECK (effective BETWEEN 1 AND ceiling)
+                );
                 CREATE TABLE IF NOT EXISTS jobs (
                     seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
                     state TEXT NOT NULL, option TEXT, targets TEXT NOT NULL, keys TEXT NOT NULL,
@@ -117,6 +122,10 @@ class ImportQueue:
                 CREATE INDEX IF NOT EXISTS history_expiry ON import_history(removed,closed_at);
             """)
             db.execute("INSERT OR IGNORE INTO settings VALUES (1, 0, ?)", (DEFAULT_BATCHES,))
+            db.execute("INSERT OR IGNORE INTO download_settings VALUES (1, ?, ?)", (DEFAULT_DOWNLOADS, DEFAULT_DOWNLOADS))
+            if not any(col["name"] == "manual" for col in db.execute("PRAGMA table_info(jobs)")):
+                db.execute("ALTER TABLE jobs ADD COLUMN manual INTEGER NOT NULL DEFAULT 1 CHECK (manual IN (0,1))")
+                db.execute("UPDATE jobs SET manual=0 WHERE id IN (SELECT job FROM maintenance_receipts)")
             db.execute("INSERT OR IGNORE INTO history_policy(id,days) VALUES(1,0)")
             if not db.execute("SELECT 1 FROM sqlite_schema WHERE name='import_history_settled'").fetchone():
                 # Backfill terminal lots once, atomically with installation of
@@ -158,6 +167,16 @@ class ImportQueue:
     def pause_requested(self):
         return self.settings()[0]
 
+    def download_limits(self):
+        with self.connect() as db:
+            return tuple(db.execute("SELECT ceiling,effective FROM download_settings WHERE id=1").fetchone())
+
+    def set_download_limit(self, limit):
+        # An owner may lower admission while workers hold leases. Workers
+        # drain existing transfers and apply this value to their next one.
+        with self.connect(write=True) as db:
+            db.execute("UPDATE download_settings SET effective=min(ceiling,?) WHERE id=1", (limit,))
+
     def activity(self, *, shared=True):
         # A worker holds a shared lease from admission through visible
         # checkpoint/cleanup. An exclusive probe confirms quiescence across
@@ -177,24 +196,31 @@ class ImportQueue:
                 return "running"
             return "suspending" if self.draining(db) else "paused"
 
-    def configure(self, *, paused=None, batches=None):
+    def configure(self, *, paused=None, batches=None, downloads=None):
         if paused is not None and type(paused) is not bool:
             raise ValueError("État de pause invalide.")
         if batches is not None and (type(batches) is not int or not 1 <= batches <= MAX_BATCHES):
             raise ValueError(f"Choisis entre 1 et {MAX_BATCHES} lots simultanés.")
+        if downloads is not None and (type(downloads) is not int or not 1 <= downloads <= MAX_DOWNLOADS):
+            raise ValueError(f"Choisis entre 1 et {MAX_DOWNLOADS} téléchargements simultanés.")
         with self.connect(write=True) as db:
             current = bool(db.execute("SELECT paused FROM settings WHERE id=1").fetchone()[0])
             if current and paused is False and self.draining(db):
                 raise ValueError("La suspension de la file est encore en cours.")
             db.execute("UPDATE settings SET paused=coalesce(?,paused), batches=coalesce(?,batches) WHERE id=1",
                        (paused, batches))
+            if downloads is not None:
+                db.execute("""UPDATE download_settings
+                              SET effective=min(?, CASE WHEN ? > ceiling THEN max(effective,?) ELSE effective END),
+                                  ceiling=? WHERE id=1""",
+                           (downloads, downloads, DEFAULT_DOWNLOADS, downloads))
             return paused is not None and paused != current
 
-    def enqueue(self, targets, *, option=None, journal=None, request=None, artist_routes=None, db=None):
+    def enqueue(self, targets, *, option=None, journal=None, request=None, artist_routes=None, manual=True, db=None):
         if db is None:
             with self.connect(write=True) as transaction:
                 return self.enqueue(targets, option=option, journal=journal, request=request,
-                                    artist_routes=artist_routes, db=transaction)
+                                    artist_routes=artist_routes, manual=manual, db=transaction)
         unique = {}
         for title, url in targets:
             if local_url(url):
@@ -210,9 +236,12 @@ class ImportQueue:
                          (keys and keys <= set(map(tuple, json.loads(row["keys"]))))), None)
         if identity is None:
             identity = uuid4().hex
-            db.execute("INSERT INTO jobs (id,state,option,targets,keys,message,journal) VALUES (?, 'queued', ?, ?, ?, ?, ?)",
+            db.execute("""INSERT INTO jobs (id,state,option,targets,keys,message,journal,manual)
+                          VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)""",
                        (identity, option, json.dumps(list(unique.values())), json.dumps(sorted(keys)),
-                        "En attente…", journal))
+                        "En attente…", journal, int(manual)))
+        elif manual:
+            db.execute("UPDATE jobs SET manual=1 WHERE id=? AND manual=0", (identity,))
         if request is not None:
             request["task_id"] = identity
             self.save_request(request, db=db)
@@ -245,7 +274,7 @@ class ImportQueue:
                 return row[0]
             if db.execute("SELECT paused FROM settings WHERE id=1").fetchone()[0]:
                 return None
-            identity = self.enqueue([(title, url)], db=db)
+            identity = self.enqueue([(title, url)], manual=False, db=db)
             db.execute("INSERT INTO maintenance_receipts VALUES(?,?)", (receipt, identity))
             return identity
 
@@ -263,6 +292,11 @@ class ImportQueue:
             predicate = f"({CURRENT}) OR refresh>0" if include_hidden_refresh else CURRENT
             rows = db.execute(f"SELECT *, {VISIBLE} AS visible FROM jobs WHERE {predicate} ORDER BY seq")
             return [self.decode(row) for row in rows]
+
+    def transfer_settings(self, identity):
+        with self.connect() as db:
+            return tuple(db.execute("""SELECT effective,coalesce((SELECT manual FROM jobs WHERE id=?),1)
+                                       FROM download_settings WHERE id=1""", (identity,)).fetchone())
 
     def history(self, before=None, limit=25):
         with self.connect() as db:

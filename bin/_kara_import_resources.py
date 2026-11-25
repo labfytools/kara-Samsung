@@ -1,5 +1,5 @@
 """Cross-process admission and cooldowns for the import engine."""
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from collections import deque
 from concurrent.futures import wait as wait_futures
 from contextvars import ContextVar, copy_context
@@ -11,6 +11,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+from tempfile import NamedTemporaryFile
 from threading import Event, Lock, Thread
 import time
 
@@ -18,15 +19,45 @@ from _kara_import_result import ImportIssue
 from _kara_paths import STATE
 
 DOWNLOADS = 3
+DEFAULT_DOWNLOADS = 10
 MAX_DOWNLOADS = 20
+# YouTube's existing access profile remains three concurrent transfers.
+# Direct downloads keep their existing host gates and provider quotas.
+AUDIO_PROVIDERS = {"youtube": (DOWNLOADS, 60), "archive.org": (MAX_DOWNLOADS, 5),
+                   "api.jamendo.com": (MAX_DOWNLOADS, 5)}
 CATALOGUE = 2
 PROCESSING = 2
 DISK_RESERVE = 2 * 1024**3
 STATE_RESERVE = 64 * 1024**2
 MAX_MEDIA = 256 * 1024**2
-WORKING_RESERVE = MAX_MEDIA * DOWNLOADS * 2
+WORKING_RESERVE = MAX_MEDIA * 2
 RATE_DIRECTORY = STATE / "kara" / "import-rates"
 _pause = ContextVar("import_pause", default=None)
+_downloads = ContextVar("import_downloads", default=None)
+_download_observer = ContextVar("import_download_observer", default=None)
+
+
+@contextmanager
+def download_scope(settings):
+    token = _downloads.set(settings)
+    try:
+        yield
+    finally:
+        _downloads.reset(token)
+
+
+@contextmanager
+def watch_download(observer):
+    token = _download_observer.set(observer)
+    try:
+        yield
+    finally:
+        _download_observer.reset(token)
+
+
+def download_event(event, **fields):
+    if observer := _download_observer.get():
+        observer(event, **fields)
 
 
 class ImportSuspended(Exception):
@@ -248,6 +279,137 @@ def slot_count(directory, capacity):
     return active
 
 
+def memory_download_limit():
+    try:
+        available = next(int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
+                         if line.startswith("MemAvailable:")) // 1024
+        pressure = float(Path("/proc/pressure/memory").read_text().splitlines()[0].split()[1].split("=")[1])
+    except (OSError, ValueError, StopIteration, IndexError):
+        return DOWNLOADS, "Mesure de la mémoire indisponible"
+    # Leave memory for Strawberry, desktop and video. Each admitted track
+    # may own a downloader and its conversion subprocess at the same time.
+    limit = max(1, min(MAX_DOWNLOADS, (available - 1280) // 192))
+    if pressure >= 1:
+        limit = min(limit, DOWNLOADS)
+    return limit, "Pression mémoire" if limit < MAX_DOWNLOADS else ""
+
+
+def storage_download_limit(path):
+    return max(0, min(MAX_DOWNLOADS, (disk_usage(path).free - DISK_RESERVE) // WORKING_RESERVE))
+
+
+def service_delay(service):
+    path = RATE_DIRECTORY / service
+    if not path.exists():
+        return 0.
+    with lease(path) as fd:
+        return max(0., rate_record(fd) - time.time())
+
+
+def pending_downloads(directory):
+    # Tickets exist only while a living worker waits. A killed owner leaves
+    # an unlocked file which the next observer can safely discard.
+    waiting = directory / "waiting"
+    if not waiting.is_dir():
+        return
+    for path in sorted(waiting.iterdir()):
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            continue
+        try:
+            try:
+                flock(fd, LOCK_EX | LOCK_NB)
+            except BlockingIOError:
+                # tempfile's random part may itself contain underscores.
+                yield path, path.name.rsplit("_", 1)[-1]
+            else:
+                path.unlink(missing_ok=True)
+        finally:
+            os.close(fd)
+
+
+@contextmanager
+def audio_slot(directory, service, interval=0., notice=None, *, admitted=None):
+    # Acquisition across competing processes is serialized. The leases
+    # themselves outlive admission and are inherited by an external worker.
+    # A capped or cooling provider cannot hold a global transfer slot.
+    profile, max_wait = AUDIO_PROVIDERS[service]
+    provider_slots = directory / service
+    waiting = directory / "waiting"
+    waiting.mkdir(parents=True, mode=0o770, exist_ok=True)
+    mutex = directory / "admission.lock"
+    settings = _downloads.get() or (lambda: (DEFAULT_DOWNLOADS, True))
+    _, manual = settings()
+    prefix = f"{0 if manual else 1}_{time.monotonic_ns():020d}-"
+    with ExitStack() as transferred:
+        with lease(mutex):
+            ticket = transferred.enter_context(NamedTemporaryFile(
+                dir=waiting, prefix=prefix, suffix="_" + service, delete=False))
+            flock(ticket.fileno(), LOCK_EX)
+        path = Path(ticket.name)
+        try:
+            while True:
+                checkpoint()
+                with lease(mutex), ExitStack() as claim:
+                    effective, manual = settings()
+                    if manual and path.name.startswith("1"):
+                        promoted = path.with_name("0" + path.name[1:])
+                        path.rename(promoted)
+                        path = promoted
+                    delay = service_delay(service)
+                    if delay > max_wait:
+                        raise ImportIssue("network", f"Temporisation du fournisseur {service}.")
+                    # Reserve worst-case space for currently active transfers
+                    # and their drafts. Count high-numbered slots when the
+                    # effective cap has just been reduced.
+                    active = slot_count(directory, MAX_DOWNLOADS)
+                    global_fd = None
+                    if active < effective:
+                        memory, _ = memory_download_limit()
+                        free = storage_download_limit(directory)
+                        if not free:
+                            check_space(directory, extra=WORKING_RESERVE)
+                    if active < effective and active < min(memory, free):
+                        available = {}
+                        for waiter, host in pending_downloads(directory):
+                            if host not in AUDIO_PROVIDERS:
+                                continue
+                            if host not in available:
+                                cap, _ = AUDIO_PROVIDERS[host]
+                                available[host] = (service_delay(host) <= 0
+                                                   and slot_count(directory / host, cap) < cap)
+                            if not available[host]:
+                                continue
+                            if waiter == path and reserve_service(service, interval):
+                                provider_fd = claim.enter_context(resource_slot(provider_slots, profile))
+                                global_fd = claim.enter_context(resource_slot(directory, MAX_DOWNLOADS))
+                                transferred.enter_context(claim.pop_all())
+                            break
+                    if global_fd is not None:
+                        break
+                if notice:
+                    notice()
+                    notice = None
+                wait(.1)
+        finally:
+            path.unlink(missing_ok=True)
+        if admitted:
+            admitted()
+        download_event("audio-started")
+        yield global_fd, provider_fd
+
+
+def download_limitations(directory):
+    if not (directory / "waiting").is_dir():
+        return []
+    with lease(directory / "admission.lock", wait=False) as fd:
+        hosts = {host for _, host in pending_downloads(directory)} if fd is not None else set()
+    return [(service, delay, AUDIO_PROVIDERS[service][0]) for service in sorted(hosts & AUDIO_PROVIDERS.keys())
+            if (delay := service_delay(service)) > 2 or
+            slot_count(directory / service, AUDIO_PROVIDERS[service][0]) >= AUDIO_PROVIDERS[service][0]]
+
+
 def check_space(path, *, state=False, extra=0):
     reserve = STATE_RESERVE if state else DISK_RESERVE
     if disk_usage(path).free < reserve + extra:
@@ -265,6 +427,15 @@ def rate_record(fd, when=None):
         os.write(fd, str(max(when, previous)).encode())
         os.ftruncate(fd, os.lseek(fd, 0, os.SEEK_CUR))
     return previous
+
+
+def reserve_service(service, interval):
+    with lease(RATE_DIRECTORY / service) as fd:
+        now = time.time()
+        if rate_record(fd) > now:
+            return False
+        rate_record(fd, now + interval)
+        return True
 
 
 def wait_service(service, interval, *, max_wait=60):

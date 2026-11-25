@@ -289,6 +289,7 @@ def main():
     parser.add_argument("--garder-tags-import", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dossier-import", nargs=2, metavar=("ARTISTE", "ALBUM"), help=argparse.SUPPRESS)
     parser.add_argument("--classement-artiste", help=argparse.SUPPRESS)
+    parser.add_argument("--liste-import", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.classement_artiste and (not args.reprise_interne or args.dossier_import or args.apercu or
             component(args.classement_artiste, "") in {"", INBOX, "YouTube"}
@@ -305,6 +306,23 @@ def main():
     if not root.is_dir():
         parser.error(f"bibliothèque absente : {root}")
     sources = args.sources or [path for path in (root / INBOX, root / "YouTube") if path.is_dir()]
+    if args.liste_import:
+        # The private importer can publish a bounded subset of staged
+        # originals. Unlisted files remain available for the next attempt.
+        try:
+            if (not args.reprise_interne or len(sources) != 1 or not sources[0].is_dir()
+                    or args.liste_import.stat().st_size > 1024**2):
+                raise ValueError
+            names = json.loads(args.liste_import.read_text(encoding="utf-8"))
+            if (not isinstance(names, list) or not 0 < len(names) <= 4096
+                    or any(not isinstance(name, str) or Path(name).name != name or name.startswith(".")
+                           for name in names)):
+                raise ValueError
+            sources = [sources[0] / name for name in names]
+            if any(path.is_symlink() or not audio_file(path) for path in sources):
+                raise ValueError
+        except (OSError, ValueError):
+            parser.error("liste interne d’import invalide")
     if any(not path.expanduser().exists() for path in sources):
         parser.error("au moins un chemin source est introuvable")
     tracks = sorted({track.resolve() for source in sources

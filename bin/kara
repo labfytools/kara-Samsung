@@ -29,9 +29,10 @@ from _kara_import_local import LOCAL, local_entries, local_selection, local_url,
 
 from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_category, retry_albums
 from _kara_import_queue import COMPLETE, ImportQueue, digest
-from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE, ImportPause,
-                                   ImportSuspended, check_space, checkpoint as pause_checkpoint, current_pause, defer_service, lease,
-                                   resource_slot, terminate_group, track_results, wait_service)
+from _kara_import_resources import (AUDIO_PROVIDERS, CATALOGUE, MAX_DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE,
+                                   ImportPause, ImportSuspended, audio_slot, check_space, checkpoint as pause_checkpoint,
+                                   current_pause, defer_service, download_scope, lease, resource_slot, terminate_group,
+                                   track_results, wait_service, watch_download)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
                          shared_mutation, source_video)
@@ -95,9 +96,9 @@ class ImportProgress:
         self.measure_index = None
         self.announce_provider = lambda *_: None
         self.transfers = {}
-        self.telemetry = None
+        self.audio_event = lambda *_args, **_fields: None
         self.artist_route = None
-        self.track_pool = None
+        self.track_pools = {}
 
     def emit(self, message, fraction=None, *, event="progress", **fields):
         if self.report is not None:
@@ -174,11 +175,10 @@ class ImportProgress:
                 transfer = self.transfers.get(index)
                 if transfer is not None:
                     now, size_now = monotonic(), int(downloaded)
-                    previous_bytes, previous_stamp = transfer.bytes, transfer.last
+                    previous_bytes = transfer.bytes
                     transfer.received(size_now, now)
-                    if (self.telemetry and status == "downloading" and previous_stamp is not None
-                            and now > previous_stamp and size_now > previous_bytes):
-                        self.telemetry(index, (size_now - previous_bytes) / (now - previous_stamp))
+                    if transfer.bytes > previous_bytes:
+                        self.audio_event("audio-bytes", size=transfer.bytes - previous_bytes)
                 estimate = max(0.0, min(1.0, int(downloaded) / int(size))) if int(size) > 0 else 0.0
                 if status == "finished":
                     self.track_status("Préparation de l’audio", index, 0.94)
@@ -671,15 +671,17 @@ def download_track(source, folder, progress):
     ]
     directory = folder.parent / ".kara-transferts"
     waiting = monotonic()
-    with resource_slot(directory, DOWNLOADS, lambda: progress.emit("En attente d’un téléchargement…")) as slot:
+    with audio_slot(directory, "youtube", .5, lambda: progress.emit("En attente d’un téléchargement…"),
+                    admitted=lambda: progress.audio_event("audio-started")) as slots:
         progress.measured(label, "download_queue", monotonic() - waiting)
         check_space(folder, extra=WORKING_RESERVE)
-        waiting = monotonic()
-        wait_service("youtube", 0.5)
-        progress.measured(label, "provider_wait", monotonic() - waiting)
         with progress.download_lock:
             transfer = progress.transfers[position] = Transfer(monotonic())
-        result = run(label, command, progress=progress, download=True, announce=False, resource=(slot,), disk=folder)
+        result = run(label, command, progress=progress, download=True, announce=False, resource=slots, disk=folder)
+        if not result and position in progress.finished_positions:
+            progress.audio_event("audio-complete")
+        elif result:
+            progress.audio_event("audio-error")
         if transfer.first is not None:
             progress.measured(label, "first_byte", transfer.first - transfer.started)
             progress.measured(label, "transfer", transfer.last - transfer.first, bytes=transfer.bytes)
@@ -688,18 +690,25 @@ def download_track(source, folder, progress):
         return result
 
 
-def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, folder_hint=None, filing_artist=None):
-    if not any(audio_files(batch)):
+def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, folder_hint=None, filing_artist=None,
+               selected=None):
+    if not selected and not any(audio_files(batch)):
         return 0, []
     with TemporaryDirectory(prefix="kara-rapport-") as temporary:
         report = Path(temporary) / "pistes.json"
         credit = ["--artiste-album", album_artist] if album_artist else []
         destination = ["--dossier-import", *folder_hint] if folder_hint else []
         filing = ["--classement-artiste", filing_artist] if filing_artist else []
+        selection = []
+        if selected is not None:
+            paths = Path(temporary) / "selection.json"
+            paths.write_text(json.dumps(sorted(selected)), encoding="utf-8")
+            selection = ["--liste-import", str(paths)]
         code = run("Tri dans l’audiothèque",
                    [str(BIN / "musique-tri"), "--bibliotheque", str(SHARED_LIBRARY),
                     "--rapport", str(report), "--rapport-detaille", "--reprise-interne", str(receipt),
-                    *credit, *(["--garder-tags-import"] if preserve_tags else ()), *destination, *filing, "--", str(batch)],
+                    *credit, *(["--garder-tags-import"] if preserve_tags else ()), *destination, *filing,
+                    *selection, "--", str(batch)],
                    progress=progress, fraction=0.76, resource="processing", cooperative=True)
         if not report.is_file():
             if not code:
@@ -1017,12 +1026,11 @@ def publish_staged(item, root, inbox, folder, records, active, targets, receipt,
     # Store source proof before sorting so a restart after an
     # audio publication can recover its exact destination.
     write_checkpoint(manifest, records)
-    for candidate in audio_files(folder):
-        if candidate.parent == folder and candidate.name not in active:
-            candidate.unlink()
     check_space(folder, extra=MAX_MEDIA * PROCESSING)
     hint = grouped_destination(reuse, root)
-    item.added, _ = sort_audio(folder, progress, None, receipt, preserve_tags=True, folder_hint=hint)
+    # A prefetched original may be complete while validation is paused or
+    # stopped. Publish the verified subset and leave other originals staged.
+    item.added, _ = sort_audio(folder, progress, None, receipt, preserve_tags=True, folder_hint=hint, selected=active)
     published = local_receipts(receipt)
     for stage, name in active.items():
         target = local_destination(records[name], published.get(stage, []), root)
@@ -1094,12 +1102,22 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                 record["catalogue_tags"] = provider_tags
                                 targets[name] = target
                                 continue
-                        yield number, name, entry, provider_tags, stage
+                        transfer = remote and not (folder / stage).is_file()
+                        if transfer:
+                            progress.audio_event("audio-queued", amount=1)
+                        yield number, name, entry, provider_tags, stage, transfer
 
                 def receive(task):
-                    number, name, entry, _, stage = task
+                    number, name, entry, _, stage, transfer = task
                     draft = folder / stage
                     action = "Téléchargement" if entry.external_id else "Copie locale"
+                    started = False
+
+                    def observed(event, **fields):
+                        nonlocal started
+                        started = started or event == "audio-started"
+                        progress.audio_event(event, **fields)
+
                     try:
                         if stop.is_set():
                             return None, None
@@ -1110,19 +1128,28 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                         folder.mkdir(mode=0o770, exist_ok=True)
                         if draft.is_symlink():
                             raise ImportIssue("path", "Fichier de réception symbolique.")
-                        return file_sha(draft) if draft.is_file() else read_entry(entry, draft, stop), None
+                        with watch_download(observed if transfer else None):
+                            checksum = file_sha(draft) if draft.is_file() else read_entry(entry, draft, stop)
+                        if transfer and checksum:
+                            progress.audio_event("audio-complete")
+                        return checksum, None
                     except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
+                        if transfer:
+                            progress.audio_event("audio-error")
                         return None, error
+                    finally:
+                        if transfer and not started:
+                            progress.audio_event("audio-dropped")
 
                 # A ZIP reader owns a shared local descriptor. Only remote
                 # entries open independent streams and can be prefetched.
-                pool = progress.track_pool if remote else None
+                pool = progress.track_pools.get("archive.org" if item.provider == ARCHIVE else "api.jamendo.com") if remote else None
 
                 def received(task):
                     return task, receive(task)
 
                 with track_results(pool, received, pending_entries()) as results:
-                    for (number, name, entry, provider_tags, stage), (checksum, error) in results:
+                    for (number, name, entry, provider_tags, stage, _), (checksum, error) in results:
                         draft = folder / stage
                         if folder.is_dir() and not folder.is_symlink():
                             item.folder = folder
@@ -1349,7 +1376,8 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
             child.guard = progress.guard + (guard,)
             child.measure_index = index
             child.defer_enrichment = progress.defer_enrichment
-            child.track_pool = progress.track_pool
+            child.track_pools = progress.track_pools
+            child.audio_event = progress.audio_event
             attempt = BatchAlbum(uri, item.title, child, provider=source)
             started = monotonic()
             parsed = urlsplit(uri)
@@ -1517,14 +1545,16 @@ def import_album(item, root, inbox, previous, stop, seen):
                             raise ImportIssue("download", "Le téléchargeur n’a publié aucun fichier pour cette piste.")
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         record_error(progress, f"Téléchargement · piste {source.position}", error, "download")
+                        progress.audio_event("audio-error")
                     finally:
                         with progress.download_lock:
                             item.processed += 1
                             progress.track_status("Piste traitée", source.position, 1.0)
 
                 if tasks:
+                    progress.audio_event("audio-queued", amount=len(tasks))
                     with ExitStack() as workers:
-                        pool = progress.track_pool or workers.enter_context(
+                        pool = progress.track_pools.get("youtube") or workers.enter_context(
                             ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS))
                         results = workers.enter_context(track_results(pool, transfer, tasks))
                         for _ in results:
@@ -1589,11 +1619,12 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
         child.guard = progress.guard
         child.download_lock = RLock()
         child.measure_index = metrics
-        child.track_pool = progress.track_pool
+        child.track_pools = progress.track_pools
         child.announce_provider = lambda source, label: progress.emit(label, event="provider", provider=source)
         if progress.managed:
-            child.telemetry = lambda position, rate: progress.emit(
-                "Mesure du transfert audio", event="transfer", url=url, position=position, bytes_per_second=rate)
+            child.audio_event = lambda event, **fields: progress.emit(
+                "Mesure du transfert audio", event=event, url=url, **fields)
+            child.audio_event("album-started")
         item = BatchAlbum(url, (titles or {}).get(url) or f"Album {index}", child)
         started = monotonic()
 
@@ -1735,7 +1766,10 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
 
     with ExitStack() as workers:
         if progress.managed:
-            progress.track_pool = workers.enter_context(ThreadPoolExecutor(max_workers=MAX_DOWNLOADS))
+            # A provider waiting for its own quota cannot occupy the threads
+            # that feed another provider. Audio leases remain global.
+            progress.track_pools = {service: workers.enter_context(ThreadPoolExecutor(max_workers=capacity))
+                                    for service, (capacity, _) in AUDIO_PROVIDERS.items()}
         results = album_results()
         workers.callback(results.close)
         for result in results:
@@ -1890,6 +1924,8 @@ def main():
                     if not urls:
                         progress.emit("Les albums du lot sont déjà terminés.", 1., event="skip")
                         return 0
+                configuration = queue or ImportQueue()
+                resources.enter_context(download_scope(lambda: configuration.transfer_settings(args.import_file)))
                 return prepare_batch(urls, progress, stop, previous, titles=titles,
                                      routes=queue.routes(job["id"]) if job else None,
                                      on_album=(lambda outcome: queue.album(job["id"], outcome)) if job else None)

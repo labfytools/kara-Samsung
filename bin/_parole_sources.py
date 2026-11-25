@@ -1,6 +1,7 @@
 """Registre des fournisseurs et transport HTTPS."""
 from contextlib import contextmanager
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 import http.client
 import ipaddress
@@ -11,7 +12,7 @@ import ssl
 from time import monotonic, time
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
-from _kara_import_resources import checkpoint, current_pause, defer_service, wait_service
+from _kara_import_resources import checkpoint, current_pause, defer_service, download_event, wait_service
 from _kara_import_result import ImportIssue
 from _parole_index import document
 from _parole_import_providers import ARCHIVE, JAMENDO, MANUAL
@@ -66,7 +67,7 @@ def configure_limits(index, identity, daily, seconds):
         db.execute("UPDATE sources SET config=? WHERE id=?", (document(config), identity))
 
 
-def wait_provider(index, identity, host, interval, *, max_wait=5, validation=False):
+def provider_policy(index, identity, *, validation=False):
     with index.db() as db:
         row = db.execute("SELECT state,config FROM sources WHERE id=?", (identity,)).fetchone()
     if not row or (row["state"] != "active" and not (validation and row["state"] != "excluded")):
@@ -74,12 +75,38 @@ def wait_provider(index, identity, host, interval, *, max_wait=5, validation=Fal
     daily, configured = provider_limits(json.loads(row["config"]))
     if not daily:
         raise ProviderUnavailable("Limite quotidienne du fournisseur atteinte")
+    return daily, configured
+
+
+def retry_delay(value):
+    if value.isascii() and value.isdecimal() and len(value) < 12:
+        return int(value)
     try:
-        # The host gate already coordinates separate clients and import
-        # accesses. Settings can raise each protocol's minimum interval.
-        wait_service(host, max(interval, configured), max_wait=max_wait)
-    except ImportIssue as error:
-        raise ProviderUnavailable("Temporisation fournisseur") from error
+        stamp = parsedate_to_datetime(value)
+        if stamp.tzinfo is not None:
+            return max(0., stamp.timestamp() - time())
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return 120
+
+
+def download_interval(index, identity, interval):
+    try:
+        _, configured = provider_policy(index, identity)
+    except ProviderUnavailable as error:
+        raise ImportIssue("network", str(error), stage=f"Téléchargement {identity}") from error
+    return max(interval, configured)
+
+
+def wait_provider(index, identity, host, interval, *, max_wait=5, validation=False, paced=False):
+    daily, configured = provider_policy(index, identity, validation=validation)
+    if not paced:
+        try:
+            # Catalogue and audio share the host gate. Scheduled audio
+            # already reserved its interval at global track admission.
+            wait_service(host, max(interval, configured), max_wait=max_wait)
+        except ImportIssue as error:
+            raise ProviderUnavailable("Temporisation fournisseur") from error
     if not validation and not index.source_enabled(identity):
         raise ProviderUnavailable("Fournisseur désactivé pendant la temporisation")
     if not index.reserve_daily("provider:" + identity, daily):
@@ -173,7 +200,7 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
                 return None
             if response.status == 429 or response.status >= 500:
                 retry = response.getheader("Retry-After", "")
-                delay = min(int(retry), 86400) if retry.isdecimal() and len(retry) < 8 else 120
+                delay = retry_delay(retry)
                 defer_service(service, delay)
                 if provider in (ARCHIVE, JAMENDO):
                     limited(registry, provider, delay, response.status)
@@ -206,6 +233,8 @@ class AudioDownload:
         self.length = length
         self.offset = offset
         self.transfer = Transfer(started)
+        self.reported_at = started
+        self.reported_bytes = 0
         self.finished = False
 
     def read(self, size):
@@ -218,19 +247,26 @@ class AudioDownload:
             checkpoint()
             raise ImportIssue("network", "Transfert audio interrompu.") from error
         checkpoint()
+        now = monotonic()
         if block:
-            self.transfer.received(self.transfer.bytes + len(block), monotonic())
+            self.transfer.received(self.transfer.bytes + len(block), now)
         else:
             self.finished = True
+        if self.finished or now - self.reported_at >= .35:
+            delta = self.transfer.bytes - self.reported_bytes
+            if delta:
+                download_event("audio-bytes", size=delta)
+                self.reported_bytes = self.transfer.bytes
+                self.reported_at = now
         return block
 
 
 @contextmanager
-def open_audio(url, *, registry, provider, service, hosts, expected_size=None, interval=1.2, offset=0):
+def open_audio(url, *, registry, provider, service, hosts, expected_size=None, interval=1.2, offset=0, paced=False):
     # Rate and authorization are checked before contacting any storage node.
     # Redirects must stay in the adapter's allowed domains and keep TLS.
     try:
-        wait_provider(registry, provider, service, interval)
+        wait_provider(registry, provider, service, interval, paced=paced)
     except ProviderUnavailable as error:
         raise ImportIssue("network", str(error), stage=f"Téléchargement {provider}") from error
     started = monotonic()
@@ -257,7 +293,7 @@ def open_audio(url, *, registry, provider, service, hosts, expected_size=None, i
                 continue
             if response.status == 429 or response.status >= 500:
                 retry = response.getheader("Retry-After", "")
-                delay = min(int(retry), 86400) if retry.isdecimal() and len(retry) < 8 else 120
+                delay = retry_delay(retry)
                 defer_service(service, delay)
                 limited(registry, provider, delay, response.status)
                 raise ImportIssue("network", f"{provider} HTTP {response.status}")

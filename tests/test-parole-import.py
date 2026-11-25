@@ -1090,6 +1090,9 @@ os.execv(os.environ['REAL_FFMPEG'], [os.environ['REAL_FFMPEG'], *args])
         pid = int(marker.read_text())
         self.until(lambda: Path(f"/proc/{pid}/comm").exists() and
                    Path(f"/proc/{pid}/comm").read_text().strip() == "ffmpeg")
+        # Album admission is concurrent. Wait for the independent receipt
+        # before interrupting the intentionally slowed PCM subprocess.
+        self.until(lambda: first.as_uri() in queue.outcomes(identity), seconds=3)
         original = queue.outcomes(identity)[first.as_uri()]
         self.await_pause(queue, worker)
         self.assertFalse(Path(f"/proc/{pid}").exists())
@@ -1208,7 +1211,9 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         self.assertEqual(Counter(self.requests.read_text().splitlines()), {"soundPART01": 1, "soundPART02": 1})
 
     def test_one_lot_downloads_tracks_from_several_albums(self):
-        self.config["transfer_delay"] = 3
+        # Leave room for the real catalogue request cadence and yt-dlp
+        # startup variance while the three independent transfers overlap.
+        self.config["transfer_delay"] = 6
         targets = []
         for number in range(DOWNLOADS):
             key = f"PLPARALLEL{number}"

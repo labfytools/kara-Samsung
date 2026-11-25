@@ -392,6 +392,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                            cache=self.references, background=background)
             self.album_import.provider_enabled = self.maintenance.index.source_enabled
             self.album_import.measure_index = self.maintenance.index
+            self.album_import.enrichment_activity = lambda: (
+                *self.maintenance.import_activity,
+                int(bool(self.maintenance.active and self.maintenance.active[0] in ("import_lyrics", "import_cover"))))
             self.album_import.refresh_providers()
             self.maintenance.set_priority(self.maintenance_busy())
             self.maintenance.start()
