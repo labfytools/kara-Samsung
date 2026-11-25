@@ -29,13 +29,19 @@ def plan_id(url):
     return value if len(value) == 64 and all(ch in "0123456789abcdef" for ch in value) else None
 
 
-def source_order(urls):
-    # Keep intra-source order and the original ordinal, while bringing
-    # each requested source into the bounded album window from the start.
+def source_order(urls, previous=None):
+    # Bring each requested source into the album window early. On resume,
+    # prior failed extractions must not monopolize that source's resolution
+    # slots while fresh targets are still waiting. Positions in the durable
+    # lot and order among equally advanced albums are preserved.
+    previous = previous or {}
+    priority = {"suspended": 1, "partial": 2, "failure": 2}
     lanes = {}
     for ordinal, url in enumerate(urls, 1):
         lane = "edition" if plan_id(url) else audio_source(url)
         lanes.setdefault(lane, []).append((ordinal, url))
+    for items in lanes.values():
+        items.sort(key=lambda item: priority.get(previous.get(item[1], {}).get("status"), 0))
     return (item for group in zip_longest(*lanes.values()) for item in group if item is not None)
 
 

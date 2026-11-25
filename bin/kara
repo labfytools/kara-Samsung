@@ -1818,7 +1818,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
                     break
                 yield process_album(index, url)
             return
-        targets = iter(source_order(urls))
+        targets = iter(source_order(urls, previous))
         # Leave room for albums in catalogue resolution and publication
         # while the remaining albums keep all audio slots supplied.
         with ThreadPoolExecutor(max_workers=min(ALBUM_WINDOW, len(urls))) as albums:

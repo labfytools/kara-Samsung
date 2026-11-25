@@ -62,6 +62,15 @@ class QueueTests(unittest.TestCase):
         order = list(source_order([*youtube, archive, jamendo]))
         self.assertEqual(order[:4], [(1, youtube[0]), (232, archive), (233, jamendo), (2, youtube[1])])
         self.assertEqual(sorted(url for _, url in order), sorted([*youtube, archive, jamendo]))
+
+    def test_resume_prepares_unattempted_targets_before_repeat_failures(self):
+        interrupted, partial, ready, new, failed = (playlist(f"REPRISE{i}") for i in range(5))
+        archive = "https://archive.org/details/album-mixte"
+        previous = {interrupted: {"status": "suspended"}, partial: {"status": "partial"},
+                    ready: {"status": "pending"}, failed: {"status": "failure"}}
+        order = list(source_order([interrupted, partial, ready, new, failed, archive], previous))
+        self.assertEqual(order, [(3, ready), (6, archive), (4, new), (1, interrupted), (2, partial), (5, failed)])
+
     def test_mobile_discography_approval_keeps_the_selected_artist(self):
         private = Path(self.enterContext(TemporaryDirectory()))
         queue = ImportQueue(private / "state", private)

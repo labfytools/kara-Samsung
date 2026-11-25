@@ -2,6 +2,8 @@
 
 ## En développement
 
+- À la reprise d’un lot, préparer en priorité les albums encore en attente et conserver les tentatives interrompues ou en échec pour la suite du même lot.
+
 - Alterner les sources d’un lot dès la préparation des albums, prendre en compte l’attente de créneau dans le choix entre éditions équivalentes et afficher l’origine des limites dans Parole.
 
 - Libérer le créneau global pendant la résolution YouTube et transférer la conversion yt-dlp à la file de traitement, en conservant le profil réseau du fournisseur et les fichiers de reprise.
