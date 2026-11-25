@@ -193,12 +193,16 @@ def consolidate(entries, gap, first, second, source, known):
 def refine(song, lines, basis, duration, language, decoder, *, vocal_stem=None,
            audit_only=False, progress=lambda *_: None):
     lines = deepcopy(lines)
-    withheld = audit_prefixes(lines) if lines[0]["source_start"] is not None else {}
+    timed_source = lines[0]["source_start"] is not None
+    withheld = audit_prefixes(lines) if timed_source else {}
     entries = [(i, word) for i, line in enumerate(lines) for word in line["words"]]
     n_known = sum(w["start"] is not None for _, w in entries)
     report = {"version": VERSION, "windows": 0, "decodes": 0, "stem_windows": 0,
               "recovered_mix": 0, "recovered_stem": 0, "quarantined": len(withheld)}
-    enough_lines = basis["line_coverage"] >= MIN_LINE_COVERAGE
+    # An untimed source has no inherited onsets. High word coverage can
+    # justify skipping retries only when every line already has evidence.
+    enough_lines = (basis["line_coverage"] >= MIN_LINE_COVERAGE if timed_source
+                    else basis["uncertain_lines"] == 0)
     if not withheld and (basis["word_coverage"] >= TARGET_COVERAGE and enough_lines or n_known < 3
                          or basis["transcript_agreement"] < MIN_TRANSCRIPT_AGREEMENT):
         finished, summary, ready = finish_alignment(lines, duration, basis)

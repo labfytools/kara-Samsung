@@ -54,3 +54,7 @@ Le manifeste Turbo et ses repères sont déjà persistés séparément des piste
 ### Compatibilité du moteur de séparation
 
 L’environnement installé associe Demucs 4.0.1 à PyTorch et Torchaudio 2.6.0 `+cpu`. Il déclare `cuda=None` et `hip=None`. Le Vulkan de whisper.cpp équipe Turbo. Demucs utilise le modèle `htdemucs`, des segments de 7 s, un chevauchement de 10 %, zéro décalage aléatoire et une tâche de segment. Le traitement produit les deux stems FLAC. Demucs expose un parallélisme de segments sur CPU et plusieurs modèles. Leur coût mémoire, leur vitesse et la qualité nécessitent des comparaisons sur des morceaux terminés. [Implémentation Demucs](https://github.com/facebookresearch/demucs/blob/main/demucs/apply.py) · [Matrice AMD ROCm](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html)
+
+### Cas de génération depuis un texte
+
+Une fixture passe par la publication LRC de Kara avec 24 mots observés sur 25 et quatre débuts de ligne sur cinq. Avant la correction, le seuil de couverture des mots déclenchait l’arrêt avant le premier essai local, alors que la publication exigeait encore le cinquième début. Après la correction, la même fixture publie les cinq lignes. Elle exécute une seule passe globale simulée, puis deux décodages simulés sur des fenêtres de moins de sept secondes. Le PCM encadrant ces fenêtres est décodé par FFmpeg. Aucun seuil acoustique ou de publication ne change. Le test mesure la décision et le travail demandé au décodeur. Le résultat sur les chansons complètes reste à qualifier.

@@ -17,7 +17,7 @@ import _kara_prepare as prepare
 from _kara_reference import alignment, align_words, lrc_text
 from _kara_refine import Gap, consolidate, refine, two_observations
 from _kara_scoring import prepared_window, score_breakdown, score_reference_line
-from _kara_turbo import ObservedWord, decode_segment, transcribe_file
+from _kara_turbo import ObservedWord, Segment, decode_segment, transcribe_file
 from _kara_words import word_boundaries
 from _paroles_lrc import parse_lrc, source_orders
 
@@ -172,6 +172,41 @@ class PlainReferenceTests(unittest.TestCase):
         self.assertFalse(ready)
         self.assertEqual(report["line_coverage"], .5)
         self.assertIsNone(lines[1]["display_start"])
+
+    def test_high_word_coverage_still_searches_for_the_missing_line_start(self):
+        rows = [(2., "Derrière les collines tourne lentement"),
+                (6., "Un moulin aux ailes rouges"),
+                (10., "Demain reviendra notre douce chanson"),
+                (14., "Emportée par des vents contraires"),
+                (18., "Jamais personne ne chante pareil")]
+        heard = observations(rows)
+        del heard[10]
+        # One absent onset leaves 24/25 words but prevents an untimed LRC.
+        # The two local observations contain the onset and its neighbor.
+        spoken = [observations(rows[2:3], [delta]) for delta in (0., .04)]
+        decoder = Mock()
+        decoder.decode.side_effect = [("fr", [Segment("", 9., 12., .01, tuple(words))]) for words in spoken]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio, model = root / "titre.wav", root / "model"
+            with wave.open(str(audio), "wb") as stream:
+                stream.setparams((1, 2, 16_000, 0, "NONE", ""))
+                stream.writeframes(bytes(24 * 16_000 * 2))
+            model.write_bytes(b"poids de test")
+            worker = prepare.Preparer(prepare.PreparedCache(root / "prepared", model))
+            plain = "\n".join(text for _, text in rows).encode()
+            with (patch.object(worker, "settings", return_value={}),
+                  patch.object(worker, "transcribe", return_value=(24., "fr", heard, [], 0., .1)) as first,
+                  patch.object(worker, "load_decoder", return_value=decoder),
+                  patch.object(prepare, "music_library", return_value=root)):
+                ready, report, _, _ = worker.prepare(audio, plain=plain)
+            self.assertTrue(ready)
+            first.assert_called_once()
+            self.assertEqual(report["baseline"]["word_coverage"], .96)
+            self.assertEqual(report["refinement"]["decodes"], 2)
+            self.assertEqual(report["refinement"]["recovered_mix"], 1)
+            self.assertTrue(all(len(call.args[0]) < 7 * 16_000 * 2 for call in decoder.decode.call_args_list))
+            self.assertEqual(parse_lrc(audio.with_suffix(".lrc").read_text()), rows)
 
     def test_refrain_publication_and_move_reuse_the_observed_reference(self):
         with TemporaryDirectory() as tmp:

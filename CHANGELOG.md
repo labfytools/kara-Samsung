@@ -21,3 +21,4 @@
 - Documenter les essais nocturnes ArchASP sur deux morceaux complets et la validation sur secteur, écran éteint.
 - Ajouter un banc silencieux de préparation sur dix morceaux complets et un comparateur de repères sur annotations indépendantes.
 - Distinguer références temporelles et préparations complètes, et afficher les temps moyens observés et les blocs mutualisés dans le bilan nocturne.
+- Continuer la recherche locale des débuts de ligne manquants lorsque la transcription d’un texte sans minutage couvre déjà au moins 95 % des mots.
