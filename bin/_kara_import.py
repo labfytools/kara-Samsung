@@ -1225,15 +1225,14 @@ class ImportJob(Gtk.Box):
         if event == "transfer":
             rate, position = payload.get("bytes_per_second"), payload.get("position")
             if type(rate) in (int, float) and 0 <= rate <= 2 * 1024**3 and type(position) is int:
-                # One album supplies a lot's transfers at any given time.
-                self.transfer_rates[position] = monotonic(), rate
+                self.transfer_rates[payload.get("url"), position] = monotonic(), rate
             return
         if event == "journal":
             self.journal = payload.get("path")
         elif event == "album" and isinstance(payload.get("url"), str):
             self.outcomes[payload["url"]] = payload
-            self.transfer_rates.clear()
-            self.album_fraction = 0.
+            self.transfer_rates = {key: rate for key, rate in self.transfer_rates.items() if key[0] != payload["url"]}
+            self.album_fraction = payload.get("album_fraction", 0.)
             if fraction is not None:
                 self.fraction = max(self.fraction, fraction)
                 self.progress.set_fraction(self.fraction)

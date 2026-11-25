@@ -1207,6 +1207,25 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         self.assertTrue(queue.outcomes(identity)[playlist("PLPART")]["enrichment"]["import_lyrics"])
         self.assertEqual(Counter(self.requests.read_text().splitlines()), {"soundPART01": 1, "soundPART02": 1})
 
+    def test_one_lot_downloads_tracks_from_several_albums(self):
+        self.config["transfer_delay"] = 3
+        targets = []
+        for number in range(DOWNLOADS):
+            key = f"PLPARALLEL{number}"
+            self.config["playlists"][key] = {"title": key, "tracks": [
+                {"id": f"parallel{number:03d}", "title": key}]}
+            targets.append((key, playlist(key)))
+        self.update_config()
+        queue = ImportQueue(self.temp / "state", self.library)
+        identity = queue.enqueue(targets)
+        worker = self.launch_managed(queue, identity)
+        self.until(lambda: slot_count(self.inbox / ".kara-transferts", DOWNLOADS) == DOWNLOADS)
+        stdout, stderr = worker.communicate(timeout=35)
+        self.assertEqual(worker.returncode, 0, (stdout, stderr))
+        self.assertEqual(queue.totals(), (DOWNLOADS, DOWNLOADS, DOWNLOADS, DOWNLOADS))
+        self.assertEqual(Counter(self.requests.read_text().splitlines()),
+                         {f"parallel{number:03d}": 1 for number in range(DOWNLOADS)})
+
     def test_four_lots_share_download_slots_and_finish_after_client_exit(self):
         self.config["transfer_delay"] = 2
         targets = []

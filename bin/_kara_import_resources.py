@@ -1,6 +1,8 @@
 """Cross-process admission and cooldowns for the import engine."""
 from contextlib import contextmanager
-from contextvars import ContextVar
+from collections import deque
+from concurrent.futures import wait as wait_futures
+from contextvars import ContextVar, copy_context
 from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, flock
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ from _kara_import_result import ImportIssue
 from _kara_paths import STATE
 
 DOWNLOADS = 3
+MAX_DOWNLOADS = 20
 CATALOGUE = 2
 PROCESSING = 2
 DISK_RESERVE = 2 * 1024**3
@@ -101,6 +104,38 @@ def wait(seconds):
         time.sleep(seconds)
     elif pause.suspended.wait(seconds):
         raise ImportSuspended
+
+
+@contextmanager
+def track_results(executor, handler, values, *, window=MAX_DOWNLOADS):
+    # One executor feeds all albums in the lot. Keep only a window of
+    # submitted work per album, and drain it before releasing its lease or
+    # closing its input manifest, even when a pause or error interrupts it.
+    if executor is None:
+        yield map(handler, values)
+        return
+    pending = deque()
+    values = iter(values)
+
+    def admit():
+        checkpoint()
+        for value in values:
+            pending.append(executor.submit(copy_context().run, handler, value))
+            break
+
+    def results():
+        while pending:
+            result = pending[0].result()
+            pending.popleft()
+            admit()
+            yield result
+
+    try:
+        for _ in range(window):
+            admit()
+        yield results()
+    finally:
+        wait_futures([future for future in pending if not future.cancel()])
 
 
 def terminate_group(process):

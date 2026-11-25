@@ -2,7 +2,7 @@
 """Importe un album ou complète la bibliothèque partagée."""
 import argparse
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from contextlib import ExitStack
 from contextvars import copy_context
 from dataclasses import dataclass, field
@@ -29,9 +29,9 @@ from _kara_import_local import LOCAL, local_entries, local_selection, local_url,
 
 from _kara_import_result import CATEGORIES, ImportIssue, ImportLog, failure_category, retry_albums
 from _kara_import_queue import COMPLETE, ImportQueue, digest
-from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE, ImportPause,
+from _kara_import_resources import (CATALOGUE, DOWNLOADS, MAX_DOWNLOADS, MAX_MEDIA, PROCESSING, WORKING_RESERVE, ImportPause,
                                    ImportSuspended, check_space, checkpoint as pause_checkpoint, current_pause, defer_service, lease,
-                                   resource_slot, terminate_group, wait_service)
+                                   resource_slot, terminate_group, track_results, wait_service)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
                          shared_mutation, source_video)
@@ -97,6 +97,7 @@ class ImportProgress:
         self.transfers = {}
         self.telemetry = None
         self.artist_route = None
+        self.track_pool = None
 
     def emit(self, message, fraction=None, *, event="progress", **fields):
         if self.report is not None:
@@ -928,7 +929,7 @@ def import_internet_archive(item, root, inbox, previous, stop, seen, identity, *
     item.title, item.artist = album.title, album.artist
     source = archive.release_url(identity)
     import_entries(item, root, inbox, previous, stop, seen, archive.entries(index, inbox, album),
-                   source, source, album.license, "catalogue", verified=verified, reuse=reuse, catalogue=album.facts)
+                   source, source, album.license, "catalogue", verified=verified, reuse=reuse, catalogue=album.facts, remote=True)
 
 
 def import_jamendo(item, root, inbox, previous, stop, seen, selection, *, plan=None, reuse=None):
@@ -946,7 +947,7 @@ def import_jamendo(item, root, inbox, previous, stop, seen, selection, *, plan=N
     item.title, item.artist = release.title, release.artist
     source = jamendo.release_url(kind, identity)
     import_entries(item, root, inbox, previous, stop, seen, jamendo.entries(index, inbox, release),
-                   source, source, "", "catalogue", verified=verified, reuse=reuse, catalogue=release.facts)
+                   source, source, "", "catalogue", verified=verified, reuse=reuse, catalogue=release.facts, remote=True)
 
 
 def checked_offer(plan, current):
@@ -1032,7 +1033,7 @@ def publish_staged(item, root, inbox, folder, records, active, targets, receipt,
 
 
 def import_entries(item, root, inbox, previous, stop, seen, reader, source, reference, license_url, verification,
-                   *, verified=None, reuse=None, catalogue=None):
+                   *, verified=None, reuse=None, catalogue=None, remote=False):
     progress = item.progress
     verified = verified or {}
     reuse = reuse or {}
@@ -1049,6 +1050,9 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
     manifest = workspace / "originaux.json"
     folder = inbox / f".kara-local-{digest(item.identity)}"
     with lease(workspace / "verrou") as guard:
+        if item.identity in seen:
+            item.status = "duplicate"
+            return
         progress.guard += (guard,)
         try:
             with reader as entries:
@@ -1059,86 +1063,111 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                 published = local_receipts(receipt)
                 targets = {}
                 active = {}
-                for number, name in enumerate(audio, 1):
-                    pause_checkpoint()
-                    if stop.is_set():
-                        break
-                    entry = entries[name]
-                    provider_tags = declared_tags(release, catalogue_tracks.get(entry.position))
-                    if verified and entry.position not in verified:
-                        raise ImportIssue("path", "Position absente de l’édition vérifiée.")
-                    if entry.position in reuse:
-                        continue
-                    # Each revision has a different staging name. The source
-                    # only becomes eligible once a full read and PCM check end.
-                    stage = digest(json.dumps([name, entry.revision])) + Path(name).suffix.lower()
-                    record = records.get(name, {})
-                    if record.get("stage") == stage:
-                        candidates = published.get(stage, [])
-                        if record.get("path") and record["path"] not in candidates:
-                            candidates = [*candidates, record["path"]]
-                        target = local_destination(record, candidates, root)
-                        if target:
-                            if "tags" not in record:
-                                try:
-                                    tags, _ = probe(target, include_duration=True, include_codec=True)
-                                    record["tags"] = original_tags(tags)
-                                except (OSError, ValueError, subprocess.SubprocessError):
-                                    record["tags"] = {}
-                            record["catalogue_tags"] = provider_tags
-                            targets[name] = target
+
+                def pending_entries():
+                    for number, name in enumerate(audio, 1):
+                        pause_checkpoint()
+                        if stop.is_set():
+                            break
+                        entry = entries[name]
+                        provider_tags = declared_tags(release, catalogue_tracks.get(entry.position))
+                        if verified and entry.position not in verified:
+                            raise ImportIssue("path", "Position absente de l’édition vérifiée.")
+                        if entry.position in reuse:
                             continue
+                        # Each revision has a different staging name. The source
+                        # only becomes eligible once a full read and PCM check end.
+                        stage = digest(json.dumps([name, entry.revision])) + Path(name).suffix.lower()
+                        record = records.get(name, {})
+                        if record.get("stage") == stage:
+                            candidates = published.get(stage, [])
+                            if record.get("path") and record["path"] not in candidates:
+                                candidates = [*candidates, record["path"]]
+                            target = local_destination(record, candidates, root)
+                            if target:
+                                if "tags" not in record:
+                                    try:
+                                        tags, _ = probe(target, include_duration=True, include_codec=True)
+                                        record["tags"] = original_tags(tags)
+                                    except (OSError, ValueError, subprocess.SubprocessError):
+                                        record["tags"] = {}
+                                record["catalogue_tags"] = provider_tags
+                                targets[name] = target
+                                continue
+                        yield number, name, entry, provider_tags, stage
+
+                def receive(task):
+                    number, name, entry, _, stage = task
+                    draft = folder / stage
                     action = "Téléchargement" if entry.external_id else "Copie locale"
-                    progress.emit(f"{item.provider} · {action} · piste {number}/{len(audio)}",
-                                  0.72 * (number - 1) / len(audio))
-                    draft = None
                     try:
+                        if stop.is_set():
+                            return None, None
+                        progress.emit(f"{item.provider} · {action} · piste {number}/{len(audio)}",
+                                      0.72 * (number - 1) / len(audio))
                         if folder.is_symlink():
                             raise ImportIssue("path", "Dossier de réception symbolique.")
                         folder.mkdir(mode=0o770, exist_ok=True)
-                        item.folder = folder
-                        draft = folder / stage
                         if draft.is_symlink():
                             raise ImportIssue("path", "Fichier de réception symbolique.")
-                        checksum = file_sha(draft) if draft.is_file() else read_entry(entry, draft, stop)
-                        if not checksum:
-                            break
-                        with resource_slot(inbox / ".kara-traitements", PROCESSING) as processing:
-                            tags, _ = probe(draft, include_codec=True, include_duration=True)
-                            if not (tags.get("title") and (tags.get("album") or len(audio) == 1)
-                                    and (tags.get("albumartist") or tags.get("artist"))):
-                                raise ImportIssue("path", "Métadonnées titre, album ou artiste manquantes.")
-                            if entry.format and tags["codec"] != entry.format:
-                                raise ImportIssue("processing", "Le fichier reçu ne correspond pas au format demandé.")
-                            if verified:
-                                disc = position(tags.get("disc") or tags.get("discnumber")) or 1
-                                track = position(tags.get("track") or tags.get("tracknumber"))
-                                actual = Track(disc, track, tags["title"], duration_ms(tags.get("duration_seconds")))
-                                if ((disc, track) != entry.position or not actual.millis
-                                        or same_track(verified[entry.position], actual) == DIFFERENT):
-                                    raise ImportIssue("path", "Le fichier reçu ne correspond pas à la piste vérifiée.")
-                            records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft),
-                                             "tags": original_tags(tags), "catalogue_tags": provider_tags}
-                            if tool:
-                                record = records[name]
-                                try:
-                                    value = stored_fingerprint(progress.measure_index, record["pcm"])
-                                except sqlite3.Error:
-                                    value = ""
-                                if not value:
-                                    measured = fingerprint(draft, tool=tool, retain=progress.guard + (processing,))
-                                    value = measured.document() if measured else ""
-                                if value:
-                                    record["fingerprint"] = value
-                        active[stage] = name
-                        item.processed += 1
+                        return file_sha(draft) if draft.is_file() else read_entry(entry, draft, stop), None
                     except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
-                        if draft is not None and not draft.is_symlink():
-                            draft.unlink(missing_ok=True)
-                        record_error(progress, f"{action} · piste {number} · {name}",
-                                     error if isinstance(error, ImportIssue) else ImportIssue("path", str(error)))
-                        if progress.failures[-1]["category"] == "space":
-                            break
+                        return None, error
+
+                # A ZIP reader owns a shared local descriptor. Only remote
+                # entries open independent streams and can be prefetched.
+                pool = progress.track_pool if remote else None
+
+                def received(task):
+                    return task, receive(task)
+
+                with track_results(pool, received, pending_entries()) as results:
+                    for (number, name, entry, provider_tags, stage), (checksum, error) in results:
+                        draft = folder / stage
+                        if folder.is_dir() and not folder.is_symlink():
+                            item.folder = folder
+                        action = "Téléchargement" if entry.external_id else "Copie locale"
+                        try:
+                            if error is not None:
+                                raise error
+                            if not checksum:
+                                break
+                            with resource_slot(inbox / ".kara-traitements", PROCESSING) as processing:
+                                tags, _ = probe(draft, include_codec=True, include_duration=True)
+                                if not (tags.get("title") and (tags.get("album") or len(audio) == 1)
+                                        and (tags.get("albumartist") or tags.get("artist"))):
+                                    raise ImportIssue("path", "Métadonnées titre, album ou artiste manquantes.")
+                                if entry.format and tags["codec"] != entry.format:
+                                    raise ImportIssue("processing", "Le fichier reçu ne correspond pas au format demandé.")
+                                if verified:
+                                    disc = position(tags.get("disc") or tags.get("discnumber")) or 1
+                                    track = position(tags.get("track") or tags.get("tracknumber"))
+                                    actual = Track(disc, track, tags["title"], duration_ms(tags.get("duration_seconds")))
+                                    if ((disc, track) != entry.position or not actual.millis
+                                            or same_track(verified[entry.position], actual) == DIFFERENT):
+                                        raise ImportIssue("path", "Le fichier reçu ne correspond pas à la piste vérifiée.")
+                                records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft),
+                                                 "tags": original_tags(tags), "catalogue_tags": provider_tags}
+                                if tool:
+                                    record = records[name]
+                                    try:
+                                        value = stored_fingerprint(progress.measure_index, record["pcm"])
+                                    except sqlite3.Error:
+                                        value = ""
+                                    if not value:
+                                        measured = fingerprint(draft, tool=tool, retain=progress.guard + (processing,))
+                                        value = measured.document() if measured else ""
+                                    if value:
+                                        record["fingerprint"] = value
+                            active[stage] = name
+                            item.processed += 1
+                        except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
+                            if not draft.is_symlink():
+                                draft.unlink(missing_ok=True)
+                            record_error(progress, f"{action} · piste {number} · {name}",
+                                         error if isinstance(error, ImportIssue) else ImportIssue("path", str(error)))
+                            if progress.failures[-1]["category"] == "space":
+                                break
                 # Serialize identity decisions only through publication.
                 # Network transfers and the subsequent enrichment stay parallel.
                 with lease(workspace.parent / "identification.lock") as ownership:
@@ -1182,9 +1211,11 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
         except BadZipFile as error:
             raise ImportIssue("path", str(error), stage="Archive ZIP") from error
         finally:
-            if item.folder is not None:
-                item.remaining = close_batch(item.folder)
-            progress.guard = progress.guard[:-1]
+            try:
+                if folder.is_dir() and not folder.is_symlink():
+                    item.remaining = close_batch(folder)
+            finally:
+                progress.guard = progress.guard[:-1]
 
 
 def declared_tags(release, track):
@@ -1254,6 +1285,9 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
     checkpoint = directory / "fournisseurs.json"
     progress = item.progress
     with lease(directory / "verrou") as guard:
+        if item.identity in seen:
+            item.status = "duplicate"
+            return
         saved = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.is_file() else {}
         prior = verified_publications(saved.get("tracks", []) or previous.get("provenance", []), root, inbox, positions)
         if len(prior) < len(positions):
@@ -1315,6 +1349,7 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
             child.guard = progress.guard + (guard,)
             child.measure_index = index
             child.defer_enrichment = progress.defer_enrichment
+            child.track_pool = progress.track_pool
             attempt = BatchAlbum(uri, item.title, child, provider=source)
             started = monotonic()
             parsed = urlsplit(uri)
@@ -1427,6 +1462,9 @@ def import_album(item, root, inbox, previous, stop, seen):
     identity = digest(item.identity)
     workspace = inbox / ".kara-reprises" / identity
     with lease(workspace / "verrou") as guard:
+        if item.identity in seen:
+            item.status = "duplicate"
+            return
         if stop.is_set():
             return
         progress.guard += (guard,)
@@ -1485,11 +1523,12 @@ def import_album(item, root, inbox, previous, stop, seen):
                             progress.track_status("Piste traitée", source.position, 1.0)
 
                 if tasks:
-                    with ThreadPoolExecutor(max_workers=min(DOWNLOAD_WORKERS, len(tasks))) as pool:
-                        # Only this album supplies work. A discography never
-                        # allocates a future for every track of every release.
-                        list(pool.map(lambda source, scope: scope.run(transfer, source), tasks,
-                                      (copy_context() for _ in tasks)))
+                    with ExitStack() as workers:
+                        pool = progress.track_pool or workers.enter_context(
+                            ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS))
+                        results = workers.enter_context(track_results(pool, transfer, tasks))
+                        for _ in results:
+                            pass
                 if any(audio_files(folder)):
                     check_space(folder, extra=MAX_MEDIA * PROCESSING)
                     item.added, sorted_tracks = sort_audio(folder, progress, item.artist, receipt, filing_artist=filing_artist)
@@ -1533,18 +1572,24 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
     details = []
     seen = set()
     urls = list(dict.fromkeys(urls))
-    for index, url in enumerate(urls, 1):
+    fractions, completed = {}, 0
+    storage_limited = Event()
+    batch_lock = Lock()
+
+    def process_album(index, url):
+        nonlocal completed
         pause_checkpoint()
-        # A cooperative stop leaves untouched targets and their prior outcomes
-        # alone. The active album still reconciles its publication receipts.
+        # A cooperative stop leaves untouched targets and prior outcomes
+        # alone. Started albums still reconcile publication receipts.
         if stop.is_set():
-            break
+            return None
         child = ImportProgress(journal=progress.journal, json_output=progress.json_output, url=url)
         child.defer_enrichment = progress.managed
         child.artist_route = (routes or {}).get(url)
         child.guard = progress.guard
         child.download_lock = RLock()
         child.measure_index = metrics
+        child.track_pool = progress.track_pool
         child.announce_provider = lambda source, label: progress.emit(label, event="provider", provider=source)
         if progress.managed:
             child.telemetry = lambda position, rate: progress.emit(
@@ -1556,9 +1601,12 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
             with child.download_lock:
                 if fraction is not None:
                     item.fraction = max(item.fraction, fraction)
-                progress.emit(f"{index}/{len(urls)} · {item.title} · {message}",
-                              (index - 1 + item.fraction) / len(urls), url=url,
-                              album_fraction=item.fraction, processed=item.processed)
+                with batch_lock:
+                    fractions[url] = item.fraction
+                    partial = sum(fractions.values())
+                    progress.emit(f"{index}/{len(urls)} · {item.title} · {message}",
+                                  (completed + partial) / len(urls), url=url,
+                                  album_fraction=partial, processed=item.processed)
 
         child.report = report
         if not stop.is_set():
@@ -1605,9 +1653,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
             try:
                 # Another import can be initializing the index while this
                 # worker starts. Retry the mandatory admission after audio.
-                if metrics is None:
-                    metrics = Index(root)
-                enrichment = schedule_enrichment(metrics, item.tracks)
+                enrichment = schedule_enrichment(metrics or Index(root), item.tracks)
             except (OSError, sqlite3.Error) as error:
                 record_error(child, "Admission de l’enrichissement", error, "processing")
         if item.status != "duplicate":
@@ -1647,13 +1693,61 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
             on_album(outcome)
         child.measured("Album", "audio" if progress.managed else "total", monotonic() - started,
                        added=item.added, tracks=len(item.tracks), audio_complete=item.audio_complete)
-        progress.emit(fraction=index / len(urls), event="album", **outcome)
-        counts[item.status] += 1
-        added += item.added
-        if not progress.json_output:
-            details.extend(f"{item.title} · {entry['stage']}\n{entry['detail']}" for entry in diagnostics)
-        if any(diagnostic["category"] == "space" for diagnostic in diagnostics):
-            break
+        with batch_lock:
+            completed += 1
+            fractions.pop(url, None)
+            partial = sum(fractions.values())
+            progress.emit(fraction=(completed + partial) / len(urls), event="album",
+                          album_fraction=partial, **outcome)
+        return item, diagnostics
+
+    def album_results():
+        targets = iter(enumerate(urls, 1))
+        if not progress.managed or len(urls) == 1:
+            for index, url in targets:
+                if stop.is_set() or storage_limited.is_set():
+                    break
+                yield process_album(index, url)
+            return
+        # Albums own staging and publication. A rolling window feeds the
+        # shared track pool, while catalogue and metadata keep their own slots.
+        with ThreadPoolExecutor(max_workers=min(MAX_DOWNLOADS, len(urls))) as albums:
+            pending = set()
+
+            def admit():
+                if stop.is_set() or storage_limited.is_set():
+                    return
+                for index, url in targets:
+                    pending.add(albums.submit(copy_context().run, process_album, index, url))
+                    break
+
+            for _ in range(MAX_DOWNLOADS):
+                admit()
+            try:
+                while pending:
+                    ready, pending = wait_futures(pending, return_when=FIRST_COMPLETED)
+                    for future in ready:
+                        yield future.result()
+                        admit()
+            finally:
+                for future in pending:
+                    future.cancel()
+
+    with ExitStack() as workers:
+        if progress.managed:
+            progress.track_pool = workers.enter_context(ThreadPoolExecutor(max_workers=MAX_DOWNLOADS))
+        results = album_results()
+        workers.callback(results.close)
+        for result in results:
+            if result is None:
+                continue
+            item, diagnostics = result
+            counts[item.status] += 1
+            added += item.added
+            if not progress.json_output:
+                details.extend(f"{item.title} · {entry['stage']}\n{entry['detail']}" for entry in diagnostics)
+            if any(diagnostic["category"] == "space" for diagnostic in diagnostics):
+                storage_limited.set()
 
     failed = bool(counts["failure"] or counts["partial"])
     if not counts:
