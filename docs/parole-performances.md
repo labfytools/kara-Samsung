@@ -86,6 +86,18 @@ Le temps moyen total est de 476,3 s. Les reprises représentent 75,2 % du temps 
 
 Les quatre variantes texte seul ont terminé en 224,3 à 329,2 s. Elles couvrent de 69,2 à 91,5 % des mots et de 54,2 à 91,5 % des débuts de ligne. Les quatre publications LRC ont été refusées.
 
+### Contexte audio réduit pour les reprises Turbo
+
+Le candidat isolé conserve le modèle F16, le DTW et la taille du faisceau. Sur les seules reprises en faisceau, il encode la fenêtre fournie avec deux secondes de marge, arrondies à un bloc de 64 positions d’encodeur. La première passe et les reprises gloutonnes conservent leur contexte. Les trois essais utilisent les pistes Demucs exactes du banc de référence.
+
+| Cas | Turbo de référence → candidat | Reprises de référence → candidat | Mots | Débuts de ligne | Validation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| fr-rap-dense | 322,2 → 270,8 s | 253,3 → 183,1 s | 89,0 → 88,8 % | 91,5 → 92,7 % | Oui → Oui |
+| en-rap-alternance | 326,6 → 210,5 s | 273,8 → 147,3 s | 83,9 → 71,7 % | 78,7 → 65,6 % | Oui → Refusée |
+| es-chant-studio | 298,2 → 148,6 s | 217,2 → 71,6 s | 91,9 → 88,3 % | 86,8 → 81,6 % | Oui → Oui |
+
+Le candidat réduit de 33,5 % le temps Turbo cumulé sur ces trois titres. La perte de couverture sur *Good Guy* provoque le refus d’une préparation auparavant validée. Le candidat est écarté. Les traces privées sont conservées sous `ab-local-context/`.
+
 ### Stockage et coût d’ouverture
 
 Le relevé du cache de production donne 160,82 Mio d’instrumentaux FLAC, 145,67 Mio de voix FLAC, 0,047 Mio de métadonnées Demucs et 0,645 Mio de références Turbo et LRC. Les tailles sont allouées et les liens physiques déjà dédupliqués par inode. Les pistes existantes sont en FLAC stéréo. Les deux fichiers représentent plus de 99 % de l’espace mesuré.
