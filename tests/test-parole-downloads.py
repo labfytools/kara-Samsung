@@ -209,6 +209,14 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(sample(62, 5, 3, (1700, 17, 0, 1)), 3)
         self.assertIn("sous-utilisé", controller.reason)
 
+    def test_trial_retains_the_previous_values_of_live_gtk_counters(self):
+        controller = DownloadConcurrency(window=10)
+        counters = [0, 0, 0, 0]
+        self.assertEqual(controller.update(0, 20, 3, 20, 3, 10, counters), 3)
+        counters[0] += 4096
+        counters[1] += 4
+        self.assertEqual(controller.update(11, 20, 3, 20, 3, 8, counters), 5)
+
     def test_provider_cooldown_priority_and_ticket_names(self):
         with TemporaryDirectory() as temp, patch.object(resources, "RATE_DIRECTORY", Path(temp) / "rates"):
             folder = Path(temp) / "slots"

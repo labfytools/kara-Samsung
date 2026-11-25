@@ -161,7 +161,8 @@ class DownloadConcurrency:
             return limit
         self.last_saturation = now
         if self.sample is None or self.sample[1] != limit:
-            self.sample = now, limit, counters
+            # GTK updates its cumulative counters in place between samples.
+            self.sample = now, limit, tuple(counters)
             return limit
         started, _, initial = self.sample
         elapsed = now - started

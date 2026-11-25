@@ -94,6 +94,17 @@ La file exige 64 Mio libres dans l’espace d’état. L’admission conserve 2 
 
 L’audit de `06bb68d` identifie trois choix locaux historiques. Le CLI utilisait deux travailleurs par album, le profil local de YouTube accordait trois créneaux et yt-dlp recevait un plafond de 512 Kio/s. Avec yt-dlp 2026.11.23, quatre passages successifs sur le même original CC0 de 7,87 Mio ont pris 19,94 et 19,38 s avec ce plafond, puis 5,19 et 5,04 s pour les deux passages intercalés sans plafond local. La durée inclut la connexion et le lancement du programme. Les quatre fichiers ont été vérifiés avec la somme du manifeste. [Fiche Internet Archive](https://archive.org/details/ILOOSE)
 
+La qualification du 25 novembre 2026 a importé et publié 26 originaux CC0 d’Internet Archive (272,38 Mio) dans une bibliothèque isolée, avec un seul lot par passage. Les départs ont été espacés de 1,22 s en médiane. Le pic mesure les corps audio en cours de réception. [ILOOSE](https://archive.org/details/ILOOSE) · [Jj Lens](https://archive.org/details/JjLensAkvavitSessionsDansihLanguageTributesToGgAllin) · [LAM002](https://archive.org/details/LAM002) · [Hindle Wakes](https://archive.org/details/hindlewakes_1209_librivox)
+
+| Plafond global | Pic en réception | Durée | Débit de bout en bout | Pistes publiées/min |
+| ---: | ---: | ---: | ---: | ---: |
+| 5 | 5 | 108,00 s | 2,52 Mio/s | 14,44 |
+| 10 | 4 | 149,70 s | 1,82 Mio/s | 10,42 |
+| 15 | 4 | 115,44 s | 2,36 Mio/s | 13,51 |
+| 20 | 7 | 57,41 s | 4,74 Mio/s | 27,17 |
+
+Les plafonds de 10 à 20 sont restés au-dessus des pics observés. Ces passages donnent la cadence d’importation de cet échantillon, avec la variabilité du réseau. Pour mesurer la capacité de réception, un autre essai sur 21 originaux (150,92 Mio) a ralenti localement la lecture de chaque flux à 48 Kio/s pendant les 55 premières secondes, avec les mêmes règles d’accès au fournisseur. Le moteur a observé 5, 10, 15 et 20 réceptions simultanées à 10,30 s, 16,61 s, 22,67 s et 28,70 s. Les 21 pistes ont été publiées en 107,82 s. Cette durée inclut le ralentissement de l’essai.
+
 `python3 -B tests/test-parole-downloads.py -v` passe par la file persistante, l’admission des pistes, les réponses HTTP avec plages, la validation d’originaux FLAC et le tri. Le serveur local définit une cadence et des quotas propres à la fixture. Les mesures couvrent la durée jusqu’à la publication des 36 pistes sur disque. La maintenance des paroles reste en attente au moment où l’audio est disponible.
 
 | Plafond global | Pic observé | Durée | Débit de bout en bout | Pistes publiées/min |
