@@ -454,6 +454,50 @@ class GtkTests(Fixture):
         self.assertIn("0 préparations complètes", summary)
         self.assertIn("0 références temporelles validées", summary)
         self.assertNotIn("Moyennes", summary)
+
+        from time import sleep
+
+        # Exercise the real multi-selection, preview and confirmation in a
+        # mounted GTK dialog. The fixture collection alone is mutated.
+        (self.root / "Lune").mkdir()
+        album = self.root / "Soleil" / "Édition locale"
+        album.mkdir(parents=True)
+        (album / "Piste.opus").write_bytes(path.read_bytes())
+        view.artist_groups(view.root)
+        grouping = next(item for item in Gtk.Window.list_toplevels() if item.get_title() == "Regrouper les artistes")
+        self.addCleanup(grouping.destroy)
+
+        def widgets(widget):
+            yield widget
+            child = widget.get_first_child()
+            while child:
+                yield from widgets(child)
+                child = child.get_next_sibling()
+
+        children = list(widgets(grouping))
+        selection = next(item.get_model() for item in children if isinstance(item, Gtk.ListView))
+        for i in range(selection.get_n_items()):
+            if selection.get_item(i).data in ("Lune", "Soleil"):
+                selection.select_item(i, False)
+        lookup = {item.get_label(): item for item in children if isinstance(item, Gtk.Button)}
+        lookup["Prévisualiser"].emit("clicked")
+        context = GLib.MainContext.default()
+        for _ in range(300):
+            while context.pending():
+                context.iteration(False)
+            if lookup["Confirmer le regroupement"].get_sensitive():
+                break
+            sleep(.01)
+        self.assertTrue(lookup["Confirmer le regroupement"].get_sensitive())
+        self.assertFalse((self.root / "Lune" / album.name).exists())
+        lookup["Confirmer le regroupement"].emit("clicked")
+        for _ in range(300):
+            while context.pending():
+                context.iteration(False)
+            if any(isinstance(item, Gtk.Label) and item.get_label().startswith("Artistes regroupés") for item in children):
+                break
+            sleep(.01)
+        self.assertTrue((self.root / "Lune" / album.name / "Piste.opus").is_file())
         window.maintenance.journal.emit("SCAN", "Fixture")
         view.console.update()
         self.assertTrue(any(e[-1] == "Fixture" for e in view.console.lines))

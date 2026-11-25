@@ -10,6 +10,8 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from _kara_party import Song
 from _kara_import import show_details
+from _kara_paths import STATE
+from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, rebind_preparations, undo as undo_group
 from _parole_index import key, document, encoded_key, sidecar
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_offer import AUTOMATIC, STRATEGIES
@@ -320,6 +322,17 @@ class ParoleView:
         tree_view = Gtk.ListView(model=self.tree_selection, factory=factory(self.render_tree, Gtk.TreeExpander))
         tree_view.add_css_class("library-tree")
         tree_view.connect("activate", self.open_tree)
+        context = Gtk.Popover()
+        context.set_parent(tree_view)
+        context.set_child(button("Regrouper les artistes", lambda widget: (context.popdown(), self.artist_groups(widget))))
+        click = Gtk.GestureClick(button=3)
+        def show_context(_gesture, _count, x, y):
+            rectangle = Gdk.Rectangle()
+            rectangle.x, rectangle.y, rectangle.width, rectangle.height = int(x), int(y), 1, 1
+            context.set_pointing_to(rectangle)
+            context.popup()
+        click.connect("pressed", show_context)
+        tree_view.add_controller(click)
         panes.set_start_child(scroller(tree_view, min_content_width=160))
         panes.set_shrink_start_child(False)
         self.songs = Gio.ListStore(item_type=Row)
@@ -355,6 +368,7 @@ class ParoleView:
         for widget in (self.artist_codex, self.album_codex,
                        button("Vérifier l’édition", lambda *_: self.review_scope("album")),
                        button("Vérifier la discographie", lambda *_: self.review_scope("discography")),
+                       button("Regrouper les artistes", self.artist_groups),
                        button("Exclure cet artiste de la maintenance", self.exclude_artist),
                        button("Liste de lecture Strawberry", controller.show_library),
                        button("Préparer des morceaux pour Kara", controller.show_preparation)):
@@ -1043,6 +1057,141 @@ class ParoleView:
         lines += [f"{r['first_name']} / {r['second_name']} · {r['album']} · alias de comparaison" for r in aliases]
         lines += [f"Exclusion · {r['kind']} · {r['subject']}" for r in exclusions]
         show_details(widget, "Regroupements validés et exclusions", "\n".join(lines))
+
+    def artist_groups(self, widget):
+        root = self.index.root
+        artists = sorted((p.name for p in root.iterdir() if p.is_dir() and not p.is_symlink()
+                          and p.name not in ("A_trier", "YouTube") and not p.name.startswith(".")), key=str.casefold)
+        names = Gio.ListStore(item_type=Row)
+        names.splice(0, 0, [Row(name) for name in artists])
+        selection = Gtk.MultiSelection.new(names)
+        window = Gtk.Window(title="Regrouper les artistes", transient_for=self.control, modal=True,
+                            destroy_with_parent=True, default_width=790, default_height=575)
+        area = box(css_classes=["panel-content"])
+        pane = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, position=230, vexpand=True, wide_handle=True)
+        view = Gtk.ListView(model=selection, factory=factory(lambda label, row: label.set_label(row.data)))
+        pane.set_start_child(scroller(view, min_content_width=200))
+        file_list = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        pane.set_end_child(scroller(file_list, min_content_width=380))
+        area.append(Gtk.Label(label="Sélectionne les artistes à regrouper", xalign=0))
+        area.append(pane)
+        target = Gtk.DropDown.new_from_strings([])
+        line = box(Gtk.Orientation.HORIZONTAL)
+        line.append(Gtk.Label(label="Nom à conserver"))
+        line.append(target)
+        area.append(line)
+        actions = box(Gtk.Orientation.HORIZONTAL)
+        status = Gtk.Label(wrap=True, xalign=0)
+        state = self.maintenance.state_root or STATE
+        prior = last_group(self.index)
+        current_plan = None
+        revision = 0
+
+        def selected():
+            bits = selection.get_selection()
+            return [artists[bits.get_nth(i)] for i in range(bits.get_size())]
+
+        def chosen():
+            item = target.get_selected_item()
+            return item.get_string() if item else ""
+
+        def reset(*_args):
+            nonlocal current_plan, revision
+            revision += 1
+            current_plan = None
+            accept.set_sensitive(False)
+            file_list.get_buffer().set_text("")
+            preview_button.set_sensitive(len(selected()) >= 2 and bool(chosen()))
+
+        def selection_changed(*_args):
+            previous = chosen()
+            values = selected()
+            target.set_model(Gtk.StringList.new(values))
+            target.set_selected(values.index(previous) if previous in values else 0)
+            reset()
+
+        def complete(future, generation):
+            nonlocal current_plan
+            if generation != revision:
+                return GLib.SOURCE_REMOVE
+            try:
+                current_plan = future.result()
+            except (OSError, ValueError) as error:
+                status.set_text(str(error))
+            else:
+                lines = []
+                for row in current_plan["moves"]:
+                    flag = " · collision, édition séparée" if row["collision"] else ""
+                    lines.append(f"{row['source']} → {row['destination']}{flag}")
+                    lines.extend(f"    {name}" for name in row["file_names"])
+                file_list.get_buffer().set_text("\n".join(lines))
+                status.set_text(f"{len(current_plan['moves'])} dossier(s) d’édition à déplacer.")
+                accept.set_sensitive(True)
+            return GLib.SOURCE_REMOVE
+
+        def inspect(_widget):
+            reset()
+            generation = revision
+            status.set_text("Vérification des éditions…")
+            future = self.control.tag_reader.submit(preview_group, root, chosen(), selected())
+            future.add_done_callback(lambda result: GLib.idle_add(complete, result, generation))
+
+        def finish(future, plan, reverse):
+            try:
+                identity, preparation = future.result()
+            except (OSError, sqlite3.Error, ValueError) as error:
+                status.set_text(str(error))
+                return GLib.SOURCE_REMOVE
+            message = ("Regroupement annulé" if reverse else "Artistes regroupés")
+            amount = len(plan["moves"])
+            collisions = sum(row["collision"] for row in plan["moves"])
+            self.maintenance.journal.emit("ALBUM", f"{message} · {amount} éditions · {collisions} collisions · {identity}")
+            for row in plan["moves"]:
+                self.maintenance.journal.emit("ALBUM", f"{row['source']} → {row['destination']}")
+            self.control.artist_group_changed(plan, reverse=reverse)
+            status.set_text(f"{message} · {preparation['references']} références et {preparation['stems']} séparations réassociées.")
+            accept.set_sensitive(False)
+            restore.set_sensitive(False)
+            return GLib.SOURCE_REMOVE
+
+        def run(plan, identity=None):
+            if not plan or self.control.maintenance_busy() or self.control.album_import.running:
+                status.set_text("Attends la fin de l’activité Kara et des imports actifs.")
+                return
+            accept.set_sensitive(False)
+            restore.set_sensitive(False)
+            status.set_text("Mise à jour de la bibliothèque…")
+            def change():
+                queue = self.maintenance.import_queue
+                previous = (undo_group(self.index, identity, queue, state=state) if identity else
+                            group_artists(self.index, plan, queue, state=state))
+                return previous, rebind_preparations(self.index, plan, undo=bool(identity))
+            future = self.control.tag_reader.submit(change)
+            future.add_done_callback(lambda result: GLib.idle_add(finish, result, plan, bool(identity)))
+
+        def confirm_undo(_widget):
+            if prior is None:
+                return
+            dialog = Gtk.MessageDialog(transient_for=window, modal=True, buttons=Gtk.ButtonsType.OK_CANCEL,
+                                       text=f"Rétablir les dossiers de {len(prior[1]['moves'])} éditions ?")
+            def respond(widget, response):
+                widget.destroy()
+                if response == Gtk.ResponseType.OK:
+                    run(prior[1], prior[0])
+            dialog.connect("response", respond)
+            dialog.present()
+
+        preview_button = button("Prévisualiser", inspect, sensitive=False)
+        accept = button("Confirmer le regroupement", lambda _: run(current_plan), sensitive=False)
+        restore = button("Annuler le dernier regroupement", confirm_undo, sensitive=prior is not None)
+        for action in (preview_button, accept, restore):
+            actions.append(action)
+        selection.connect("selection-changed", selection_changed)
+        target.connect("notify::selected", reset)
+        area.append(actions)
+        area.append(status)
+        window.set_child(area)
+        window.present()
 
     def comparison_aliases(self, widget):
         window = Gtk.Window(title="Alias d’artiste pour une édition", transient_for=widget.get_root(),

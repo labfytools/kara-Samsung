@@ -39,7 +39,7 @@ from _kara_import import AlbumImport
 from _kara_paths import BIN, music_library
 from _labfy_sync import MusicSync
 from _kara_tv import https_configured, start_receiver
-from _musique_oz import probe
+from _musique_oz import AUDIO, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _parole_maintenance import Maintenance
 from _parole_ui import ParoleView
@@ -618,6 +618,25 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 throughput = f" · {rate / (1024**2):.2f} Mio/s mesurés" if rate else ""
                 self.maintenance.journal.emit(
                     "DOWNLOAD", f"{payload['provider']} · {payload['title']} · {payload['message']}{throughput}", level)
+
+    def artist_group_changed(self, plan, *, reverse=False):
+        old, new = set(), set()
+        for row in plan["moves"]:
+            source, target = (LIBRARY.resolve() / row[key] for key in ("source", "destination"))
+            if reverse:
+                source, target = target, source
+            for name in row["file_names"]:
+                if Path(name).suffix.lower() in AUDIO:
+                    old.add(source / name)
+                    new.add(target / name)
+        if self.receiver is not None:
+            self.receiver.room.remove_catalogue_paths(old)
+        self.import_published_paths.update(new)
+        if self.import_refresh_timer is None and not self.import_refresh_active:
+            self.import_refresh_timer = GLib.timeout_add(250, self.reload_after_import)
+        if self.music_window:
+            GLib.timeout_add_seconds(4, self.refresh_import_library_window)
+        self.maintenance.rescan()
 
     def reload_after_import(self):
         self.import_refresh_timer = None

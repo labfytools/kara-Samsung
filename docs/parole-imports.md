@@ -34,6 +34,8 @@ La comparaison des graphies ignore certaines différences de casse, accents et p
 
 Le moteur de regroupement prévisualise chaque dossier d’édition et son nombre de pistes. Il déplace le dossier entier sous un artiste existant. En cas de collision, il attribue à l’édition déplacée un nom de dossier distinct. Le reçu persistant permet l’annulation ou la reprise après interruption. La file et les références canoniques suivent les chemins déplacés. Les journaux de publication historiques restent lisibles et leurs anciens chemins sont résolus depuis le reçu. Les tags et les fichiers associés sont conservés. Les préparations Kara compatibles sont réassociées par vérification de l’audio et des références.
 
+Dans Parole, le menu contextuel des artistes propose **Regrouper les artistes**. Sélectionner les dossiers, choisir le nom à conserver et ouvrir l’aperçu des fichiers avant de confirmer. **Annuler le dernier regroupement** restaure les dossiers et la règle correspondante après confirmation. L’action est disponible hors lecture et hors import actif.
+
 ## Déplacement du dépôt sur ArchASP
 
 Le commit `2201869` a déplacé `kara` dans le dépôt dédié. Les appels de tri et de recherche de pochette utilisaient déjà le répertoire de `kara`, mais `musique-tri` et `musique-pochettes` sont restés dans `~/.dotfiles/bin/.local/bin`, accessible sur ArchASP par `~/.local/bin`. Ces deux exécutables n’avaient pas d’historique dans Git. Les copies datées du 22 novembre dans `~/.local/state/kara-tri-paroles-*` corroborent l’origine du script de tri. Les scripts locaux ont été repris dans `bin/`, avec des adaptations ciblées pour les chemins et la reprise.

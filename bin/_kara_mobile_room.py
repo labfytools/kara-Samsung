@@ -87,6 +87,16 @@ class MobileRoom:
             self._catalogue_ready = True
             self._catalogue_revision += 1
 
+    def remove_catalogue_paths(self, paths):
+        with self._lock:
+            removed = {identity for identity, song, _, _ in self._catalogue if song.path in paths}
+            if removed:
+                self._catalogue = [row for row in self._catalogue if row[0] not in removed]
+                for identity in removed:
+                    self._songs.pop(identity, None)
+                    self._covers.pop(identity, None)
+                self._catalogue_revision += 1
+
     def set_mode(self, *, locked, game_mode, current, editable=()):
         with self._lock:
             self._locked = bool(locked)

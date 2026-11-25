@@ -81,6 +81,7 @@ def preview(root, target, names):
             occupied.add(chosen.casefold())
             moves.append(dict(source=relative, destination=str((destination / chosen).relative_to(root)),
                               directory=directory_identity(folder), files=len(original), audio=audio,
+                              file_names=[entry[0] for entry in original],
                               fingerprint=sha256(document(original).encode()).hexdigest(), collision=collision))
     if not moves:
         raise ValueError("Aucune édition à déplacer.")
