@@ -156,6 +156,10 @@ Le temps mural baisse de 37,3 %. Les vingt pistes ont le même taux, le même no
 
 Au seuil de 1 % appliqué par Parole la nuit, un nouveau passage à six fils sur `en-rap-alternance` s’est arrêté après 29,2 s à 1,23 % de PSI. Les deux fils restent le réglage nocturne. Les mesures sont conservées sous `demucs-six/`, `demucs-six-strict/` et `demucs-six-comparison.json`.
 
+### Profil énergétique
+
+Le profil Équilibré a été essayé sur le même titre de Joe Dassin, capot ouvert sur secteur, à deux fils, avec les mêmes limites thermiques. Demucs a pris 81,5 s, contre 155,4 s en Économie. Son maximum CPU est passé de 74,9 à 77,8 °C. Le PPT moyen exposé par AMD est passé de 15,9 à 20,4 W. Le parcours Turbo a franchi son seuil thermique après 4,25 s, avec 76 °C lus sur le GPU. Économie reste le profil du comparatif complet. Le profil initial Performance a été rétabli à la fin du test. Les mesures sont conservées sous `profile-balanced/`.
+
 ### Cas de génération depuis un texte
 
 Une fixture passe par la publication LRC de Kara avec 24 mots observés sur 25 et quatre débuts de ligne sur cinq. Avant la correction, le seuil de couverture des mots déclenchait l’arrêt avant le premier essai local, alors que la publication exigeait encore le cinquième début. Après la correction, la même fixture publie les cinq lignes. Elle exécute une seule passe globale simulée, puis deux décodages simulés sur des fenêtres de moins de sept secondes. Le PCM encadrant ces fenêtres est décodé par FFmpeg. Aucun seuil acoustique ou de publication ne change. Le test mesure la décision et le travail demandé au décodeur. Le résultat sur les chansons complètes reste à qualifier.
