@@ -35,6 +35,7 @@ from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifi
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as compare_music, duration_ms,
                                     from_catalogue as music_facts, position, same_track)
+from _parole_music_registry import original_tags, possible_duplicates, store_import
 from _parole_offer import load_plan, plan_id, rank as rank_offers
 import _parole_archive as archive
 import _parole_jamendo as jamendo
@@ -867,7 +868,7 @@ def import_internet_archive(item, root, inbox, previous, stop, seen, identity, *
     item.title, item.artist = album.title, album.artist
     source = archive.release_url(identity)
     import_entries(item, root, inbox, previous, stop, seen, archive.entries(index, inbox, album),
-                   source, source, album.license, "catalogue", verified=verified, reuse=reuse)
+                   source, source, album.license, "catalogue", verified=verified, reuse=reuse, catalogue=album.facts)
 
 
 def import_jamendo(item, root, inbox, previous, stop, seen, selection, *, plan=None, reuse=None):
@@ -885,7 +886,7 @@ def import_jamendo(item, root, inbox, previous, stop, seen, selection, *, plan=N
     item.title, item.artist = release.title, release.artist
     source = jamendo.release_url(kind, identity)
     import_entries(item, root, inbox, previous, stop, seen, jamendo.entries(index, inbox, release),
-                   source, source, "", "catalogue", verified=verified, reuse=reuse)
+                   source, source, "", "catalogue", verified=verified, reuse=reuse, catalogue=release.facts)
 
 
 def checked_offer(plan, current):
@@ -906,11 +907,66 @@ def grouped_destination(reuse, root):
     return next(iter(albums))
 
 
+def reuse_duplicate(index, name, record, folder, inbox, progress):
+    for identity, target, allow_pcm in possible_duplicates(index, record):
+        try:
+            matches = file_sha(target) == record["sha256"]
+            if not matches and allow_pcm:
+                with resource_slot(inbox / ".kara-traitements", PROCESSING):
+                    matches = pcm_digest(target) == record["pcm"]
+            if matches:
+                record.update(path=str(target), published_revision=stamp(target.stat()), canonical_reference=identity)
+                # Only our own staging copy can be discarded. The library
+                # path and all existing associations and sidecars stay owned.
+                (folder / record["stage"]).unlink()
+                notice = f"Doublon évité · {record['tags'].get('title', name)}"
+                progress.log("Identité canonique", notice)
+                progress.announce_provider("Identité canonique", notice)
+                return target
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def publish_staged(item, root, inbox, folder, records, active, targets, receipt, manifest, reuse):
+    progress = item.progress
+    if progress.measure_index is not None:
+        for stage, name in tuple(active.items()):
+            try:
+                target = reuse_duplicate(progress.measure_index, name, records[name], folder, inbox, progress)
+            except sqlite3.Error as error:
+                record_error(progress, "Registre canonique", error)
+                break
+            if target:
+                targets[name] = target
+                del active[stage]
+    if not active:
+        return
+    # Store source proof before sorting so a restart after an
+    # audio publication can recover its exact destination.
+    write_checkpoint(manifest, records)
+    for candidate in audio_files(folder):
+        if candidate.parent == folder and candidate.name not in active:
+            candidate.unlink()
+    check_space(folder, extra=MAX_MEDIA * PROCESSING)
+    hint = grouped_destination(reuse, root)
+    item.added, _ = sort_audio(folder, progress, None, receipt, preserve_tags=True, folder_hint=hint)
+    published = local_receipts(receipt)
+    for stage, name in active.items():
+        target = local_destination(records[name], published.get(stage, []), root)
+        if target:
+            targets[name] = target
+        else:
+            progress.issue("Tri local", "processing", f"Publication non vérifiée : {name}")
+
+
 def import_entries(item, root, inbox, previous, stop, seen, reader, source, reference, license_url, verification,
-                   *, verified=None, reuse=None):
+                   *, verified=None, reuse=None, catalogue=None):
     progress = item.progress
     verified = verified or {}
     reuse = reuse or {}
+    release = music_facts(catalogue)
+    catalogue_tracks = {(t.disc, t.number): t for t in release.tracks} if release else {}
     item.tracks = available_tracks(previous.get("tracks", []), root)
     if item.identity in seen:
         item.status = "duplicate"
@@ -935,6 +991,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                     if stop.is_set():
                         break
                     entry = entries[name]
+                    provider_tags = declared_tags(release, catalogue_tracks.get(entry.position))
                     if verified and entry.position not in verified:
                         raise ImportIssue("path", "Position absente de l’édition vérifiée.")
                     if entry.position in reuse:
@@ -944,8 +1001,18 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                     stage = digest(json.dumps([name, entry.revision])) + Path(name).suffix.lower()
                     record = records.get(name, {})
                     if record.get("stage") == stage:
-                        target = local_destination(record, published.get(stage, []), root)
+                        candidates = published.get(stage, [])
+                        if record.get("path") and record["path"] not in candidates:
+                            candidates = [*candidates, record["path"]]
+                        target = local_destination(record, candidates, root)
                         if target:
+                            if "tags" not in record:
+                                try:
+                                    tags, _ = probe(target, include_duration=True, include_codec=True)
+                                    record["tags"] = original_tags(tags)
+                                except (OSError, ValueError, subprocess.SubprocessError):
+                                    record["tags"] = {}
+                            record["catalogue_tags"] = provider_tags
                             targets[name] = target
                             continue
                     action = "Téléchargement" if entry.external_id else "Copie locale"
@@ -964,7 +1031,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                         if not checksum:
                             break
                         with resource_slot(inbox / ".kara-traitements", PROCESSING):
-                            tags, _ = probe(draft, include_codec=bool(entry.format), include_duration=bool(verified))
+                            tags, _ = probe(draft, include_codec=True, include_duration=True)
                             if not (tags.get("title") and (tags.get("album") or len(audio) == 1)
                                     and (tags.get("albumartist") or tags.get("artist"))):
                                 raise ImportIssue("path", "Métadonnées titre, album ou artiste manquantes.")
@@ -977,7 +1044,8 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                 if ((disc, track) != entry.position or not actual.millis
                                         or same_track(verified[entry.position], actual) == DIFFERENT):
                                     raise ImportIssue("path", "Le fichier reçu ne correspond pas à la piste vérifiée.")
-                            records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft)}
+                            records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft),
+                                             "tags": original_tags(tags), "catalogue_tags": provider_tags}
                         active[stage] = name
                         item.processed += 1
                     except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
@@ -987,39 +1055,35 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                      error if isinstance(error, ImportIssue) else ImportIssue("path", str(error)))
                         if progress.failures[-1]["category"] == "space":
                             break
-                if active:
-                    # Store source proof before sorting so a restart after an
-                    # audio publication can recover its exact destination.
-                    write_checkpoint(manifest, records)
-                    # The shared sorter sees only the current selection.
-                    # Old staging from a different revision stays out of it.
-                    for candidate in audio_files(folder):
-                        if candidate.parent == folder and candidate.name not in active:
-                            candidate.unlink()
-                    check_space(folder, extra=MAX_MEDIA * PROCESSING)
-                    hint = grouped_destination(reuse, root)
-                    item.added, _ = sort_audio(folder, progress, None, receipt, preserve_tags=True, folder_hint=hint)
-                    published = local_receipts(receipt)
-                    for stage, name in active.items():
-                        record = records[name]
-                        target = local_destination(record, published.get(stage, []), root)
-                        if target:
-                            targets[name] = target
-                        else:
-                            progress.issue("Tri local", "processing", f"Publication non vérifiée : {name}")
+                # Serialize identity decisions only through publication.
+                # Network transfers and the subsequent enrichment stay parallel.
+                with lease(workspace.parent / "identification.lock") as ownership:
+                    progress.guard += (ownership,)
+                    try:
+                        if active:
+                            publish_staged(item, root, inbox, folder, records, active, targets, receipt, manifest, reuse)
+                        if targets:
+                            write_checkpoint(manifest, records)
+                            item.provenance = [
+                                {"provider": item.provider, "external_id": entries[name].external_id or records[name]["sha256"],
+                                 "sha256": records[name]["sha256"], "member": name, "source": source, "path": str(track),
+                                 "edition_ref": reference, "verification": verification, "pcm": records[name]["pcm"],
+                                 "tags": records[name]["tags"], "catalogue_tags": records[name]["catalogue_tags"],
+                                 **({"canonical_reference": records[name]["canonical_reference"]}
+                                    if records[name].get("canonical_reference") else {}),
+                                 **({"position": list(entries[name].position)} if entries[name].position else {}),
+                                 **({"license": entries[name].license or license_url}
+                                    if entries[name].license or license_url else {})}
+                                for name, track in sorted(targets.items())
+                            ]
+                            if progress.measure_index is not None:
+                                store_import(progress.measure_index, item.provenance)
+                    except sqlite3.Error as error:
+                        record_error(progress, "Registre canonique", error)
+                    finally:
+                        progress.guard = progress.guard[:-1]
                 if targets or reuse:
-                    write_checkpoint(manifest, records)
                     item.tracks = sorted(set(item.tracks).union(map(str, targets.values()), (p["path"] for p in reuse.values())))
-                    item.provenance = [
-                        {"provider": item.provider, "external_id": entries[name].external_id or records[name]["sha256"],
-                         "sha256": records[name]["sha256"], "member": name, "source": source, "path": str(track),
-                         "edition_ref": reference, "verification": verification,
-                         "pcm": records[name]["pcm"],
-                         **({"position": list(entries[name].position)} if entries[name].position else {}),
-                         **({"license": entries[name].license or license_url}
-                            if entries[name].license or license_url else {})}
-                        for name, track in sorted(targets.items())
-                    ]
                     item.provenance.extend(reuse.values())
                     if targets:
                         local_sidecars(targets, entries, root, progress)
@@ -1033,6 +1097,16 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
             if item.folder is not None:
                 item.remaining = close_batch(item.folder)
             progress.guard = progress.guard[:-1]
+
+
+def declared_tags(release, track):
+    if not release or not track:
+        return {}
+    tags = {"musicbrainzalbumid": release.release_id, "musicbrainzalbumartistid": release.artist_id,
+            "musicbrainzreleasegroupid": release.group_id, "barcode": release.barcode, "year": release.year,
+            "edition": release.edition, "musicbrainzrecordingid": track.recording, "musicbrainzworkid": track.work,
+            "isrc": track.isrc, "disc": track.disc, "track": track.number}
+    return {key: value for key, value in tags.items() if value}
 
 
 def verified_publications(provenance, root, inbox, positions):
@@ -1173,6 +1247,36 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
             progress.log("Échec du fournisseur", "\n".join(error["detail"] for error in child.failures))
 
 
+def remember_youtube(item, inbox):
+    index = item.progress.measure_index
+    if index is None or not item.tracks:
+        return
+    try:
+        with index.db() as db:
+            pending = [value for value in item.tracks if not db.execute(
+                "SELECT 1 FROM canonical_references WHERE path=? AND provider=? LIMIT 1", (value, YOUTUBE)).fetchone()]
+        for value in pending:
+            target = Path(value)
+            try:
+                with resource_slot(inbox / ".kara-traitements", PROCESSING):
+                    tags, _ = probe(target, include_duration=True, include_codec=True)
+                external = source_video(tags.get("purl"))
+                if not external:
+                    continue
+                disc = position(tags.get("disc") or tags.get("discnumber")) or 1
+                track = position(tags.get("track") or tags.get("tracknumber"))
+                item.provenance.append({
+                    "provider": YOUTUBE, "external_id": external, "path": value, "sha256": file_sha(target),
+                    "source": f"https://www.youtube.com/watch?v={external}", "edition_ref": item.url,
+                    "verification": "playlist", "member": f"{disc}/{track}", "tags": original_tags(tags),
+                })
+            except (OSError, ValueError, subprocess.SubprocessError):
+                continue
+        store_import(index, item.provenance)
+    except sqlite3.Error as error:
+        record_error(item.progress, "Registre canonique", error)
+
+
 def import_album(item, root, inbox, previous, stop, seen):
     progress = item.progress
     parsed, playlist = checked_link(item.url)
@@ -1278,6 +1382,7 @@ def import_album(item, root, inbox, previous, stop, seen):
             if item.audio_complete:
                 write_checkpoint(checkpoint, {"tracks": item.tracks, "title": item.title})
             if item.tracks:
+                remember_youtube(item, inbox)
                 enrich_tracks(item.tracks, progress)
             if item.audio_complete and not progress.failures:
                 seen.add(item.identity)

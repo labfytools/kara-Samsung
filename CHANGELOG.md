@@ -35,3 +35,4 @@
 - Mesurer les recherches, les transferts, les importations et les limitations réelles par fournisseur.
 - Comparer les éditions multisources à partir de preuves normalisées en conservant les tags et les mentions de version.
 - Regrouper les offres automatiques d’une édition confirmée et sélectionner un fournisseur selon la vitesse, la qualité ou la préférence.
+- Conserver les identités et les provenances dans l’index existant et éviter une nouvelle copie quand l’identité locale est prouvée.

@@ -26,7 +26,7 @@ from _kara_import_local import local_target
 from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
 from _kara_import_result import ImportIssue
-from _parole_index import Index
+from _parole_index import Index, inventory
 from _parole_import_metrics import LOOKUP, SUCCEEDED, TOTAL, snapshot
 from _parole_import_providers import ARCHIVE, ARTIST_SITES, JAMENDO, OPEN_LICENSES
 from _parole_sources import controls, seed
@@ -522,6 +522,54 @@ class AlbumImportTests(unittest.TestCase):
         _, replay, _ = self.run_import(target, env=env)
         self.assertEqual((replay[0]["status"], replay[0]["processed"]), ("present", 0))
         self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "02.flac", "39012"])
+
+    def test_canonical_provenance_follows_a_renamed_file_and_avoids_a_second_copy(self):
+        track = self.temp / "canonical-source" / "01.flac"
+        self.make_local_track(track, 1, album="Album canonique")
+        first_target = local_target(track.as_uri(), "Bandcamp", "https://label.bandcamp.com/album/album-canonique")
+        _, imported, _ = self.run_import(first_target)
+        published = Path(imported[0]["tracks"][0])
+        index = Index(self.library, self.temp / "state")
+
+        def scan():
+            return inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None)
+
+        scan()
+        with index.db() as db:
+            first = dict(db.execute("SELECT * FROM canonical_references").fetchone())
+        self.assertTrue(first["song"])
+        renamed = published.with_name("Nom corrigé.flac")
+        published.rename(renamed)
+        manual = renamed.with_suffix(".lrc")
+        manual.write_bytes(b"[00:00.20]Correction manuelle.")
+        before = renamed.read_bytes()
+        scan()
+        archive = self.temp / "canonical-second.zip"
+        with ZipFile(archive, "w") as output:
+            output.write(track, "01.flac")
+            output.writestr("01.lrc", "[00:00.10]Copie d’une autre source.")
+        second_target = local_target(archive.as_uri(), "Qobuz", "https://www.qobuz.com/fr-fr/album/canonique/0060254719724")
+        _, reused, _ = self.run_import(second_target)
+        self.assertEqual((reused[0]["status"], reused[0]["added"], reused[0]["tracks"]), ("present", 0, [str(renamed)]))
+        self.assertEqual(renamed.read_bytes(), before)
+        self.assertEqual(manual.read_bytes(), b"[00:00.20]Correction manuelle.")
+        self.assertEqual(list(renamed.parent.glob("*.flac")), [renamed])
+        with index.db() as db:
+            catalogue = [dict(row) for row in db.execute("SELECT * FROM canonical_references ORDER BY provider")]
+        self.assertEqual([row["provider"] for row in catalogue], ["Bandcamp", "Qobuz"])
+        self.assertEqual({row["recording"] for row in catalogue}, {first["recording"]})
+        self.assertEqual({row["edition"] for row in catalogue}, {first["edition"]})
+        self.assertEqual({row["path"] for row in catalogue}, {str(renamed)})
+        self.assertEqual(json.loads(catalogue[1]["tags"])["album"], "Album canonique")
+
+        deluxe = self.temp / "canonical-deluxe" / "01.flac"
+        self.make_local_track(deluxe, 1, album="Album canonique Deluxe")
+        self.assertEqual(pcm_digest(deluxe), pcm_digest(track))
+        _, other, _ = self.run_import(deluxe.as_uri())
+        self.assertEqual(other[0]["added"], 1)
+        self.assertNotEqual(Path(other[0]["tracks"][0]).parent, renamed.parent)
+        with index.db() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM canonical_editions").fetchone()[0], 2)
 
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]

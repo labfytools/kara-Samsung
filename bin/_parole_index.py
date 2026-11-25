@@ -77,6 +77,7 @@ class Index:
                     checked REAL NOT NULL, info TEXT NOT NULL, audio TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS songs_owner ON songs(owner, album, edition, disc, track);
+                CREATE INDEX IF NOT EXISTS songs_release_position ON songs(release_id,track,disc) WHERE release_id!='';
                 CREATE INDEX IF NOT EXISTS songs_edition ON songs(edition, disc, track);
                 CREATE INDEX IF NOT EXISTS songs_inode ON songs(dev, inode);
                 CREATE INDEX IF NOT EXISTS songs_audio ON songs(audio);
@@ -117,6 +118,27 @@ class Index:
                 CREATE TABLE IF NOT EXISTS import_offer_plans (
                     id TEXT PRIMARY KEY, offers TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS canonical_editions (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL, year INTEGER NOT NULL,
+                    mb_artist TEXT NOT NULL, mb_group TEXT NOT NULL, mb_release TEXT NOT NULL, gtin TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS canonical_recordings (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL,
+                    pcm TEXT NOT NULL, mb_recording TEXT NOT NULL, mb_work TEXT NOT NULL, isrc TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS canonical_recording_pcm ON canonical_recordings(pcm);
+                CREATE TABLE IF NOT EXISTS canonical_references (
+                    id TEXT PRIMARY KEY, provider TEXT NOT NULL, external_id TEXT NOT NULL,
+                    edition TEXT NOT NULL REFERENCES canonical_editions(id),
+                    recording TEXT NOT NULL REFERENCES canonical_recordings(id),
+                    path TEXT NOT NULL, song TEXT NOT NULL, sha256 TEXT NOT NULL, disc INTEGER NOT NULL,
+                    track INTEGER NOT NULL, duration INTEGER NOT NULL, confidence TEXT NOT NULL,
+                    tags TEXT NOT NULL, evidence TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS canonical_reference_file ON canonical_references(sha256);
+                CREATE INDEX IF NOT EXISTS canonical_reference_recording ON canonical_references(recording);
+                CREATE INDEX IF NOT EXISTS canonical_reference_path ON canonical_references(path);
+                CREATE INDEX IF NOT EXISTS canonical_reference_song ON canonical_references(song);
                 CREATE TABLE IF NOT EXISTS exclusions (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(kind, subject)
                 );
@@ -516,6 +538,12 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                   plays=excluded.plays,lyrics=excluded.lyrics,lrc=excluded.lrc,kara=excluded.kara,
                   search=excluded.search,seen=excluded.seen,checked=excluded.checked,info=excluded.info,audio=excluded.audio
             """, pending)
+            # Existing inode-based inventory decisions can move a provenance
+            # pointer without changing the canonical recording or edition ID.
+            db.executemany("""
+                UPDATE canonical_references SET path=:path,song=:id
+                WHERE (path=:path AND song='') OR (path=:canonical_previous AND song IN ('',:id))
+            """, pending)
         pending.clear()
         unchanged.clear()
 
@@ -543,11 +571,13 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                 continue
             token = document([st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns])
             old = previous.get(str(path))
+            canonical_previous = None
             matches = inodes[st.st_dev, st.st_ino]
             if old is None and len(matches) == 1:
                 known = json.loads(matches[0]["token"])
                 if not Path(matches[0]["path"]).exists() and known[2:4] == [st.st_size, st.st_mtime_ns]:
                     old = matches.pop()
+                    canonical_previous = old["path"]
             same_audio = old is not None and old["token"] == token
             same_metadata = same_audio and old["path"] == str(path)
             duration = strawberry["length"] / 1e9 if strawberry and (strawberry["length"] or 0) > 0 else (
@@ -610,7 +640,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                 release_id=release_id, plays=integer(strawberry["playcount"]) if strawberry else 0,
                                 lyrics=lyrics, lrc=lrc, kara=kara, search=key(" ".join((title, artist, owner, album))),
                                 seen=generation, added=old["added"] if old else now, checked=now, info=document(info),
-                                audio=old["audio"] if same_audio else ""))
+                                audio=old["audio"] if same_audio else "", canonical_previous=canonical_previous))
             counts["scanned"] += 1
             counts["changed"] += 1
             if len(pending) >= 128:

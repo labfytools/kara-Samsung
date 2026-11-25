@@ -583,6 +583,10 @@ class ParoleView:
                                    ORDER BY kind""", (identity,)).fetchall()
             identification = db.execute("SELECT value FROM reviews WHERE kind='metadata' AND subject=? AND state='identified'",
                                         (identity,)).fetchone()
+            provenance = [dict(reference) for reference in db.execute("""
+                SELECT provider,external_id,edition,recording,confidence,tags,evidence FROM canonical_references
+                WHERE path=? AND song IN ('',?) ORDER BY provider,external_id LIMIT 30
+            """, (row["path"], identity))]
         coverage = (f"{report.get('coverage', 0):.0%} mots · {report.get('line_coverage', 0):.0%} lignes"
                     if "coverage" in report else "Non mesurée")
         updated = datetime.fromtimestamp(row["checked"]).strftime("%d/%m/%Y à %H:%M")
@@ -608,6 +612,12 @@ class ParoleView:
         editbar = box(Gtk.Orientation.HORIZONTAL)
         panel.append(editbar)
         editbar.append(forms)
+        if provenance:
+            for reference in provenance:
+                reference["tags"] = json.loads(reference["tags"])
+                reference["evidence"] = json.loads(reference["evidence"])
+            editbar.append(button("Provenance", lambda widget: show_details(
+                widget, "Identité et provenance", json.dumps(provenance, ensure_ascii=False, indent=2))))
         path = Path(row["path"])
         versions = {}
 

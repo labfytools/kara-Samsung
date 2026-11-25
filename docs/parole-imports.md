@@ -124,6 +124,12 @@ Dans **Paramètres → Général**, **Vitesse maximale** estime le temps de réc
 
 Le motif, le débit observé et le délai estimé, quand ils existent, figurent dans la console. Après un échec persistant, une indisponibilité signalée ou une piste inaccessible, une autre offre confirmée peut reprendre les positions manquantes. La reprise conserve les fichiers intégrés dans le dossier de la première édition et les tags d’origine de chaque piste. Une interruption conserve le fournisseur actif et ses reçus pour vérifier ses publications avant de basculer.
 
+### Identités et provenances locales
+
+L’index de maintenance contient les identités locales de l’édition et de l’enregistrement ainsi que les références de fournisseur. Il conserve les identifiants d’œuvre, de groupe de publications et de catalogue lorsqu’ils sont disponibles. **Détails → Provenance** présente les tags d’origine utiles à l’identification et les preuves, séparément des tags fournis par les catalogues. Un renommage établi par l’inventaire conserve l’identité et déplace la référence vers le chemin actuel.
+
+Le tri peut réutiliser un fichier déjà publié si son original est identique octet pour octet, ou si l’identité PCM concorde dans une édition et à une position établies. Le fichier en bibliothèque est revérifié. Les crédits, fichiers associés et préparations existants sont conservés. Une édition distincte peut contenir le même enregistrement. La correspondance du PCM seule ne fusionne donc pas ses éditions.
+
 ## Validation
 
 ```bash
@@ -159,3 +165,5 @@ Une mesure réelle isolée sur l’introduction de *Electric Funeral* a confirm�
 Les tests d’identité ont confirmé les cas concordants avec variations de présentation et un album incomplet. Les 16 variantes construites pour représenter des éditions, artistes, positions ou enregistrements différents ont produit zéro confirmation. Il s’agit d’un contrôle sur des cas construits.
 
 Les stratégies et le basculement sont validés avec deux catalogues simulés. Après deux échecs sur la seconde piste Internet Archive, Jamendo a fourni cette seule position dans le même dossier. La première piste est restée identique et une relance n’a rien retéléchargé. La comparaison en ligne entre deux fournisseurs reste à qualifier avec un identifiant Jamendo autorisé et une édition commune confirmée.
+
+Le test de provenance importe le même FLAC par deux parcours, avec un renommage entre les deux. Il conserve un seul fichier, son LRC manuel et deux références de fournisseur. La variante Deluxe de même PCM conserve une édition séparée.
