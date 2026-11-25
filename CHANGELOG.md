@@ -9,3 +9,4 @@
 - Afficher la bibliothèque, les statistiques et la console dans la fenêtre Parole. Réutiliser la file d’import et la connexion au téléviseur depuis l’en-tête, avec le thème Catppuccin Mocha.
 - Limiter les relances classiques des imports, mutualiser les diagnostics Codex par signature et reprendre les mêmes lots après confirmation indépendante d’une référence de catalogue. Conserver les échecs à vérifier et leur historique.
 - Appliquer la désactivation des fournisseurs aux vérifications MusicBrainz et à l’admission d’imports automatiques YouTube Music.
+- Vérifier la libération du groupe de processus lors d’une sélection Kara ou d’un retour d’activité. Documenter l’essai Vulkan réel qui refuse une publication sans repères suffisants.

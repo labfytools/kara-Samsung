@@ -50,10 +50,11 @@ Le statut Local, Externe ou Généré du LRC apparaît dans le tableau. Les dét
 
 ## Qualification
 
-Les fixtures se lancent avec les commandes suivantes.
+Les fixtures vérifient aussi que la reprise d’activité ou une demande Kara interrompt un sous-processus déjà démarré. Elles vérifient la réserve sur chaque partition, indépendamment de la place totale. Les commandes suivantes exécutent les tests.
 
 ```sh
 python3 -B tests/test-parole-v3.py -v
+python3 -B tests/test-parole-resources.py -v
 python3 -B tests/test-parole-import.py -v
 python3 -B tests/test-kara-preparation.py -v
 KARA_SILENT=1 python3 -B tests/test-kara-v1.py -v
@@ -68,6 +69,7 @@ Pour les tests graphiques, utiliser `PAROLE_TEST_GTK=1` sur un bureau ou un comp
 | Inventaire réel, 80 fichiers | 0,283 s au premier passage, 0,212 s à chaud, 0 modification au second passage |
 | Demucs CPU, échantillon de 22,754 s | 19,575 s, lecture du cache en 0,302 s |
 | Turbo Vulkan sur le même échantillon | 22,297 s pour le processus complet, 2,392 s d’analyse reportée, 93,83 % de mots couverts, 1,657 s pour la relecture du cache |
+| Turbo Vulkan avec le même texte sans minutage | 14,30 s, 93,83 % de mots et 80 % de débuts de ligne couverts. Publication refusée. L’original est resté identique. |
 | Pic de charge GPU pendant Turbo | 97 % observés sur le périphérique, charge agrégée |
 | Taille de préparation de l’échantillon | Environ 2,57 Mo pour les deux FLAC et le manifeste |
 | Cache existant mesuré en lecture seule | Environ 307 Mio sur la machine à la date du relevé |
