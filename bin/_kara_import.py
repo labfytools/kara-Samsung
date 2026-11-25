@@ -20,6 +20,7 @@ from _parole_import_providers import (ALL, ARCHIVE, JAMENDO, MANUAL, OPEN_LICENS
                                       archive_identifier, jamendo_identifier)
 from _parole_jamendo import client_id as jamendo_client
 from _parole_import_metrics import LOOKUP, observe
+from _parole_music_identity import CONFIRMED, PROBABLE, compare as compare_editions, from_catalogue, normalized
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
@@ -85,6 +86,7 @@ class AlbumImport(Gtk.Revealer):
         self.provider_enabled = lambda _: True
         self.measure_index = None
         self.albums = []
+        self.edition_facts = {}
         self.by_id = {}
         self.imports_snapshot = ([], {})
         self.next_poll = 0
@@ -337,6 +339,7 @@ class AlbumImport(Gtk.Revealer):
 
     def clear_results(self):
         self.albums = []
+        self.edition_facts.clear()
         while row := self.results.get_first_child():
             self.results.remove(row)
         self.results_header.set_visible(False)
@@ -498,6 +501,7 @@ class AlbumImport(Gtk.Revealer):
         self.hide_message()
         for album in data["albums"]:
             job = (album["title"], album["url"])
+            self.edition_facts[job[1]] = (YOUTUBE, from_catalogue({**album, "artist": artist}))
             text = " · ".join(str(part) for part in (album["title"], album["year"]) if part)
             self.add_row(f"{YOUTUBE} · {text}", "Télécharger", lambda _button, selected=job: self.start_queue([selected]))
         self.refresh_controls()
@@ -523,8 +527,9 @@ class AlbumImport(Gtk.Revealer):
             formats = ", ".join(album["formats"])
             license_name = next((name for name, url in OPEN_LICENSES.items() if url == album["license"]), "")
             quality = f"{formats} d’origine" if source == ARCHIVE else f"{formats} demandé"
+            comparison = self.compare_result(source, album)
             text = " · ".join(part for part in (source, album["artist"], album["title"],
-                              f"{album['tracks']} piste(s)", quality, "Gratuit", license_name) if part)
+                              f"{album['tracks']} piste(s)", quality, "Gratuit", license_name, comparison) if part)
             self.add_row(text, "Télécharger", lambda _button, selected=target: self.start_queue([selected]))
         if self.albums:
             self.results_title.set_text(f"{len(self.albums)} résultat(s)")
@@ -536,6 +541,25 @@ class AlbumImport(Gtk.Revealer):
             self.message("Aucune édition à licence compatible trouvée.")
         self.refresh_controls()
         self.search_next_catalogue(source, query)
+
+    def compare_result(self, source, offer):
+        facts = from_catalogue(offer.get("facts"))
+        if facts is None:
+            return ""
+        verdicts = set()
+        for existing_source, existing in self.edition_facts.values():
+            if existing_source == source or existing is None or normalized(existing.title) != normalized(facts.title):
+                continue
+            result = compare_editions(existing, facts)
+            verdicts.add(result.confidence)
+            self.on_update(None, "provider", {
+                "provider": source, "message": f"{existing_source} / {source} · {facts.title} · {result.confidence} · "
+                                              + ", ".join(result.reasons),
+            })
+        self.edition_facts[offer["url"]] = (source, facts)
+        if CONFIRMED in verdicts:
+            return "Édition confirmée"
+        return "Édition à vérifier" if PROBABLE in verdicts else ""
 
     def add_row(self, text, action, handler):
         row = Gtk.Box(spacing=8, margin_start=8, margin_end=8, margin_top=4, margin_bottom=4)

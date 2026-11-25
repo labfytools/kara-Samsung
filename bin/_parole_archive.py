@@ -33,6 +33,7 @@ class Original:
     name: str
     size: int
     sha1: str
+    facts: dict
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class Album:
     artist: str
     license: str
     originals: tuple[Original, ...]
+    facts: dict
 
     @property
     def size(self):
@@ -82,14 +84,24 @@ def parse_item(item_id, value):
                 or name in audio or not re.fullmatch(r"[0-9]{1,10}", size) or not 0 < int(size) <= MAX_AUDIO
                 or not isinstance(checksum, str) or not SHA1.fullmatch(checksum) or restricted(file)):
             raise ImportIssue("path", "Fichier original Internet Archive non vérifiable ou non accessible.")
-        audio[name] = Original(name, int(size), checksum)
+        audio[name] = Original(name, int(size), checksum, {
+            "title": file.get("title"), "disc": file.get("disc") or file.get("discnumber") or 1,
+            "number": file.get("track"), "duration": file.get("length"), "artist": file.get("artist"),
+            "recording_id": file.get("musicbrainz_recordingid"), "isrc": file.get("isrc"),
+        })
     if not audio:
         raise ImportIssue("path", "Aucun fichier audio original disponible pour cette fiche.")
     title, artist = metadata.get("title"), metadata.get("creator")
     if not isinstance(title, str) or not title.strip() or not isinstance(artist, str) or not artist.strip():
         raise ImportIssue("path", "Titre ou artiste absent de la fiche Internet Archive.")
-    return Album(item_id, title.strip()[:180], artist.strip()[:180], license_url,
-                 tuple(audio[name] for name in sorted(audio)))
+    originals = tuple(audio[name] for name in sorted(audio))
+    title, artist = title.strip()[:180], artist.strip()[:180]
+    facts = {"title": title, "artist": artist, "year": metadata.get("date"),
+             "count": len(originals), "release_id": metadata.get("musicbrainz_releaseid"),
+             "group_id": metadata.get("musicbrainz_releasegroupid"), "artist_id": metadata.get("musicbrainz_artistid"),
+             "barcode": metadata.get("barcode") or metadata.get("upc"),
+             "edition": metadata.get("edition"), "tracks": [file.facts for file in originals]}
+    return Album(item_id, title, artist, license_url, originals, facts)
 
 
 def item(index, item_id):
@@ -138,7 +150,7 @@ def search(index, query):
         else:
             results.append({"title": album.title, "artist": album.artist, "url": release_url(value),
                             "tracks": len(album.originals), "formats": album.formats, "bytes": album.size,
-                            "license": album.license, "provider": ARCHIVE, "price": 0})
+                            "license": album.license, "provider": ARCHIVE, "price": 0, "facts": album.facts})
         if len(checked) >= 4:
             break
     if not results and unavailable:

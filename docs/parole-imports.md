@@ -110,6 +110,12 @@ Les détails de **Paramètres → Sources** présentent les délais de recherche
 
 Les réponses HTTP 429 et 5xx qui déclenchent une attente sont mémorisées avec leur échéance. L’expiration réadmet la source. La réinitialisation des statistiques efface les observations et conserve les temporisations en cours.
 
+### Comparer les éditions
+
+Les comparaisons réduisent les variations Unicode, de casse, d’accents, d’apostrophes, de ponctuation et de présentation des collaborations. Les tags originaux restent disponibles. Les mentions Deluxe, Live, Remix, Acoustic, Instrumental et Remastered participent à l’identité. L’application compare séparément artiste, groupe de publications, édition et enregistrements, avec les identifiants MusicBrainz, ISRC et codes de publication présents. Elle confronte également les positions, les nombres de pistes et de disques et les durées.
+
+Une correspondance confirmée demande une preuve d’édition complétée par les enregistrements ou les minutages comparables. Une piste locale manquante peut laisser l’édition confirmée si les autres positions portent les preuves nécessaires. Les rapprochements insuffisants sont présentés comme **Édition à vérifier**. Le journal indique la raison de la comparaison.
+
 ## Validation
 
 ```bash
@@ -141,3 +147,5 @@ La découverte Codex est testée avec une réponse de recherche simulée. Le fou
 Les tests de mesures contrôlent la pondération récente, la persistance des comptes, la séparation entre démarrage et débit et l’expiration d’une limitation. Le parcours Internet Archive de synthèse vérifie l’enregistrement d’une recherche, d’un échec de récupération et de sa reprise réussie.
 
 Une mesure réelle isolée sur l’introduction de *Electric Funeral* a confirmé la somme de contrôle des 1 325 388 octets reçus. Sur ce transfert unique, le premier bloc est arrivé en 1,80 s et le débit après ce bloc était de 1,51 Mio/s. [Fiche et crédits officiels](https://archive.org/details/electric-funeral)
+
+Les tests d’identité ont confirmé les cas concordants avec variations de présentation et un album incomplet. Les 16 variantes construites pour représenter des éditions, artistes, positions ou enregistrements différents ont produit zéro confirmation. Il s’agit d’un contrôle sur des cas construits.

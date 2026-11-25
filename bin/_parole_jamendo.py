@@ -57,6 +57,8 @@ class Track:
     title: str
     duration: int
     license: str
+    recording_id: str
+    isrc: str
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ class Release:
     artist: str
     revision: str
     tracks: tuple[Track, ...]
+    facts: dict
 
 
 def safe_text(value):
@@ -94,7 +97,8 @@ def track_metadata(row, position):
             or not title or not license_url or link is None or link.scheme != "https"
             or not (link.netloc == DOMAIN or link.netloc.endswith("." + DOMAIN))):
         return None
-    return Track(value, position, title, int(duration), license_url)
+    return Track(value, position, title, int(duration), license_url,
+                 safe_text(row.get("musicbrainz_recordingid")), safe_text(row.get("isrc")))
 
 
 def parse_release(kind, row):
@@ -127,8 +131,14 @@ def parse_release(kind, row):
         if ({track.position for track in tracks} != set(range(1, len(tracks) + 1))
                 or len({track.identifier for track in tracks}) != len(tracks)):
             return None
-    return Release(kind, edition, title, artist, safe_text(row.get("releasedate")),
-                   tuple(sorted(tracks, key=lambda t: t.position)))
+    revision = safe_text(row.get("releasedate"))
+    tracks = tuple(sorted(tracks, key=lambda t: t.position))
+    facts = {"title": title, "artist": artist, "year": revision, "discs": 1, "count": len(tracks),
+             "release_id": safe_text(row.get("musicbrainz_releaseid")), "barcode": safe_text(row.get("barcode")),
+             "artist_id": safe_text(row.get("musicbrainz_artistid")),
+             "tracks": [{"title": t.title, "disc": 1, "number": t.position, "duration": t.duration,
+                         "recording_id": t.recording_id, "isrc": t.isrc} for t in tracks]}
+    return Release(kind, edition, title, artist, revision, tracks, facts)
 
 
 def item(index, kind, identifier):
@@ -155,6 +165,7 @@ def search(index, query):
                 "title": album.title, "artist": album.artist, "url": release_url("album", identity),
                 "tracks": len(album.tracks), "formats": ["FLAC"], "provider": JAMENDO, "price": 0,
                 "license": album.tracks[0].license if len({track.license for track in album.tracks}) == 1 else "",
+                "facts": album.facts,
             }
     return list(results.values())
 
