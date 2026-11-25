@@ -419,9 +419,11 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_window.present()
 
     def maintenance_busy(self):
+        # The maintenance owner already yields heavy preparation to pending
+        # imports. Import activity itself must not block their enrichment.
         return bool(self.validating or self.party.active is not None or self.game_score.requested
                     or self.remote_party.phase in ("preparing", "running")
-                    or self.playback_state == "Playing" or self.album_import.running)
+                    or self.playback_state == "Playing")
 
     def toggle_vocal_effect(self, button):
         if self.effect_changing:
