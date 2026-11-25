@@ -8,6 +8,7 @@ from math import isfinite
 import os
 from pathlib import Path
 import re
+from shutil import disk_usage
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +24,8 @@ from _kara_stems import ROOT as STEM_ROOT, FILES, cached_stems, stem_directory
 from _parole_codex import KINDS, research
 from _parole_index import Index, document, encoded_key, inventory, sidecar
 from _parole_import_diagnostics import ImportDiagnostics
+from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
+from _parole_import_enrichment import paths_for as enrichment_paths, pending as enrichment_pending
 from _parole_night import Night
 from _parole_process import Interrupted, run
 from _parole_resources import Resources
@@ -151,6 +154,8 @@ class Maintenance:
         self.next_scan = 0
         self.next_network = 0
         self.network_cursor = 0
+        self.import_enrichment_turn = 0
+        self.next_import_probe = 0.
         self.revision = 0
         self.sampling = 0
         self.lock = Lock()
@@ -171,7 +176,7 @@ class Maintenance:
     def set_priority(self, busy):
         with self.lock:
             self.priority = busy
-            if busy and self.active and self.active[0] == "prepare":
+            if busy and self.active and self.active[0] in ("prepare", *IMPORT_ENRICHMENT):
                 self.interrupt.set()
         if busy and self.active:
             self.wake.set()
@@ -245,6 +250,12 @@ class Maintenance:
         if self.shutdown.is_set() or self.interrupt.is_set():
             return True
         if self.active and self.active[0] == "prepare":
+            now = monotonic()
+            if self.import_queue and now >= self.next_import_probe:
+                self.next_import_probe = now + 1.
+                if self.import_queue.pending():
+                    self.interrupt.set()
+                    return True
             if self.night_running:
                 return not self.night_allowed(self.current_settings, running=True)
             return not self.resources.check(self.current_settings,
@@ -298,14 +309,16 @@ class Maintenance:
             self.active = None
             self.progress = None
 
-    def plan(self, settings):
+    def plan(self, settings, *, paths=None):
         now = time()
         with self.index.db() as db:
             db.execute("BEGIN IMMEDIATE")
             # Queue cursors are stable song/edition identities, independent
             # from filter, pagination and GTK selection.
             blocked = {row[0] for row in db.execute("SELECT subject FROM exclusions WHERE kind='artist'")}
-            for song in db.execute("SELECT * FROM songs"):
+            songs = (db.execute("SELECT * FROM songs") if paths is None else
+                     (row for path in paths for row in db.execute("SELECT * FROM songs WHERE path=?", (str(path),))))
+            for song in songs:
                 revision = encoded_key(song["token"], song["side"], song["title"], song["artist"], song["edition"])
                 subject = song["id"]
                 if song["owner"] in blocked:
@@ -332,6 +345,8 @@ class Maintenance:
                         self.index.enqueue(kind, subject, night_revision, priority, db=db)
                     elif settings.get("autoprepare" if kind == "prepare" else kind):
                         self.index.enqueue(kind, subject, revision, priority, db=db)
+            if paths is not None:
+                return
             for kind, column in (("album", "edition"), ("discography", "owner"), ("cover", "edition")):
                 enabled = settings["albums" if kind == "album" else kind]
                 if not enabled:
@@ -525,6 +540,42 @@ class Maintenance:
         retain = (self.owner,) if self.owner is not None else ()
         return run(command, stop=self.stopped, timeout=timeout, event=observer, env=env, maximum=maximum,
                    retain=retain)
+
+    def enrich_import(self, task):
+        kind, subject = task["kind"], task["subject"]
+        paths = enrichment_paths(self.index, kind, subject)
+        code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
+                                 timeout=180)
+        value = json.loads(data) if not code else {"state": "temporary"}
+        if kind == IMPORT_LYRICS and paths:
+            inventory(self.index, self.collection, self.inspect_cache, self.stopped, lambda *_: None, paths=paths)
+            self.plan(self.current_settings, paths=paths)
+            self.revision += 1
+        if self.stopped():
+            raise Interrupted
+        if value["state"] == "complete":
+            return "done", "enrichissement vérifié", 0
+        if value["state"] == "temporary" and task["attempts"] < 2:
+            return "temporary", "recherche différée", 300
+        return "review", "enrichissement partiel · maintenance complémentaire", 0
+
+    def tick_import_enrichment(self, settings, now):
+        # Enrichment can run without a nocturnal resource sample. It needs
+        # the library's free-space reserve and consumes no preparation cache.
+        if disk_usage(self.index.root).free <= settings["reserve_gib"] * 1024**3:
+            return False
+        # One owner alternates stages and keeps their claims separate from the
+        # classic maintenance budget. Audio imports own their existing slots.
+        for _ in IMPORT_ENRICHMENT:
+            kind = IMPORT_ENRICHMENT[self.import_enrichment_turn]
+            self.import_enrichment_turn = (self.import_enrichment_turn + 1) % len(IMPORT_ENRICHMENT)
+            if not (settings["lyrics"] or settings["lrc"] if kind == IMPORT_LYRICS else settings["cover"]):
+                continue
+            task = self.index.claim((kind,), now)
+            if task is not None:
+                self.execute(task)
+                return True
+        return False
 
     def night_reference(self, song, path):
         settings = self.current_settings
@@ -780,10 +831,11 @@ class Maintenance:
         started = monotonic()
         kind, subject = task["kind"], task["subject"]
         category = {"discography": "DISCOGRAPHIE", "prepare": "KARA", "source_probe": "SOURCE",
-                    "cleanup": "CACHE"}.get(kind, kind.upper())
+                    "cleanup": "CACHE", IMPORT_LYRICS: "LYRICS", IMPORT_COVER: "COVER"}.get(kind, kind.upper())
         with self.lock:
             self.interrupt.clear()
-            if kind == "prepare" and (self.priority or monotonic() < self.priority_until):
+            if ((kind == "prepare" and (self.priority or monotonic() < self.priority_until))
+                    or kind in IMPORT_ENRICHMENT and self.priority):
                 stats = (dict(seconds=0., outcome="interrupted", cache_bytes=None, corrected=0, generated=0)
                          if nocturnal else None)
                 self.index.finish(task, "suspended", "ressources prioritaires", 15, night=stats)
@@ -798,6 +850,7 @@ class Maintenance:
         if kind not in ("prepare", "codex"):
             self.journal.emit(category, {"lyrics": "Recherche de paroles", "lrc": "Recherche d’un LRC",
                                         "album": "Vérification d’une édition", "discography": f"Vérification · {subject}",
+                                        IMPORT_LYRICS: "Paroles et LRC des imports", IMPORT_COVER: "Pochette d’un import",
                                         "source": "Vérification des conditions et des correspondances",
                                         "source_probe": "Vérification de la documentation fournisseur",
                                         "cover": "Recherche de pochette", "metadata": "Vérification de l’identification", "cleanup": "Nettoyage des brouillons"}[kind]
@@ -812,6 +865,8 @@ class Maintenance:
                     result = self.prepare(task)
             elif kind == "codex":
                 result = self.do_codex(task)
+            elif kind in IMPORT_ENRICHMENT:
+                result = self.enrich_import(task)
             elif kind == "cleanup":
                 removed = self.cleanup_interrupted()
                 self.journal.emit("CACHE", f"{removed} dossiers intermédiaires retirés")
@@ -1000,9 +1055,14 @@ class Maintenance:
         if policy != self.night_policy:
             self.resources.sample = 0.
         self.night_policy = policy
-        if not self.foreground.is_set() and not settings["night_enabled"]:
+        imports_pending = self.import_queue and self.import_queue.pending()
+        if imports_pending and self.night.fd is not None:
+            self.night.close()
+            self.resources.close()
+        if (not self.foreground.is_set() and not settings["night_enabled"] and not imports_pending
+                and not enrichment_pending(self.index, now)):
             return
-        if settings["night_enabled"] and self.night.fd is not None and self.tick_night(settings, now):
+        if settings["night_enabled"] and not imports_pending and self.night.fd is not None and self.tick_night(settings, now):
             return
         if self.scan_now.is_set() or settings["startup"] and now >= self.next_scan:
             self.scan_now.clear()
@@ -1013,7 +1073,9 @@ class Maintenance:
             return
         if self.import_diagnostics:
             self.import_diagnostics.tick(settings, now)
-        if settings["night_enabled"] and self.tick_night(settings, now):
+        if self.tick_import_enrichment(settings, now):
+            return
+        if settings["night_enabled"] and not imports_pending and self.tick_night(settings, now):
             return
         if not self.foreground.is_set():
             return
@@ -1031,7 +1093,7 @@ class Maintenance:
             self.block = self.resources.reason
             self.journal.emit("IDLE", self.block)
         self.authorized_imports(settings)
-        if (not settings["night_enabled"] and settings["autoprepare"] and self.resources.can_start
+        if (not imports_pending and not settings["night_enabled"] and settings["autoprepare"] and self.resources.can_start
                 and monotonic() >= self.priority_until and not self.priority):
             task = self.index.claim(("prepare",), now, bucket="heavy", limit=settings["heavy_daily"])
             if task is not None:

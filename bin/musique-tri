@@ -14,7 +14,7 @@ import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file, audio_files,
-                         canonical_album_artist, component, probe, share_file, shared_mutation,
+                         canonical_album_artist, component, mutation_report, probe, share_file, shared_mutation,
                          SHARED_LIBRARY, source_video, title_pair)
 
 TAG_WRITABLE = {".opus", ".ogg", ".oga", ".flac", ".m4a", ".mp3"}
@@ -230,7 +230,7 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
         if existing is not None and source != existing and audio_file(existing):
             remember(existing)
             source.unlink()
-            print(f"Déjà dans la bibliothèque : {existing.relative_to(root)}")
+            mutation_report(f"Déjà dans la bibliothèque : {existing.relative_to(root)}")
             return existing, False
     for attempt in range(1, 10_000):
         suffix = "" if attempt == 1 else f" [{attempt}]"
@@ -239,17 +239,17 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
             if updates:
                 if not preview:
                     write_tags(source, target, tags, updates)
-                print(f"{source.name} · tags de l’album : {album_artist} / {album_title}")
+                mutation_report(f"{source.name} · tags de l’album : {album_artist} / {album_title}")
             return target, False
         if target in reserved or target.exists() or target.is_symlink():
             if importing and not preview and (same_content(source, target)
                     or not preserve_tags and same_import_track(source, target, tags)):
                 remember(target)
                 source.unlink()
-                print(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
+                mutation_report(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
                 return target, False
             if same_content(source, reserved.get(target, target)):
-                print(f"Identique, conservé à la source : {source.name}")
+                mutation_report(f"Identique, conservé à la source : {source.name}")
                 return (target if target.is_file() else None), False
             continue
         if not preview:
@@ -265,7 +265,7 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
             reserved[target] = source
         elif video:
             known_sources[folder][identity] = target
-        print(f"{source.name} → {target.relative_to(root)}")
+        mutation_report(f"{source.name} → {target.relative_to(root)}")
         return target, not preview
     raise ValueError("aucun nom de fichier libre")
 
@@ -302,7 +302,7 @@ def main():
         tracks = sorted({track.resolve() for source in sources
                          for track in audio_files(source.expanduser().absolute())})
         if not tracks:
-            print("Aucun fichier audio à classer.")
+            mutation_report("Aucun fichier audio à classer.")
         failures = 0
         items = []
         for track in tracks:
@@ -311,7 +311,7 @@ def main():
                 items.append((track, tags))
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 failures += 1
-                print(f"Erreur pour {track.name} : {error}", file=sys.stderr)
+                mutation_report(f"Erreur pour {track.name} : {error}", file=sys.stderr)
 
         artists = album_artists(items, root)
         reserved = {}
@@ -335,7 +335,7 @@ def main():
                 added += moved
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 failures += 1
-                print(f"Erreur pour {track.name} : {error}", file=sys.stderr)
+                mutation_report(f"Erreur pour {track.name} : {error}", file=sys.stderr)
         if args.rapport:
             tracks = sorted(destinations)
             report = {"tracks": tracks, "added": added} if args.rapport_detaille else tracks

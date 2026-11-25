@@ -1,6 +1,7 @@
 """Exécute une opération bornée avec les moteurs de la bibliothèque."""
 import json
 from collections import defaultdict
+from contextlib import redirect_stdout
 from functools import partial
 from importlib.machinery import SourceFileLoader
 import math
@@ -16,6 +17,7 @@ from _kara_prepare import file_token
 from _musique_oz import shared_mutation
 from _parole_catalogue import check_album, check_discography, check_recording, request, MBID
 from _parole_index import Index, document, key, sidecar
+from _parole_import_enrichment import COVER, KINDS, LYRICS, paths_for
 from _parole_sources import ProviderUnavailable, LyricsEndpoint, validate_endpoint, record, fetch
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
@@ -178,11 +180,57 @@ def verify_documentation(index, subject):
     return "available"
 
 
+def import_enrichment(index, kind, subject):
+    paths = paths_for(index, kind, subject)
+    if not paths:
+        return {"state": "not_found"}
+    os.environ["KARA_IMPORT_PROCESSING"] = "1"
+    os.environ["KARA_SHARED_WAIT"] = "texte"
+    if kind == COVER:
+        result = subprocess.run([str(BIN / "musique-pochettes"), "--bibliotheque", str(index.root),
+                                 "--manquantes", "--en-ligne", "--suivi-activite", "--", str(paths[0])],
+                                env=dict(os.environ, KARA_PAROLE_COVER="1"), stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=110)
+        state = ("temporary" if result.returncode else "not_found" if b"KARA_POCHETTES 0 1" in result.stdout
+                 else "complete")
+        return {"state": state}
+    engine = lyrics_engine()
+    settings = index.settings()
+    client = engine.LyricsSources()
+
+    class RegisteredSources:
+        def find(self, *args, **kwargs):
+            return client.find(*args, **kwargs, registry=index, strict=True)
+
+    source = RegisteredSources()
+    counts = defaultdict(int)
+    for path in paths:
+        for synced, flag in ((False, "lyrics"), (True, "lrc")):
+            if not settings[flag]:
+                counts["missing"] += 1
+                continue
+            try:
+                message = engine.process_track(path, source, False, synced, index.root)
+            except engine.ServiceUnavailable:
+                counts["temporary"] += 1
+            except (OSError, ValueError, subprocess.SubprocessError):
+                counts["missing"] += 1
+            else:
+                counts["missing" if message.startswith(("aucune", "titre", "format")) else "complete"] += 1
+    return {"state": "temporary" if counts["temporary"] else "not_found" if counts["missing"] else "complete",
+            "counts": dict(counts)}
+
+
 def main():
     kind, subject = sys.argv[1:3]
     index = Index(music_library())
     if kind in ("lyrics", "lrc"):
         result = lookup_song(index, subject, kind == "lrc")
+    elif kind in KINDS:
+        # Library-lock progress and tool diagnostics must not contaminate the
+        # machine-readable result expected by the maintenance supervisor.
+        with redirect_stdout(sys.stderr):
+            result = import_enrichment(index, kind, subject)
     elif kind in ("prepare_plain", "prepare_lrc"):
         # A nocturnal lookup can supply a candidate to Turbo. It never
         # retags audio or publishes any provider text to the library.

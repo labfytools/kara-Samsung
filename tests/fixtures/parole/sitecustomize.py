@@ -42,7 +42,7 @@ if "PAROLE_TEST_CONFIG" in os.environ:
                                  "syncedLyrics": "[00:00.20]Son créé pour le test."})
             raise HTTPError(query.full_url, 404, "Service inexistant pour ce test", None, None)
 
-    if Path(sys.argv[0]).name in {"musique-pochettes", "paroles-musique"}:
+    if Path(sys.argv[0]).name in {"musique-pochettes", "paroles-musique", "_parole_work.py"}:
         request.build_opener = lambda *_args: FixtureOpener()
 
     class FixtureYTMusic:

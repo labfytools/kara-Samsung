@@ -221,6 +221,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_refresh_timer = None
         self.import_refresh_active = False
         self.import_refresh_tasks = {}
+        self.import_published_paths = set()
         self.import_toggle = Gtk.ToggleButton(label="Importer un album")
         self.import_toggle.connect("toggled", self.album_import.toggle)
         self.music_sync = MusicSync(self, LIBRARY, BIN)
@@ -602,6 +603,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def report_import_update(self, job, kind, payload):
         self.mobile_imports.update(job, kind, payload)
+        if kind == "album" and payload.get("tracks"):
+            self.import_published_paths.update(map(Path, payload["tracks"]))
+            if self.import_refresh_timer is None and not self.import_refresh_active:
+                self.import_refresh_timer = GLib.timeout_add_seconds(3, self.reload_after_import)
         if getattr(self, "maintenance", None) and payload.get("provider"):
             if kind == "provider":
                 self.maintenance.journal.emit("DOWNLOAD", payload["message"])
@@ -617,6 +622,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if self.closed:
             return GLib.SOURCE_REMOVE
         pending, self.import_refresh_tasks = self.import_refresh_tasks, {}
+        published, self.import_published_paths = self.import_published_paths, set()
         generations = [(task.identity, task.refresh_generation) for task, _ in pending.values()]
         receiver = self.receiver
         jobs = [job for _, linked in pending.values() for job in linked]
@@ -624,9 +630,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
                  for outcome in task.outcomes.values() for path in outcome.get("tracks", [])}
         paths.update(Path(path).resolve() for job in jobs for outcome in job["results"].values()
                      for path in outcome.get("tracks", []))
+        paths.update(published)
         def reload():
             try:
-                rows = catalogue(COLLECTION, LIBRARY.resolve())
+                rows = catalogue(COLLECTION, LIBRARY.resolve()) if pending else []
             except (OSError, sqlite3.Error):
                 rows = []
             indexed = {song.path for song, _ in rows}
@@ -651,7 +658,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 linked = receiver if self.receiver is receiver else None
                 visible = {song.path for song, _ in rows if song.path.is_file()}
                 if linked is not None:
-                    linked.room.update_catalogue(rows)
+                    linked.room.update_catalogue(rows, incremental=not pending)
                 for task, _ in pending.values():
                     missing = [url for url, outcome in task.outcomes.items()
                                if outcome.get("audio_complete") and
@@ -661,18 +668,19 @@ class LyricsWindow(Gtk.ApplicationWindow):
                         task.outcomes = self.album_import.queue.outcomes(task.identity)
                 self.mobile_imports.integrated(jobs, linked, visible)
                 self.album_import.acknowledge_refresh(generations)
-                if getattr(self, "maintenance", None):
+                if pending and getattr(self, "maintenance", None):
                     self.maintenance.rescan()
                     self.maintenance.journal.emit("DOWNLOAD", f"{len(paths)} pistes signalées après import")
-                if self.music_window:
+                if pending and self.music_window:
                     self.music_window.load_library()
                     # Strawberry can index files shortly after publication.
                     GLib.timeout_add_seconds(4, self.refresh_import_library_window)
             except (OSError, sqlite3.Error, RoomError, ValueError) as error:
                 self.album_import.release_refresh(generations)
                 self.blackbox.emit("imports", "error", stage="library-refresh", error=str(error))
-            if self.import_refresh_tasks:
-                self.import_refresh_timer = GLib.timeout_add(250, self.reload_after_import)
+            if self.import_refresh_tasks or self.import_published_paths:
+                self.import_refresh_timer = GLib.timeout_add(250 if self.import_refresh_tasks else 3000,
+                                                            self.reload_after_import)
             return GLib.SOURCE_REMOVE
 
         self.import_refresh_active = True

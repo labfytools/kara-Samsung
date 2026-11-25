@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import sys
 from unicodedata import combining, normalize
 from urllib.parse import parse_qs, urlsplit
 
@@ -225,6 +226,20 @@ def share_file(draft, destination):
         os.chmod(draft, 0o660)
 
 
+def mutation_report(message, *, file=None):
+    try:
+        print(message, file=file, flush=True)
+    except BrokenPipeError:
+        if os.environ.get("KARA_SHARED_WAIT") != "suivi":
+            raise
+        # A managed sorter still owns publication receipts after losing its
+        # reporting parent. Drain subsequent messages locally.
+        if file is sys.stderr:
+            sys.stderr = open(os.devnull, "w")
+        else:
+            sys.stdout = open(os.devnull, "w")
+
+
 @contextmanager
 def shared_mutation(root, enabled=True, *, wait=False):
     if not enabled or root != SHARED_LIBRARY:
@@ -244,8 +259,8 @@ def shared_mutation(root, enabled=True, *, wait=False):
                 raise SystemExit("Un autre import, tri ou enrichissement est en cours.") from error
             message = ("KARA_ATTENTE_BIBLIOTHEQUE" if mode == "suivi"
                        else "Attente de l’accès à la bibliothèque partagée…")
-            print(message, flush=True)
+            mutation_report(message)
             flock(lock, LOCK_EX)
             if mode == "suivi":
-                print("KARA_BIBLIOTHEQUE_DISPONIBLE", flush=True)
+                mutation_report("KARA_BIBLIOTHEQUE_DISPONIBLE")
         yield

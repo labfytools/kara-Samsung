@@ -33,6 +33,7 @@ from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, probe, shared_mutation, source_video
 from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
+from _parole_import_enrichment import schedule as schedule_enrichment
 from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as compare_music, duration_ms,
                                     from_catalogue as music_facts, position, same_track)
 from _parole_music_registry import (acoustic_evidence, original_tags, possible_duplicates, registered_positions,
@@ -69,6 +70,7 @@ class ImportProgress:
     def __init__(self, report=None, *, journal=None, json_output=True, url=None):
         self.report = report
         self.managed = False
+        self.defer_enrichment = False
         self.guard = ()
         self.output_lock = Lock()
         self.commit_result = None
@@ -660,6 +662,8 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
 
 
 def enrich_tracks(tracks, progress):
+    if progress.defer_enrichment:
+        return 0
     albums = sorted({str(Path(track).parent) for track in tracks})
     return enrich(["--", *albums], ["--", *tracks], progress)
 
@@ -1250,6 +1254,7 @@ def import_equivalent(item, root, inbox, previous, stop, seen, identity):
             child = ImportProgress(report=progress.emit, journal=progress.journal, json_output=progress.json_output, url=uri)
             child.guard = progress.guard + (guard,)
             child.measure_index = index
+            child.defer_enrichment = progress.defer_enrichment
             attempt = BatchAlbum(uri, item.title, child, provider=source)
             started = monotonic()
             parsed = urlsplit(uri)
@@ -1398,6 +1403,8 @@ def import_album(item, root, inbox, previous, stop, seen):
                 progress.selected = tuple(source.position for source in tasks)
 
                 def transfer(source):
+                    if stop.is_set():
+                        return
                     try:
                         code = download_track(source, folder, progress)
                         if not code and source.position not in progress.finished_positions:
@@ -1420,7 +1427,8 @@ def import_album(item, root, inbox, previous, stop, seen):
                     item.tracks = sorted(set(item.tracks).union(sorted_tracks))
                 if not item.tracks and not progress.failures:
                     raise ImportIssue("download", "Aucune piste complète n’a été reçue.")
-            item.audio_complete = bool(item.tracks) and not progress.failures
+            item.audio_complete = bool(item.tracks) and not progress.failures and (
+                not stop.is_set() or all(position in progress.finished_positions for position in progress.selected or ()))
             if item.audio_complete:
                 write_checkpoint(checkpoint, {"tracks": item.tracks, "title": item.title})
             if item.tracks:
@@ -1457,7 +1465,12 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
     seen = set()
     urls = list(dict.fromkeys(urls))
     for index, url in enumerate(urls, 1):
+        # A cooperative stop leaves untouched targets and their prior outcomes
+        # alone. The active album still reconciles its publication receipts.
+        if stop.is_set():
+            break
         child = ImportProgress(journal=progress.journal, json_output=progress.json_output, url=url)
+        child.defer_enrichment = progress.managed
         child.guard = progress.guard
         child.download_lock = RLock()
         child.measure_index = metrics
@@ -1499,6 +1512,16 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
                     import_album(item, root, inbox, previous.get(url, {}), stop, seen)
             except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as error:
                 record_error(child, "Import de l’album", error)
+        enrichment = None
+        if child.defer_enrichment and item.tracks and item.status != "duplicate":
+            try:
+                # Another import can be initializing the index while this
+                # worker starts. Retry the mandatory admission after audio.
+                if metrics is None:
+                    metrics = Index(root)
+                enrichment = schedule_enrichment(metrics, item.tracks)
+            except (OSError, sqlite3.Error) as error:
+                record_error(child, "Admission de l’enrichissement", error, "processing")
         if item.status != "duplicate":
             if child.failures:
                 item.status = "partial" if item.tracks else "failure"
@@ -1510,7 +1533,8 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
         category = ("partial" if item.status == "partial" else diagnostics[0]["category"] if diagnostics
                     else "present" if item.status == "present" else None)
         message = CATEGORIES.get(category) or {
-            "success": "Import terminé", "duplicate": "Lien en double", "pending": "Arrêté avant téléchargement",
+            "success": "Audio complet" if enrichment else "Import terminé",
+            "duplicate": "Lien en double", "pending": "Arrêté avant téléchargement",
         }[item.status]
         outcome = dict(url=url, title=item.title, status=item.status, category=category, diagnostics=diagnostics,
                        added=item.added, tracks=item.tracks, audio_complete=item.audio_complete,
@@ -1520,6 +1544,8 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
             outcome["provenance"] = item.provenance
         if item.provider:
             outcome["provider"] = item.provider
+        if enrichment:
+            outcome["enrichment"] = enrichment
         if metrics is not None and item.provider and item.status not in {"pending", "duplicate"}:
             if not plan_id(url):
                 measure_acquisition(metrics, item, started)
@@ -1540,7 +1566,9 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
             break
 
     failed = bool(counts["failure"] or counts["partial"])
-    if len(urls) == 1:
+    if not counts:
+        message = "Import arrêté avant téléchargement."
+    elif len(urls) == 1:
         if item.status == "failure":
             category = album_diagnostics(item)[0]["category"]
             message = f"{CATEGORIES[category]} · {item.title}"
@@ -1551,7 +1579,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
         elif item.status == "pending":
             message = "Import arrêté avant téléchargement."
         else:
-            message = f"Import terminé · {added} piste(s) ajoutée(s)."
+            message = f"{'Audio complet' if progress.managed else 'Import terminé'} · {added} piste(s) ajoutée(s)."
     else:
         summary = [f"{counts['success']} album(s) importé(s)", f"{counts['present']} déjà en collection"]
         for status, label in (("partial", "importation(s) partielle(s)"), ("failure", "échec(s)"),

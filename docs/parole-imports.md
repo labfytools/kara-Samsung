@@ -2,6 +2,12 @@
 
 Le tableau de bord et la maintenance sont documentés dans [Parole V3](parole-v3.md).
 
+## Publication audio et enrichissement
+
+Un résultat « Audio complet » confirme que les pistes de l’édition sont disponibles. Les imports de la file enregistrent séparément les recherches de paroles et de pochettes dans les tâches persistantes de Parole. Le reçu audio permet de rejouer l’admission après une interruption. Les tâches ont des identifiants stables dérivés des chemins publiés. Les sorties audio partielles suivent la même procédure pour les pistes déjà classées.
+
+Kara intègre les pistes publiées par petits lots pendant l’import. La vérification globale avec la collection Strawberry intervient à la fin du lot. Les recherches repassent en maintenance classique quand le traitement initial laisse des éléments manquants. Les parties Kara interrompent cet enrichissement. Les imports en attente ont priorité sur la préparation lourde, qui retrouve ses tâches après la libération des ressources.
+
 ## Déplacement du dépôt sur ArchASP
 
 Le commit `2201869` a déplacé `kara` dans le dépôt dédié. Les appels de tri et de recherche de pochette utilisaient déjà le répertoire de `kara`, mais `musique-tri` et `musique-pochettes` sont restés dans `~/.dotfiles/bin/.local/bin`, accessible sur ArchASP par `~/.local/bin`. Ces deux exécutables n’avaient pas d’historique dans Git. Les copies datées du 22 novembre dans `~/.local/state/kara-tri-paroles-*` corroborent l’origine du script de tri. Les scripts locaux ont été repris dans `bin/`, avec des adaptations ciblées pour les chemins et la reprise.

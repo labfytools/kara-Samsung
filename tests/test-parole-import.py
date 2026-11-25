@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Event, Thread
 import unittest
 from zipfile import ZipFile
 
@@ -199,21 +199,26 @@ class AlbumImportTests(unittest.TestCase):
         journal = next(event["path"] for event in events if event["event"] == "journal")
         return journal, [event for event in events if event["event"] == "album"], events[-1]
 
-    def check_tracks(self, album, count):
+    def check_tracks(self, album, count, *, enriched=True):
         directory = self.library / self.config["artist"] / album
         tracks = sorted(directory.glob("*.opus"))
         self.assertEqual(len(tracks), count, list(directory.glob("*")))
-        self.assertGreater((directory / "cover.jpg").stat().st_size, 0)
+        if enriched:
+            self.assertGreater((directory / "cover.jpg").stat().st_size, 0)
         for index, track in enumerate(tracks, 1):
             self.assertTrue(track.name.startswith(f"{index:02d} - "))
-            self.assertIn("[00:00.20]Son créé pour le test.", track.with_suffix(".lrc").read_text())
+            if enriched:
+                self.assertIn("[00:00.20]Son créé pour le test.", track.with_suffix(".lrc").read_text())
             exported = json.loads(subprocess.check_output(
                 [TOOLS["ffprobe"], "-v", "error", "-show_entries", "stream_tags", "-of", "json", str(track)]
             ))["streams"][0]["tags"]
             tags = {key.casefold(): value for key, value in exported.items()}
             self.assertEqual(tags["album"], album)
             self.assertEqual(tags["track"], str(index))
-            self.assertEqual(tags["lyrics"], "Son créé pour le test.")
+            if enriched:
+                self.assertEqual(tags["lyrics"], "Son créé pour le test.")
+            else:
+                self.assertNotIn("lyrics", tags)
         return tracks
 
     def make_local_track(self, path, number, *, album="Album local"):
@@ -255,11 +260,29 @@ class AlbumImportTests(unittest.TestCase):
         queue.transition(identity, "partial", "queued", "Relance du dossier")
         complete = run_job(0)
         self.assertEqual((complete["status"], complete["added"], complete["processed"]), ("success", 1, 1))
+        with Index(self.library, self.temp / "state").db() as db:
+            states = {(kind, subject): state for kind, subject, state in
+                      db.execute("SELECT kind,subject,state FROM tasks")}
+        self.assertTrue(complete["enrichment"]["import_lyrics"])
+        for kind, subjects in complete["enrichment"].items():
+            for subject in subjects:
+                self.assertEqual(states[kind, subject], "queued")
         self.assertEqual([row["member"] for row in complete["provenance"]], ["01.flac", "02.flac"])
         self.assertEqual(complete["provenance"][0]["external_id"], partial["provenance"][0]["external_id"])
         self.assertEqual(first.read_bytes(), original)
         self.assertEqual(published.read_bytes(), before)
         self.assertEqual(pcm_digest(complete["tracks"][1]), pcm_digest(second))
+        maintenance = Index(self.library, self.temp / "state")
+        seed(maintenance)
+        task = maintenance.claim(("import_lyrics",), time.time())
+        self.assertEqual(maintenance.recover(), False)
+        restarted = Index(self.library, self.temp / "state")
+        self.assertEqual(restarted.claim(("import_lyrics",), time.time())["subject"], task["subject"])
+        result = subprocess.check_output([sys.executable, "-B", str(BIN / "_parole_work.py"),
+                                          "import_lyrics", task["subject"]], env=self.env, timeout=20)
+        self.assertEqual(json.loads(result)["state"], "complete")
+        self.assertTrue(published.with_suffix(".lrc").is_file())
+        self.assertEqual(pcm_digest(published), pcm_digest(first))
         _, items, _ = self.run_import(url)
         self.assertEqual((items[0]["status"], items[0]["processed"]), ("present", 0))
         self.assertEqual(self.requests.read_text(), "")
@@ -768,7 +791,18 @@ class AlbumImportTests(unittest.TestCase):
                 worker = self.managed_worker(queue, identity, fd)
             # The real sorter is blocked under the library lock. Simulate the
             # import process disappearing while its admitted child is alive.
-            self.until(lambda: slot_count(self.inbox / ".kara-traitements", PROCESSING) == 1)
+            waiting = Event()
+
+            def sorter_started():
+                for line in worker.stdout:
+                    if "En attente de la bibliothèque" in line:
+                        waiting.set()
+                        break
+
+            reader = Thread(target=sorter_started, daemon=True)
+            reader.start()
+            self.assertTrue(waiting.wait(20))
+            reader.join()
             worker.kill()
             worker.communicate(timeout=10)
             self.assertEqual(queue.job(identity)["state"], "running")
@@ -785,7 +819,9 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual(restarted.returncode, 0, (stdout, stderr))
         self.assertEqual(queue.job(identity)["state"], "done")
         self.assertTrue(queue.job(identity)["refresh"])
-        self.check_tracks("Deux pistes", 2)
+        self.check_tracks("Deux pistes", 2, enriched=False)
+        self.assertEqual(list(self.library.rglob("*.lrc")), [])
+        self.assertTrue(queue.outcomes(identity)[playlist("PLPART")]["enrichment"]["import_lyrics"])
         self.assertEqual(Counter(self.requests.read_text().splitlines()), {"soundPART01": 1, "soundPART02": 1})
 
     def test_four_lots_share_download_slots_and_finish_after_client_exit(self):
@@ -813,8 +849,8 @@ class AlbumImportTests(unittest.TestCase):
         for worker in workers:
             worker.stdout.close()
             worker.stdout = None
-        for worker in workers:
-            self.assertEqual(worker.wait(timeout=45), 0)
+        for worker, identity in zip(workers, ids):
+            self.assertEqual(worker.wait(timeout=45), 0, queue.outcomes(identity))
         restarted = ImportQueue(self.temp / "state", self.library)
         self.assertEqual(restarted.count(), {"done": 4})
         self.assertEqual(restarted.totals(), (4, 8, 4, 4))

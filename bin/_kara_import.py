@@ -852,7 +852,7 @@ class AlbumImport(Gtk.Revealer):
                                                   progress=progress, paused=paused, batches=capacity,
                                                   limitation=CATEGORIES["space"] if limitation else "",
                                                   max_batches=MAX_BATCHES))
-        summary = (f"{active} lot(s) actif(s) · {waiting} en attente · {albums} album(s) terminé(s) · "
+        summary = (f"{active} lot(s) actif(s) · {waiting} en attente · {albums} album(s) audio complet(s) · "
                    f"{tracks} piste(s) traitée(s) · {errors} erreur(s)\n"
                    f"{downloads}/{DOWNLOADS} téléchargement(s) · {processing}/{PROCESSING} traitement(s)")
         self.queue_status.set_text(f"{summary}\n{limitation}" if limitation else summary)

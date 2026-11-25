@@ -58,7 +58,7 @@ class MobileRoom:
         with self._lock:
             self._party = state
 
-    def update_catalogue(self, rows):
+    def update_catalogue(self, rows, *, incremental=False):
         catalogue, songs, covers = [], {}, {}
         album_art = {}
         for song, normalized in rows:
@@ -72,9 +72,18 @@ class MobileRoom:
             if album_art[folder]:
                 covers[key] = album_art[folder]
         with self._lock:
-            self._catalogue = catalogue
-            self._songs = songs
-            self._covers = covers
+            if incremental:
+                # A published path keeps the same room ID across batch updates
+                # and the eventual full Strawberry refresh.
+                self._catalogue = [row for row in self._catalogue if row[0] not in songs] + catalogue
+                self._songs.update(songs)
+                for identity in songs.keys() - covers.keys():
+                    self._covers.pop(identity, None)
+                self._covers.update(covers)
+            else:
+                self._catalogue = catalogue
+                self._songs = songs
+                self._covers = covers
             self._catalogue_ready = True
             self._catalogue_revision += 1
 
