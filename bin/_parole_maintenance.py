@@ -4,6 +4,7 @@ from logging import Logger
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -130,6 +131,7 @@ class Maintenance:
         self.night_handover = 0.
         self.night_policy = None
         self.night_lrc = (False, False)
+        self.night_measures = {}
         self.owner = None
         self.foreground = Event()
         if not background:
@@ -214,14 +216,16 @@ class Maintenance:
             stem = stem_directory(path)
             stem_tokens = [file_token(stem / name) if (stem / name).is_file() else None
                            for name in ("meta.json", *FILES)]
-            saved = document([rt, model, stem_tokens, REFINEMENT_VERSION])
+            # A previous inventory contains coverage but cannot distinguish a
+            # rejected reference from a validated reference awaiting stems.
+            saved = document([rt, model, stem_tokens, REFINEMENT_VERSION, "reference-status"])
             if old and old["cache"] == saved and old["token"] == token and old["side"] == side:
                 return saved, old["kara"], json.loads(old["info"]).get("report", {})
             item = self.cache.cached(path, verify=False) if rt and model else None
             stems = cached_stems(path) if all(stem_tokens) else None
             if item and item.get("refinement", {}).get("version") != REFINEMENT_VERSION:
                 item = None
-            report = {"instrumental": bool(stems), "voice": bool(stems)}
+            report = {"instrumental": bool(stems), "voice": bool(stems), "reference_validated": bool(item)}
             if item:
                 report.update(coverage=item["report"]["word_coverage"], line_coverage=item["report"]["line_coverage"],
                               source=item["source"].get("provider", "bibliothèque"),
@@ -639,6 +643,19 @@ class Maintenance:
                     seconds = event.get("seconds")
                     if type(seconds) in (int, float):
                         self.metrics["turbo_seconds"] = seconds
+                    if nocturnal and not event.get("cached"):
+                        report = event.get("report", {})
+                        refinement = report.get("refinement", {})
+                        # A cached first-pass report describes old work. A
+                        # local retry can contribute only its own elapsed time.
+                        measurements = {}
+                        if refinement.get("decodes"):
+                            measurements["reprises"] = refinement.get("seconds")
+                        if not refinement.get("reused_reference"):
+                            measurements["turbo"] = report.get("analysis_seconds")
+                        self.night_measures.update((name, seconds) for name, seconds in measurements.items()
+                                                   if type(seconds) in (int, float) and isfinite(seconds)
+                                                   and seconds >= 0)
             return receive
 
         if not cached_stems(path):
@@ -649,6 +666,8 @@ class Maintenance:
             self.metrics["demucs_seconds"] = monotonic() - began
             if rc:
                 return "temporary", "séparation indisponible", 6 * HOUR
+            if nocturnal:
+                self.night_measures["demucs"] = self.metrics["demucs_seconds"]
         analyzed = not saved or saved.get("refinement", {}).get("version") != REFINEMENT_VERSION
         if analyzed:
             self.journal.emit("TURBO", f"Analyse Turbo{' Vulkan' if nocturnal else ''} · {song['title']}")
@@ -670,8 +689,18 @@ class Maintenance:
                 if rc and not self.cache.cached(path, verify=False, insufficient=True):
                     return "temporary", "analyse Turbo indisponible", 6 * HOUR
         reference = self.cache.cached(path, verify=False)
-        if (reference and reference.get("refinement", {}).get("version") == REFINEMENT_VERSION
-                and cached_stems(path)):
+        prepared_stems = (cached_stems(path) if reference and
+                          reference.get("refinement", {}).get("version") == REFINEMENT_VERSION else None)
+        if prepared_stems:
+            if nocturnal:
+                folder = self.cache.folder(path)
+                try:
+                    # Measure this complete generation, excluding locks,
+                    # superseded drafts and unrelated changes to the cache.
+                    files = (*prepared_stems, folder / "prepared.json", folder / (reference["lrc_sha256"] + ".lrc"))
+                    self.night_measures["taille"] = sum(file.stat().st_blocks * 512 for file in files)
+                except OSError:
+                    pass
             updated = {"audio": reference["audio"].get("pcm_sha256", ""), "kara": "prêt"}
             origin = reference["source"]
             generated = bool(origin.get("plain_sha256") and reference_option == "--plain-reference")
@@ -748,6 +777,7 @@ class Maintenance:
         self.night_running = nocturnal
         self.night_settings_at = 0.
         self.night_lrc = (False, False)
+        self.night_measures = {}
         song = self.index.song(subject) if kind in ("lyrics", "lrc", "prepare") else None
         self.progress = (category, song["title"] if song is not None else "En cours", None)
         if kind not in ("prepare", "codex"):
@@ -829,7 +859,7 @@ class Maintenance:
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
             stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
-                         corrected=corrected, generated=generated)
+                         corrected=corrected, generated=generated, measurements=self.night_measures)
         self.index.finish(task, *result, night=stats)
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
         self.revision += 1

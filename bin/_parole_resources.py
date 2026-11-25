@@ -17,22 +17,27 @@ MIB = 1024**2
 
 
 def contents(root):
-    total, sizes, seen = 0, {}, set()
+    total, shared, sizes, seen = 0, 0, {}, set()
     for parent, _, names in os.walk(root):
         for name in names:
             p = Path(parent) / name
             try:
                 info = p.lstat()
                 identity = info.st_dev, info.st_ino
-                if stat.S_ISREG(info.st_mode) and identity not in seen:
-                    seen.add(identity)
+                if stat.S_ISREG(info.st_mode):
                     size = info.st_blocks * 512
+                    if identity in seen:
+                        # Count each additional name for an already allocated
+                        # inode without charging its blocks to the disk cap.
+                        shared += size
+                        continue
+                    seen.add(identity)
                     total += size
                     category = name if name.endswith(".flac") else p.suffix
                     sizes[category] = sizes.get(category, 0) + size
             except FileNotFoundError:
                 continue
-    return total, sizes
+    return total, sizes, shared
 
 
 def nearest(path):
@@ -121,11 +126,12 @@ class Resources:
     def collect_storage(self, now, force=False):
         if not force and now < self.last_usage + 30:
             return
-        prepared, reference = contents(CACHE_ROOT)
-        stems, audio = contents(STEM_ROOT)
+        prepared, reference, shared_references = contents(CACHE_ROOT)
+        stems, audio, shared_stems = contents(STEM_ROOT)
         paths = {name: nearest(path) for name, path in (
             ("bibliothèque", self.root), ("références", CACHE_ROOT), ("pistes IA", STEM_ROOT))}
         self.storage = {"bytes": prepared + stems, "reference": reference, "stems": audio,
+                        "shared_bytes": shared_references + shared_stems,
                         "free": {name: disk_usage(path).free for name, path in paths.items()},
                         "devices": {name: block_device(path) for name, path in paths.items()}}
         self.last_usage = now

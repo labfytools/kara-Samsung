@@ -97,6 +97,8 @@ La qualification ne fixe pas la précision de 500 ms. Elle demande un corpus don
 
 Le [banc de performances](parole-performances.md) décrit la campagne élargie, la mesure par étape et le témoin temporel indépendant.
 
+Le bilan nocturne distingue les préparations complètes et les références temporelles validées, y compris celles qui attendent leurs pistes. Chaque moyenne est accompagnée du nombre de mesures. Demucs inclut la séparation et sa publication. La transcription Turbo reprend la mesure de la première passe du moteur, décodage PCM compris. Les reprises comptent la durée de consolidation lorsqu’un décodage local a eu lieu. La moyenne de cache par préparation porte sur les deux pistes, le manifeste et son LRC alloués à une préparation complète. La taille de la session reste mesurée séparément. Les octets mutualisés par liens physiques sont observés lors de l’inventaire disque. Les sessions antérieures conservent uniquement les mesures qu’elles avaient enregistrées.
+
 Deux morceaux complets ont été traités sur des copies privées, capot ouvert, avec Demucs CPU à deux fils et Turbo Vulkan. Les mesures utilisent temporairement le profil Économie de TLP. Le profil Performance a fait dépasser 85 °C au CPU pendant l’essai initial. En Économie, les essais terminés ont mesuré au plus 74,9 °C au CPU et 61 °C au GPU. Le décodeur strict a confirmé `Vulkan0`. Lorsque le pilote a été masqué pour le seul processus de test, il a quitté avec le code 4 avant d’annoncer sa disponibilité.
 
 | Morceau entier | Demucs | Turbo avec LRC | Couverture mots / lignes | Repères corrigés | Cache alloué |

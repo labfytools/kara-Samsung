@@ -20,3 +20,4 @@
 - Exiger un backend Vulkan initialisé pour les analyses nocturnes et conserver le profil système sur les versions de TLP dont les demandes survivent au client.
 - Documenter les essais nocturnes ArchASP sur deux morceaux complets et la validation sur secteur, écran éteint.
 - Ajouter un banc silencieux de préparation sur dix morceaux complets et un comparateur de repères sur annotations indépendantes.
+- Distinguer références temporelles et préparations complètes, et afficher les temps moyens observés et les blocs mutualisés dans le bilan nocturne.

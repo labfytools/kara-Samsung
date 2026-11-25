@@ -525,8 +525,12 @@ class ParoleView:
             value.set_text(formatted)
 
     def refresh_night_summary(self):
-        ready, remaining, report = self.index.night_progress()
-        lines = [f"Bibliothèque · {ready} prêtes · {remaining} restantes dans la file"]
+        ready, references, remaining, report = self.index.night_progress()
+        lines = [f"Bibliothèque · {ready} préparations complètes · {references} références temporelles validées · "
+                 f"{remaining} restantes dans la file"]
+        storage = self.maintenance.resources.storage
+        if "shared_bytes" in storage:
+            lines.append(f"Espace mutualisé par liens · {display_size(storage['shared_bytes'])}")
         if report:
             stamp = datetime.fromtimestamp(report["started"]).strftime("%d/%m à %H:%M")
             seconds = report["seconds"]
@@ -540,6 +544,15 @@ class ParoleView:
                 f"Traitement cumulé · {seconds / 60:.1f} min{cadence}",
                 f"Cache utilisé · {display_size(report['cache_bytes'])} · {sign}{display_size(abs(delta))} sur la session",
             ))
+            averages = []
+            for key, label in (("demucs", "Demucs"), ("turbo", "Transcription Turbo"),
+                               ("reprises", "Reprises"), ("taille", "Cache par préparation")):
+                total, count = report.get("measurements", {}).get(key, (0, 0))
+                if count:
+                    value = display_size(total / count) if key == "taille" else f"{total / count:.1f} s"
+                    averages.append(f"{label} · {value} ({count})")
+            if averages:
+                lines.append("Moyennes · " + "  ·  ".join(averages))
         else:
             lines.append("Aucune session nocturne enregistrée.")
         self.night_summary.set_text("\n".join(lines))
@@ -571,11 +584,17 @@ class ParoleView:
         coverage = (f"{report.get('coverage', 0):.0%} mots · {report.get('line_coverage', 0):.0%} lignes"
                     if "coverage" in report else "Non mesurée")
         updated = datetime.fromtimestamp(row["checked"]).strftime("%d/%m/%Y à %H:%M")
-        details = [f"Instrumental {'disponible' if report.get('instrumental') else 'absent'}",
+        verified = report.get("reference_validated", row["kara"] == "prêt")
+        reference = "validée" if verified else "insuffisante" if "coverage" in report else "absente"
+        provider = metadata.get("lrc_provider") or report.get("source")
+        lrc = row["lrc"] + (f" ({provider})" if provider else "")
+        details = [f"Préparation Kara · {row['kara']}",
+                   f"Référence temporelle · {reference}",
+                   f"Instrumental {'disponible' if report.get('instrumental') else 'absent'}",
                    f"Voix séparée {'disponible' if report.get('voice') else 'absente'}",
                    f"Couverture {coverage}",
                    f"Paroles · {metadata.get('lyrics_provider') or row['lyrics']}",
-                   f"LRC · {metadata.get('lrc_provider') or report.get('source') or row['lrc']}",
+                   f"LRC source · {lrc}",
                    f"Vérifié le {updated}"]
         details.extend(f"{t['kind']} · {t['detail']} ({t['attempts']} tentatives)" for t in checks
                        if t["detail"] and t["state"] in ("review", "temporary", "suspended"))

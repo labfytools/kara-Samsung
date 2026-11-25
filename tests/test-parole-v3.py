@@ -382,6 +382,11 @@ class GtkTests(Fixture):
         for page in ("general", "sources", "codex", "storage", "resources", "night"):
             view.settings(page)
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)
+        view.refresh_night_summary()
+        summary = view.night_summary.get_label()
+        self.assertIn("0 préparations complètes", summary)
+        self.assertIn("0 références temporelles validées", summary)
+        self.assertNotIn("Moyennes", summary)
         window.maintenance.journal.emit("SCAN", "Fixture")
         view.console.update()
         self.assertTrue(any(e[-1] == "Fixture" for e in view.console.lines))

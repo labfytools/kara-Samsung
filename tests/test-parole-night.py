@@ -13,7 +13,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
-from _kara_prepare import file_token
+from _kara_prepare import PreparedCache, file_token
+from _kara_refine import VERSION as REFINEMENT_VERSION
 from _parole_index import document, sidecar
 from _parole_maintenance import Maintenance
 from _parole_night import Desktop, Login, mains_online
@@ -135,7 +136,7 @@ class NightTests(unittest.TestCase):
         with self.owner.index.db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM daily_usage").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM tasks WHERE state='done'").fetchone()[0], 5)
-        _, _, report = self.owner.index.night_progress()
+        _, _, _, report = self.owner.index.night_progress()
         self.assertEqual(report["ready"], 5)
         self.assertEqual(report["cache_bytes"], 100)
         self.assertIsNone(report["pending"])
@@ -146,14 +147,43 @@ class NightTests(unittest.TestCase):
         index.enqueue("prepare", "first", "fixture", now=at)
         task = index.claim(("prepare",), at, night=(10., 20))
         index.finish(task, "done", night=dict(seconds=30., outcome="ready", cache_bytes=42, corrected=1, generated=0))
+        index.enqueue("prepare", "measured", "fixture", now=at)
+        task = index.claim(("prepare",), at, night=(10., 42))
+        measured = dict(seconds=15., outcome="ready", cache_bytes=62, corrected=0, generated=0,
+                        measurements={"turbo": 6., "reprises": 2., "taille": 4096})
+        index.finish(task, "done", night=measured)
+        index.finish(task, "done", night=measured)
         index.enqueue("prepare", "second", "fixture", now=at)
-        index.claim(("prepare",), at, night=(10., 42))
+        index.claim(("prepare",), at, night=(10., 62))
         self.assertTrue(index.recover())
         self.assertFalse(index.recover())
-        _, _, report = index.night_progress()
-        self.assertEqual((report["ready"], report["interrupted"], report["corrected"], report["seconds"]), (1, 1, 1, 30.))
-        self.assertEqual((report["cache_baseline"], report["cache_bytes"]), (20, 42))
+        _, _, _, report = index.night_progress()
+        self.assertEqual((report["ready"], report["interrupted"], report["corrected"], report["seconds"]), (2, 1, 1, 45.))
+        self.assertEqual((report["cache_baseline"], report["cache_bytes"]), (20, 62))
+        self.assertEqual(report["measurements"], {"turbo": [6., 1], "reprises": [2., 1], "taille": [4096, 1]})
         self.assertIsNone(report["pending"])
+
+    def test_cache_state_distinguishes_reference_without_stems_from_rejected_reference(self):
+        root = self.owner.index.root
+        path, model = root / "song.opus", root / "model"
+        path.write_bytes(b"x" * 4096)
+        model.touch()
+        cache = self.owner.cache = PreparedCache(root / "prepared", model)
+        folder = cache.folder(path)
+        folder.mkdir(parents=True)
+        (folder / "prepared.json").touch()
+        item = {"refinement": {"version": REFINEMENT_VERSION},
+                "report": {"word_coverage": .9, "line_coverage": .8}, "source": {}}
+        with patch.object(cache, "cached", return_value=item):
+            _, state, report = self.owner.inspect_cache(path, None, "", "")
+            self.assertEqual(state, "partiel")
+            self.assertTrue(report["reference_validated"])
+            self.assertFalse(report["instrumental"])
+        with patch.object(cache, "cached", side_effect=[None, item]):
+            _, state, report = self.owner.inspect_cache(path, None, "", "")
+            self.assertEqual(state, "partiel")
+            self.assertFalse(report["reference_validated"])
+            self.assertEqual(report["coverage"], .9)
 
     def test_recovery_removes_only_owned_drafts(self):
         stage = self.stems / "processing-interrupted"

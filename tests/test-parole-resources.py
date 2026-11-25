@@ -1,5 +1,6 @@
 #!/usr/bin/python3 -B
 """Contrôles du propriétaire de processus sans matériel audio."""
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -12,10 +13,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_index import DEFAULTS
 from _parole_maintenance import Maintenance
-from _parole_resources import GIB, Resources
+from _parole_resources import GIB, Resources, contents
 
 
 class ResourceTests(unittest.TestCase):
+    def test_stem_shared_blocks_do_not_count_twice_against_the_cap(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stem = root / "instrumental.flac"
+            stem.write_bytes(b"x" * 8192)
+            (root / "reused").mkdir()
+            os.link(stem, root / "reused" / stem.name)
+            allocated = stem.stat().st_blocks * 512
+            self.assertGreater(allocated, 0)
+            self.assertEqual(contents(root), (allocated, {stem.name: allocated}, allocated))
+
     def test_storage_checks_the_least_free_partition_and_working_margin(self):
         resources = Resources(Path("/fixture"))
         resources.storage = {"bytes": GIB, "free": {"library": 22 * GIB, "cache": 20 * GIB}}

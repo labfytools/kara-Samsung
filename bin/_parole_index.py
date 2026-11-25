@@ -192,13 +192,17 @@ class Index:
     def night_progress(self):
         with self.db(wait=.15) as db:
             ready = db.execute("SELECT ready FROM library_stats WHERE id=1").fetchone()[0]
+            references = db.execute("""
+                SELECT count(*) FROM songs
+                WHERE kara='prêt' OR (kara='partiel' AND json_extract(info, '$.report.reference_validated')=1)
+            """).fetchone()[0]
             remaining = db.execute("""
                 SELECT count(*) FROM tasks JOIN songs ON songs.id=tasks.subject
                 WHERE tasks.kind='prepare' AND tasks.state IN ('queued','running','suspended','temporary')
                 AND songs.kara!='prêt' AND songs.lyrics!='instrumental'
                 AND NOT EXISTS(SELECT 1 FROM exclusions WHERE kind='artist' AND subject=songs.owner)
             """).fetchone()[0]
-            return ready, remaining, self.read_night_report(db)
+            return ready, references, remaining, self.read_night_report(db)
 
     def configure(self, **changes):
         if "night_enabled" in changes:
@@ -316,6 +320,13 @@ class Index:
                         report[night["outcome"]] += 1
                         report["corrected"] += night["corrected"]
                         report["generated"] += night["generated"]
+                        # Store sums and observation counts in the same
+                        # transaction as the claim outcome. Missing stages
+                        # from old reports or interruptions add no samples.
+                        for name, value in night.get("measurements", {}).items():
+                            aggregate = report.setdefault("measurements", {}).setdefault(name, [0, 0])
+                            aggregate[0] += value
+                            aggregate[1] += 1
                     else:
                         report["interrupted"] += 1
                     self.write_night_report(db, report)
