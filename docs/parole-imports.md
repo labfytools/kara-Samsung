@@ -58,6 +58,12 @@ La file copie les pistes dans le dossier de réception, vérifie qu’elles se d
 
 Les reçus vérifient le contenu audio publié avant de sauter une piste lors d’une reprise depuis la même sélection. Une erreur sur une piste laisse les autres disponibles. Les liens symboliques, noms ZIP qui sortent de l’archive, entrées chiffrées et répertoires ZIP trop volumineux sont écartés. Les limites de lecture sont de 4 096 entrées et 2 Gio par piste. La réserve disque de l’import s’applique aux copies. Les défauts de la sélection locale restent à vérifier localement.
 
+### Bandcamp
+
+Dans le sélecteur de sources, **Bandcamp** propose le site officiel et son aide au téléchargement. Récupérer l’album gratuit ou déjà acheté avec les droits applicables, puis sélectionner le dossier ou le ZIP dans Parole. La page publique de l’édition peut être renseignée pour conserver sa référence dans le résultat. Il s’agit d’une provenance déclarée. Parole ne déclenche aucun achat. L’API publiée documente les comptes, ventes et commandes des partenaires. Le parcours auditeur utilise les fichiers remis directement par Bandcamp. [Documentation de l’API](https://bandcamp.com/developer) · [Récupération des achats](https://get.bandcamp.help/en/articles/15263192-can-i-re-download-my-purchases)
+
+**Toutes les sources** donne accès à la recherche YouTube Music et au choix de fichiers locaux. Choisir **Bandcamp** pour afficher le parcours officiel et conserver ce fournisseur dans la provenance. Les formats de sortie pris en charge par l’import local, dont le FLAC, restent inchangés pendant la copie.
+
 ## Diagnostic des échecs persistants
 
 La tentative initiale appartient au moteur d’import. Après l’enregistrement de son résultat et l’actualisation du catalogue, Parole peut planifier jusqu’à deux relances classiques pour un échec temporaire. Ces relances attendent 60 secondes puis 240 secondes au minimum, ou le délai signalé par le fournisseur s’il est plus long. Plusieurs échecs comparables peuvent différer leurs relances automatiques de 30 minutes. Les autres lots gardent les règles de la file. Les compteurs et échéances survivent à l’arrêt de Parole. La commande manuelle reste disponible dans l’import.
@@ -77,3 +83,5 @@ PAROLE_TEST_GTK=1 python3 tests/test-parole-import.py -v
 La suite crée une bibliothèque temporaire avec un son de synthèse. Elle utilise `yt-dlp` et FFmpeg sur une source HTTP locale et contrôle les réponses du catalogue, des pochettes et des paroles. Elle couvre 100 lots totalisant 500 albums, quatre lots actifs, le verrou de tri, la reprise après interruption, les doublons et le manque d’espace. Les tests GTK facultatifs utilisent une session GTK et D-Bus. Ils exercent le journal, la relance sélective, la file commune avec la salle mobile et l’actualisation de la bibliothèque.
 
 Les essais locaux vérifient l’identité PCM de pistes FLAC, le maintien des sources, la conservation octet pour octet du LRC et de la pochette fournis, le refus d’un membre ZIP hors chemin et la reprise d’une seule piste dans un lot partiellement publié.
+
+Le parcours Bandcamp est testé avec un FLAC de synthèse et une référence publique représentative. Le test vérifie la provenance et la désactivation du fournisseur. Il ne se connecte pas à un compte Bandcamp.

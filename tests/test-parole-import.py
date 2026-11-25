@@ -21,8 +21,12 @@ BIN = ROOT / "bin"
 FIXTURES = ROOT / "tests/fixtures/parole"
 sys.path.insert(0, str(BIN))
 from _kara_audio_identity import pcm_digest
+from _kara_import_local import local_target
 from _kara_import_queue import ImportQueue
 from _kara_import_resources import DOWNLOADS, PROCESSING, lease, slot_count
+from _kara_import_result import ImportIssue
+from _parole_index import Index
+from _parole_sources import controls, seed
 
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
 
@@ -42,6 +46,21 @@ class QuietHTTP(SimpleHTTPRequestHandler):
 
 
 class QueueTests(unittest.TestCase):
+    def test_manual_bandcamp_reference_accepts_only_public_release_pages(self):
+        local = "file:///tmp/album.zip"
+        release = "https://label.bandcamp.com/album/album-test"
+        self.assertIn("label.bandcamp.com", local_target(local, "Bandcamp", release))
+        for private in (release + "?token=private", "https://label.bandcamp.com/download/code",
+                        "https://label.bandcamp.com.example.com/album/test"):
+            with self.subTest(private=private), self.assertRaises(ImportIssue):
+                local_target(local, "Bandcamp", private)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = ImportQueue(root / "state", root)
+            with self.assertRaises(ImportIssue):
+                queue.enqueue([("Album", local + "?provider=Bandcamp&edition=" + release + "%3Ftoken=secret")])
+            self.assertEqual(queue.count(), {})
+
     def test_only_acknowledged_imports_move_to_history(self):
         with TemporaryDirectory(prefix="parole-history-") as temporary:
             root = Path(temporary)
@@ -268,6 +287,24 @@ class AlbumImportTests(unittest.TestCase):
         self.assertEqual((items[0]["category"], items[0]["tracks"]), ("path", []))
         self.assertFalse(list(self.library.rglob("*.flac")))
         self.assertFalse((self.temp / "sortie.flac").exists())
+
+    def test_bandcamp_local_route_preserves_declared_public_reference(self):
+        source = self.temp / "Bandcamp"
+        track = source / "01.flac"
+        self.make_local_track(track, 1, album="Album du label")
+        release = "https://label.bandcamp.com/album/album-test"
+        target = local_target(source.as_uri(), "Bandcamp", release)
+        _, items, _ = self.run_import(target)
+        self.assertEqual((items[0]["status"], items[0]["provider"]), ("success", "Bandcamp"))
+        evidence = items[0]["provenance"][0]
+        self.assertEqual((evidence["edition_ref"], evidence["verification"]), (release, "manual"))
+        self.assertEqual(pcm_digest(evidence["path"]), pcm_digest(track))
+        idx = Index(self.library, state=self.temp / "state")
+        seed(idx)
+        controls(idx, "Bandcamp", "disabled")
+        _, items, _ = self.run_import(target, expected=1)
+        self.assertEqual((items[0]["category"], items[0]["tracks"]), ("path", []))
+        self.assertEqual(self.requests.read_text(), "")
 
     def test_search_import_and_album_already_present(self):
         command = [sys.executable, "-B", str(BIN / "_kara_catalogue.py")]

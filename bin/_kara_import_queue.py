@@ -7,6 +7,7 @@ import sqlite3
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
+from _kara_import_local import local_selection, local_url
 from _kara_paths import STATE
 from _musique_oz import SHARED_LIBRARY
 
@@ -123,6 +124,9 @@ class ImportQueue:
                 return self.enqueue(targets, option=option, journal=journal, request=request, db=transaction)
         unique = {}
         for title, url in targets:
+            if local_url(url):
+                # Reject private edition links before persisting the selection.
+                local_selection(url)
             unique.setdefault(import_key(url), (title, url))
         if not unique:
             raise ValueError("Aucun album à importer.")

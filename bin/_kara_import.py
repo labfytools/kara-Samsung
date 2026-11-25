@@ -9,12 +9,13 @@ from time import monotonic
 
 from gi.repository import Gio, GLib, Gtk, Pango
 
-from _kara_import_local import LOCAL
+from _kara_import_local import LOCAL, local_target, local_url
 from _kara_import_queue import COMPLETE, ImportQueue, MAX_BATCHES, import_key
 from _kara_import_resources import DOWNLOADS, PROCESSING, WORKING_RESERVE, check_space, lease, slot_count
 from _kara_import_result import CATEGORIES, ImportIssue
 from _musique_oz import INBOX, SHARED_LIBRARY
 from _kara_paths import BIN, catalogue_command
+from _parole_import_providers import ALL, MANUAL, YOUTUBE
 
 KARA = BIN / "kara"
 PIPE = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
@@ -77,6 +78,7 @@ class AlbumImport(Gtk.Revealer):
         self.imports = []
         self.can_launch = lambda: True
         self.on_update = lambda *_: None
+        self.provider_enabled = lambda _: True
         self.albums = []
         self.by_id = {}
         self.imports_snapshot = ([], {})
@@ -109,7 +111,7 @@ class AlbumImport(Gtk.Revealer):
         self.submit = Gtk.Button(label="Télécharger", sensitive=False, css_classes=["fetch"])
         self.submit.connect("clicked", self.start)
         form.append(self.submit)
-        local_menu = Gtk.MenuButton(label=LOCAL, sensitive=self.queue is not None)
+        self.local_menu = Gtk.MenuButton(label=LOCAL, sensitive=self.queue is not None)
         local_popover = Gtk.Popover()
         local_choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         for caption, folder in (("Choisir un dossier d’album", True), ("Choisir une archive ZIP", False)):
@@ -117,8 +119,17 @@ class AlbumImport(Gtk.Revealer):
             button.connect("clicked", lambda _button, folder=folder: self.choose_local(local_popover, folder))
             local_choices.append(button)
         local_popover.set_child(local_choices)
-        local_menu.set_popover(local_popover)
-        form.append(local_menu)
+        self.local_menu.set_popover(local_popover)
+        form.append(self.local_menu)
+
+        provider_row = Gtk.Box(spacing=8)
+        self.provider = Gtk.DropDown()
+        provider_row.append(self.provider)
+        self.official_download = Gtk.LinkButton(label="Ouvrir le téléchargement officiel", visible=False, uri="")
+        provider_row.append(self.official_download)
+        self.download_help = Gtk.LinkButton(label="Aide du fournisseur", visible=False, uri="")
+        provider_row.append(self.download_help)
+        panel.append(provider_row)
 
         self.results_header = Gtk.Box(spacing=8, visible=False)
         self.results_title = Gtk.Label(xalign=0.0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
@@ -170,6 +181,8 @@ class AlbumImport(Gtk.Revealer):
         self.history_button = Gtk.Button(label="Historique", halign=Gtk.Align.END, sensitive=self.queue is not None)
         self.history_button.connect("clicked", self.show_history)
         panel.append(self.history_button)
+        self.provider.connect("notify::selected", self.change_provider)
+        self.refresh_providers()
         GLib.idle_add(self.launch_next)
 
     def show_history(self, button):
@@ -216,15 +229,58 @@ class AlbumImport(Gtk.Revealer):
         opened = button.get_active()
         self.set_reveal_child(opened)
         if opened and self.lookup is None:
-            self.artist.grab_focus()
+            self.refresh_providers()
+            (self.artist if self.can_search_youtube() else self.link).grab_focus()
         elif not opened:
             self.cancel_suggestions()
 
+    def selected_provider(self):
+        selected = self.provider.get_selected_item()
+        return selected.get_string() if selected else ALL
+
+    def refresh_providers(self):
+        choices = [ALL, LOCAL]
+        try:
+            choices.extend(name for name in (YOUTUBE, *MANUAL) if self.provider_enabled(name))
+        except (OSError, sqlite3.Error):
+            choices.extend((YOUTUBE, *MANUAL))
+        model = self.provider.get_model()
+        current = [model.get_string(i) for i in range(model.get_n_items())] if model else []
+        if choices != current:
+            selected = self.selected_provider()
+            self.provider.set_model(Gtk.StringList.new(choices))
+            self.provider.set_selected(choices.index(selected) if selected in choices else 0)
+
+    def can_search_youtube(self):
+        provider = self.selected_provider()
+        model = self.provider.get_model()
+        names = [model.get_string(i) for i in range(model.get_n_items())] if model else []
+        return provider == YOUTUBE or provider == ALL and YOUTUBE in names
+
+    def change_provider(self, *_args):
+        self.cancel_search()
+        self.suggestions = []
+        self.suggestion_query = ""
+        self.clear_results()
+        self.hide_message()
+        route = MANUAL.get(self.selected_provider())
+        self.official_download.set_visible(route is not None)
+        self.download_help.set_visible(route is not None)
+        if route:
+            self.official_download.set_uri(route.downloads)
+            self.download_help.set_uri(route.help)
+        self.link.set_placeholder_text("Page publique de l’édition (facultatif)" if route else "Lien d’album")
+        self.submit.set_label("Importer" if route or self.selected_provider() == LOCAL else "Télécharger")
+        self.refresh_controls()
+
     def refresh_controls(self, _widget=None):
         idle = self.lookup is None or self.lookup_live
-        self.artist.set_sensitive(idle)
+        self.artist.set_sensitive(idle and self.can_search_youtube())
         self.results.set_sensitive(idle)
-        self.submit.set_sensitive(bool(self.link.get_text().strip()))
+        provider = self.selected_provider()
+        url = self.link.get_text().strip()
+        self.submit.set_sensitive(self.queue is not None and (provider in MANUAL or provider == LOCAL
+                                  or bool(url) and (self.can_search_youtube() or local_url(url))))
         self.download_all.set_sensitive(idle and bool(self.albums))
 
     def message(self, text, *, failed=False, detail=""):
@@ -259,7 +315,7 @@ class AlbumImport(Gtk.Revealer):
         self.clear_results()
         self.hide_message()
         query = self.artist.get_text().strip()
-        if self.get_reveal_child() and len(query) >= 2:
+        if self.get_reveal_child() and self.can_search_youtube() and len(query) >= 2:
             self.suggestion_timer = GLib.timeout_add(320, self.suggest_artists, query)
 
     def suggest_artists(self, query):
@@ -283,7 +339,7 @@ class AlbumImport(Gtk.Revealer):
 
     def search_artists(self, _widget, *args):
         query = self.artist.get_text().strip()
-        if not query:
+        if not query or not self.can_search_youtube():
             return
         self.cancel_suggestions()
         if self.lookup is not None:
@@ -408,12 +464,21 @@ class AlbumImport(Gtk.Revealer):
 
     def start(self, _widget):
         url = self.link.get_text().strip()
+        provider = self.selected_provider()
+        if provider in MANUAL or provider == LOCAL and not local_url(url):
+            self.local_menu.popup()
+            return
+        if provider == YOUTUBE and local_url(url):
+            self.message("Sélectionne Fichiers locaux pour importer ce chemin.", failed=True)
+            return
         if url and self.start_queue([("", url)]):
             self.link.set_text("")
             self.link.grab_focus()
 
     def choose_local(self, popover, folder):
         popover.popdown()
+        provider = self.selected_provider()
+        reference = self.link.get_text().strip() if provider in MANUAL else ""
         chooser = Gtk.FileChooserNative.new(
             "Choisir un dossier d’album" if folder else "Choisir une archive ZIP", self.get_root(),
             Gtk.FileChooserAction.SELECT_FOLDER if folder else Gtk.FileChooserAction.OPEN, "Importer", "Annuler")
@@ -426,7 +491,12 @@ class AlbumImport(Gtk.Revealer):
             if response == Gtk.ResponseType.ACCEPT:
                 chosen = dialog.get_file()
                 if chosen is not None and chosen.is_native() and chosen.get_uri_scheme() == "file":
-                    self.start_queue([(chosen.get_basename(), chosen.get_uri())])
+                    try:
+                        selected_uri = local_target(chosen.get_uri(), provider, reference)
+                    except ImportIssue as error:
+                        self.message(str(error), failed=True)
+                    else:
+                        self.start_queue([(chosen.get_basename(), selected_uri)])
                 else:
                     self.message("Sélectionne un dossier ou une archive sur le disque local.", failed=True)
             dialog.destroy()

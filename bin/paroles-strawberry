@@ -389,6 +389,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if not self.maintenance:
             self.maintenance = Maintenance(LIBRARY, COLLECTION, import_queue=self.album_import.queue,
                                            cache=self.references, background=background)
+            self.album_import.provider_enabled = self.maintenance.index.source_enabled
+            self.album_import.refresh_providers()
             self.maintenance.set_priority(self.maintenance_busy())
             self.maintenance.start()
         elif not background:

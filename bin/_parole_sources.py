@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from _kara_import_resources import defer_service, wait_service
 from _kara_import_result import ImportIssue
 from _parole_index import document
+from _parole_import_providers import MANUAL
 
 BUILTINS = {
     "LRCLIB": ("lrclib.net", "lyrics,lrc", "https://lrclib.net/docs"),
@@ -165,6 +166,10 @@ def seed(index):
                        VALUES(?,?,?,'active','builtin',?,?)""",
                        ((name, name, kinds, document({"host": host, "docs": docs}), time())
                         for name, (host, kinds, docs) in BUILTINS.items()))
+        db.executemany("""INSERT OR IGNORE INTO sources(id,name,category,state,adapter,config,discovered)
+                       VALUES(?,?,'import','active','builtin',?,?)""",
+                       ((name, name, document({"host": route.host, "docs": route.help, "transport": "local"}), time())
+                        for name, route in MANUAL.items()))
 
 
 def discover(index, source, research_id):

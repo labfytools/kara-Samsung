@@ -7,13 +7,14 @@ from pathlib import Path, PurePosixPath
 from stat import S_IFDIR, S_IFREG, S_IFMT, S_ISREG
 from struct import unpack_from
 from tempfile import NamedTemporaryFile
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from zipfile import BadZipFile, ZipFile
 import os
 
 from _kara_import_resources import MAX_MEDIA, PROCESSING, check_space
 from _kara_import_result import ImportIssue
 from _musique_oz import AUDIO, share_file
+from _parole_import_providers import MANUAL
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 LOCAL = "Fichiers locaux"
@@ -28,14 +29,35 @@ def local_url(value):
     return value.startswith("file:")
 
 
-def local_path(value):
+def local_selection(value):
     parts = urlsplit(value)
     path = Path(unquote(parts.path, errors="strict"))
-    if parts.scheme != "file" or parts.netloc or parts.query or parts.fragment or not path.is_absolute():
+    if parts.scheme != "file" or parts.netloc or parts.fragment or not path.is_absolute():
         raise ImportIssue("path", "Un dossier ou un ZIP local est attendu.")
     if "\0" in str(path) or ".." in path.parts or path == path.parent:
         raise ImportIssue("path", "Le chemin de l’album local est invalide.")
-    return path
+    if len(parts.query) > 1200:
+        raise ImportIssue("path", "Provenance de téléchargement trop longue.")
+    try:
+        query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+    except ValueError as error:
+        raise ImportIssue("path", "Provenance de téléchargement invalide.") from error
+    if query.keys() - {"provider", "edition"} or any(len(values) != 1 for values in query.values()):
+        raise ImportIssue("path", "Provenance de téléchargement invalide.")
+    provider = query.get("provider", [LOCAL])[0]
+    reference = query.get("edition", [""])[0]
+    if provider in MANUAL:
+        return path, provider, MANUAL[provider].release_reference(reference) if reference else ""
+    if provider != LOCAL or query:
+        raise ImportIssue("path", "Fournisseur de téléchargement inconnu.")
+    return path, LOCAL, ""
+
+
+def local_target(uri, provider, reference):
+    if provider not in MANUAL:
+        return uri
+    canonical = MANUAL[provider].release_reference(reference) if reference else ""
+    return uri + "?" + urlencode({"provider": provider, "edition": canonical})
 
 
 def stamp(stat):

@@ -379,6 +379,17 @@ class GtkTests(Fixture):
         window.open_import()
         self.assertTrue(window.album_import.get_reveal_child())
         self.assertEqual(window.album_import.get_root(), window.import_window)
+        imports = window.album_import
+        self.assertEqual(imports.selected_provider(), "Toutes les sources")
+        providers = imports.provider.get_model()
+        names = [providers.get_string(i) for i in range(providers.get_n_items())]
+        imports.provider.set_selected(names.index("Bandcamp"))
+        self.assertEqual(imports.official_download.get_uri(), "https://bandcamp.com/")
+        self.assertTrue(imports.official_download.get_visible())
+        self.assertFalse(imports.artist.get_sensitive())
+        imports.provider.set_selected(names.index("YouTube Music"))
+        self.assertFalse(imports.official_download.get_visible())
+        self.assertTrue(imports.artist.get_sensitive())
         for page in ("general", "sources", "codex", "storage", "resources", "night"):
             view.settings(page)
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)
