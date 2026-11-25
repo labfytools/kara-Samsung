@@ -18,6 +18,8 @@ Le réglage par défaut interrompt l’essai à 1 % de pression mémoire PSI. Po
 
 Les résultats privés distinguent décodage PCM, identité PCM, inférence Demucs, encodage FLAC, chargement Turbo, transcription, alignement, reprises, validation et écritures. Les durées instrumentées excluent les phases imbriquées. Les compteurs hôte sont échantillonnés environ chaque seconde. Le taux d’occupation CPU vient de la différence de compteurs actifs entre les échantillons, le GPU de `gpu_busy_percent`, la pression mémoire de PSI, et le stockage des secteurs et du temps d’activité par périphérique. Le signal PPT du pilote AMD ne représente pas la consommation électrique totale de la machine. `ru_maxrss` distingue le maximum du processus Python et celui de ses enfants. Les tailles allouées viennent de `st_blocks`. Les exécutions terminées sont reprises sous la même configuration et les interruptions gardent un reçu séparé.
 
+Pour comparer une modification Turbo dans un nouveau dossier, utiliser `--phase timed plain --stems-from /dossier/de/reference`. Le banc vérifie l’identité des fichiers audio et utilise les mêmes pistes validées en lecture seule. Pour comparer les profils CPU Demucs existants, utiliser `--phase demucs` et `--demucs-threads 2` ou `6` dans des dossiers distincts.
+
 ## Qualification temporelle indépendante
 
 Le témoin privé retient trois enregistrements de JamendoLyrics MultiLang, révision `de188c9`. Il comprend *l’abandon* de Flo (français, CC BY), *Feel (Stripped)* de Cortez (anglais, BY) et *Te Recuerdo* de Wilson Way (espagnol, CC BY-SA). L’inférence reçoit les lignes de texte seules. Le banc ouvre ensuite les fichiers d’annotation manuelle pour la comparaison. Les débuts de ligne fournis par le jeu dérivent du premier mot de chaque ligne. Un mot scindé en plusieurs unités par Kara est exclu du calcul temporel par mot, car l’annotation ne donne pas de repère distinct à chaque unité. Les enregistrements et les paroles restent hors dépôt. [JamendoLyrics MultiLang](https://huggingface.co/datasets/jamendolyrics/jamendolyrics/tree/de188c9) · [Article de Durand, Stoller et Ewert](https://arxiv.org/abs/2306.07744)
@@ -59,6 +61,8 @@ Le code de référence provient de `5b6403d`, avant la correction de reprise des
 | Couverture mots / débuts de ligne | 83,91 % / 78,69 % |
 
 Demucs a consommé 307 s de CPU cumulées et rapporté 1,56 Gio de RSS maximal pour ses enfants. Le parcours Turbo a consommé 104 s de CPU et rapporté 208 Mio de RSS maximal pour ses enfants. Pendant Turbo, le GPU a été occupé en moyenne à 94,4 % sur les échantillons hôte et la mémoire disponible n’est pas descendue sous 4,24 Gio. Les maxima s’établissent à 71,9 °C côté CPU et 66 °C côté GPU sur les deux étapes. La couverture décrit les repères produits. La précision sera mesurée sur le témoin annoté.
+
+Sur ce même titre, le texte Strawberry seul a donné 75,97 % de mots et 75,41 % de débuts de ligne couverts, après 242,3 s et 34 décodages locaux. Quinze débuts restaient non établis, dont treize avec le premier mot absent. Huit de ces lignes n’avaient aucun mot repéré. Le parcours avec le LRC source a trouvé deux de ces quinze débuts. La génération a donc conservé son refus de publication.
 
 ### Stockage et coût d’ouverture
 

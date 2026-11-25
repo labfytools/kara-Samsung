@@ -193,10 +193,25 @@ def sizes(folder):
             for p in folder.iterdir() if p.is_file() and p.name != "lock"}
 
 
-def worker(workspace, case, mode, threads):
-    stems.ROOT = workspace / "stems"
+def worker(workspace, case, mode, threads, stems_from=None):
+    stems.ROOT = (stems_from or workspace) / "stems"
     base_song = next(path for path in (workspace / "input" / case).iterdir()
                      if path.suffix in (".opus", ".mp3"))
+    stem_song = base_song
+    if stems_from is not None:
+        stem_song = stems_from / "input" / case / base_song.name
+        # Audio equality ties both sides of a Turbo A/B to the exact same
+        # stems from the reference run. Neither side rewrites that cache.
+        if turbo.digest(stem_song) != turbo.digest(base_song) or not stems.stem_directory(stem_song).is_dir():
+            raise ValueError("Les pistes de référence ne correspondent pas à l'entrée du comparatif")
+
+        def comparison_stems(_):
+            pair = stems.cached_stems(stem_song)
+            if pair is None:
+                raise ValueError("Les pistes de référence ne passent plus la validation")
+            return pair
+
+        prepare.cached_stems = comparison_stems
     timing = Timings()
     start = monotonic()
     details = {}
@@ -245,7 +260,8 @@ def worker(workspace, case, mode, threads):
             if generated.exists():
                 generated.rename(workspace / "evidence" / f"{case}-{mode}-{time_ns()}.interrupted.lrc")
             plain = (base_song.parent / "strawberry.txt").read_bytes()
-            prepare.cached_stems = lambda _: stems.cached_stems(base_song)
+            if stems_from is None:
+                prepare.cached_stems = lambda _: stems.cached_stems(stem_song)
         os.environ["KARA_MUSIC_LIBRARY"] = str(workspace)
         cache = prepare.PreparedCache(workspace / mode)
         folder = cache.folder(song)
@@ -346,8 +362,9 @@ def bench(args):
         (workspace / "evidence").mkdir(exist_ok=True)
         (workspace / "results").mkdir(exist_ok=True)
         sources = [*sorted((REPO / "bin").glob("_kara_*.py")), turbo.SOURCE, Path(__file__)]
-        config = {"profile": args.profile, "demucs_threads": 2, "turbo_threads": args.threads,
+        config = {"profile": args.profile, "demucs_threads": args.demucs_threads, "turbo_threads": args.threads,
                   "memory_psi_limit_pct": args.memory_psi,
+                  "stem_reference": str(args.stems_from) if args.stems_from else None,
                   "turbo_weights_file": prepare.file_token(turbo.MODEL), "demucs": stems.model_signature(),
                   "kernel": os.uname().release,
                   "sources": {str(path.resolve().relative_to(REPO)): turbo.digest(path) for path in sources}}
@@ -365,7 +382,8 @@ def bench(args):
                 result = workspace / "results" / f"{case_id}-{mode}.json"
                 if result.exists():
                     continue
-                if mode in ("timed", "plain") and not (workspace / "results" / f"{case_id}-demucs.json").exists():
+                stem_results = (args.stems_from or workspace) / "results"
+                if mode in ("timed", "plain") and not (stem_results / f"{case_id}-demucs.json").exists():
                     raise ValueError("Le résultat Demucs est requis avant Turbo pour ce cas.")
                 monitor = Monitor(workspace, library, args.profile, args.memory_psi)
                 print(f"{case_id} {mode}", flush=True)
@@ -378,11 +396,13 @@ def bench(args):
                     raise Interrupted(monitor.reason)
                 monitor.samples.clear()
                 monitor.start = monitor.next = monotonic()
-                env = dict(os.environ, KARA_DEMUCS_THREADS="2")
+                env = dict(os.environ, KARA_DEMUCS_THREADS=str(args.demucs_threads))
+                command_line = ["nice", "-n", "12", sys.executable, "-B", __file__, str(workspace),
+                                "--worker", case_id, mode, "--threads", str(args.threads)]
+                if args.stems_from:
+                    command_line.extend(("--stems-from", str(args.stems_from)))
                 try:
-                    code, output = run(["nice", "-n", "12", sys.executable, "-B", __file__,
-                                        str(workspace), "--worker", case_id, mode, "--threads", str(args.threads)],
-                                       stop=monitor.stop, timeout=1800, env=env)
+                    code, output = run(command_line, stop=monitor.stop, timeout=1800, env=env)
                 except Interrupted:
                     record(result.with_suffix(f".{time_ns()}.interrupted.json"),
                            {"reason": monitor.reason, "system": monitor.samples})
@@ -415,11 +435,19 @@ def main():
     parser.add_argument("--memory-psi", choices=(1., 2., 3.), type=float, default=1.,
                         help="Seuil PSI manuel. Au-dessus de 1 %% le banc réserve 4 Gio de RAM disponible.")
     parser.add_argument("--threads", type=int, choices=range(1, 33), default=4)
+    parser.add_argument("--demucs-threads", type=int, choices=(2, 6), default=2)
+    parser.add_argument("--stems-from", type=Path)
     parser.add_argument("--phase", choices=("demucs", "timed", "plain", "annotated"), nargs="+",
                         default=["demucs", "timed", "plain"])
     parser.add_argument("--case", action="append")
     parser.add_argument("--worker", nargs=2, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.stems_from:
+        args.stems_from = args.stems_from.resolve()
+        if (args.worker and args.worker[1] not in ("timed", "plain")
+                or not args.worker and not set(args.phase).issubset({"timed", "plain"})
+                or args.stems_from == args.workspace.resolve()):
+            parser.error("--stems-from requiert un dossier de référence distinct et une phase timed ou plain.")
 
     def cancel(_signal, _frame):
         raise KeyboardInterrupt
@@ -427,7 +455,8 @@ def main():
     signal.signal(signal.SIGTERM, cancel)
     if args.worker:
         try:
-            print(json.dumps(worker(args.workspace, *args.worker, args.threads), allow_nan=False), flush=True)
+            print(json.dumps(worker(args.workspace, *args.worker, args.threads, args.stems_from),
+                             allow_nan=False), flush=True)
         except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
             print(json.dumps({"error": str(error)}), flush=True)
             return 1
