@@ -591,6 +591,9 @@ class Maintenance:
             task = self.index.claim((kind,), now)
             if task is not None:
                 self.execute(task)
+                # Recheck available enrichment immediately. Supplier gates
+                # still control traffic, including after errors and retries.
+                self.wake.set()
                 return True
         return False
 

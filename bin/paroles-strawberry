@@ -609,6 +609,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.import_published_paths.update(map(Path, payload["tracks"]))
             if self.import_refresh_timer is None and not self.import_refresh_active:
                 self.import_refresh_timer = GLib.timeout_add_seconds(3, self.reload_after_import)
+            if payload.get("enrichment") and self.maintenance:
+                self.maintenance.wake.set()
         if getattr(self, "maintenance", None) and payload.get("provider"):
             if kind == "provider":
                 self.maintenance.journal.emit("DOWNLOAD", payload["message"])

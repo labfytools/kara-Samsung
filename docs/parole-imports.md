@@ -28,6 +28,8 @@ Sur ArchASP, un essai isolé avec deux albums synthétiques et quatre transferts
 
 Le second essai utilise seize pistes de synthèse, des réponses contrôlées et les vrais créneaux du moteur. Quatre recherches restent le réglage par défaut. Les deux plafonds plus élevés ont presque les mêmes durées globales, davantage de requêtes et des textes différés.
 
+Le parcours complet a été rejoué sur la même partition avec les deux albums, la file de maintenance et les pochettes. L’ancienne version finissait après 9,59 s. Avec l’enrichissement asynchrone, le signal audio du dernier album arrive à 4,40 s et les quatre tâches d’enrichissement finissent après 6,96 s. Les quatre textes et quatre LRC utilisent quatre requêtes communes. Un essai intermédiaire conservant l’attente de réveil entre tâches prenait 11,11 s au total.
+
 ## Classement d’une discographie
 
 Lors de la sélection d’un artiste YouTube Music, Parole conserve l’identité de l’artiste et les identifiants d’album obtenus depuis sa discographie. La file garde cette provenance après redémarrage. L’import vérifie l’identifiant d’album pendant la résolution et utilise le nom sélectionné pour le dossier. Le crédit d’album du catalogue et les crédits complets des pistes sont conservés indépendamment.
