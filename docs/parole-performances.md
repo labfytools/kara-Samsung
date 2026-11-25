@@ -64,6 +64,28 @@ Demucs a consommé 307 s de CPU cumulées et rapporté 1,56 Gio de RSS maximal p
 
 Sur ce même titre, le texte Strawberry seul a donné 75,97 % de mots et 75,41 % de débuts de ligne couverts, après 242,3 s et 34 décodages locaux. Quinze débuts restaient non établis, dont treize avec le premier mot absent. Huit de ces lignes n’avaient aucun mot repéré. Le parcours avec le LRC source a trouvé deux de ces quinze débuts. La génération a donc conservé son refus de publication.
 
+### Référence complète sur dix titres
+
+Les dix parcours ont utilisé HTDemucs CPU à deux fils et large-v3-turbo Vulkan F16 à quatre fils, capot ouvert, profil Économie et comparatif manuel à 3 % de PSI. Ils totalisent 4 762,9 s de calcul. Sept titres ont été validés, soit 5,29 validations par heure, en incluant dans le temps de calcul les trois titres refusés. Le cache moyen alloué, calculé sur les dix titres, est de 28,47 Mio. Le lot historique de deux morceaux est un échantillon différent.
+
+| Cas du corpus | Demucs (s) | Turbo (s) | Reprises (s) | Cache (Mio) | Mots | Débuts de ligne | Validation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| fr-rap-dense | 187,6 | 322,2 | 253,3 | 32,76 | 89,0 % | 91,5 % | Oui |
+| en-rap-alternance | 167,6 | 326,6 | 273,8 | 25,09 | 83,9 % | 78,7 % | Oui |
+| fr-rap-lent | 170,7 | 480,7 | 403,9 | 23,45 | 51,2 % | 38,5 % | Refusée |
+| fr-refrain | 182,0 | 325,4 | 261,9 | 25,16 | 91,4 % | 77,5 % | Oui |
+| fr-chanson-ancienne | 155,4 | 162,4 | 83,9 | 21,65 | 95,2 % | 97,0 % | Oui |
+| en-chant-studio | 184,2 | 288,9 | 234,5 | 24,30 | 70,8 % | 54,2 % | Refusée |
+| en-rap-live | 184,8 | 494,3 | 405,5 | 30,29 | 65,1 % | 54,9 % | Refusée |
+| es-chant-studio | 254,1 | 298,2 | 217,2 | 43,38 | 91,9 % | 86,8 % | Oui |
+| es-rap | 223,9 | 76,1 | < 0,01 | 32,79 | 99,0 % | 100 % | Oui |
+| es-chant-ancien | 214,6 | 63,1 | < 0,01 | 25,88 | 95,5 % | 90,3 % | Oui |
+| **Moyenne** | **192,5** | **283,8** | **213,4** | **28,47** | **83,3 %** | **76,9 %** | **7/10** |
+
+Le temps moyen total est de 476,3 s. Les reprises représentent 75,2 % du temps Turbo sur ces dix titres. La charge CPU de l’hôte était de 37 % pendant les deux moteurs. L’occupation GPU moyenne était de 26,7 % pendant Demucs, où elle inclut l’activité graphique de fond, et de 95,1 % pendant Turbo. Le CPU a atteint 75,6 °C pendant Demucs et 74,9 °C pendant Turbo. Le GPU a atteint 69 °C. La mémoire disponible est restée au-dessus de 5,21 Gio pendant Demucs et 4,24 Gio pendant Turbo. Le PPT moyen exposé par AMD était de 15,5 W et 16,7 W respectivement. Les compteurs d’E/S par périphérique et les données par titre sont conservés dans `baseline-manual/results/` et `baseline-summary.json`.
+
+Les quatre variantes texte seul ont terminé en 224,3 à 329,2 s. Elles couvrent de 69,2 à 91,5 % des mots et de 54,2 à 91,5 % des débuts de ligne. Les quatre publications LRC ont été refusées.
+
 ### Stockage et coût d’ouverture
 
 Le relevé du cache de production donne 160,82 Mio d’instrumentaux FLAC, 145,67 Mio de voix FLAC, 0,047 Mio de métadonnées Demucs et 0,645 Mio de références Turbo et LRC. Les tailles sont allouées et les liens physiques déjà dédupliqués par inode. Les pistes existantes sont en FLAC stéréo. Les deux fichiers représentent plus de 99 % de l’espace mesuré.
