@@ -127,6 +127,10 @@ class Index:
                     pcm TEXT NOT NULL, mb_recording TEXT NOT NULL, mb_work TEXT NOT NULL, isrc TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS canonical_recording_pcm ON canonical_recordings(pcm);
+                CREATE INDEX IF NOT EXISTS canonical_recording_credit ON canonical_recordings(title,artist);
+                CREATE TABLE IF NOT EXISTS canonical_fingerprints (
+                    pcm TEXT PRIMARY KEY, fingerprint TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS canonical_references (
                     id TEXT PRIMARY KEY, provider TEXT NOT NULL, external_id TEXT NOT NULL,
                     edition TEXT NOT NULL REFERENCES canonical_editions(id),

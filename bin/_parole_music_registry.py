@@ -4,7 +4,8 @@ from pathlib import Path
 from stat import S_ISREG
 
 from _parole_index import document, encoded_key
-from _parole_music_identity import (CONFIRMED, Track, barcode, duration_ms, isrc,
+from _parole_fingerprint import parse as parse_fingerprint, similarity
+from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, barcode, duration_ms, isrc,
                                     mbid, normalized, position, same_track, year)
 
 # Keep the original source values relevant to comparison. Lyrics and
@@ -98,7 +99,7 @@ def recognized_path(root, value):
     return None
 
 
-def store_import(index, proofs):
+def store_import(index, proofs, *, fingerprints=None):
     if not proofs:
         return
     # Metadata, edition references, provenance and recordings become visible
@@ -138,7 +139,8 @@ def store_import(index, proofs):
                                    proof.get("source"), proof.get("member"), proof.get("sha256") or pcm)
             song = db.execute("SELECT id FROM songs WHERE path=?", (str(target),)).fetchone()
             evidence = {key: proof[key] for key in ("source", "member", "license", "verification", "edition_ref",
-                                                   "position", "canonical_reference", "catalogue_tags") if key in proof}
+                                                   "position", "canonical_reference", "catalogue_tags", "acoustic")
+                        if key in proof}
             db.execute("""
                 INSERT INTO canonical_references VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
@@ -148,6 +150,49 @@ def store_import(index, proofs):
             """, (reference, kind, external, edition_key, recording_key, str(target), song[0] if song else "",
                   proof.get("sha256", ""), track.disc, track.number, track.millis, CONFIRMED,
                   document(proof.get("tags", {})), document(evidence)))
+            if fingerprints and (fingerprint := fingerprints.get(pcm)):
+                db.execute("INSERT OR IGNORE INTO canonical_fingerprints VALUES(?,?)", (pcm, fingerprint))
+
+
+def stored_fingerprint(index, pcm):
+    with index.db(wait=.35) as db:
+        row = db.execute("SELECT fingerprint FROM canonical_fingerprints WHERE pcm=?", (pcm,)).fetchone()
+    return row[0] if row else ""
+
+
+def acoustic_evidence(index, proof):
+    current = parse_fingerprint(json.loads(proof["fingerprint"]))
+    if current is None:
+        return []
+    tags = comparison_tags(proof)
+    recording = recording_metadata(tags, proof["pcm"])
+    local_track = track_metadata(tags)
+    with index.db(wait=.35) as db:
+        rows = db.execute("""
+            SELECT p.id,p.path,p.tags,p.evidence,r.pcm,f.fingerprint
+            FROM canonical_recordings r JOIN canonical_fingerprints f ON f.pcm=r.pcm
+            JOIN canonical_references p ON p.recording=r.id
+            WHERE r.title=? AND r.artist=? AND r.pcm!=? ORDER BY p.path,p.id LIMIT 12
+        """, (recording["title"], recording["artist"], recording["pcm"])).fetchall()
+    results = []
+    reviewed = set()
+    for row in rows:
+        if row["pcm"] in reviewed or not recognized_path(index.root, row["path"]):
+            continue
+        reviewed.add(row["pcm"])
+        other = parse_fingerprint(json.loads(row["fingerprint"]))
+        other_tags = comparison_tags({"tags": json.loads(row["tags"]),
+                                      "catalogue_tags": json.loads(row["evidence"]).get("catalogue_tags", {})})
+        relation = same_track(local_track, track_metadata(other_tags))
+        if relation == DIFFERENT or other is None:
+            continue
+        score = similarity(current, other)
+        if score is not None and score >= .93:
+            # Even a strong prefix is complementary evidence. No file or
+            # timing cache is reused through this comparison.
+            results.append({"reference": row["id"], "confiance": relation, "similarite": round(score, 4),
+                            "durees_ms": [current.millis, other.millis]})
+    return results
 
 
 def possible_duplicates(index, proof):

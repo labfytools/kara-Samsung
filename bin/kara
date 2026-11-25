@@ -35,7 +35,8 @@ from _parole_import_providers import ARCHIVE, JAMENDO, YOUTUBE, archive_identifi
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as compare_music, duration_ms,
                                     from_catalogue as music_facts, position, same_track)
-from _parole_music_registry import original_tags, possible_duplicates, store_import
+from _parole_music_registry import acoustic_evidence, original_tags, possible_duplicates, store_import, stored_fingerprint
+from _parole_fingerprint import executable as fingerprint_tool, read as fingerprint
 from _parole_offer import load_plan, plan_id, rank as rank_offers
 import _parole_archive as archive
 import _parole_jamendo as jamendo
@@ -940,6 +941,16 @@ def publish_staged(item, root, inbox, folder, records, active, targets, receipt,
             if target:
                 targets[name] = target
                 del active[stage]
+            elif records[name].get("fingerprint"):
+                try:
+                    evidence = acoustic_evidence(progress.measure_index, records[name])
+                except (sqlite3.Error, ValueError):
+                    evidence = []
+                if evidence:
+                    records[name]["acoustic"] = evidence
+                    label = "Empreinte concordante · " + records[name]["tags"]["title"]
+                    progress.log("Identité canonique", label)
+                    progress.announce_provider("Identité canonique", label)
     if not active:
         return
     # Store source proof before sorting so a restart after an
@@ -967,6 +978,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
     reuse = reuse or {}
     release = music_facts(catalogue)
     catalogue_tracks = {(t.disc, t.number): t for t in release.tracks} if release else {}
+    tool = fingerprint_tool() if progress.measure_index is not None else None
     item.tracks = available_tracks(previous.get("tracks", []), root)
     if item.identity in seen:
         item.status = "duplicate"
@@ -1030,7 +1042,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                         checksum = file_sha(draft) if draft.is_file() else read_entry(entry, draft, stop)
                         if not checksum:
                             break
-                        with resource_slot(inbox / ".kara-traitements", PROCESSING):
+                        with resource_slot(inbox / ".kara-traitements", PROCESSING) as processing:
                             tags, _ = probe(draft, include_codec=True, include_duration=True)
                             if not (tags.get("title") and (tags.get("album") or len(audio) == 1)
                                     and (tags.get("albumartist") or tags.get("artist"))):
@@ -1046,6 +1058,17 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                     raise ImportIssue("path", "Le fichier reçu ne correspond pas à la piste vérifiée.")
                             records[name] = {"stage": stage, "sha256": checksum, "pcm": pcm_digest(draft),
                                              "tags": original_tags(tags), "catalogue_tags": provider_tags}
+                            if tool:
+                                record = records[name]
+                                try:
+                                    value = stored_fingerprint(progress.measure_index, record["pcm"])
+                                except sqlite3.Error:
+                                    value = ""
+                                if not value:
+                                    measured = fingerprint(draft, tool=tool, retain=progress.guard + (processing,))
+                                    value = measured.document() if measured else ""
+                                if value:
+                                    record["fingerprint"] = value
                         active[stage] = name
                         item.processed += 1
                     except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
@@ -1069,6 +1092,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                  "sha256": records[name]["sha256"], "member": name, "source": source, "path": str(track),
                                  "edition_ref": reference, "verification": verification, "pcm": records[name]["pcm"],
                                  "tags": records[name]["tags"], "catalogue_tags": records[name]["catalogue_tags"],
+                                 **({"acoustic": records[name]["acoustic"]} if records[name].get("acoustic") else {}),
                                  **({"canonical_reference": records[name]["canonical_reference"]}
                                     if records[name].get("canonical_reference") else {}),
                                  **({"position": list(entries[name].position)} if entries[name].position else {}),
@@ -1077,7 +1101,10 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                 for name, track in sorted(targets.items())
                             ]
                             if progress.measure_index is not None:
-                                store_import(progress.measure_index, item.provenance)
+                                store_import(progress.measure_index, item.provenance, fingerprints={
+                                    records[name]["pcm"]: records[name]["fingerprint"]
+                                    for name in targets if records[name].get("fingerprint")
+                                })
                     except sqlite3.Error as error:
                         record_error(progress, "Registre canonique", error)
                     finally:
