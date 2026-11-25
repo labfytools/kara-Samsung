@@ -11,7 +11,7 @@ import subprocess
 from datetime import date
 import stat
 from time import time
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
 from _kara_paths import STATE
@@ -431,7 +431,7 @@ class Index:
 
 
 @contextmanager
-def collection_reader(database, root):
+def collection_reader(database, root, *, targeted=False):
     if not database or not Path(database).is_file():
         yield lambda paths: {}
         return
@@ -445,6 +445,27 @@ def collection_reader(database, root):
                    "musicbrainz_album_id musicbrainz_album_artist_id musicbrainz_recording_id").split()
         selected = ",".join(c if c in available else f"NULL AS {c}" for c in columns)
         where = " WHERE unavailable=0" if "unavailable" in available else ""
+        if targeted:
+            def targeted_batch(paths):
+                # Strawberry stores either a fully escaped file URL or Qt's
+                # form with safe path punctuation left unescaped. idx_url
+                # can serve both without walking the entire collection.
+                variants = {}
+                for path in paths:
+                    for value in {path.as_uri()[7:], quote(str(path), safe="/!$&'()*+,;=:@")}:
+                        variants["file://" + value] = str(path)
+                        variants["file://localhost" + value] = str(path)
+                if not variants:
+                    return {}
+                marks = ",".join("?" for _ in variants)
+                condition = (" AND " if where else " WHERE ") + f"url IN ({marks})"
+                rows = {}
+                for row in db.execute("SELECT " + selected + " FROM songs" + where + condition + " ORDER BY rowid",
+                                      tuple(variants)):
+                    rows.setdefault(variants[row["url"]], row)
+                return rows
+            yield targeted_batch
+            return
         catalog = {}
         for rowid, value in db.execute("SELECT rowid,url FROM songs" + where + " ORDER BY rowid"):
             url = urlsplit(value or "")
@@ -568,7 +589,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
         counts["errors"] += 1
 
     def files():
-        with collection_reader(collection, root) as read_batch:
+        with collection_reader(collection, root, targeted=paths is not None) as read_batch:
             paths_iter = iter(audio_paths(root, error) if paths is None else paths)
             while batch := tuple(islice(paths_iter, 128)):
                 rows = read_batch(batch)

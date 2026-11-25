@@ -1066,7 +1066,7 @@ def process_track(path, client, preview, synced=False, publication_root=None):
     return f"paroles intégrées · {source}"
 
 
-def process_import_track(path, client, index, settings, excluded, locks):
+def process_import_track(path, client, index, settings, excluded, locks, activity, strawberry):
     from _parole_index import document, sidecar as read_sidecar
 
     version = track_version(path)
@@ -1080,6 +1080,8 @@ def process_import_track(path, client, index, settings, excluded, locks):
     duration = round(duration)
     local_text = next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
     local_text = local_text or read_sidecar(path, ".txt")[1]
+    if not local_text and strawberry and (version[2], version[3] // 10**9) == (strawberry["filesize"], strawberry["mtime"]):
+        local_text = strawberry["lyrics"] or ""
     if not local_text:
         with index.db() as db:
             row = db.execute("SELECT info FROM songs WHERE path=? AND token=?", (str(path), document(version))).fetchone()
@@ -1098,6 +1100,7 @@ def process_import_track(path, client, index, settings, excluded, locks):
         client.new_track()
 
         def lookup(synced):
+            activity(synced, 1)
             try:
                 value, _ = client.find(*signature, synced=synced, local_text=local_text,
                                        registry=index, strict=True)
@@ -1105,6 +1108,8 @@ def process_import_track(path, client, index, settings, excluded, locks):
                 return "temporary", None
             except AmbiguousLyrics:
                 return "review", None
+            finally:
+                activity(synced, -1)
             return ("missing" if value is None else "found" if value else "instrumental"), value
 
         plain, text = (("present", None) if plain_present else

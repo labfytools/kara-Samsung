@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
 from threading import Lock
+from time import time
 
 from _kara_paths import STATE
 
@@ -70,7 +71,7 @@ class ImportLog:
 
     def write(self, payload):
         with self.lock:
-            self.file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.file.write(json.dumps({"stamp": time(), **payload}, ensure_ascii=False) + "\n")
             self.file.flush()
             if payload.get("event") in {"header", "success", "skip", "failure", "cancelled"}:
                 os.fsync(self.file.fileno())

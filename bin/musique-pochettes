@@ -300,23 +300,29 @@ def album_dirs(root, selected):
                 yield album
 
 
-def save_cover(payload, album):
+def prepare_cover(payload):
     if len(payload) > MAX_IMAGE_BYTES:
         raise ValueError("image trop volumineuse")
-    destination = album / "cover.jpg"
     with Image.open(BytesIO(payload)) as source:
         if source.width * source.height > 30_000_000:
             raise ValueError("dimensions trop grandes")
         image = ImageOps.exif_transpose(source).convert("RGB")
         image.thumbnail((1000, 1000))
-        with NamedTemporaryFile(dir=album, prefix=".pochette-") as draft:
-            image.save(draft, format="JPEG", quality=90)
-            draft.flush()
-            share_file(draft.name, destination)
-            try:
-                os.link(draft.name, destination)
-            except FileExistsError:
-                return False
+        with BytesIO() as prepared:
+            image.save(prepared, format="JPEG", quality=90)
+            return prepared.getvalue()
+
+
+def save_cover(prepared, album):
+    destination = album / "cover.jpg"
+    with NamedTemporaryFile(dir=album, prefix=".pochette-") as draft:
+        draft.write(prepared)
+        draft.flush()
+        share_file(draft.name, destination)
+        try:
+            os.link(draft.name, destination)
+        except FileExistsError:
+            return False
     return True
 
 
@@ -338,6 +344,9 @@ def fetch_cover(album, catalog, shared_root=None):
     version = album.stat() if shared_root is not None else None
 
     def persist(payload):
+        # Decode and resize outside the shared lock. The directory identity
+        # and competing cover are checked immediately before publication.
+        prepared = prepare_cover(payload)
         with shared_mutation(shared_root):
             if version is not None:
                 current = album.stat()
@@ -345,7 +354,7 @@ def fetch_cover(album, catalog, shared_root=None):
                     raise ValueError("album déplacé pendant la recherche")
                 if has_cover(album):
                     return False
-            return save_cover(payload, album)
+            return save_cover(prepared, album)
 
     tracks = [path for path in sorted(album.iterdir()) if audio_file(path)]
     if not tracks:

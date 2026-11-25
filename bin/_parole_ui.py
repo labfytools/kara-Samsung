@@ -1,6 +1,7 @@
 """Tableau de bord GTK4 de Parole et consultation ponctuelle des textes."""
 from datetime import datetime
 import json
+from math import ceil
 from pathlib import Path
 import sqlite3
 from time import monotonic
@@ -91,6 +92,8 @@ class Console:
         self.seen = self.floor = -1
         self.lines = []
         self.import_state = ()
+        self.import_stats_at = 0.
+        self.import_summary = ""
         self.panel = box(spacing=4, css_classes=["maintenance-console"])
         toolbar = box(Gtk.Orientation.HORIZONTAL, 5)
         self.reveal = Gtk.Revealer(reveal_child=True, transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
@@ -118,6 +121,8 @@ class Console:
         self.panel.append(toolbar)
         self.active = Gtk.Label(xalign=0, css_classes=["muted"], ellipsize=Pango.EllipsizeMode.END)
         self.panel.append(self.active)
+        self.import_metrics = Gtk.Label(xalign=0, wrap=True, css_classes=["muted"])
+        self.panel.append(self.import_metrics)
         self.bar = Gtk.ProgressBar(visible=False)
         self.panel.append(self.bar)
         self.store = Gio.ListStore(item_type=Row)
@@ -189,9 +194,54 @@ class Console:
             progress = ("DOWNLOAD", f"{state[0]} lot(s) en cours", summary.get("progress"))
         self.active.set_label(f"{progress[0]} · {progress[1]}" if progress else
                               self.maintenance.block or "En attente")
+        if monotonic() >= self.import_stats_at:
+            self.import_stats_at = monotonic() + 5.
+            try:
+                self.import_summary = self.enrichment_summary()
+            except (OSError, sqlite3.Error, ValueError):
+                pass
+        lyrics, lrc = self.maintenance.import_activity
+        line = (f"{summary.get('downloads', 0)} téléchargement(s) · {lyrics} recherche(s) de texte · "
+                f"{lrc} recherche(s) LRC · {summary.get('albums', 0)} album(s) audio complet(s)")
+        if rate := summary.get("audio_bytes_per_second"):
+            line += f" · {rate / 1024**2:.2f} Mio/s mesurés"
+        self.import_metrics.set_label(f"{line}\n{self.import_summary}" if self.import_summary else line)
         self.bar.set_visible(bool(progress and progress[2] is not None))
         if progress and progress[2] is not None:
             self.bar.set_fraction(progress[2])
+
+    def enrichment_summary(self):
+        with self.maintenance.index.db(wait=.15) as db:
+            tasks = {(kind, subject): (state, attempts) for kind, subject, state, attempts in db.execute("""
+                SELECT kind,subject,state,attempts FROM tasks WHERE kind IN ('import_lyrics','import_cover')
+            """)}
+        groups = self.maintenance.import_queue.enrichment_groups() if self.maintenance.import_queue else []
+        active = complete = partial = 0
+        for group in groups:
+            states = {tasks.get((kind, subject), ("review", 0))[0]
+                      for kind, subjects in group.items() for subject in subjects}
+            if states <= {"done"}:
+                complete += 1
+            elif states & {"queued", "running", "temporary", "suspended"}:
+                active += 1
+            else:
+                partial += 1
+        retries = sum(attempts > 1 for _, attempts in tasks.values())
+        lines = [f"{active} album(s) en enrichissement · {complete} enrichi(s) · {partial} partiel(s) · "
+                 f"{retries} tâche(s) relancée(s)"]
+        if value := self.maintenance.import_lyrics_stats:
+            timings = sorted(value["tracks_seconds"])
+            if timings and value["seconds"] > 0:
+                rate = 60 * value["lyrics"].get("found", 0) / value["seconds"]
+                lines.append(f"Dernier lot · {rate:.1f} textes/min · {sum(timings) / len(timings):.2f} s par piste · "
+                             f"P95 {timings[ceil(.95 * len(timings)) - 1]:.2f} s · {value['cache_hits']} recherches évitées")
+            if value["providers"]:
+                lines.append("Derniers fournisseurs sollicités · " + ", ".join(value["providers"]))
+        limited = [source for source, value in import_metrics(self.maintenance.index).items()
+                   if "limited_until" in value]
+        if limited:
+            lines.append("Fournisseurs suspendus · " + ", ".join(limited))
+        return "\n".join(lines)
 
 
 CARDS = (

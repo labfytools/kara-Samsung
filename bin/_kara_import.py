@@ -844,11 +844,14 @@ class AlbumImport(Gtk.Revealer):
         downloads = slot_count(inbox / ".kara-transferts", DOWNLOADS)
         processing = slot_count(inbox / ".kara-traitements", PROCESSING)
         running = [job for job in self.imports if job.process is not None]
+        now = monotonic()
+        rates = [rate for job in running for stamp, rate in job.transfer_rates.values() if now - stamp <= 5.]
         progressed = sum(job.album_fraction for job in running)
         progress = min(1., (settled + progressed) / planned) if planned else 0.
         owner_rows = [job.snapshot() for job in reversed(self.imports)]
         self.imports_snapshot = (owner_rows, dict(active=active, waiting=waiting, albums=albums, tracks=tracks,
                                                   errors=errors, downloads=downloads, processing=processing,
+                                                  audio_bytes_per_second=sum(rates) if rates else None,
                                                   progress=progress, paused=paused, batches=capacity,
                                                   limitation=CATEGORIES["space"] if limitation else "",
                                                   max_batches=MAX_BATCHES))
@@ -941,6 +944,7 @@ class ImportJob(Gtk.Box):
         self.measured = False
         self.result = None
         self.outcomes = {}
+        self.transfer_rates = {}
         self.unstructured = deque(maxlen=32)
         self.failed_jobs = []
         self.detail_text = ""
@@ -1071,10 +1075,17 @@ class ImportJob(Gtk.Box):
         fraction = payload.get("fraction")
         if type(fraction) not in (float, int) or not 0 <= fraction <= 1:
             fraction = None
+        if event == "transfer":
+            rate, position = payload.get("bytes_per_second"), payload.get("position")
+            if type(rate) in (int, float) and 0 <= rate <= 2 * 1024**3 and type(position) is int:
+                # One album supplies a lot's transfers at any given time.
+                self.transfer_rates[position] = monotonic(), rate
+            return
         if event == "journal":
             self.journal = payload.get("path")
         elif event == "album" and isinstance(payload.get("url"), str):
             self.outcomes[payload["url"]] = payload
+            self.transfer_rates.clear()
             self.album_fraction = 0.
             if fraction is not None:
                 self.fraction = max(self.fraction, fraction)

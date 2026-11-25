@@ -155,6 +155,8 @@ class Maintenance:
         self.next_network = 0
         self.network_cursor = 0
         self.import_enrichment_turn = 0
+        self.import_activity = (0, 0)
+        self.import_lyrics_stats = None
         self.next_import_probe = 0.
         self.revision = 0
         self.sampling = 0
@@ -530,8 +532,10 @@ class Maintenance:
         return ("temporary" if state not in ("excluded",) else "excluded",
                 state, self.current_settings["review_days"] * DAY)
 
-    def output(self, command, timeout=140, observer=None, maximum=262_144):
+    def output(self, command, timeout=140, observer=None, maximum=262_144, *, extra_env=None):
         env = dict(os.environ, KARA_MUSIC_LIBRARY=str(self.index.root))
+        if extra_env:
+            env.update(extra_env)
         if self.state_root is not None:
             env["XDG_STATE_HOME"] = str(self.state_root)
         if self.night_running:
@@ -544,10 +548,22 @@ class Maintenance:
     def enrich_import(self, task):
         kind, subject = task["kind"], task["subject"]
         paths = enrichment_paths(self.index, kind, subject)
-        code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
-                                 timeout=180)
-        value = json.loads(data) if not code else {"state": "temporary"}
+        def update(event):
+            if event.get("event") == "activity":
+                self.import_activity = event["lyrics"], event["lrc"]
+        try:
+            code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
+                                     timeout=180, observer=update, extra_env={"KARA_ENRICHMENT_EVENTS": "1"})
+        finally:
+            self.import_activity = (0, 0)
+        value = json.loads(data.splitlines()[-1]) if not code else {"state": "temporary"}
         if kind == IMPORT_LYRICS and paths:
+            if "tracks_seconds" in value:
+                self.import_lyrics_stats = value
+                self.index.review("import_lyrics_metrics", subject, "measured", value)
+                self.journal.emit("LYRICS", f"{value['lyrics'].get('found', 0)} textes · "
+                                  f"{value['lrc'].get('found', 0)} LRC · {value['seconds']:.2f} s · "
+                                  f"{value['requests']} requêtes · {value['cache_hits']} recherches évitées")
             inventory(self.index, self.collection, self.inspect_cache, self.stopped, lambda *_: None, paths=paths)
             self.plan(self.current_settings, paths=paths)
             self.revision += 1

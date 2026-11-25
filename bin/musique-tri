@@ -13,6 +13,7 @@ import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
+from _kara_import_local import stamp
 from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file, audio_files,
                          canonical_album_artist, component, mutation_report, probe, share_file, shared_mutation,
                          SHARED_LIBRARY, source_video, title_pair)
@@ -298,21 +299,32 @@ def main():
     sources = args.sources or [path for path in (root / INBOX, root / "YouTube") if path.is_dir()]
     if any(not path.expanduser().exists() for path in sources):
         parser.error("au moins un chemin source est introuvable")
+    tracks = sorted({track.resolve() for source in sources
+                     for track in audio_files(source.expanduser().absolute())})
+    if not tracks:
+        mutation_report("Aucun fichier audio à classer.")
+    failures = 0
+    prepared = []
+    # FFprobe can run in parallel with a different album's publication. The
+    # exact input version must still match when the shared lock is obtained.
+    for track in tracks:
+        try:
+            token = stamp(track.lstat())
+            tags, _ = probe(track)
+            prepared.append((track, tags, token))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            failures += 1
+            mutation_report(f"Erreur pour {track.name} : {error}", file=sys.stderr)
     with shared_mutation(root, not args.apercu):
-        tracks = sorted({track.resolve() for source in sources
-                         for track in audio_files(source.expanduser().absolute())})
-        if not tracks:
-            mutation_report("Aucun fichier audio à classer.")
-        failures = 0
         items = []
-        for track in tracks:
+        for track, tags, token in prepared:
             try:
-                tags, _ = probe(track)
+                if track.resolve() != track or stamp(track.lstat()) != token:
+                    raise ValueError("fichier modifié depuis la lecture des métadonnées")
                 items.append((track, tags))
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
+            except (OSError, ValueError) as error:
                 failures += 1
                 mutation_report(f"Erreur pour {track.name} : {error}", file=sys.stderr)
-
         artists = album_artists(items, root)
         reserved = {}
         known_sources = {}

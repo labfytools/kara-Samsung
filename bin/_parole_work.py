@@ -15,11 +15,11 @@ from threading import Lock, local
 from time import monotonic
 
 from _kara_audio_identity import pcm_digest
-from _kara_paths import BIN, music_library
+from _kara_paths import BIN, DATA, music_library
 from _kara_prepare import file_token
 from _musique_oz import shared_mutation
 from _parole_catalogue import check_album, check_discography, check_recording, request, MBID
-from _parole_index import Index, document, key, sidecar
+from _parole_index import Index, collection_reader, document, key, sidecar
 from _parole_import_enrichment import COVER, KINDS, LYRICS, paths_for
 from _parole_import_metrics import snapshot
 from _parole_lyrics_lookup import prune
@@ -185,7 +185,7 @@ def verify_documentation(index, subject):
     return "available"
 
 
-def import_enrichment(index, kind, subject):
+def import_enrichment(index, kind, subject, report):
     paths = paths_for(index, kind, subject)
     if not paths:
         return {"state": "not_found"}
@@ -203,6 +203,11 @@ def import_enrichment(index, kind, subject):
     settings = index.settings()
     with index.db() as db:
         excluded = {row[0] for row in db.execute("SELECT subject FROM exclusions WHERE kind='artist'")}
+    try:
+        with collection_reader(DATA / "strawberry/strawberry/strawberry.db", index.root, targeted=True) as read_batch:
+            strawberry = read_batch(paths)
+    except (OSError, sqlite3.Error):
+        strawberry = {}
     limits = snapshot(index)
     worker_count = settings["import_lyrics_workers"]
     if type(worker_count) is not int or worker_count not in (4, 8, 16):
@@ -221,6 +226,13 @@ def import_enrichment(index, kind, subject):
     clients = []
     storage = local()
     locks = tuple(Lock() for _ in range(31))
+    activity_lock = Lock()
+    active = [0, 0]
+
+    def activity(synced, delta):
+        with activity_lock:
+            active[int(synced)] += delta
+            report(dict(event="activity", lyrics=active[0], lrc=active[1]))
 
     def initialize():
         storage.source = engine.LyricsSources(persistent=True)
@@ -229,7 +241,8 @@ def import_enrichment(index, kind, subject):
     def work(path):
         began = monotonic()
         try:
-            result = engine.process_import_track(path, storage.source, index, settings, excluded, locks)
+            result = engine.process_import_track(path, storage.source, index, settings, excluded, locks, activity,
+                                                 strawberry.get(str(path)))
         except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
             result = "temporary", "temporary"
         return result, monotonic() - began
@@ -262,8 +275,13 @@ def main():
     elif kind in KINDS:
         # Library-lock progress and tool diagnostics must not contaminate the
         # machine-readable result expected by the maintenance supervisor.
+        output = sys.stdout
+        def report(event):
+            print(document(event), file=output, flush=True)
+        if os.environ.get("KARA_ENRICHMENT_EVENTS") != "1":
+            report = lambda _: None
         with redirect_stdout(sys.stderr):
-            result = import_enrichment(index, kind, subject)
+            result = import_enrichment(index, kind, subject, report)
     elif kind in ("prepare_plain", "prepare_lrc"):
         # A nocturnal lookup can supply a candidate to Turbo. It never
         # retags audio or publishes any provider text to the library.

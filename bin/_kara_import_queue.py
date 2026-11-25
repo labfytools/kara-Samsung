@@ -192,6 +192,16 @@ class ImportQueue:
             return bool(db.execute("SELECT 1 FROM jobs WHERE state IN ('queued','running') AND option IS NULL LIMIT 1")
                         .fetchone())
 
+    def enrichment_groups(self):
+        with self.connect() as db:
+            # Historical outcomes predate enrichment receipts. Count only
+            # receipts written by the asynchronous pipeline.
+            return [json.loads(value) for value, in db.execute("""
+                SELECT json_extract(payload,'$.enrichment') FROM outcomes
+                WHERE json_type(payload,'$.enrichment')='object'
+                AND json_extract(payload,'$.audio_complete')=1
+            """)]
+
     def totals(self):
         with self.connect() as db:
             albums, tracks = set(), set()

@@ -91,13 +91,14 @@ class ImportProgress:
         self.measure_index = None
         self.announce_provider = lambda *_: None
         self.transfers = {}
+        self.telemetry = None
 
     def emit(self, message, fraction=None, *, event="progress", **fields):
         if self.report is not None:
             self.report(message, fraction)
             return
         payload = {"event": event, "message": message, "fraction": fraction, **fields}
-        if self.journal and event != "progress":
+        if self.journal and event not in ("progress", "transfer"):
             self.journal.write(payload)
         if self.commit_result is not None and event in {"success", "failure", "skip", "cancelled"}:
             terminal = {key: fields[key] for key in ("category", "detail", "interrupted") if key in fields}
@@ -120,6 +121,11 @@ class ImportProgress:
         if self.journal:
             self.journal.write({"event": "output", "url": self.url, "stage": stage,
                                 "command": command, "output": output})
+
+    def measured(self, stage, component, seconds, **fields):
+        if self.journal:
+            self.journal.write(dict(event="measurement", url=self.url, stage=stage, component=component,
+                                    seconds=round(seconds, 6), **fields))
 
     def issue(self, stage, category, detail, *, returncode=None, tool=None):
         diagnostic = {"stage": stage, "category": category, "detail": detail}
@@ -161,7 +167,12 @@ class ImportProgress:
                 index = max(1, int(index))
                 transfer = self.transfers.get(index)
                 if transfer is not None:
-                    transfer.received(int(downloaded), monotonic())
+                    now, size_now = monotonic(), int(downloaded)
+                    previous_bytes, previous_stamp = transfer.bytes, transfer.last
+                    transfer.received(size_now, now)
+                    if (self.telemetry and status == "downloading" and previous_stamp is not None
+                            and now > previous_stamp and size_now > previous_bytes):
+                        self.telemetry(index, (size_now - previous_bytes) / (now - previous_stamp))
                 estimate = max(0.0, min(1.0, int(downloaded) / int(size))) if int(size) > 0 else 0.0
                 if status == "finished":
                     self.track_status("Préparation de l’audio", index, 0.94)
@@ -208,9 +219,12 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
 
     if resource == "processing":
         directory = SHARED_LIBRARY / INBOX / ".kara-traitements"
+        waiting = monotonic()
         with resource_slot(directory, PROCESSING, lambda: progress.emit("En attente d’un traitement…")) as slot:
+            progress.measured(label, "processing_queue", monotonic() - waiting)
             return run(label, command, progress=progress, fraction=fraction, announce=False,
                        total=total, unit=unit, span=span, resource=(slot,))
+    started = monotonic()
     try:
         if resource and not download:
             env["KARA_IMPORT_PROCESSING"] = "1"
@@ -219,6 +233,7 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
         category = "dependency" if isinstance(error, FileNotFoundError) else "path"
         progress.issue(label, category, f"{command[0]} : {error}")
         return 1
+    progress.measured(label, "spawn", monotonic() - started)
     finished = Event()
     abort = []
 
@@ -242,13 +257,17 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
 
     watchdog = Thread(target=watch, daemon=True)
     watchdog.start()
+    locked_at = None
     with process:
         for raw in iter(lambda: process.stdout.readline(65536), ""):
             line = raw.rstrip("\r\n")
             if line == "KARA_ATTENTE_BIBLIOTHEQUE":
+                locked_at = monotonic()
                 progress.emit(f"En attente de la bibliothèque · {label}", fraction)
                 continue
             if line == "KARA_BIBLIOTHEQUE_DISPONIBLE":
+                if locked_at is not None:
+                    progress.measured(label, "library_wait", monotonic() - locked_at)
                 progress.emit(label, fraction)
                 continue
             if download and line.startswith(("KARA_ITEM ", "KARA_BYTES ", "KARA_CONVERT ", "KARA_DONE ")):
@@ -292,6 +311,7 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
         result = process.wait()
     finished.set()
     watchdog.join()
+    progress.measured(label, "subprocess", monotonic() - started, returncode=result)
     if result:
         detail = "\n".join(errors or tail) or f"{command[0]} a retourné le code {result}."
         category = failure_category(detail, "download" if download else "processing")
@@ -627,12 +647,19 @@ def download_track(source, folder, progress):
         *YT_PROGRESS, "--", source.url,
     ]
     directory = folder.parent / ".kara-transferts"
+    waiting = monotonic()
     with resource_slot(directory, DOWNLOADS, lambda: progress.emit("En attente d’un téléchargement…")) as slot:
+        progress.measured(label, "download_queue", monotonic() - waiting)
         check_space(folder, extra=WORKING_RESERVE)
+        waiting = monotonic()
         wait_service("youtube", 0.5)
+        progress.measured(label, "provider_wait", monotonic() - waiting)
         with progress.download_lock:
             transfer = progress.transfers[position] = Transfer(monotonic())
         result = run(label, command, progress=progress, download=True, announce=False, resource=(slot,), disk=folder)
+        if transfer.first is not None:
+            progress.measured(label, "first_byte", transfer.first - transfer.started)
+            progress.measured(label, "transfer", transfer.last - transfer.first, bytes=transfer.bytes)
         if not result and progress.measure_index is not None:
             observe(progress.measure_index, YOUTUBE, transfer.measurements())
         return result
@@ -1475,6 +1502,9 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
         child.download_lock = RLock()
         child.measure_index = metrics
         child.announce_provider = lambda source, label: progress.emit(label, event="provider", provider=source)
+        if progress.managed:
+            child.telemetry = lambda position, rate: progress.emit(
+                "Mesure du transfert audio", event="transfer", url=url, position=position, bytes_per_second=rate)
         item = BatchAlbum(url, (titles or {}).get(url) or f"Album {index}", child)
         started = monotonic()
 
@@ -1557,6 +1587,8 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None)
                 outcome["measured_bytes_per_second"] = measured["mean"]
         if on_album is not None:
             on_album(outcome)
+        child.measured("Album", "audio" if progress.managed else "total", monotonic() - started,
+                       added=item.added, tracks=len(item.tracks), audio_complete=item.audio_complete)
         progress.emit(fraction=index / len(urls), event="album", **outcome)
         counts[item.status] += 1
         added += item.added

@@ -12,6 +12,20 @@ Chaque lot d’enrichissement des paroles utilise une seule lecture initiale des
 
 Le propriétaire de maintenance admet quatre recherches de pistes à la fois par défaut et ramène ce plafond à deux en cas de limitation HTTP ou de pression sur les ressources. Les créneaux HTTP, les quotas et les temporisations des fournisseurs restent mutualisés. La sélection exploite les mesures récentes du registre quand suffisamment de réponses ont été observées.
 
+Les journaux d’import horodatent les mesures de démarrage, de transfert, de traitement et d’attente. Les durées de sous-processus sont inclusives. Les temps de créneau, d’attente du verrou et de premier octet décrivent des sous-étapes et ne s’additionnent pas au total. La console montre les transferts et recherches actifs et les mesures du dernier lot de paroles. Le débit direct représente les transferts qui ont signalé des octets récemment.
+
+Le trieur lit les tags avant le verrou et vérifie la version de l’entrée sous le verrou. Les pochettes sont décodées et redimensionnées avant la publication. L’actualisation de petites listes de pistes interroge Strawberry par URL et en lecture seule.
+
+Sur ArchASP, un essai isolé avec deux albums synthétiques et quatre transferts HTTP locaux a comparé le parcours géré à la révision `657c291`. Le premier résultat d’album est arrivé en 4,66 s puis 2,23 s. Le dernier est arrivé en 9,07 s puis 4,18 s. L’ancien signal attendait l’enrichissement. Le nouveau confirme la disponibilité audio.
+
+| Recherches de pistes admises | Durée de l’essai | P95 par piste | Requêtes | Textes publiés | LRC publiés |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 11,49 s | 5,25 s | 18 | 16 | 16 |
+| 8 | 11,49 s | 9,81 s | 25 | 15 | 16 |
+| 16 | 11,34 s | 11,34 s | 33 | 14 | 16 |
+
+Le second essai utilise seize pistes de synthèse, des réponses contrôlées et les vrais créneaux du moteur. Quatre recherches restent le réglage par défaut. Les deux plafonds plus élevés ont presque les mêmes durées globales, davantage de requêtes et des textes différés.
+
 ## Déplacement du dépôt sur ArchASP
 
 Le commit `2201869` a déplacé `kara` dans le dépôt dédié. Les appels de tri et de recherche de pochette utilisaient déjà le répertoire de `kara`, mais `musique-tri` et `musique-pochettes` sont restés dans `~/.dotfiles/bin/.local/bin`, accessible sur ArchASP par `~/.local/bin`. Ces deux exécutables n’avaient pas d’historique dans Git. Les copies datées du 22 novembre dans `~/.local/state/kara-tri-paroles-*` corroborent l’origine du script de tri. Les scripts locaux ont été repris dans `bin/`, avec des adaptations ciblées pour les chemins et la reprise.
