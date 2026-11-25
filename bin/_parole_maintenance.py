@@ -129,6 +129,7 @@ class Maintenance:
         self.night_settings_at = 0.
         self.night_handover = 0.
         self.night_policy = None
+        self.night_lrc = (False, False)
         self.owner = None
         self.foreground = Event()
         if not background:
@@ -660,14 +661,17 @@ class Maintenance:
                 and cached_stems(path)):
             updated = {"audio": reference["audio"].get("pcm_sha256", ""), "kara": "prêt"}
             origin = reference["source"]
+            generated = bool(origin.get("plain_sha256") and reference_option == "--plain-reference")
+            corrected = bool(reference["report"].get("changed") and analyzed)
             if origin.get("plain_sha256") and origin["kind"] == "local":
                 updated["lrc"] = "généré"
                 updated["provenance"] = {"lrc_provider": f"Turbo · {origin['provider']}"}
-            if origin.get("plain_sha256") and reference_option == "--plain-reference":
+            if generated:
                 self.journal.emit("LRC", f"LRC généré et validé · {song['title']}")
-            if reference["report"].get("changed") and analyzed:
+            if corrected:
                 self.journal.emit("LRC", f"Minutage corrigé dans Kara · {song['title']}")
             self.refresh_song(song, **updated)
+            self.night_lrc = (corrected, generated)
             self.journal.emit("KARA", f"Chanson prête · {song['title']}")
             return "done", "prêt", 0
         self.refresh_song(song)
@@ -720,11 +724,14 @@ class Maintenance:
         with self.lock:
             self.interrupt.clear()
             if kind == "prepare" and (self.priority or monotonic() < self.priority_until):
-                self.index.finish(task, "suspended", "ressources prioritaires", 15)
+                stats = (dict(seconds=0., outcome="interrupted", cache_bytes=None, corrected=0, generated=0)
+                         if nocturnal else None)
+                self.index.finish(task, "suspended", "ressources prioritaires", 15, night=stats)
                 return
             self.active = (kind, subject)
         self.night_running = nocturnal
         self.night_settings_at = 0.
+        self.night_lrc = (False, False)
         song = self.index.song(subject) if kind in ("lyrics", "lrc", "prepare") else None
         self.progress = (category, song["title"] if song is not None else "En cours", None)
         if kind not in ("prepare", "codex"):
@@ -790,7 +797,23 @@ class Maintenance:
                 self.interrupt.clear()
             self.progress = None
             self.night_running = False
-        self.index.finish(task, *result)
+        stats = None
+        if nocturnal:
+            state, detail, _ = result
+            outcome = {"done": "ready", "review": "failed", "suspended": "interrupted"}.get(state, "deferred")
+            if detail in ("séparation indisponible", "analyse Turbo indisponible", "opération indisponible"):
+                outcome = "failed"
+            corrected, generated = self.night_lrc
+            storage = None
+            elapsed = monotonic() - started
+            try:
+                self.resources.collect_storage(monotonic(), force=True)
+                storage = self.resources.storage["bytes"]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
+                         corrected=corrected, generated=generated)
+        self.index.finish(task, *result, night=stats)
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
         self.revision += 1
 
@@ -850,7 +873,8 @@ class Maintenance:
                     self.journal.emit("SYSTEM", "Maintenance déjà supervisée par une autre instance", "WARNING")
                     return
                 self.owner = owner
-                self.index.recover()
+                if self.index.recover():
+                    self.journal.emit("IDLE", "Préparation nocturne interrompue avant le redémarrage", "WARNING")
                 self.journal.emit("SYSTEM", "Maintenance de Parole démarrée")
                 while not self.shutdown.is_set():
                     try:
@@ -989,7 +1013,8 @@ class Maintenance:
         if not self.night.open(settings):
             self.night.close()
             return False
-        task = self.index.claim(("prepare",), now)
+        task = self.index.claim(("prepare",), now,
+                                night=(self.night.budget, self.resources.storage.get("bytes", 0)))
         if task is None:
             self.night.close()
             return False

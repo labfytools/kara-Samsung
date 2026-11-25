@@ -63,6 +63,8 @@ class NightTests(unittest.TestCase):
         self.settings = self.owner.current_settings = self.owner.index.settings()
         self.owner.resources.session_idle = Mock(return_value=True)
         self.owner.resources.check = Mock(return_value=True)
+        self.owner.resources.collect_storage = Mock()
+        self.owner.resources.storage = {"bytes": 100}
 
     def open(self):
         self.assertTrue(self.owner.night_allowed(self.settings, running=False))
@@ -120,6 +122,25 @@ class NightTests(unittest.TestCase):
         with self.owner.index.db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM daily_usage").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM tasks WHERE state='done'").fetchone()[0], 5)
+        _, _, report = self.owner.index.night_progress()
+        self.assertEqual(report["ready"], 5)
+        self.assertEqual(report["cache_bytes"], 100)
+        self.assertIsNone(report["pending"])
+
+    def test_report_retains_validated_work_and_counts_a_crashed_claim_once(self):
+        index = self.owner.index
+        at = time()
+        index.enqueue("prepare", "first", "fixture", now=at)
+        task = index.claim(("prepare",), at, night=(10., 20))
+        index.finish(task, "done", night=dict(seconds=30., outcome="ready", cache_bytes=42, corrected=1, generated=0))
+        index.enqueue("prepare", "second", "fixture", now=at)
+        index.claim(("prepare",), at, night=(10., 42))
+        self.assertTrue(index.recover())
+        self.assertFalse(index.recover())
+        _, _, report = index.night_progress()
+        self.assertEqual((report["ready"], report["interrupted"], report["corrected"], report["seconds"]), (1, 1, 1, 30.))
+        self.assertEqual((report["cache_baseline"], report["cache_bytes"]), (20, 42))
+        self.assertIsNone(report["pending"])
 
     def test_real_subprocess_stops_on_power_loss_sleep_heat_space_and_kara(self):
         cases = ("Demucs", "Turbo", "veille", "température", "stockage", "Kara", "activité", "désactivation")

@@ -180,6 +180,26 @@ class Index:
             return db.execute("""SELECT 1 FROM tasks WHERE kind='prepare' AND due<=?
                                  AND state IN ('queued','suspended','temporary') LIMIT 1""", (now,)).fetchone() is not None
 
+    @staticmethod
+    def read_night_report(db):
+        row = db.execute("SELECT value FROM settings WHERE key='night_report'").fetchone()
+        return json.loads(row[0]) if row else None
+
+    @staticmethod
+    def write_night_report(db, report):
+        db.execute("INSERT OR REPLACE INTO settings VALUES('night_report',?)", (document(report),))
+
+    def night_progress(self):
+        with self.db(wait=.15) as db:
+            ready = db.execute("SELECT ready FROM library_stats WHERE id=1").fetchone()[0]
+            remaining = db.execute("""
+                SELECT count(*) FROM tasks JOIN songs ON songs.id=tasks.subject
+                WHERE tasks.kind='prepare' AND tasks.state IN ('queued','running','suspended','temporary')
+                AND songs.kara!='prêt' AND songs.lyrics!='instrumental'
+                AND NOT EXISTS(SELECT 1 FROM exclusions WHERE kind='artist' AND subject=songs.owner)
+            """).fetchone()[0]
+            return ready, remaining, self.read_night_report(db)
+
     def configure(self, **changes):
         with self.db() as db:
             db.executemany("INSERT OR REPLACE INTO settings VALUES(?,?)",
@@ -202,7 +222,15 @@ class Index:
     def recover(self):
         # Only the application holding the maintenance lease may recover claims.
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            report = self.read_night_report(db)
+            interrupted = bool(report and report["pending"] is not None)
+            if interrupted:
+                report["interrupted"] += 1
+                report["pending"] = None
+                self.write_night_report(db, report)
             db.execute("UPDATE tasks SET state='suspended' WHERE state='running'")
+            return interrupted
 
     @staticmethod
     def can_reserve(db, bucket, day, now, limit, gap):
@@ -235,7 +263,7 @@ class Index:
             self.reserve(db, bucket, day, now, gap)
             return True
 
-    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0):
+    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
@@ -255,14 +283,40 @@ class Index:
             """, (now, *kinds, now, high, codex_auto, now)).fetchone()
             if bucket and task is not None:
                 self.reserve(db, bucket, day, now, gap)
+            if night is not None and task is not None:
+                since, storage = night
+                window = [Path("/proc/sys/kernel/random/boot_id").read_text().strip(), since]
+                report = self.read_night_report(db)
+                # Reserve one durable receipt with the queue claim. A crash
+                # leaves the last completed totals and one interrupted item.
+                if not report or report["window"] != window:
+                    report = dict(window=window, started=now, seconds=0., ready=0, corrected=0, generated=0,
+                                  failed=0, deferred=0, interrupted=0, cache_baseline=storage, cache_bytes=storage)
+                report["pending"] = [task["subject"], task["revision"]]
+                self.write_night_report(db, report)
             return task
 
-    def finish(self, task, state, detail="", delay=0):
+    def finish(self, task, state, detail="", delay=0, *, night=None):
         now = time()
         with self.db() as db:
-            db.execute("""UPDATE tasks SET state=?, detail=?, updated=?, due=?
+            changed = db.execute("""UPDATE tasks SET state=?, detail=?, updated=?, due=?
                           WHERE kind=? AND subject=? AND state='running' AND revision=?""",
-                       (state, detail[:300], now, now + delay, task["kind"], task["subject"], task["revision"]))
+                                 (state, detail[:300], now, now + delay,
+                                  task["kind"], task["subject"], task["revision"])).rowcount
+            if night is not None:
+                report = self.read_night_report(db)
+                if report and report["pending"] == [task["subject"], task["revision"]]:
+                    report["pending"] = None
+                    report["seconds"] += night["seconds"]
+                    if night["cache_bytes"] is not None:
+                        report["cache_bytes"] = night["cache_bytes"]
+                    if changed:
+                        report[night["outcome"]] += 1
+                        report["corrected"] += night["corrected"]
+                        report["generated"] += night["generated"]
+                    else:
+                        report["interrupted"] += 1
+                    self.write_night_report(db, report)
 
     def exclude(self, kind, subject):
         with self.db() as db:

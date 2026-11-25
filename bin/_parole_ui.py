@@ -224,6 +224,7 @@ class ParoleView:
         self.tv_state = ""
         self.tv_requested = 0.
         self.settings_dialog = None
+        self.night_summary = None
         self.stats_at = 0.
         self.cards = {}
         gtkroot = self.root = box(spacing=8, css_classes=["parole"], margin_start=12, margin_end=12,
@@ -498,6 +499,8 @@ class ParoleView:
         if not dirty and monotonic() < self.stats_at + 3.:
             return
         self.stats_at = monotonic()
+        if self.night_summary is not None and self.night_summary.get_mapped():
+            self.refresh_night_summary()
         with self.index.db(wait=.15) as db:
             stats = dict(db.execute("SELECT * FROM library_stats WHERE id=1").fetchone())
             stats.update(artists=self.artists.get_n_items(), albums=db.execute("SELECT count(DISTINCT edition) FROM songs WHERE album!=''").fetchone()[0],
@@ -520,6 +523,26 @@ class ParoleView:
             else:
                 formatted = f"{data:,}".replace(",", " ")
             value.set_text(formatted)
+
+    def refresh_night_summary(self):
+        ready, remaining, report = self.index.night_progress()
+        lines = [f"Bibliothèque · {ready} prêtes · {remaining} restantes dans la file"]
+        if report:
+            stamp = datetime.fromtimestamp(report["started"]).strftime("%d/%m à %H:%M")
+            seconds = report["seconds"]
+            cadence = f" · {report['ready'] * 3600 / seconds:.1f} prêtes/h" if seconds > 0 else ""
+            delta = report["cache_bytes"] - report["cache_baseline"]
+            sign = "+" if delta >= 0 else "−"
+            lines.extend((
+                f"Session du {stamp} · {report['ready']} prêtes · {report['corrected']} LRC corrigés · "
+                f"{report['generated']} LRC générés",
+                f"{report['failed']} échecs · {report['interrupted']} interruptions · {report['deferred']} reports",
+                f"Traitement cumulé · {seconds / 60:.1f} min{cadence}",
+                f"Cache utilisé · {display_size(report['cache_bytes'])} · {sign}{display_size(abs(delta))} sur la session",
+            ))
+        else:
+            lines.append("Aucune session nocturne enregistrée.")
+        self.night_summary.set_text("\n".join(lines))
 
     def selected(self):
         return self.song_selection.get_selected_item()
@@ -851,6 +874,9 @@ class ParoleView:
         resources.append(Gtk.Label(label="Un traitement de maintenance à la fois.", xalign=0, css_classes=["muted"]))
         stack.add_titled(scroller(resources), "resources", "Ressources")
         night = new()
+        self.night_summary = Gtk.Label(xalign=0, wrap=True, selectable=True, css_classes=["muted"])
+        night.append(self.night_summary)
+        self.refresh_night_summary()
         toggles(night, (("night_enabled", "Activer la préparation nocturne"),
                         ("night_screen_off", "Préparer lorsque l’écran est éteint"),
                         ("night_lid", "Préparer lorsque le capot est fermé"),

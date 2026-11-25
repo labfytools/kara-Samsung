@@ -16,3 +16,4 @@
 - Rétablir la recherche Web native de Codex dans l’environnement isolé et laisser l’automatisation désactivée par défaut.
 - Ajouter la préparation nocturne sur secteur, séquentielle et sans plafond quotidien, sous la supervision du service Kara. Porter la réserve de disque à 20 Gio.
 - Configurer les délais et quotas des recherches classiques, avec une régulation persistante par fournisseur.
+- Afficher dans Parole le bilan persistant de la dernière session nocturne, avec la cadence et le stockage mesurés.
