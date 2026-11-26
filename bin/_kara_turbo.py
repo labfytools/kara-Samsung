@@ -18,6 +18,7 @@ RATE = 16_000
 STRIDE = 24
 OVERLAP = 2
 MAX_SECONDS = 3600
+MAX_PROMPT_BYTES = 512
 MODEL = DATA / "pywhispercpp/models/ggml-large-v3-turbo.bin"
 SOURCE = BIN.parent / "native/src/_kara_dtw.c"
 
@@ -98,7 +99,7 @@ def decode_segment(start, end, no_speech, tokens, origin, duration):
 
 
 class TurboDecoder:
-    """One native context for the batch. Every frame is bounded and unprompted."""
+    """One native context with an optional, frame-local experimental prompt."""
     def __init__(self, binary, model, device, threads, *, logs=False, require_vulkan=False):
         backend = "vulkan" if require_vulkan else device
         self.process = subprocess.Popen([str(binary), "--prepare", str(model), backend, str(threads)],
@@ -144,12 +145,18 @@ class TurboDecoder:
         except (OSError, StopIteration, ValueError, IndexError):
             return None
 
-    def decode(self, pcm, language, origin=0, *, beam=False):
+    def decode(self, pcm, language, origin=0, *, beam=False, prompt=""):
         code = (language or "auto").encode("ascii")
         if len(pcm) % 2 or not 0 < len(pcm) <= 29 * RATE * 2 or not 0 < len(code) <= 15:
             raise ValueError("Fenêtre PCM invalide.")
+        hints = prompt.encode("utf-8")
+        if hints and (len(hints) > MAX_PROMPT_BYTES or not prompt.isprintable()):
+            raise ValueError("Contexte linguistique invalide.")
         pipe = self.process.stdin
-        pipe.write(struct.pack("<IB", len(pcm) // 2, len(code) | (0x80 if beam else 0)) + code)
+        flags = (0x80 if beam else 0) | (0x40 if hints else 0)
+        pipe.write(struct.pack("<IB", len(pcm) // 2, len(code) | flags) + code)
+        if hints:
+            pipe.write(struct.pack("<H", len(hints)) + hints)
         pipe.write(pcm)
         pipe.flush()
         limit = monotonic() + 180
@@ -172,6 +179,10 @@ class TurboDecoder:
                 boundary = int(fields[0]) / 100, int(fields[1]) / 100, float(fields[2])
             elif kind == b"token":
                 tokens.append((int(fields[0]) / 100, float(fields[1]), bytes.fromhex(fields[2].decode())))
+            elif kind == b"error":
+                if self.read_line(limit) != b"done":
+                    raise ValueError("Fin de trame Turbo invalide.")
+                raise ValueError("Turbo a rejeté la fenêtre ou son contexte linguistique.")
             else:
                 raise ValueError("Échec du décodage Whisper Turbo.")
         raise ValueError("Sortie Turbo trop volumineuse.")

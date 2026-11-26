@@ -17,7 +17,7 @@ import _kara_prepare as prepare
 from _kara_reference import alignment, align_words, lrc_text
 from _kara_refine import Gap, consolidate, refine, two_observations
 from _kara_scoring import prepared_window, score_breakdown, score_reference_line
-from _kara_turbo import ObservedWord, Segment, decode_segment, transcribe_file
+from _kara_turbo import ObservedWord, Segment, TurboDecoder, decode_segment, transcribe_file
 from _kara_words import word_boundaries
 from _paroles_lrc import parse_lrc, source_orders
 
@@ -32,6 +32,20 @@ def observations(rows, shifts=None):
                          .94, "next_token")
             for (stamp, phrase), shift in zip(rows, shifts)
             for index, (word, *_chars) in enumerate(word_boundaries(phrase))]
+
+
+class TurboProtocolTests(unittest.TestCase):
+    def test_prompt_is_bounded_and_legacy_frame_is_unchanged(self):
+        decoder = TurboDecoder.__new__(TurboDecoder)
+        decoder.process = Mock(stdin=io.BytesIO())
+        decoder.read_line = Mock(return_value=b"done")
+        decoder.decode(b"\x00\x00", "fr")
+        self.assertEqual(decoder.process.stdin.getvalue(), b"\x01\0\0\0\x02fr\0\0")
+        decoder.process.stdin = io.BytesIO()
+        decoder.decode(b"\x00\x00", "fr", prompt="été")
+        self.assertEqual(decoder.process.stdin.getvalue(), b"\x01\0\0\0\x42fr\x05\0" + "été".encode() + b"\0\0")
+        with self.assertRaises(ValueError):
+            decoder.decode(b"\x00\x00", "fr", prompt="é" * 257)
 
 
 class AlignmentTests(unittest.TestCase):

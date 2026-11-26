@@ -219,7 +219,7 @@ static void print_prepared(struct whisper_context *context)
 
 static int prepare_stream(const char *model, bool gpu, int threads, bool require_vulkan)
 {
-    enum { MAX_SAMPLES = 29 * WHISPER_SAMPLE_RATE, MAX_LANG = 15 };
+    enum { MAX_SAMPLES = 29 * WHISPER_SAMPLE_RATE, MAX_LANG = 15, MAX_PROMPT = 512, MAX_PROMPT_TOKENS = 64 };
     static struct vulkan_probe probe;
     /* Whisper may fall back to CPU after a GPU request. Its pinned backend
      * reports device selection and initialization failure before it is ready. */
@@ -256,10 +256,12 @@ static int prepare_stream(const char *model, bool gpu, int threads, bool require
         // The model is process-owned and survives requests and language changes.
         uint32_t count = (uint32_t)header[0] | (uint32_t)header[1] << 8 |
                          (uint32_t)header[2] << 16 | (uint32_t)header[3] << 24;
-        // The low bits retain the original language-length encoding.
-        // The high bit selects beam search for an unprompted local retry.
+        // Frames without a prompt retain their original byte encoding. Bit
+        // 6 adds a 16-bit little-endian UTF-8 byte length after the language.
+        // Bit 7 still selects beam search. Prompts apply to this frame only.
         const bool beam = (header[4] & 0x80u) != 0;
-        unsigned int lang_length = header[4] & 0x7fu;
+        const bool prompted = (header[4] & 0x40u) != 0;
+        unsigned int lang_length = header[4] & 0x3fu;
         char language[MAX_LANG + 1];
         if (count == 0 || count > MAX_SAMPLES || lang_length == 0 || lang_length > MAX_LANG ||
             fread(language, 1, lang_length, stdin) != lang_length) {
@@ -267,6 +269,21 @@ static int prepare_stream(const char *model, bool gpu, int threads, bool require
             break;
         }
         language[lang_length] = '\0';
+        char prompt[MAX_PROMPT + 2] = " ";
+        if (prompted) {
+            unsigned char size_bytes[2];
+            if (fread(size_bytes, 1, sizeof(size_bytes), stdin) != sizeof(size_bytes)) {
+                status = 6;
+                break;
+            }
+            unsigned int length = (unsigned int)size_bytes[0] | (unsigned int)size_bytes[1] << 8;
+            if (length == 0 || length > MAX_PROMPT || fread(prompt + 1, 1, length, stdin) != length ||
+                memchr(prompt + 1, '\0', length)) {
+                status = 6;
+                break;
+            }
+            prompt[length + 1] = '\0';
+        }
         for (uint32_t offset = 0; offset < count;) {
             unsigned char pcm[8192];
             uint32_t batch = count - offset > sizeof(pcm) / 2 ? sizeof(pcm) / 2 : count - offset;
@@ -286,6 +303,18 @@ static int prepare_stream(const char *model, bool gpu, int threads, bool require
         params.n_threads = threads;
         params.audio_ctx = 0;
         params.greedy.best_of = 1;
+        whisper_token prompt_tokens[MAX_PROMPT_TOKENS];
+        if (prompted) {
+            int token_count = whisper_tokenize(context, prompt, prompt_tokens, MAX_PROMPT_TOKENS);
+            if (token_count <= 0 || token_count > MAX_PROMPT_TOKENS) {
+                puts("error");
+                puts("done");
+                fflush(stdout);
+                continue;
+            }
+            params.prompt_tokens = prompt_tokens;
+            params.prompt_n_tokens = token_count;
+        }
         if (beam) {
             params.strategy = WHISPER_SAMPLING_BEAM_SEARCH;
             params.beam_search.beam_size = 3;

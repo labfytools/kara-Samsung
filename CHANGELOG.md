@@ -4,6 +4,7 @@
 
 - Supprimer le plafond et l’intervalle globaux de la maintenance réseau, isoler les temporisations par fournisseur et compter les paroles et LRC publiés par heure.
 - Traiter les recherches indépendantes en parallèle et alterner les lots réseau avec une seule préparation Kara.
+- Qualifier expérimentalement des contextes Turbo issus d’un lexique local en excluant les morceaux d’évaluation du corpus.
 - Armer l’inhibiteur de capot avant la fermeture sur secteur, confirmer le verrouillage Sway avant l’extinction et porter la durée nocturne par défaut à huit heures.
 - Alterner la préparation Kara avec les recherches et vérifications capot fermé, même sans fenêtre Parole, et conserver un bilan par catégorie.
 

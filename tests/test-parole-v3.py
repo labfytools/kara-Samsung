@@ -44,11 +44,11 @@ class Fixture(unittest.TestCase):
         self.root.mkdir()
         self.index = Index(self.root, self.base / "state")
 
-    def audio(self, name="01 Chanson.flac"):
+    def audio(self, name="01 Chanson.flac", *, title="Chanson"):
         path = self.root / "Groupe" / "Album" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                        "-t", "5", "-metadata", "title=Chanson", "-metadata", "artist=Groupe, Invité",
+                        "-t", "5", "-metadata", f"title={title}", "-metadata", "artist=Groupe, Invité",
                         "-metadata", "album_artist=Groupe", "-metadata", "album=Album",
                         "-metadata", "track=1", str(path)], check=True)
         return path
@@ -63,6 +63,20 @@ class Fixture(unittest.TestCase):
 
 
 class InventoryTests(Fixture):
+    def test_lexicon_excludes_held_out_content_and_generated_lrc(self):
+        from _parole_lexicon import records, select_prompt
+
+        paths = [self.audio(f"{title}.flac", title=title) for title in ("test", "duplicate", "generated", "training")]
+        for path, text in zip(paths, ("Texte témoin", "Texte témoin!", "Copie Turbo", "Wèche, j'suis chez Mélo.")):
+            path.with_suffix(".lrc").write_text(f"[00:01.00]{text}\n")
+        self.scan()
+        group = {Path(row["path"]).stem: row for row in self.songs()}
+        self.index.update(group["generated"]["id"], lrc="généré")
+        corpus = list(records(self.index.path, self.root, exclude=(group["test"]["id"],)))
+        self.assertEqual([row["song"] for row in corpus], [group["training"]["id"]])
+        self.assertIn("j'suis", corpus[0]["forms"])
+        self.assertIn("Mélo", select_prompt(corpus, artist="Groupe"))
+
     def test_incremental_rename_and_disappearance(self):
         path = self.audio()
         path.with_suffix(".lrc").write_text("[00:01.00]Tout commence ici\n[00:02.00]Et continue là\n")
