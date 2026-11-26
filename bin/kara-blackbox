@@ -326,6 +326,7 @@ def main():
     parser.add_argument("--frames", type=int)
     parser.add_argument("--reference", choices=("monitor", "playback"), default="monitor")
     parser.add_argument("--aec-delay-ms", type=int, help="délai préalablement mesuré pour le comparatif hors ligne")
+    parser.add_argument("--calibration", type=Path, help="reçu local de délai et de configuration audio")
     parser.add_argument("--simulation", help="objet JSON de perturbations hors ligne")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--label")
@@ -430,7 +431,8 @@ def main():
             from _kara_blackbox_aec import compare, input_pair
             from _kara_blackbox_lab import analyze
 
-            validate_recording(folder, read(folder / "manifest.json"))
+            manifest = read(folder / "manifest.json")
+            validate_recording(folder, manifest)
             if args.cycle is None:
                 raise ValueError("Le comparatif AEC exige la sélection explicite d’un --cycle SESSION/TOUR.")
             if args.output and args.output.resolve().is_relative_to(args.root.resolve()):
@@ -438,8 +440,25 @@ def main():
             report = analyze(folder)
             if args.cycle not in report["cycles"]:
                 raise ValueError("Cycle V3 absent.")
+            delay = args.aec_delay_ms
+            if args.calibration:
+                if delay is not None:
+                    raise ValueError("Choisis le reçu de calibration ou le délai saisi.")
+                with open(args.calibration, "rb", opener=private_file) as stream:
+                    raw = stream.read(4097)
+                if len(raw) > 4096:
+                    raise ValueError("Reçu de calibration trop grand.")
+                receipt = json.loads(raw)
+                if not isinstance(receipt, dict):
+                    raise ValueError("Format du reçu de calibration invalide.")
+                actual = manifest["cycles"][args.cycle].get("audio_configuration", {}).get("id")
+                if not actual or actual != receipt.get("audio_configuration_id"):
+                    raise ValueError("La configuration audio a changé depuis la calibration.")
+                delay = receipt.get("delay_ms")
+                if type(delay) is not int or not 0 <= delay <= 500:
+                    raise ValueError("Délai hors limites dans le reçu de calibration.")
             render, mic = input_pair(folder, report, args.cycle, args.reference)
-            config = {"cycle": args.cycle, "reference": args.reference, "delay_ms": args.aec_delay_ms,
+            config = {"cycle": args.cycle, "reference": args.reference, "delay_ms": delay,
                       "pcm_sha256": sha256(render.astype("<f4").tobytes() + mic.astype("<f4").tobytes()).hexdigest()}
             if args.simulation:
                 from _kara_blackbox_trials import simulate_pcm, simulation_options
@@ -450,7 +469,7 @@ def main():
                 mic = simulate_pcm(mic, render, overlay, 48000)
                 config["simulated"] = overlay
             output({"experiment": sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
-                    "inputs": config, "comparison": compare(render, mic, args.aec_delay_ms, output=args.output)})
+                    "inputs": config, "comparison": compare(render, mic, delay, output=args.output)})
         elif args.action == "extract-pcm":
             if args.id is None or args.output is None:
                 raise ValueError("Indique un événement PCM (--id) et un fichier de sortie (--output).")

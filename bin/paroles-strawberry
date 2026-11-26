@@ -1331,7 +1331,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
                            identity={"room": self.bb_room, "party": self.remote_party.identity},
                            reference={**{key: reference.get(key) for key in ("song_id", "prepared_at", "lrc_sha256",
                                        "language", "duration", "settings", "model")},
-                                      "audio_sha256": reference["audio"]["sha256"]} if reference else None)
+                                      "audio_sha256": reference["audio"]["sha256"],
+                                      "audio_pcm_sha256": reference["audio"].get("pcm_sha256")} if reference else None)
         self.turn_scored = scored
         self.game_toggle.set_sensitive(scored)
         self.turn_phase = "preparing"

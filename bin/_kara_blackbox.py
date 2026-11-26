@@ -177,6 +177,9 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
                     cycle["end_ns"] = item["monotonic_ns"]
                 elif item["component"] == "audio" and item["event"] == "reference":
                     cycle["references"] = data.get("files", {})
+                elif item["component"] == "audio" and item["event"] == "route":
+                    cycle["audio_configuration"] = {"id": data.get("audio_configuration_id"),
+                                                     "settings": data.get("capture_settings", {})}
                 elif item["event"] == "pcm":
                     track = data["track"]
                     entry = cycle["streams"].setdefault(STREAM_ROLES[track], {

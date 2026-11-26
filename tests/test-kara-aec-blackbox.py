@@ -1,7 +1,9 @@
 #!/usr/bin/python3 -B
 """The offline replay accepts shared frames and refuses a different graph."""
 from pathlib import Path
+import json
 import runpy
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -65,6 +67,8 @@ class ReplayTests(unittest.TestCase):
             echo[1920:] = mono[:-1920] * .6
             base = 1_000_000_000
             manager.emit("party", "turn-start", **turn)
+            manager.emit("audio", "route", **turn, audio_configuration_id="fixture-production",
+                         capture_settings={"capture_output": {"codec": "fixture"}})
             for first in range(0, len(mono), 960):
                 stop = first + 960
                 stamp = base + first * 1_000_000_000 // rate
@@ -93,6 +97,17 @@ class ReplayTests(unittest.TestCase):
             self.assertGreater(metrics["variants"]["unchanged"]["reference_correlation"], .99)
             self.assertEqual(wave_layout(export / "reference.wav")[:3], (rate, 2, len(mic)))
             self.assertEqual((export / "aec3.wav").stat().st_mode & 0o777, 0o600)
+            receipt = Path(directory) / "calibration.json"
+            receipt.write_text(json.dumps({"audio_configuration_id": "obsolete", "delay_ms": 40}))
+            cli = [sys.executable, "-B", str(Path(__file__).resolve().parents[1] / "bin/kara-blackbox"),
+                   "--root", str(manager.root), "compare-aec", session,
+                   "--cycle", f"{session}/{turn['turn']}", "--calibration", str(receipt)]
+            rejected = subprocess.run(cli, capture_output=True, text=True, timeout=10)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("configuration audio a changé", rejected.stderr)
+            receipt.write_text(json.dumps({"audio_configuration_id": "fixture-production", "delay_ms": 40}))
+            qualified = json.loads(subprocess.check_output(cli, text=True, timeout=10))
+            self.assertEqual(qualified["comparison"]["delay_candidate_ms"], 40)
 
 
 if __name__ == "__main__":

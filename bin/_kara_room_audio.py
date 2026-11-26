@@ -1,8 +1,11 @@
 """Turn-owned wireless capture, reusing the protected Kara return monitor."""
 import asyncio
 from dataclasses import dataclass, field
+from hashlib import sha256
 from ipaddress import ip_address
+import json
 import os
+import re
 from secrets import token_hex, token_urlsafe
 import socket
 import struct
@@ -17,8 +20,8 @@ from scipy.signal import resample_poly
 
 from _kara_audio_calibration import selected_target
 from _kara_mobile_room import RoomError
-from _kara_monitor_profiles import (DEFAULTS, MIX_TRIALS, PROFILES, PROFILE_PATH, device_key,
-                                    output_port, pulse_sinks, read_profiles)
+from _kara_monitor_profiles import (ALSA_PORT, DEFAULTS, MIX_TRIALS, PROFILES, PROFILE_PATH, device_key,
+                                    output_details, pulse_sinks, read_profiles)
 
 
 @dataclass
@@ -97,6 +100,7 @@ class RoomAudio:
         self.default_preferences = {}
         self.preference_device = None
         self.last_authorized = None
+        self.diagnostic_devices = {}
 
     def status(self):
         return {"available": bool(self.runner and not self.silent), "profile": self.profile, "output": self.output,
@@ -180,16 +184,20 @@ class RoomAudio:
             # Polling and the PCM path never execute system commands.
             trial = self.mix_trial
             if trial and trial.output == "default":
-                targets = [entry["name"] for entry in pulse_sinks()
+                targets = [entry for entry in pulse_sinks()
                            if entry.get("description") == "EDENWOOD PARTY 250 V2"
                            and entry.get("properties", {}).get("api.bluez5.codec") == "sbc"]
                 if len(targets) != 1:
                     raise RoomError("Le profil attend la sortie EDENWOOD en SBC.", 409)
-                sink, port = targets[0], None
+                output, port = targets[0], None
+                sink = output["name"]
             else:
                 future = asyncio.run_coroutine_threadsafe(selected_target(self.output), self.loop)
                 sink = future.result(timeout=1)
-                port = output_port(sink)
+                output = output_details(sink)
+                port = output.get("active_port")
+                if not isinstance(port, str) or not re.fullmatch(ALSA_PORT, port, flags=re.ASCII):
+                    port = None
             device = device_key(sink, port) or sink
             settings = dict(read_profiles(PROFILE_PATH).get(device, DEFAULTS))
         except RoomError:
@@ -211,6 +219,17 @@ class RoomAudio:
             # The organizer can increase the ceiling in explicit steps.
             settings["turn_return_drive"] = 3.
         settings["echo_guard"] = True
+        # Read the same sink snapshot used for route admission. A generated
+        # device ID avoids storing a MAC and changes conservatively on restart.
+        if device not in self.diagnostic_devices:
+            self.diagnostic_devices[device] = token_hex(16)
+        device_id = self.diagnostic_devices[device]
+        codec = output.get("properties", {}).get("api.bluez5.codec")
+        specification = output.get("sample_specification")
+        settings["capture_output"] = {"device_ref": device_id, "port": port,
+                                      "codec": codec if isinstance(codec, str) and len(codec) <= 32 else None,
+                                      "sample_specification": specification if isinstance(specification, str)
+                                      and len(specification) <= 64 else None}
         return sink, device, settings
 
     def open_turn(self, owner, player, turn, song, *, scoring=True, require_consent=False):
@@ -225,12 +244,13 @@ class RoomAudio:
             self.route = Route(owner, player, turn, song, sink, device, settings, volume, sender, scoring=scoring)
             self.last_authorized = None
             self.route.return_enabled = not require_consent
+        configuration = {key: settings[key] for key in ("mic_gain_percent", "chrome_echo", "chrome_noise",
+                         "profile", "pulse_buffer", "echo_guard", "capture_output") if key in settings}
+        configuration_id = sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
         self.diagnostics.emit("audio", "route", player=player, turn=turn, song=song, output=sink,
                               profile=settings["profile"], guard=True, requested_percent=volume, scoring=scoring,
-                              trial=self.mix_trial_name,
-                              capture_settings={key: settings[key] for key in
-                                                ("mic_gain_percent", "chrome_echo", "chrome_noise", "pulse_buffer")
-                                                if key in settings})
+                              trial=self.mix_trial_name, capture_settings=configuration,
+                              audio_configuration_id=configuration_id)
         return reader
 
     def close_turn(self):
