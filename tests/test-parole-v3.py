@@ -166,6 +166,11 @@ class InventoryTests(Fixture):
         self.assertEqual(row["lyrics"], "Strawberry")
         self.assertEqual(json.loads(row["info"])["plain"], "Tout commence ici")
         self.assertEqual(sha256(db.read_bytes()).digest(), before)
+        self.index.notify([song], now=1)
+        _, events = self.index.events(2)
+        replay = self.scan(db=db, events=events, reader=lambda _: self.fail("relecture du catalogue inchangé"))
+        self.assertEqual((replay["changed"], replay["unchanged"], replay["delivered"]), (0, 1, 1))
+        self.assertEqual(dict(self.songs()[0]), dict(row))
         with closing(sqlite3.connect(db)) as source, source:
             source.execute("ALTER TABLE songs ADD COLUMN genre")
             source.execute("UPDATE songs SET genre='Rap français'")

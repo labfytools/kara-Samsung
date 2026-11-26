@@ -783,7 +783,9 @@ def collection_reader(database, root, *, targeted=False):
                 marks = ",".join("?" for _ in variants)
                 condition = (" AND " if where else " WHERE ") + f"url IN ({marks})"
                 rows = {}
-                for row in db.execute("SELECT " + selected + " FROM songs" + where + condition + " ORDER BY rowid",
+                # Keep the exact same row layout as the full reader. The
+                # stored catalogue revision includes the selected rowid.
+                for row in db.execute("SELECT rowid," + selected + " FROM songs" + where + condition + " ORDER BY rowid",
                                       tuple(variants)):
                     rows.setdefault(variants[row["url"]], row)
                 return rows
