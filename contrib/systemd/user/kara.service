@@ -5,7 +5,10 @@ After=graphical-session-pre.target pipewire.service pipewire-pulse.service app-o
 Wants=pipewire.service pipewire-pulse.service app-org.strawberrymusicplayer.strawberry@autostart.service
 
 [Service]
-Type=exec
+# The launcher may reopen the window as soon as systemctl returns.
+# Wait for the service's session name before accepting that handoff.
+Type=dbus
+BusName=fr.labfy.ParolesStrawberry
 ExecStart=%h/.local/bin/paroles-strawberry --service
 Restart=on-failure
 RestartSec=8s

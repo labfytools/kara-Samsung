@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Attendre que Kara possède son nom D-Bus avant de terminer le démarrage du service.
 - Traiter les correspondances PCM locales même quand les quotas des fournisseurs sont épuisés.
 - Écouter les passages incertains d’un brouillon sur le mix ou la voix déjà séparée.
 - Enregistrer les refus d’accès HTTP des fournisseurs de paroles et appliquer leur temporisation avant de réessayer.
