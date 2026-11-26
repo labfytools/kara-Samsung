@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Banc hors ligne de repères CTC sur des paroles anglaises connues."""
+"""Banc hors ligne de repères CTC sur des paroles anglaises ou françaises connues."""
 from argparse import ArgumentParser
+from collections import Counter
 from csv import DictReader
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import sys
 from tempfile import NamedTemporaryFile
 from time import monotonic, sleep, time_ns
+from unicodedata import normalize
 
 HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1] / "bin"))
@@ -21,6 +24,8 @@ KERNEL = 400
 CORE = RATE * 16
 PAD = RATE * 2
 GATES = (0, .20, .40, .60, .80)
+FRENCH_WORDS = re.compile(r"[^\W_]+(?:['-][^\W_]+)*")
+FRENCH_PUNCTUATION = str.maketrans({"’": "'", "‘": "'", "‐": "-", "‑": "-"})
 
 
 def infer(model, source, checkpoint, symbols):
@@ -112,11 +117,13 @@ def viterbi(logp, tokens, blank):
     return spans
 
 
-def predict(logp, vocabulary, target):
+def predict(logp, vocabulary, target, *, language="en"):
     import numpy as np
 
     blank = vocabulary["<pad>"]
-    text = "|".join(target).upper()
+    text = "|".join(target)
+    if language == "en":
+        text = text.upper()
     tokens = [vocabulary[character] for character in text]
     spans = viterbi(logp, tokens, blank)
     position = 0
@@ -135,23 +142,50 @@ def predict(logp, vocabulary, target):
     return output
 
 
-def worker(model, vocab, case_path, source, checkpoint):
+def reference_units(labels, rows, target, parse, language):
+    units, starts, ends, mapping = [], [], [], []
+    for label, row in zip(labels, rows, strict=True):
+        tokens = words(label)
+        if not tokens:
+            continue
+        start, end = parse(row["word_start"]), parse(row["word_end"])
+        if language == "fr":
+            # Preserve trained graphemes and the single acoustic span of a
+            # contraction. Kara's normalized count still checks line order.
+            form = "|".join(FRENCH_WORDS.findall(normalize("NFC", label).casefold().translate(FRENCH_PUNCTUATION)))
+            mapping.extend([len(units)] * len(tokens))
+            units.append(form)
+            starts.append(start)
+            ends.append(end)
+        else:
+            mapping.extend(range(len(units), len(units) + len(tokens)))
+            units.extend(tokens)
+            starts.extend([start] if len(tokens) == 1 else [None] * len(tokens))
+            ends.extend([end] if len(tokens) == 1 else [None] * len(tokens))
+    if len(mapping) != len(target) or not all(units):
+        raise ValueError("Unités CTC de la référence invalides")
+    return units, starts, ends, mapping
+
+
+def worker(model, vocab, case_path, source, checkpoint, language):
     case = json.loads(case_path.read_bytes())
     annotations = Path(case["annotation"])
     vocabulary = json.loads(vocab.read_bytes())
     matcher = runpy.run_path(str(HERE.with_name("qualify-kara-reference-timing.py")))
     parse, summarize = matcher["onset"], matcher["summarize"]
-    target = case["expected"]
+    normalized = case["expected"]
     labels = (annotations / "words.words.txt").read_text().splitlines()
     with (annotations / "manual.csv").open(newline="") as stream:
         rows = list(DictReader(stream))
-    if target != [word for label in labels for word in words(label)]:
+    if normalized != [word for label in labels for word in words(label)]:
         raise ValueError("Référence modifiée")
-    starts, ends = [], []
-    for label, row in zip(labels, rows, strict=True):
-        count = len(words(label))
-        starts.extend([parse(row["word_start"])] if count == 1 else [None] * count)
-        ends.extend([parse(row["word_end"])] if count == 1 else [None] * count)
+    target, starts, ends, mapping = reference_units(labels, rows, normalized, parse, language)
+    if language == "fr" and not set("".join(target)) <= vocabulary.keys():
+        raise ValueError("Graphèmes français hors alphabet du modèle")
+    counts = Counter(mapping)
+    # The historical Turbo timing test excludes linked subtokens. Keep the
+    # same denominator available alongside all original French word spans.
+    comparable_starts = [start if counts[i] == 1 else None for i, start in enumerate(starts)]
     lines = []
     position = 0
     with (annotations / "lines.csv").open(newline="") as stream:
@@ -160,23 +194,23 @@ def worker(model, vocab, case_path, source, checkpoint):
             if not expected:
                 continue
             right = position + len(expected)
-            if expected != target[position:right]:
+            if expected != normalized[position:right]:
                 raise ValueError("Les annotations ligne et mot divergent")
-            lines.append((position, right - 1, parse(line["start_time"]), parse(line["end_time"])))
+            lines.append((mapping[position], mapping[right - 1], parse(line["start_time"]), parse(line["end_time"])))
             position = right
-    if position != len(target):
+    if position != len(normalized):
         raise ValueError("La référence ligne est incomplète")
     began = monotonic()
     logp, reused = infer(model, source, checkpoint, len(vocabulary))
     emission_s = monotonic() - began
-    hypotheses = predict(logp, vocabulary, target)
+    hypotheses = predict(logp, vocabulary, target, language=language)
     # Deliberately corrupt eight evenly spaced words. Their positions do not
     # influence thresholds or normal decoding and act as a negative control.
     altered = target.copy()
     negative = range(19, len(target), max(1, len(target) // 8))
     for i in negative:
         altered[i] = "xylophone"
-    corrupted = predict(logp, vocabulary, altered)
+    corrupted = predict(logp, vocabulary, altered, language=language)
     results = {}
     for name, metric in (("minimum", 2), ("moyenne_geometrique", 3)):
         metrics = results[name] = {}
@@ -189,6 +223,8 @@ def worker(model, vocab, case_path, source, checkpoint):
                 "line_ends": summarize([b for _, _, _, b in lines], [last[j] for _, j, *_ in lines]),
                 "corrupted_accepted": sum(corrupted[i][metric] >= threshold for i in negative),
             }
+            if language == "fr":
+                metrics[str(threshold)]["words_shared_with_turbo"] = summarize(comparable_starts, first)
     print(json.dumps(dict(complete=True, seconds=monotonic() - began, emission_s=emission_s, frames=len(logp),
                           negatives=len(negative), windows_reused=reused, results=results), allow_nan=False), flush=True)
 
@@ -201,6 +237,7 @@ def main():
     parser.add_argument("worker_python", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--vocals", action="store_true")
+    parser.add_argument("--language", choices=("en", "fr"), default="en")
     args = parser.parse_args()
     os.umask(0o077)
     case = json.loads(args.case.read_bytes())
@@ -226,13 +263,15 @@ def main():
     events, reason = [], None
     signature = {"model": digest(args.model), "source": digest(source), "case": digest(args.case),
                  "tool": digest(HERE), "vocabulary": digest(args.vocab)}
+    if args.language != "en":
+        signature["language"] = args.language
     checkpoint = args.destination.resolve().with_suffix(".windows")
     checkpoint.mkdir(mode=0o700, exist_ok=True)
     manifest = checkpoint / "manifest.json"
     command = ["bwrap", "--unshare-net", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
                "--tmpfs", "/tmp", "--bind", str(checkpoint), str(checkpoint),
                str(args.worker_python.absolute()), "-B", str(HERE), "--worker", str(args.model), str(args.vocab),
-               str(args.case), str(source), str(checkpoint)]
+               str(args.case), str(source), str(checkpoint), args.language]
 
     def stop():
         count = len(monitor.samples)
@@ -278,6 +317,7 @@ def main():
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--worker"]:
-        worker(*map(Path, sys.argv[2:]))
+        model, vocab, case, audio, checkpoint, language = sys.argv[2:]
+        worker(Path(model), Path(vocab), Path(case), Path(audio), Path(checkpoint), language)
     else:
         main()
