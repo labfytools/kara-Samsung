@@ -16,6 +16,8 @@ bin/kara-blackbox list
 bin/kara-blackbox summary IDENTIFIANT_SESSION
 bin/kara-blackbox validate IDENTIFIANT_SESSION
 bin/kara-blackbox incidents IDENTIFIANT_SESSION
+bin/kara-blackbox report IDENTIFIANT_SESSION
+bin/kara-blackbox export IDENTIFIANT_SESSION
 ```
 
 Remplacer `IDENTIFIANT_SESSION` par l'identifiant renvoyé par `list`. Voir `bin/kara-blackbox --help` pour les autres commandes. Les rapports et fichiers dérivés doivent rester locaux dans `blackbox/reports/` (ou dans un autre emplacement privé).
@@ -33,4 +35,4 @@ mkdir -m 700 -p blackbox/reports
 
 Ne pas remplacer un chemin existant sans en vérifier la nature et le contenu.
 
-Documentation technique : [Kara V1 — BlackBox](../docs/kara-v1.md) et [Kara V2](../docs/kara-v2.md).
+Documentation [BlackBox V3 — Architecture](../docs/blackbox-v3/architecture.md), [commandes de rejeu](../docs/blackbox-v3/replay.md) et [première partie laboratoire](../docs/blackbox-v3/protocole-physique.md). Le [format historique V1](../docs/kara-v1.md#blackbox) reste lisible.

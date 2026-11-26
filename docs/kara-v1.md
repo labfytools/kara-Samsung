@@ -95,7 +95,9 @@ Les profils SBC sélectionnent l’EDENWOOD connecté directement, indépendamme
 
 ## BlackBox
 
-Activer **BlackBox** avant la sélection des titres, depuis Parole ou **Admin** sur le mobile. Les deux commandes pilotent la même session. **Diagnostics** collecte événements, références et décisions. **Diagnostics + audio** enregistre le PCM reçu sur le Wi-Fi, l’entrée Whisper, le retour numérique, le monitor de la sortie et le micro physique témoin. Obtenir l’accord explicite des participants et des responsables des mineurs pour les voix et le témoin. Le monitor et le témoin sont ouverts pendant la lecture du morceau du tour actif. Le mode silencieux garde les deux fermés. Un marqueur mobile **Signaler un problème** enregistre l’instant sans interrompre le jeu.
+Parole ouvre désormais **BlackBox Studio**. Les réglages actifs, les pistes et le protocole de consentement sont décrits dans la [documentation V3](blackbox-v3/architecture.md). Les informations suivantes décrivent le format historique V1.
+
+Dans V1, **Diagnostics** collectait événements, références et décisions. **Diagnostics + audio** pouvait enregistrer le PCM issu du Wi-Fi, l’entrée du worker, le retour numérique, le monitor de la sortie et le micro physique témoin. Le code historique ouvrait le monitor et le témoin pendant la lecture du morceau du tour actif.
 
 La racine par défaut est `$XDG_STATE_HOME/kara/blackbox`, hors Git, mode 0700. Chaque session contient un manifeste JSON v1, `summary.json`, `events.jsonl`, `incidents.jsonl`, `REPORT.md` et éventuellement des segments WAV PCM16 dans `audio/`. Le manifeste final liste les tailles et SHA-256. Chaque événement a un identifiant croissant, un horodatage monotone serveur en nanosecondes et, selon le composant, un joueur, un tour, un morceau ou une position musicale. Les événements PCM indiquent le fichier, le taux, les canaux, la séquence et les positions d’échantillons. La révision TV relie la publication des paroles au compte rendu du navigateur Tizen.
 
