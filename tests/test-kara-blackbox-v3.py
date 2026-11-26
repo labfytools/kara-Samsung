@@ -260,6 +260,8 @@ class RecordingTests(unittest.TestCase):
         decisions = score_reference_line(expected, observed)
         score = score_breakdown({"lines": [expected]}, {0: decisions})
         self.box.emit("party", "turn-start", **self.turn)
+        self.box.emit("turbo", "window", **self.turn, window=1)
+        self.box.emit("turbo", "window", **self.turn, window=2)
         self.box.emit("scoring", "line-decision", **self.turn, line=0, window=1, observed=observed,
                       reference=expected, source="voice", tolerance=1., decisions=decisions)
         self.box.emit("party", "turn-end", **self.turn, summary=score)
@@ -274,6 +276,10 @@ class RecordingTests(unittest.TestCase):
         output = json.loads(subprocess.check_output([*cli, "words", session], text=True))
         self.assertEqual(output["words"][0]["delay"], .8)
         self.assertTrue(output["words"][0]["credited"])
+        report = json.loads(subprocess.check_output([*cli, "report", session], text=True))
+        cycle = report["cycles"][cycle_id(session, self.turn["turn"])]
+        self.assertEqual(cycle["windows_without_decision"], 1)
+        self.assertEqual(report["counts"]["window-no-result"], 1)
 
 
 if __name__ == "__main__":

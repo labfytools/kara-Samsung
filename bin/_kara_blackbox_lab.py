@@ -16,6 +16,10 @@ OBSERVATIONS = {
     "error": "erreur du composant",
     "tv-software-delay": "reçu logiciel TV tardif",
     "memory-pressure": "attente sous pression mémoire",
+    "window-no-result": "fenêtre journalisée sans décision associée",
+    "word-outside-tolerance": "mot apparié hors de la tolérance du score",
+    "score-source-inconsistent": "crédit sur une source que le score devait exclure",
+    "transcript-repetition": "suite répétée dans la sortie du décodeur",
 }
 
 
@@ -63,6 +67,8 @@ class Cycle:
     scored: int = 0
     score: dict | None = None
     turbo_windows: int = 0
+    pending_windows: dict = field(default_factory=dict)
+    unlisted_windows: int = 0
     turbo_frames: dict = field(default_factory=dict)
     missing_turbo: int = 0
     recorded_turbo: int = 0
@@ -110,6 +116,7 @@ class Cycle:
 
     def score_decision(self, data):
         self.scored += 1
+        self.pending_windows.pop(data.get("window"), None)
         for call in (data.get("decoder") or {}).get("decodes", ()):
             if not call.get("input_sha256"):
                 continue
@@ -153,6 +160,8 @@ class Cycle:
                     else "insufficient_overlap" if pairs else "missing_timing_or_tracks"),
                 "physical_alignment_bound_ns": None, "renderer_drift_ppm_intervals": drift,
                 "rx_gaps_reported": self.gaps, "turbo_windows": self.turbo_windows,
+                "windows_without_decision": len(self.pending_windows),
+                "windows_over_analysis_limit": self.unlisted_windows,
                 "turbo_capture": {"calls_with_all_frames": self.recorded_turbo,
                                   "missing_calls": self.missing_turbo, "unconfirmed_calls": len(self.turbo_frames)},
                 "score_decisions": self.scored, "score": self.score}
@@ -163,23 +172,47 @@ def analyze(folder):
     clients, metrics = {}, {}
     evidence = []
     first, last = None, None
+    total_scores = total_windows = 0
+
+    def observation(kind, row, stamp, cycle_id):
+        occurrences[kind] += 1
+        if len(evidence) < 1000:
+            evidence.append({"event_id": row, "cycle": cycle_id, "observed": kind,
+                             "description": OBSERVATIONS[kind], "elapsed_ns": stamp - first})
+
     for row in events(folder / "events.jsonl"):
         stamp = row["monotonic_ns"]
         first = stamp if first is None else first
         last = stamp
         event, data = row["event"], row.get("data", {})
-        key = row.get("cycle")
-        if key and key not in cycles:
-            cycles[key] = Cycle()
-        cycle = cycles.get(key)
+        cycle_id = row.get("cycle")
+        if cycle_id and cycle_id not in cycles:
+            cycles[cycle_id] = Cycle()
+        cycle = cycles.get(cycle_id)
         if cycle and row["component"] == "audio" and event == "pcm":
             cycle.add_pcm(row)
         elif cycle and row["component"] == "clock" and event == "mobile-anchor":
             cycle.add_anchor(row)
-        elif cycle and event == "window" and row["component"] == "turbo":
-            cycle.turbo_windows += 1
-        elif cycle and event == "line-decision" and row["component"] == "scoring":
-            cycle.score_decision(data)
+        elif event == "window" and row["component"] == "turbo":
+            total_windows += 1
+            if cycle:
+                cycle.turbo_windows += 1
+                cycle.pending_windows[data["window"]] = row["id"], stamp
+                if len(cycle.pending_windows) > MAX_RANGES:
+                    cycle.pending_windows.pop(next(iter(cycle.pending_windows)))
+                    cycle.unlisted_windows += 1
+        elif event == "line-decision" and row["component"] == "scoring":
+            total_scores += 1
+            if cycle:
+                cycle.score_decision(data)
+            decisions = data.get("decisions", ())
+            if any(item["status"] in ("early", "late") for item in decisions):
+                observation("word-outside-tolerance", row["id"], stamp, cycle_id)
+            if data.get("source") != "voice" and any(item["status"] == "correct" for item in decisions):
+                observation("score-source-inconsistent", row["id"], stamp, cycle_id)
+            heard = tuple(word.get("word") for word in (data.get("raw_observed") or ()))
+            if any(heard[i:i + 3] == heard[i + 3:i + 6] == heard[i + 6:i + 9] for i in range(len(heard) - 8)):
+                observation("transcript-repetition", row["id"], stamp, cycle_id)
         elif cycle and event == "turn-end" and row["component"] == "party":
             cycle.score = data.get("summary")
         if event == "browser-capture" and data.get("connection"):
@@ -207,12 +240,14 @@ def analyze(folder):
             if cycle:
                 cycle.gaps += data["missing"]
         elif event in OBSERVATIONS:
-            occurrences[event] += 1
-            if len(evidence) < 1000:
-                evidence.append({"event_id": row["id"], "cycle": row.get("cycle"), "observed": event,
-                                 "description": OBSERVATIONS[event], "elapsed_ns": stamp - first})
+            observation(event, row["id"], stamp, cycle_id)
+    for cycle_id, cycle in cycles.items():
+        for event_id, stamp in cycle.pending_windows.values():
+            observation("window-no-result", event_id, stamp, cycle_id)
+    evidence.sort(key=lambda entry: entry["event_id"])
     return {"version": 1, "duration_ns": last - first if last is not None else 0,
             "cycles": {key: cycle.describe() for key, cycle in cycles.items()},
+            "score_decisions": total_scores, "turbo_windows": total_windows,
             "transport": dict(transport), "browser_counters": {
                 "sent_reported": sum(item.get("sent", 0) for item in clients.values()),
                 "dropped_reported": sum(item.get("dropped", 0) for item in clients.values()),
@@ -227,7 +262,7 @@ def redacted(report):
     return {"version": report["version"], "duration_ns": report["duration_ns"],
             "cycles": len(report["cycles"]),
             "aec_states": dict(Counter(item["aec_state"] for item in report["cycles"].values())),
-            "score_decisions": sum(item["score_decisions"] for item in report["cycles"].values()),
-            "turbo_windows": sum(item["turbo_windows"] for item in report["cycles"].values()),
+            "score_decisions": report.get("score_decisions", sum(item["score_decisions"] for item in report["cycles"].values())),
+            "turbo_windows": report.get("turbo_windows", sum(item["turbo_windows"] for item in report["cycles"].values())),
             "transport": report["transport"], "counts": report["counts"],
             "physical_alignment_bound_ns": None}

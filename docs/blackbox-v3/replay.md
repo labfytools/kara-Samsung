@@ -13,6 +13,8 @@ bin/kara-blackbox export latest --output blackbox/reports/rapport-expurge.json
 
 Le manifeste donne les cycles et l’état des flux. Le rapport automatique `analysis.json` contient les plages, le recouvrement des pistes et les preuves d’incident. Il est produit pendant la finalisation puis inscrit dans l’inventaire SHA-256. Le rapport expurgé contient des compteurs, des durées agrégées et des états de qualification. Les identifiants de session, noms, paroles, transcriptions, chemins, empreintes du contenu, horloges brutes et commentaires restent dans la capture privée.
 
+Les détections de fenêtres sans décision, mots hors tolérance, crédits incohérents, répétitions, pression mémoire et retards logiciels de la TV pointent vers les événements qui les justifient. Une répétition observée peut venir du chant ou du modèle. Une fenêtre sans décision peut correspondre à une interruption ou une perte de journalisation. Les preuves permettent de confronter ces hypothèses à l’audio.
+
 Dans Parole, le bouton **BlackBox** ouvre **BlackBox Studio**. Les onglets affichent la capture et le prévol, les sessions et l’intégrité, la chronologie et le rapport. La chronologie lit une fenêtre de 2 à 30 s et agrège les crêtes à la demande. Les événements sélectionnés donnent les paroles, décisions et identifiants enregistrés. L’aperçu graphique utilise le temps de publication du journal. Les rapprochements AEC emploient les horloges de source du rapport. L’onglet **Rapport et rejeu** permet le comparatif de score ou l’AEC du cycle sélectionné. Le terminal fournit l’extraction audio et l’export de rapport vers un fichier privé.
 
 ## Rejeu ciblé

@@ -481,7 +481,7 @@ def main():
             from itertools import islice
             from _kara_blackbox import INCIDENTS
             kind = args.action
-            if kind in ("compare", "replay-timeline"):
+            if kind in ("replay", "compare", "replay-timeline"):
                 validate_recording(folder, read(folder / "manifest.json"))
             if kind == "compare" and not args.tolerance:
                 raise ValueError("Indique une ou deux tolérances candidates avec --tolerance.")
