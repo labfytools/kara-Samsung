@@ -13,6 +13,7 @@
 | `test-kara-preparation.py` | 37 cas passent dans le venv de score. |
 | `test-kara-aec-blackbox.py` | Le témoin de grille commune passe, avec une estimation synthétique de 40 ms. Le témoin à pilotes distincts est refusé. |
 | Tizen et code natif | Scénario JavaScript Tizen réussi. Syntaxe C17 stricte du wrapper DTW validée contre les en-têtes du moteur installé. |
+| BlackBox Studio | Les deux cas passent dans Sway headless sous bus D-Bus isolé. Le test charge une capture synthétique, affiche sa chronologie et vérifie ses empreintes. |
 
 Le premier lancement de `test-kara-turn-mix.py` avec le Python système n’avait pas `pywhispercpp`. L’exécution a ensuite utilisé le venv du moteur. Le premier passage après ajout d’un ticket dans la fixture omettait trois propriétés de route. Les propriétés ont été ajoutées et les quatre cas sont passés.
 

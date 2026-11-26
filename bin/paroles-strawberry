@@ -157,6 +157,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.blackbox = BlackBox(max_bytes=int(os.environ["KARA_BLACKBOX_MAX_BYTES"])
                                  if "KARA_BLACKBOX_MAX_BYTES" in os.environ else None)
         self.blackbox_ui = None
+        self.blackbox_studio = None
         self.blackbox_disk_check = 0.
         self.blackbox_disk_task = None
         self.bb_line = None
@@ -241,7 +242,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_toggle.connect("toggled", self.album_import.toggle)
         self.music_sync = MusicSync(self, LIBRARY, BIN)
         self.blackbox_button = Gtk.Button(label="BlackBox", tooltip_text="Enregistrer les diagnostics de la partie")
-        self.blackbox_button.connect("clicked", self.toggle_blackbox)
+        self.blackbox_button.connect("clicked", self.show_blackbox_studio)
 
         # Existing V2 UI state feeds TV and local tools. The lyric widgets
         # are kept detached so no desktop viewport animates during playback.
@@ -543,7 +544,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
         self.vocal_effect.observe_output(submit)
 
-    def toggle_blackbox(self, _button):
+    def show_blackbox_studio(self, _button):
+        from _kara_blackbox_studio import BlackBoxStudio
+
+        if self.blackbox_studio is None:
+            self.blackbox_studio = BlackBoxStudio(self)
+        self.blackbox_studio.show_studio()
+
+    def toggle_blackbox(self, _button, *, parent=None):
+        parent = parent or self
         status = self.blackbox.status()
         if status["active"]:
             self.stop_blackbox()
@@ -567,9 +576,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
                     if choice in (1, 2):
                         self.start_blackbox(True, voice=choice == 2)
                 except (OSError, ValueError, GLib.Error) as error:
-                    Gtk.AlertDialog(message="BlackBox indisponible", detail=str(error)).show(self)
+                    Gtk.AlertDialog(message="BlackBox indisponible", detail=str(error)).show(parent)
 
-            dialog.choose(self, None, confirmed)
+            dialog.choose(parent, None, confirmed)
 
     def blackbox_preflight(self):
         from _kara_blackbox import MIN_FREE
@@ -606,7 +615,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if (label, state["error"], state["latest"]) != self.blackbox_ui:
             self.blackbox_ui = label, state["error"], state["latest"]
             self.blackbox_button.set_label(label)
-            self.blackbox_button.set_sensitive(not state["finalizing"])
             if state["active"]:
                 self.blackbox_button.add_css_class("destructive-action")
             else:

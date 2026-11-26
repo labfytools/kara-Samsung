@@ -439,6 +439,8 @@ class BlackBox:
             if storage:
                 status["free_bytes"] = self.free_bytes
                 status["verified"] = self.verified
+                status["bytes_written"] = record.bytes_written if record else 0
+                status["elapsed_ns"] = max(0, time.monotonic_ns() - record.manifest["monotonic_ns"]) if record else 0
                 status["voice"] = bool(record and record.manifest["capture"]["voice"])
                 status["witness"] = bool(record and "witness" in record.tracks)
                 status["unavailable"] = sorted(record.unavailable) if record else []
@@ -856,6 +858,7 @@ class Recording:
         self.thread = Thread(target=self.write, name="kara-blackbox", daemon=True)
         self.reason = "interrupted"
         self.dropped = self.sequence = 0
+        self.bytes_written = 0
         self.segments = {}
         self.pcm_titles = {}
         self.players = {}
@@ -950,6 +953,7 @@ class Recording:
                         raise OSError("Limite de taille BlackBox atteinte.")
                     stream.write(raw)
                     written += len(raw)
+                    self.bytes_written = written
                 stream.flush()
                 os.fsync(stream.fileno())
         except OSError as exc:
