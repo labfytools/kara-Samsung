@@ -16,6 +16,11 @@ MANAGER = "/org/freedesktop/login1"
 PROFILES = "org.freedesktop.UPower.PowerProfiles"
 PROFILES_PATH = "/org/freedesktop/UPower/PowerProfiles"
 
+# A short loss of the AC signal must stop work immediately, but need not
+# release an already armed lid inhibitor before the signal is stable.
+POWER_LOSS_GRACE = 15.
+POWER_RECOVERY_STABLE = 2.
+
 
 def mains_online(root=Path("/sys/class/power_supply")):
     """True pour un secteur système confirmé, False hors secteur, None si inconnu."""
@@ -213,6 +218,8 @@ class Night:
         self.profile = self.locker = None
         self.desktop = None
         self.power = "unread"
+        self.power_loss_since = self.power_recovery_since = None
+        self.power_online_since = None
         self.next_desktop = self.next_sleep = self.next_lock = self.next_display = 0.
         self.open_since = None
         self.reopened = self.restore_display = False
@@ -253,6 +260,8 @@ class Night:
         else:
             self.stop_work()
         self.release_after_work = False
+        self.power_loss_since = self.power_recovery_since = None
+        self.power_online_since = None
         if self.locker is not None:
             process, self.locker = self.locker, None
             if process.poll() is None:
@@ -346,6 +355,38 @@ class Night:
             self.next_display = now + .85
             self.login.display(on)
 
+    def power_ready(self, power, state, settings, *, running):
+        # Never admit computation from a cached positive AC reading. The
+        # grace only preserves a lid inhibitor already held for this closure.
+        # CLOCK_BOOTTIME bounds the episode even if the system sleeps.
+        protected = (self.lid_fd is not None and state is not None and state.lid
+                     and state.active and not state.sleeping
+                     and settings["night_lid"] and settings["night_lid_qualified"])
+        if not protected:
+            self.power_loss_since = self.power_recovery_since = None
+            if power is not True:
+                return self.suspend("secteur requis", running=running)
+            return True
+        now = clock_gettime(CLOCK_BOOTTIME)
+        if power is not True:
+            if self.power_loss_since is None:
+                self.power_loss_since = now
+            self.power_recovery_since = None
+        elif self.power_loss_since is None:
+            return True
+        elif self.power_recovery_since is None:
+            self.power_recovery_since = now
+        elif now - self.power_recovery_since >= POWER_RECOVERY_STABLE:
+            self.power_loss_since = self.power_recovery_since = None
+            self.journal.emit("IDLE", "Secteur stabilisé · reprise du mode capot fermé")
+            return True
+        if now - self.power_loss_since >= POWER_LOSS_GRACE:
+            return self.suspend("secteur requis", running=running)
+        # The caller interrupts the active process and retains its checkpoint.
+        # Do not set release_after_work: stop_work keeps the lid and idle FDs
+        # until the grace expires, even if no task is runnable.
+        return self.report("Secteur instable · traitements suspendus · confirmation avant libération du capot")
+
     def refresh(self, settings, *, running=False, fast=False):
         # Arm while the lid is still open, independently of idle, queue
         # contents and the admission of compute-intensive work.
@@ -359,8 +400,14 @@ class Night:
                      "Fonctionnement sur batterie" if power is False else "Alimentation inconnue")
             self.journal.emit("IDLE", event)
             self.power = power
-        if power is not True and running:
-            return self.suspend("secteur requis", running=True)
+        # Require fresh, continuous AC evidence before arming a closed lid.
+        # A previously released inhibitor can be recovered without reopening
+        # the computer, provided logind is awake and the night policy permits it.
+        power_now = clock_gettime(CLOCK_BOOTTIME)
+        if power is not True:
+            self.power_online_since = None
+        elif self.power_online_since is None:
+            self.power_online_since = power_now
         now = monotonic()
         try:
             if self.login is None:
@@ -368,6 +415,7 @@ class Night:
             if fast and now >= self.next_sleep:
                 self.next_sleep = now + .35
                 if self.login.sleeping():
+                    self.power_online_since = None
                     return self.suspend("mise en veille demandée par logind", running=running)
             if now >= self.next_desktop:
                 self.next_desktop = now + .85
@@ -387,9 +435,8 @@ class Night:
                         self.stop_work()
         except self.errors():
             return self.suspend("état de la session Sway ou logind indisponible", running=running)
-        if power is not True:
-            return self.suspend("secteur requis", running=running)
         if state is None or state.sleeping:
+            self.power_online_since = None
             return self.suspend("mise en veille demandée par logind", running=running)
         if not state.active:
             return self.suspend("session Sway inactive", running=running)
@@ -398,10 +445,21 @@ class Night:
         allowed = settings["night_lid"] and settings["night_lid_qualified"]
         if not allowed and self.lid_fd is not None:
             return self.suspend("option capot fermé ou qualification thermique désactivée", running=running)
+        if not self.power_ready(power, state, settings, running=running):
+            return False
         try:
-            if allowed and self.lid_fd is None and not state.lid:
+            if allowed and self.lid_fd is None:
+                if state.lid:
+                    if power_now - self.power_online_since < POWER_RECOVERY_STABLE:
+                        return self.report("Capot fermé · stabilisation du secteur avant réarmement")
+                    # Do not acquire during an actual suspend request, even
+                    # if a cached desktop observation still looks awake.
+                    if self.login.sleeping():
+                        self.power_online_since = None
+                        return self.suspend("mise en veille demandée par logind", running=running)
                 self.lid_fd = self.login.inhibit("handle-lid-switch", "block")
-                self.journal.emit("IDLE", "Inhibiteur de capot actif · prêt avant fermeture")
+                self.journal.emit("IDLE", "Inhibiteur de capot réarmé · secteur stable, capot fermé"
+                                  if state.lid else "Inhibiteur de capot actif · prêt avant fermeture")
             if self.lid_fd is not None and state.lid:
                 self.restore_display = True
                 self.start_budget()

@@ -18,7 +18,7 @@ from _kara_refine import VERSION as REFINEMENT_VERSION
 from _kara_turbo import ObservedWord
 from _parole_index import document, inventory, sidecar
 from _parole_maintenance import Maintenance
-from _parole_night import Desktop, Login, Night, mains_online
+from _parole_night import Desktop, Login, Night, mains_online, POWER_LOSS_GRACE, POWER_RECOVERY_STABLE
 from _parole_transcribe import proposals, review_ranges
 
 
@@ -115,11 +115,94 @@ class NightTests(unittest.TestCase):
         self.assertEqual(self.night.lid_fd, fd)
         self.ac = False
         self.assertFalse(self.night.refresh(self.settings))
+        self.assertEqual(self.night.lid_fd, fd)
+        self.night.power_loss_since -= POWER_LOSS_GRACE + 1
+        self.assertFalse(self.night.refresh(self.settings))
         with self.assertRaises(OSError):
             os.fstat(fd)
         self.assertIsNone(self.night.fd)
         self.ac = True
         self.assertFalse(self.night.check(self.settings))
+        self.assertIsNone(self.night.lid_fd)
+        self.night.power_online_since -= POWER_RECOVERY_STABLE + 1
+        self.assertTrue(self.night.check(self.settings))
+        self.assertIsNotNone(self.night.lid_fd)
+
+    def test_closed_ac_flicker_stops_work_and_retains_inhibitor(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.open()
+        self.assertTrue(self.observe(lid=True))
+        fd, budget = self.night.lid_fd, self.night.budget
+        self.ac = False
+        self.assertFalse(self.night.refresh(self.settings, running=True))
+        self.assertFalse(self.night.release_after_work)
+        self.night.stop_work()
+        self.assertEqual(self.night.lid_fd, fd)
+        self.assertIsNone(self.night.delay)
+        self.assertIsNone(self.owner.index.closed_progress()["ended"])
+        self.ac = True
+        self.assertFalse(self.night.check(self.settings))
+        self.night.power_recovery_since -= POWER_RECOVERY_STABLE + 1
+        self.assertTrue(self.night.check(self.settings))
+        self.assertEqual(self.night.lid_fd, fd)
+        self.assertEqual(self.night.budget, budget)
+        self.assertIsNone(self.night.power_loss_since)
+
+    def test_repeated_unstable_power_does_not_extend_grace(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.open()
+        self.assertTrue(self.observe(lid=True))
+        self.ac = None
+        self.assertFalse(self.night.check(self.settings))
+        started = self.night.power_loss_since
+        self.ac = True
+        self.assertFalse(self.night.check(self.settings))
+        self.ac = False
+        self.assertFalse(self.night.check(self.settings))
+        self.assertEqual(self.night.power_loss_since, started)
+        self.night.power_loss_since -= POWER_LOSS_GRACE + 1
+        self.assertFalse(self.night.check(self.settings))
+        self.assertIsNone(self.night.lid_fd)
+
+    def test_manual_sleep_overrides_power_grace(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.open()
+        self.assertTrue(self.observe(lid=True))
+        self.ac = False
+        self.assertFalse(self.night.check(self.settings))
+        self.assertIsNotNone(self.night.lid_fd)
+        self.assertFalse(self.observe(sleeping=True))
+        self.assertIsNone(self.night.lid_fd)
+
+    def test_open_lid_battery_releases_immediately(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.assertTrue(self.night.refresh(self.settings))
+        self.ac = False
+        self.assertFalse(self.night.refresh(self.settings))
+        self.assertIsNone(self.night.lid_fd)
+
+    def test_restart_closed_on_ac_waits_for_stability_and_lock(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.state = Desktop(True, False, False, True, False)
+        self.assertFalse(self.night.refresh(self.settings))
+        self.assertIsNone(self.night.lid_fd)
+        self.night.power_online_since -= POWER_RECOVERY_STABLE + 1
+        self.assertFalse(self.night.refresh(self.settings))
+        self.assertIsNotNone(self.night.lid_fd)
+        self.login.request_lock.assert_called_once()
+        self.assertFalse(self.observe(locked=True))
+        self.login.display.assert_called_once_with(False)
+        self.assertTrue(self.observe(screen_off=True))
+
+    def test_closed_rearm_never_bypasses_manual_sleep_or_expired_budget(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.state = replace(self.state, lid=True, sleeping=True)
+        self.assertFalse(self.night.refresh(self.settings))
+        self.assertIsNone(self.night.lid_fd)
+        self.assertFalse(self.observe(sleeping=False))
+        self.night.power_online_since -= POWER_RECOVERY_STABLE + 1
+        self.night.budget = 1.
+        self.assertFalse(self.night.refresh(self.settings))
         self.assertIsNone(self.night.lid_fd)
 
     def test_ambiguous_opening_does_not_light_displays_or_reset_budget(self):
@@ -247,6 +330,9 @@ class NightTests(unittest.TestCase):
         self.assertIsNone(report["ended"])
         self.assertEqual(self.owner.index.night_progress()[3]["ready"], 1)
         self.ac = False
+        self.owner.tick()
+        self.assertIsNone(self.owner.index.closed_progress()["ended"])
+        self.night.power_loss_since -= POWER_LOSS_GRACE + 1
         self.owner.tick()
         report = self.owner.index.closed_progress()
         self.assertIsNotNone(report["ended"])
