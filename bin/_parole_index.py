@@ -40,29 +40,38 @@ LYRIC_KEYS = ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
 SKIP_TOP = {INBOX, "YouTube"}
 LOCAL_REFERENCE_MISS = "aucune preuve locale"
 
-# Start with indexed PCM identities, avoiding a scan of every waiting
-# network task when provider quotas are exhausted. Eligibility is a hint.
+# Start with indexed PCM identities and embedded LRCs. A local turn must
+# stay cheap even when thousands of network tasks are waiting for quotas.
 # The worker still verifies the waveform identity receipt and current files.
 LOCAL_REFERENCE_SCOPE = """
-    FROM songs AS target INDEXED BY songs_audio
+    FROM (
+        SELECT id,audio,lyrics,lrc,checked FROM songs INDEXED BY songs_audio
+        WHERE audio>'' AND length(audio)=64
+        UNION ALL
+        SELECT id,audio,lyrics,lrc,checked FROM songs WHERE lrc='intégré'
+        AND NOT (audio>'' AND length(audio)=64)
+    ) AS target
     CROSS JOIN (SELECT 'lyrics' AS kind UNION ALL SELECT 'lrc') AS category
     CROSS JOIN tasks AS candidate
-    WHERE target.audio>'' AND length(target.audio)=64
-      AND candidate.kind=category.kind AND candidate.subject=target.id
-      AND ((candidate.kind='lyrics' AND target.lyrics='absent')
-           OR (candidate.kind='lrc' AND target.lrc='absent'))
-      AND EXISTS (
-          SELECT 1 FROM songs AS donor WHERE donor.audio=target.audio AND donor.id<>target.id
-            AND (donor.lrc IN ('local','externe','généré')
-                 OR (candidate.kind='lyrics' AND donor.lyrics NOT IN ('absent','instrumental')))
-            AND (candidate.detail<>? OR donor.checked>candidate.updated OR target.checked>candidate.updated)
-          )
+    WHERE candidate.kind=category.kind AND candidate.subject=target.id
+      AND (
+          (candidate.kind='lrc' AND target.lrc='intégré' AND (candidate.detail<>? OR target.checked>candidate.updated))
+          OR (length(target.audio)=64
+              AND ((candidate.kind='lyrics' AND target.lyrics='absent')
+                   OR (candidate.kind='lrc' AND target.lrc='absent'))
+              AND EXISTS (
+                  SELECT 1 FROM songs AS donor WHERE donor.audio=target.audio AND donor.id<>target.id
+                    AND (donor.lrc IN ('local','externe','généré')
+                         OR (candidate.kind='lyrics' AND donor.lyrics NOT IN ('absent','instrumental')))
+                    AND (candidate.detail<>? OR donor.checked>candidate.updated OR target.checked>candidate.updated)
+              ))
+      )
       AND
 """
 
 
 def task_scope(local_reference):
-    return ((LOCAL_REFERENCE_SCOPE, (LOCAL_REFERENCE_MISS,)) if local_reference
+    return ((LOCAL_REFERENCE_SCOPE, (LOCAL_REFERENCE_MISS, LOCAL_REFERENCE_MISS)) if local_reference
             else ("FROM tasks AS candidate WHERE", ()))
 
 
@@ -112,6 +121,7 @@ class Index:
                 CREATE INDEX IF NOT EXISTS songs_edition ON songs(edition, disc, track);
                 CREATE INDEX IF NOT EXISTS songs_inode ON songs(dev, inode);
                 CREATE INDEX IF NOT EXISTS songs_audio ON songs(audio);
+                CREATE INDEX IF NOT EXISTS songs_lrc_embedded ON songs(lrc) WHERE lrc='intégré';
                 CREATE TABLE IF NOT EXISTS tasks (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL,
                     priority INTEGER NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,

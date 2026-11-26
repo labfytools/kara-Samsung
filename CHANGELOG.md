@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Donner un tour aux références locales même lorsque le réseau est disponible et exporter les LRC déjà intégrés sans requête fournisseur.
 - Attendre que Kara possède son nom D-Bus avant de terminer le démarrage du service.
 - Traiter les correspondances PCM locales même quand les quotas des fournisseurs sont épuisés.
 - Écouter les passages incertains d’un brouillon sur le mix ou la voix déjà séparée.

@@ -44,13 +44,13 @@ class Fixture(unittest.TestCase):
         self.root.mkdir()
         self.index = Index(self.root, self.base / "state")
 
-    def audio(self, name="01 Chanson.flac", *, title="Chanson"):
+    def audio(self, name="01 Chanson.flac", *, title="Chanson", lyrics=""):
         path = self.root / "Groupe" / "Album" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                         "-t", "5", "-metadata", f"title={title}", "-metadata", "artist=Groupe, Invité",
                         "-metadata", "album_artist=Groupe", "-metadata", "album=Album",
-                        "-metadata", "track=1", str(path)], check=True)
+                        "-metadata", "track=1", "-metadata", f"lyrics={lyrics}", str(path)], check=True)
         return path
 
     def scan(self, **kwargs):
@@ -416,6 +416,35 @@ class SourceTests(Fixture):
         self.assertEqual(target.read_bytes(), before)
         source.write_text("[00:01.250]Correction plus récente\n")
         self.assertIsNone(local_reference(self.index, self.index.song(second["id"]), synced=True))
+
+    def test_embedded_lrc_is_materialized_on_a_local_turn_with_or_without_provider_slots(self):
+        embedded = "[00:01.000]Vers déjà présent"
+        for available in (True, False):
+            with self.subTest(provider_slots=available):
+                path = self.audio(f"embedded-{available}.flac", lyrics=embedded)
+                self.scan()
+                song = next(row for row in self.songs() if row["path"] == str(path))
+                self.assertEqual((song["lrc"], song["audio"]), ("intégré", ""))
+                before = path.read_bytes()
+                self.index.enqueue("lrc", song["id"], "fixture")
+                owner = Maintenance(self.root, None, state=self.base / "state")
+                self.addCleanup(owner.close)
+                owner.output = Mock(wraps=owner.output)
+                if not available:
+                    with self.index.db() as db:
+                        db.execute("""INSERT INTO daily_usage(bucket,day,used)
+                                      SELECT 'provider:'||id,date('now','localtime'),200 FROM sources""")
+                settings = owner.current_settings = self.index.settings()
+                kinds = owner.network_kinds(settings, time())
+                self.assertEqual("lrc" in kinds, available)
+                self.assertTrue(self.index.work_due(("lrc",), time(), local_reference=True))
+                self.assertTrue(owner.tick_network(settings, time(), kinds))
+                self.assertEqual(owner.output.call_args.args[0][-1], "--local-reference-only")
+                self.assertEqual(path.with_suffix(".lrc").read_text(), embedded + "\n")
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(self.index.song(song["id"])["lrc"], "local")
+                self.assertFalse(self.index.work_due(("lrc",), time(), local_reference=True))
+                self.assertFalse(self.index.network_yield())
 
     def test_unison_exact_isrc_keeps_attribution_and_discards_lyrics(self):
         from _parole_unison import discover

@@ -539,7 +539,9 @@ class Maintenance:
                 self.journal.emit(kind.upper(), f"Référence PCM locale intégrée · {song['title']}")
                 return "done", "référence PCM locale", 0
             elif kind == "lrc":
-                self.refresh_song(song, lrc="intégré" if provider == "Strawberry" else "externe",
+                # A successful worker has materialized a missing sidecar.
+                # Keep « intégré » for tracks still awaiting extraction.
+                self.refresh_song(song, lrc="local" if provider == "Strawberry" else "externe",
                                   provenance={"lrc_provider": provider})
             else:
                 self.refresh_song(song, lyrics="Strawberry", audio=result["audio"],
@@ -1084,7 +1086,7 @@ class Maintenance:
         song = self.index.song(subject) if kind in ("lyrics", "lrc", *HEAVY) else None
         self.progress = (category, song["title"] if song is not None else "En cours", None)
         if local_reference_only:
-            self.journal.emit(category, "Vérification d’une référence PCM locale")
+            self.journal.emit(category, "Vérification d’une référence locale")
         elif kind not in ("prepare", "codex"):
             self.journal.emit(category, {"lyrics": "Recherche de paroles", "lrc": "Recherche d’un LRC",
                                         "transcription": "Transcription locale pour vérification",
@@ -1359,8 +1361,8 @@ class Maintenance:
                      and (kind != "codex" or now >= settings.get("codex_suspended_until", 0)))
 
     @staticmethod
-    def local_reference_kinds(settings, network_kinds):
-        return tuple(kind for kind in ("lrc", "lyrics") if settings[kind] and kind not in network_kinds)
+    def local_reference_kinds(settings):
+        return tuple(kind for kind in ("lrc", "lyrics") if settings[kind])
 
     def tick_local_reference(self, kinds, now, *, nocturnal):
         task = self.index.claim(kinds, now, local_reference=True)
@@ -1377,7 +1379,7 @@ class Maintenance:
         if manual is not None:
             self.execute(manual, nocturnal=nocturnal)
             return True
-        local_kinds = self.local_reference_kinds(settings, kinds)
+        local_kinds = self.local_reference_kinds(settings)
         try_local_first = self.local_reference_next
         if try_local_first and self.tick_local_reference(local_kinds, now, nocturnal=nocturnal):
             return True
@@ -1420,7 +1422,7 @@ class Maintenance:
     def tick_night(self, settings, now):
         kinds = self.network_kinds(settings, now, nocturnal=True)
         network_due = (self.index.work_due(kinds, now) or
-                       self.index.work_due(self.local_reference_kinds(settings, kinds), now, local_reference=True))
+                       self.index.work_due(self.local_reference_kinds(settings), now, local_reference=True))
         transcription_due = settings["night_transcribe"] and self.index.work_due(("transcription",), now)
         prepare_due = self.index.preparation_due(now)
         # Offer the other class the next turn. A bounded network batch
