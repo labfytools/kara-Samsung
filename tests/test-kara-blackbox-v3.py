@@ -9,7 +9,10 @@ import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import unittest
+from unittest.mock import patch
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
@@ -55,6 +58,30 @@ class RecordingTests(unittest.TestCase):
         manifest["files"]["events.jsonl"] = {"bytes": log.stat().st_size, "sha256": digest(log)}
         with self.assertRaisesRegex(ValueError, "Identité du flux"):
             validate_recording(folder, manifest)
+
+    def test_audio_admission_does_not_wait_for_manifest_sync(self):
+        entered, release = Event(), Event()
+
+        def gated_manifest(path, content):
+            if "provenance" not in content:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("Fixture de synchronisation bloquée")
+            return atomic_json(path, content)
+
+        with ThreadPoolExecutor(max_workers=2) as executor, patch("_kara_blackbox.atomic_json", gated_manifest):
+            setup = executor.submit(self.box.start, consent=True, voice=True)
+            try:
+                self.assertTrue(entered.wait(2))
+                audio = executor.submit(self.box.pcm, "wifi", 48000, 1, bytes(1920), **self.turn)
+                self.assertIsNone(audio.result(timeout=.5))
+                self.box.stop("cancel-open")
+            finally:
+                release.set()
+            setup.result(timeout=2)
+            self.box.stop(wait=True)
+        self.assertFalse(self.box.active())
+        self.assertEqual(self.box.status()["latest"]["reason"], "cancel-open")
 
     def test_marker_is_human_and_scoped_to_turn(self):
         self.box.start(consent=True)

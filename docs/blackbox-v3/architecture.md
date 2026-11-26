@@ -23,6 +23,8 @@ Kara conserve le dossier de session et le journal append-only. Le schéma V3 ajo
 
 Un WAV s’écrit sous suffixe `.part`, est synchronisé avec son en-tête définitif, puis renommé et publié. La fin de session publie le manifeste après les index et rapporte les pertes. Lors d’une interruption, la reprise répare les brouillons RIFF lisibles et conserve les événements dont la plage PCM est encore présente. Elle préserve les identifiants et les événements suivants, et compte séparément les références PCM irrécupérables. Les captures V1 restent lisibles avec leurs métadonnées d’origine.
 
+L’ouverture réserve le droit d’écrire avant de préparer le dossier et de publier le manifeste. Les opérations de disque se font hors du verrou d’admission des producteurs audio. Pendant cette phase, aucune piste n’est admise. Un arrêt demandé avant la publication est transmis au propriétaire de la session.
+
 Le manifeste distingue l’état du journal de l’état de couverture des pistes. Les références musicales locales peuvent être réutilisées par empreinte. Le monitor PipeWire représente le mix numérique accessible au noeud de sortie et peut inclure d’autres lecteurs. La grille interne, la latence des périphériques et le son dans la pièce ont des points de mesure distincts. Le micro témoin est désélectionné par défaut et requiert une sélection explicite.
 
 ## Points de capture et rapprochement des horloges

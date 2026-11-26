@@ -421,6 +421,8 @@ class BlackBox:
         self.queue_size = queue_size
         self.lock = Lock()
         self.session = None
+        self.opening = None
+        self.opening_reason = None
         self.last = None
         self.failure = None
         self.free_bytes = None
@@ -434,7 +436,7 @@ class BlackBox:
         with self.lock:
             record = self.session
             status = {"active": bool(record and not record.stop.is_set()),
-                    "finalizing": bool(record and record.stop.is_set()),
+                    "finalizing": self.opening is not None or bool(record and record.stop.is_set()),
                     "session": record.identity if record else None,
                     "dropped": record.dropped if record else 0,
                     "latest": self.last, "error": self.failure}
@@ -506,50 +508,70 @@ class BlackBox:
         defaults = CALIBRATION_TRACKS if mode == "calibration" else DEFAULT_TRACKS
         selected = sorted(defaults if tracks is None else set(tracks)) if voice is True else []
         with self.lock:
-            if self.session is not None:
+            if self.session is not None or self.opening is not None:
                 return
+            self.opening = Event()
+            self.opening_reason = None
+        owner = None
+        try:
+            # Directory creation, reservation and fsync may delay opening a
+            # capture. The PCM producer only sees a published session.
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
             if self.root.is_symlink() or self.root.stat().st_uid != os.getuid() or self.root.stat().st_mode & 0o077:
                 raise OSError("Le dossier BlackBox doit être privé (0700).")
             owner = open(self.root / ".writer.lock", "a", opener=private_file)
-            try:
-                flock(owner, LOCK_EX | LOCK_NB)
-                if (self.disk_available() or 0) < self.reserve + 65536:
-                    raise OSError("Espace disque insuffisant pour BlackBox.")
-                session = datetime.now(timezone.utc).strftime("session-%Y%m%dT%H%M%S-") + uuid4().hex[:12]
-                folder = self.root / session
-                folder.mkdir(mode=0o700)
-                config = clean(configuration or {})
-                manifest = {"format": FORMAT, "session": session, "status": "recording",
-                            "started": now(), "monotonic_ns": time.monotonic_ns(),
-                            "identity": clean(identity or {}),
-                            "capture": {"voice": bool(selected), "tracks": selected,
-                                        "mode": mode,
-                                        "organizer_consent": True, "witness_selected": "witness" in selected},
-                            "configuration": config,
-                            "configuration_id": sha256(json.dumps(
-                                {"options": config, "mode": mode, "tracks": selected}, sort_keys=True).encode()).hexdigest(),
-                            "clocks": {"server": "CLOCK_MONOTONIC", "graph": "PipeWire spa_io_clock",
-                                       "utc": "wall_label_only", "physical_alignment_bound_ns": None},
-                            "quota_bytes": self.max_bytes if self.max_bytes is not None else
-                                (DEFAULT_VOICE_BYTES if voice is True else DEFAULT_BYTES)}
-                atomic_json(folder / "manifest.json", manifest)
-                record = Recording(self, folder, manifest, owner)
-                self.session = record
+            flock(owner, LOCK_EX | LOCK_NB)
+            if (self.disk_available() or 0) < self.reserve + 65536:
+                raise OSError("Espace disque insuffisant pour BlackBox.")
+            session = datetime.now(timezone.utc).strftime("session-%Y%m%dT%H%M%S-") + uuid4().hex[:12]
+            folder = self.root / session
+            folder.mkdir(mode=0o700)
+            config = clean(configuration or {})
+            manifest = {"format": FORMAT, "session": session, "status": "recording",
+                        "started": now(), "monotonic_ns": time.monotonic_ns(),
+                        "identity": clean(identity or {}),
+                        "capture": {"voice": bool(selected), "tracks": selected,
+                                    "mode": mode,
+                                    "organizer_consent": True, "witness_selected": "witness" in selected},
+                        "configuration": config,
+                        "configuration_id": sha256(json.dumps(
+                            {"options": config, "mode": mode, "tracks": selected}, sort_keys=True).encode()).hexdigest(),
+                        "clocks": {"server": "CLOCK_MONOTONIC", "graph": "PipeWire spa_io_clock",
+                                   "utc": "wall_label_only", "physical_alignment_bound_ns": None},
+                        "quota_bytes": self.max_bytes if self.max_bytes is not None else
+                            (DEFAULT_VOICE_BYTES if voice is True else DEFAULT_BYTES)}
+            atomic_json(folder / "manifest.json", manifest)
+            sync_directory(self.root)
+            record = Recording(self, folder, manifest, owner)
+            with self.lock:
+                if self.opening_reason is not None:
+                    record.reason = self.opening_reason
+                    record.stop.set()
                 self.failure = None
                 self.verified = None
                 record.thread.start()
-            except BaseException:
+                self.session = record
+                owner = None
+        finally:
+            if owner is not None:
                 owner.close()
-                self.session = None
-                raise
+            with self.lock:
+                self.opening.set()
+                self.opening = None
 
     def stop(self, reason="manual", *, wait=False):
         with self.lock:
             record = self.session
+            opening = self.opening
             if record is not None and not record.stop.is_set():
                 record.reason = reason
                 record.stop.set()
+            elif opening is not None and self.opening_reason is None:
+                self.opening_reason = reason
+        if wait and opening is not None:
+            opening.wait(timeout=8)
+            with self.lock:
+                record = self.session
         if wait and record is not None:
             record.thread.join(timeout=8)
 
