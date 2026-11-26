@@ -1381,13 +1381,17 @@ class ParoleView:
             identity = source["id"]
             config = json.loads(source["config"])
             if mode == "details":
+                from _parole_sources import recent_source
+
                 with self.index.db() as db:
                     history = [dict(r) for r in db.execute("SELECT * FROM source_history WHERE source=? ORDER BY stamp DESC LIMIT 30",
                                                            (identity,))]
                 try:
                     metrics = import_metrics(self.index).get(identity, {})
-                except sqlite3.Error:
+                    recent = recent_source(self.index, identity)
+                except (sqlite3.Error, ValueError):
                     metrics = {}
+                    recent = None
                 stats = {}
                 for name, label, unit, scale in (
                     (LOOKUP, "Recherche", "s", 1), (STARTUP, "Début du transfert", "s", 1),
@@ -1404,6 +1408,7 @@ class ParoleView:
                     signal = "code API 6" if status == 6 else f"HTTP {status}"
                     stats["Limite temporaire"] = f"{signal} · jusqu’à {expiry}"
                 show_details(widget, source["name"], json.dumps({**source, "config": config, "historique": history,
+                                                                  "observations récentes": recent,
                                                                   "mesures d’import": stats},
                                                                 ensure_ascii=False, indent=2))
             elif mode == "check":

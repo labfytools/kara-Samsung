@@ -7,6 +7,7 @@ from hashlib import sha256
 import http.client
 import ipaddress
 import json
+from math import ceil, isfinite
 import re
 import socket
 import ssl
@@ -42,6 +43,9 @@ HOST = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z
 PATH = re.compile(r"/[a-zA-Z0-9_/-]{0,200}")
 MAX_RESPONSE = 1_000_000
 DEFAULT_REQUESTS = 200
+RECENT_SOURCE_LIMIT = 128
+RECENT_SOURCE_KIND = "source_latency_samples"
+SOURCE_OUTCOMES = frozenset(("found", "absent", "error", "ambiguous", "different_edition"))
 COVER_PROVIDERS = {host: identity for identity, (host, category, _) in BUILTINS.items()
                    if "cover" in category or identity == "MusicBrainz"}
 
@@ -423,9 +427,47 @@ def discover(index, source, research_id):
 
 def record(index, identity, result, seconds):
     with index.db() as db:
-        db.execute("""UPDATE sources SET attempts=attempts+1, successes=successes+?, failures=failures+?,
+        now = time()
+        changed = db.execute("""UPDATE sources SET attempts=attempts+1, successes=successes+?, failures=failures+?,
                       used=?, latency=(latency*attempts+?)/(attempts+1), error=? WHERE id=?""",
-                   (result == "found", result == "error", time(), seconds, "Indisponible" if result == "error" else "", identity))
+                   (result == "found", result == "error", now, seconds,
+                    "Indisponible" if result == "error" else "", identity)).rowcount
+        if changed and result in SOURCE_OUTCOMES and isfinite(seconds) and 0 <= seconds <= 600:
+            row = db.execute("SELECT value FROM reviews WHERE kind=? AND subject=?",
+                             (RECENT_SOURCE_KIND, identity)).fetchone()
+            try:
+                samples = json.loads(row["value"]) if row else []
+            except ValueError:
+                samples = []
+            if not isinstance(samples, list):
+                samples = []
+            # Keep only durations and decisions, in the same transaction as
+            # the provider totals. No query, title or response is persisted.
+            samples = [*samples[-(RECENT_SOURCE_LIMIT - 1):], [round(seconds * 1000), result]]
+            db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",
+                       (RECENT_SOURCE_KIND, identity, "observed", now, document(samples)))
+
+
+def recent_source(index, identity):
+    from collections import Counter
+
+    with index.db(wait=.15) as db:
+        row = db.execute("SELECT value FROM reviews WHERE kind=? AND subject=?",
+                         (RECENT_SOURCE_KIND, identity)).fetchone()
+    if not row:
+        return None
+    samples = json.loads(row["value"])
+    if not isinstance(samples, list):
+        return None
+    samples = [(ms, result) for entry in samples if isinstance(entry, list) and len(entry) == 2
+               for ms, result in (entry,) if type(ms) is int and 0 <= ms <= 600_000
+               and isinstance(result, str) and result in SOURCE_OUTCOMES]
+    if not samples:
+        return None
+    times = sorted(ms for ms, _ in samples)
+    return {"mesures": len(times), "moyenne_ms": round(sum(times) / len(times)),
+            "p95_ms": times[ceil(.95 * len(times)) - 1] if len(times) >= 20 else None,
+            "résultats": dict(Counter(result for _, result in samples))}
 
 
 def controls(index, identity, action):
@@ -437,6 +479,7 @@ def controls(index, identity, action):
         if action == "reset":
             db.execute("UPDATE sources SET attempts=0,successes=0,failures=0,latency=0,error='' WHERE id=?", (identity,))
             db.execute("DELETE FROM import_provider_metrics WHERE source=?", (identity,))
+            db.execute("DELETE FROM reviews WHERE kind=? AND subject=?", (RECENT_SOURCE_KIND, identity))
         elif action in ("excluded", "disabled") or (
                 action == "active" and source["state"] != "excluded"
                 and (source["adapter"] == "builtin" or config.get("validated"))):

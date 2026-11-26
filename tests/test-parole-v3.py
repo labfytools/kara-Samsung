@@ -371,6 +371,33 @@ class SourceTests(Fixture):
         self.assertEqual(client.find("Titre", "Artiste, Invité", "Album", 10, "Artiste"), "Paroles entendues")
         self.assertEqual(client.get.call_args.kwargs["artist_name"], "Artiste, Invité")
 
+    def test_lrclib_reports_other_edition_only_after_other_evidence_matches(self):
+        engine = lyrics_engine()
+        client = engine.LrcLib()
+        record = dict(trackName="Titre", artistName="Artiste", albumName="Anthologie",
+                      duration=12, syncedLyrics="[00:01.000]Paroles entendues")
+        client.get = Mock(side_effect=(None, [record]))
+        self.assertIsNone(client.find("Titre", "Artiste", "Album", 12, "Artiste", synced=True))
+        self.assertTrue(client.edition_candidate)
+        client.get = Mock(side_effect=(None, [dict(record, duration=22)]))
+        self.assertIsNone(client.find("Titre", "Artiste", "Album", 12, "Artiste", synced=True))
+        self.assertFalse(client.edition_candidate)
+
+    def test_source_recent_latency_is_bounded_and_can_be_reset(self):
+        from _parole_sources import recent_source, record
+
+        seed(self.index)
+        record(self.index, "LRCLIB", "different_edition", .5)
+        self.assertIsNone(recent_source(self.index, "LRCLIB")["p95_ms"])
+        for number in range(1, 136):
+            record(self.index, "LRCLIB", "absent", number / 1000)
+        result = recent_source(self.index, "LRCLIB")
+        self.assertEqual(result["mesures"], 128)
+        self.assertEqual(result["p95_ms"], 129)
+        self.assertEqual(result["résultats"], {"absent": 128})
+        controls(self.index, "LRCLIB", "reset")
+        self.assertIsNone(recent_source(self.index, "LRCLIB"))
+
     def test_unavailable_catalogue_leaves_lyrics_eligible(self):
         from _parole_import_metrics import limited
         from _parole_sources import ready_categories, seed

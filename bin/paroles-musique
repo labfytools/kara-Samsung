@@ -167,6 +167,7 @@ class LrcLib:
         self.opener = build_opener(NoRedirect)
         self.gate = RequestGate(0.75)
         self.answers = None
+        self.edition_candidate = False
 
     def get(self, endpoint, **params):
         url = f"https://lrclib.net/api/{endpoint}?{urlencode(params)}"
@@ -213,11 +214,18 @@ class LrcLib:
             time.sleep(delay)
 
     def find(self, title, artist, album, duration, album_artist, *, synced=False):
+        self.edition_candidate = False
+
+        def rejected(record):
+            if transcript(record, duration, synced):
+                self.edition_candidate = True
+
         signature = dict(track_name=title, artist_name=artist, duration=duration)
         if album:
             signature["album_name"] = album
         record = self.get("get", **signature)
-        result = verified_lyrics(record, title, artist, album, duration, album_artist, synced=synced)
+        result = verified_lyrics(record, title, artist, album, duration, album_artist,
+                                 synced=synced, on_edition=rejected)
         if result is not None:
             return result
 
@@ -235,7 +243,7 @@ class LrcLib:
             records = self.get("search", track_name=label, artist_name=credit)
             text = best_transcript(records[:20] if isinstance(records, list) else (),
                                    title, artist, album, duration, album_artist,
-                                   synced=synced, strict=getattr(self, "strict", False))
+                                   synced=synced, strict=getattr(self, "strict", False), on_edition=rejected)
             if text is not None:
                 return text
         return None
@@ -763,7 +771,16 @@ class LyricsSources:
                 if request_count != client.gate.requests:
                     self.providers.add(name)
                     elapsed = time.monotonic() - started
-                    record(registry, name, "found" if value is not None else "error" if error else "absent", elapsed)
+                    outcome = "absent"
+                    if value is not None:
+                        outcome = "found"
+                    elif error:
+                        outcome = "error"
+                    elif conflict:
+                        outcome = "ambiguous"
+                    elif name == "LRCLIB" and self.lrc.edition_candidate:
+                        outcome = "different_edition"
+                    record(registry, name, outcome, elapsed)
                     observe(registry, name, {LOOKUP: elapsed, SUCCEEDED: int(value is not None)})
                     record_profile(registry, name, synced, context, elapsed, value is not None)
             if value:
@@ -794,7 +811,7 @@ class LyricsSources:
                     value = best_transcript(response, *signature, synced=synced, strict=strict)
                 except AmbiguousLyrics:
                     ambiguous = True
-                    record(registry, row["id"], "absent", time.monotonic() - started)
+                    record(registry, row["id"], "ambiguous", time.monotonic() - started)
                     continue
                 except (ProviderUnavailable, ValueError) as error:
                     failed = error
@@ -848,7 +865,7 @@ def title_key(value):
     return re.sub(r"[, (]+(?:pt|part|partie)\.?\s+(\d+)\)?$", r" part \1", key)
 
 
-def recording_score(record, title, artist, album, duration, album_artist):
+def recording_score(record, title, artist, album, duration, album_artist, *, on_edition=None):
     if not isinstance(record, dict):
         return None
     own_raw, their_raw = normalized(title), normalized(record.get("trackName"))
@@ -861,8 +878,6 @@ def recording_score(record, title, artist, album, duration, album_artist):
     if not own_title or title_key(their_title) != title_key(own_title):
         return None
     their_album = record.get("albumName")
-    if album and title_key(their_album) != title_key(album):
-        return None
     length = record.get("duration")
     if type(length) not in (int, float) or not abs(length - duration) <= 3:
         return None
@@ -871,6 +886,12 @@ def recording_score(record, title, artist, album, duration, album_artist):
     primary = credits(album_artist)
     full_credit = actual == expected
     if not full_credit and not (album and primary and actual == primary and primary < expected):
+        return None
+    if album and title_key(their_album) != title_key(album):
+        # Credits, duration and version matched. The edition difference
+        # remains a reason for refusal in the absence of recording proof.
+        if on_edition is not None:
+            on_edition(record)
         return None
     return (full_credit, -abs(length - duration),
             normalized(their_album) == normalized(album), their_title == own_title)
@@ -916,18 +937,18 @@ def available_transcript(candidates, fetch):
     return None
 
 
-def verified_lyrics(record, title, artist, album, duration, album_artist, *, synced=False):
-    if recording_score(record, title, artist, album, duration, album_artist) is None:
+def verified_lyrics(record, title, artist, album, duration, album_artist, *, synced=False, on_edition=None):
+    if recording_score(record, title, artist, album, duration, album_artist, on_edition=on_edition) is None:
         return None
     return transcript(record, duration, synced)
 
 
-def best_transcript(records, title, artist, album, duration, album_artist, *, synced, strict=False):
+def best_transcript(records, title, artist, album, duration, album_artist, *, synced, strict=False, on_edition=None):
     if not isinstance(records, list):
         return None
     candidates = []
     for record in records:
-        score = recording_score(record, title, artist, album, duration, album_artist)
+        score = recording_score(record, title, artist, album, duration, album_artist, on_edition=on_edition)
         if score is not None:
             text = transcript(record, duration, synced)
             if text is not None:
