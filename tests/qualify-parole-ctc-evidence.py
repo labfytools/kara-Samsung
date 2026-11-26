@@ -43,14 +43,15 @@ def greedy(logp, vocabulary, offset, hop):
             yield normalized[0], offset + start * hop, offset + (end + 1) * hop
 
 
-def corroborate(known, forced, independent, tolerance=.5):
+def corroborate(known, forced, independent, tolerance=.5, *, require_overlap=True):
     by_word = defaultdict(list)
     for i, (text, start, end) in enumerate(independent):
         by_word[text].append((i, start, end))
     previous, result = -1, []
     for text, (first, last, _, _) in zip(known, forced, strict=True):
         matching = [(abs(first - start), i) for i, start, end in by_word[text]
-                    if i > previous and abs(first - start) <= tolerance and start < last and first < end]
+                    if i > previous and abs(first - start) <= tolerance
+                    and (not require_overlap or start < last and first < end)]
         if matching:
             _, previous = min(matching)
             result.append(first)
@@ -97,6 +98,7 @@ def main():
     parser = ArgumentParser(description=__doc__)
     for name in ("case", "parent_result", "vocabulary"):
         parser.add_argument(name, type=Path)
+    parser.add_argument("--turbo", type=Path, help="Dossier des observations Turbo du même mix")
     args = parser.parse_args()
     candidate = runpy.run_path(str(HERE.with_name("qualify-parole-ctc.py")))
     timing = runpy.run_path(str(HERE.with_name("qualify-kara-reference-timing.py")))
@@ -135,7 +137,8 @@ def main():
     negative = range(19, len(altered), max(1, len(altered) // 8))
     for i in negative:
         altered[i] = "xylophone"
-    counterfeit = corroborate(altered, candidate["predict"](logp, vocabulary, altered), unrestricted)
+    falsified = candidate["predict"](logp, vocabulary, altered)
+    counterfeit = corroborate(altered, falsified, unrestricted)
     # Common substitutions are a harder negative control than an outlier
     # word. A guided match to another occurrence still counts as a miss.
     ordinary, positions = common_substitutions(known, starts)
@@ -153,19 +156,45 @@ def main():
                    for expected, actual in zip(surviving, observed, strict=True))
 
     forced_without_line = [word[0] for word in timing_without_line]
-    print(json.dumps(dict(id=case["id"], timing=timing["summarize"](starts, plausible),
-                          corrupted_accepted=sum(counterfeit[i] is not None for i in negative),
-                          corrupted_total=len(negative), common_substitutions={
-                              "total": len(positions),
-                              "geometric_20_accepted": sum(mismatched[i][3] >= .20 for i in positions),
-                              "corroborated": sum(aliases[i] is not None for i in positions),
-                          }, missing_line={
-                              "removed_words": right - left,
-                              "forced": timing["summarize"](surviving, forced_without_line),
-                              "corroborated": timing["summarize"](surviving, confirmed_without_line),
-                              "forced_into_gap": strayed_into_gap(forced_without_line),
-                              "corroborated_into_gap": strayed_into_gap(confirmed_without_line),
-                          }), indent=2, allow_nan=False))
+    report = {
+        "id": case["id"],
+        "timing": timing["summarize"](starts, plausible),
+        "corrupted_accepted": sum(counterfeit[i] is not None for i in negative),
+        "corrupted_total": len(negative),
+        "common_substitutions": {
+            "total": len(positions),
+            "geometric_20_accepted": sum(mismatched[i][3] >= .20 for i in positions),
+            "corroborated": sum(aliases[i] is not None for i in positions),
+        },
+        "missing_line": {
+            "removed_words": right - left,
+            "forced": timing["summarize"](surviving, forced_without_line),
+            "corroborated": timing["summarize"](surviving, confirmed_without_line),
+            "forced_into_gap": strayed_into_gap(forced_without_line),
+            "corroborated_into_gap": strayed_into_gap(confirmed_without_line),
+        },
+    }
+    if args.turbo:
+        turbo_case = json.loads((args.turbo / "case.json").read_bytes())
+        if (turbo_case["audio_sha256"] != result["source"] or turbo_case["expected"] != known
+                or turbo_case["end"] is not None or turbo_case["start"] != 0):
+            raise ValueError("Les observations Turbo doivent venir du même mix entier")
+        observations = json.loads((args.turbo / "observations" / "mix.json").read_bytes())
+        if observations["language"] != "en":
+            raise ValueError("La langue détectée par Turbo diffère de celle du banc CTC")
+        turbo = [(text, start, end) for text, start, end, confidence, _ in observations["words"] if confidence >= .50]
+
+        def both(text, proposed):
+            # Turbo supplies an independent beginning. Some observations
+            # have no measured end, so use proximity without inventing one.
+            return corroborate(text, proposed, turbo, .30, require_overlap=False)
+
+        shared = both(known, forced)
+        false_nonce, false_common = both(altered, falsified), both(ordinary, mismatched)
+        report["turbo_agreement"] = dict(timing=timing["summarize"](starts, shared),
+                                         corrupted=sum(false_nonce[i] is not None for i in negative),
+                                         substitutions=sum(false_common[i] is not None for i in positions))
+    print(json.dumps(report, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":
