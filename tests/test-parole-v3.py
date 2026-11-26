@@ -669,10 +669,31 @@ class GtkTests(Fixture):
         window.maintenance.index.enqueue("transcription", visible.data["id"], "fixture")
         with patch("_parole_transcribe.read_draft", return_value=draft):
             view.details(view.songs.get_item(0).data)
+        detail = next(w for w in Gtk.Window.get_toplevels() if w.get_transient_for() is window
+                      and w.get_title() == visible.data["title"])
+
+        def descendants(widget):
+            yield widget
+            child = widget.get_first_child()
+            while child:
+                yield from descendants(child)
+                child = child.get_next_sibling()
+
+        expander = next(widget for widget in descendants(detail) if isinstance(widget, Gtk.Expander))
+        expander.set_expanded(True)
+        controls_by_label = {widget.get_label(): widget for widget in descendants(expander.get_child())
+                             if isinstance(widget, Gtk.Button)}
+        self.assertFalse(controls_by_label["Voix"].get_sensitive())
+        with patch.object(view.draft_audition, "start") as preview:
+            controls_by_label["Mix"].emit("clicked")
+            self.assertEqual(preview.call_args.args[2:6], (path, visible.data["token"], .75, 1.99))
+        self.assertFalse(window.permits_draft_audition())
         self.assertIn("désactivé", window.seek_draft_review(path, .75))
         with patch.dict(os.environ, {"KARA_SILENT": "0"}), patch.object(window, "player_command") as seek:
             window.track, window.player_track_id, window.duration = path, "/org/mpris/Track/fixture", 5.
             window.player_seen = app_module.time.monotonic()
+            with patch.object(window, "playback_state", "Playing"):
+                self.assertFalse(window.permits_draft_audition())
             self.assertIsNotNone(window.seek_draft_review(path.with_suffix(".wav"), .75))
             self.assertIsNone(window.seek_draft_review(path, .75))
             method, values = seek.call_args.args

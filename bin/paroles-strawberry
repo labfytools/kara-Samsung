@@ -752,6 +752,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.bus.call(PLAYER, OBJECT, INTERFACE, method, parameters, None,
                       Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
 
+    def permits_draft_audition(self):
+        return (not self.closed and os.environ.get("KARA_SILENT") != "1"
+                and self.playback_state in ("Paused", "Stopped")
+                and (self.track is None or time.monotonic() - self.player_seen <= 2)
+                and self.party.active is None and not self.validating
+                and not self.game_score.requested and not self.remote_party.locked)
+
     def seek_draft_review(self, path, seconds):
         if os.environ.get("KARA_SILENT") == "1":
             return "Le lecteur est désactivé pour cette session."
@@ -1245,6 +1252,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.players_window.message.set_text("Les pistes du mixage ont changé. Prépare à nouveau la partie.")
             self.players_window.refresh()
             return
+        if self.parole_ui is not None:
+            self.parole_ui.draft_audition.stop()
         self.game_toggle.set_active(False)
         self.bb_turn = self.remote_party.turn_id or token_hex(8)
         if self.remote_party.current and player.mobile_id:
@@ -1818,6 +1827,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def close_window(self, _window, *, wait=True):
         if self.closed:
             return False
+        if self.parole_ui is not None:
+            self.parole_ui.draft_audition.stop()
         if self.party.active is not None:
             self.finish_turn(pause=True)
         self.vocal_effect.disable()

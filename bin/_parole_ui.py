@@ -12,6 +12,7 @@ from _kara_party import Song
 from _kara_import import show_details
 from _kara_paths import STATE
 from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, rebind_preparations, undo as undo_group
+from _parole_audition import DraftAudition, vocal_file
 from _parole_index import key, document, encoded_key, sidecar
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_offer import AUTOMATIC, STRATEGIES
@@ -275,6 +276,7 @@ SQL_FILTER = {
 
 class ParoleView:
     def __init__(self, controller, maintenance):
+        self.draft_audition = DraftAudition(controller.permits_draft_audition)
         self.control = controller
         self.maintenance = maintenance
         self.index = maintenance.index
@@ -809,6 +811,19 @@ class ParoleView:
         if draft and (ranges := review_ranges(draft)):
             expander = Gtk.Expander(label="Passages à vérifier")
             review = box()
+            audition = self.draft_audition
+            separated = vocal_file(path) is not None
+            panel.connect("unmap", lambda *_: audition.stop(panel))
+
+            def expanded(widget, _param):
+                if not widget.get_expanded():
+                    audition.stop(panel)
+
+            expander.connect("notify::expanded", expanded)
+
+            def preview(start, end, isolated):
+                audition.start(panel, self.index.root, path, row["token"], start, end, status.set_text,
+                               isolated=isolated)
 
             def jump(_widget, start):
                 error = self.control.seek_draft_review(path, start)
@@ -818,9 +833,18 @@ class ParoleView:
                 minute, second = divmod(int(seconds), 60)
                 return f"{minute:02d}:{second:02d}"
 
+            def stop_preview(_widget):
+                audition.stop(panel)
+                status.set_text("")
+
+            review.append(button("Arrêter l’écoute", stop_preview))
             for start, end, text in ranges:
                 line = box(Gtk.Orientation.HORIZONTAL, 6)
                 line.append(button(f"{stamp(start)} – {stamp(end)}", lambda widget, at=start: jump(widget, at)))
+                line.append(button("Mix", lambda _widget, a=start, b=end: preview(a, b, False),
+                                   tooltip_text="Écouter le passage dans le mix"))
+                line.append(button("Voix", lambda _widget, a=start, b=end: preview(a, b, True),
+                                   tooltip_text="Écouter la voix séparée déjà disponible", sensitive=separated))
                 line.append(Gtk.Label(label=text, xalign=0, wrap=True, hexpand=True))
                 review.append(line)
             expander.set_child(scroller(review, min_content_height=110, max_content_height=200))
