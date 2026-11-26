@@ -78,6 +78,12 @@ git diff --check
 
 Sur ArchASP, le banc utilise les bibliothèques installées, Python avec NumPy/SciPy et, pour WebRTC, un compilateur C++17 avec `pkg-config`. Le programme choisit le moteur avec `--engine`. Les chiffres de temps dépendent de la machine. Les tests AEC vérifient la réduction à délai fixe, la continuité des trames, les tailles en entrée de l’ABI, le mode stéréo et la différence entre annulation et atténuation générale.
 
+## Rejeu BlackBox hors ligne
+
+Le [rejeu du moniteur et du témoin](../tests/qualify-kara-aec-blackbox.py) prend un dossier de session BlackBox terminée. Il vérifie l’inventaire et les empreintes de capture. Il sélectionne jusqu’à douze secondes de cycles contigus dont les deux pistes partagent le pilote, l’époque et l’index de trame. Les deux moteurs reçoivent les mêmes échantillons. Le rapport donne les niveaux RMS, la corrélation avec la référence et le coût par trame. Ces mesures sur un micro mêlant voix et écho ne déterminent pas la préservation de la voix sans piste de référence indépendante.
+
+L’audit Omega du 26 novembre a trouvé douze sessions terminées avec manifestes privés. Quatre contenaient un moniteur et un témoin. Le moniteur et le témoin avaient des positions de cycle disjointes dans les quatre cas, avec des quanta de 256 et 1 024 échantillons respectivement. Le banc les a écartées pour l’annulation d’écho. Le rejeu des 34 décisions de score enregistrées a reproduit les 34 décisions. Le témoin synthétique du banc, avec cinq secondes et un retard imposé de 40 ms, a retrouvé ce retard et exécuté les deux moteurs. Ces essais se déroulent sans ouvrir de flux audio ni enregistrer une nouvelle session physique.
+
 ## Repères de la séance EDENWOOD
 
 Avec l’EDENWOOD PARTY 250 V2 en A2DP SBC, trois sondes de 100 ms ont donné 131,77, 134,52 et 136,94 ms du monitor à la recapture sur le Vivobook. L’intervalle couvre la restitution, la propagation et la chaîne du témoin. Le S21 FE était coupé pendant cette mesure. En écoute seule sur le S21 FE, les trois sondes ont traversé le graphe et des paquets continus sont arrivés au serveur. À 65 % sur l’enceinte, les pics de corrélation sur le téléphone avaient des concurrents trop proches pour calibrer une référence d’annulation.
