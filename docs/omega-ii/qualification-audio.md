@@ -52,6 +52,25 @@ Les essais de chant sur CPU ont produit 31 reports en plusieurs passes sur des e
 
 Sur les reçus historiques, une grille de seuils utilise le nombre de mots au-dessus de 0,62 de confiance et la confiance médiane pendant les cinq premières secondes. Chaque séparation coûte un point d’erreur dans la fonction d’ajustement pour écarter les gains trop faibles. La grille a préféré **zéro séparation**. Les résultats ajustés sur ces 50 mêmes extraits sont descriptifs. Le choix reggae par genre aurait donné 46,01 % avec quatre séparations. Les références de ces quatre extraits avaient déjà motivé la règle. L’ensemble d’évaluation tenu à part fige 20 nouveaux enregistrements, 8 en rap américain, 8 en rap français et 4 en reggae, avec un texte total de 638 mots. Le filtre exclut les identifiants, les couples artiste-titre, les versions audio exactes et les paroles normalisées déjà rencontrées. Il partage des artistes avec le corpus historique, faute de titres admissibles en nombre suffisant avec exclusion de tous les artistes. Le regroupement de genre reprend la table utilisée pour échantillonner OMEGA I. Il ne devient pas un classificateur de production.
 
+| Règle sur les 50 extraits historiques | WER | CER | Séparations nécessaires | Choix de la voix |
+| --- | ---: | ---: | ---: | ---: |
+| Mix systématique | 47,08 % | 37,55 % | 0 | 0 |
+| Voix systématique | 48,97 % | 37,02 % | 50 | 50 |
+| Genre reggae | 46,01 % | 36,59 % | 4 | 4 |
+| Confiance et débit sur les cinq premières secondes | 47,08 % | 37,55 % | 0 | 0 |
+| Basses et confiance initiale | 49,43 % | 39,09 % | 5 | 5 |
+| Accord prudent si le stem existe déjà | 45,03 % | 35,73 % | 0 | 9 |
+
+La mesure acoustique utilise la part de l’énergie entre 50 et 350 Hz sur les cinq premières secondes. Les médianes sont de 69,75 % pour le reggae, 66,86 % pour le rap américain et 47,61 % pour le rap français. Les plages se recouvrent largement. La règle déclenche à partir de 65 % d’énergie dans cette bande et sous 0,62 de confiance médiane du mix. Elle reproduit mal le gain du reggae et coûte 31 erreurs sur le lot historique. La dernière règle suppose le stem présent. Elle exige au moins 80 % du nombre de mots reconnus sur le mix et une confiance médiane supérieure d’au moins 0,05. Ces décisions ne lisent pas les paroles de référence. Leur WER est mesuré après le choix. [Banc de sélection](../../tests/qualify-parole-input-policy.py)
+
+| Groupe | Substitutions mix → voix | Omissions mix → voix | Insertions mix → voix |
+| --- | ---: | ---: | ---: |
+| Rap américain | 71 → 64 | 156 → 203 | 21 → 20 |
+| Rap français | 112 → 106 | 108 → 103 | 64 → 69 |
+| Reggae | 9 → 11 | 26 → 12 | 6 → 4 |
+
+Les omissions expliquent l’essentiel de la différence historique sur le rap américain et le reggae. Les métriques ne déterminent pas si Demucs a écarté des consonnes, des chœurs ou des ad-libs, ni si Turbo réagit aux changements de timbre. Le reggae reste représenté par quatre extraits historiques. Le rap français doit garder ses résultats séparés. Une amélioration moyenne ne doit pas compenser une perte dans un groupe.
+
 ## Première validation distincte sur le hip-hop anglais
 
 Le titre *CROWD PLEASER* de JASON MILLER, 192,80 s et 555 mots normalisés, a été fixé avec *Embers* d’Avercage avant cet essai. Ce sont deux nouveaux enregistrements de JamendoLyrics, conservés pour le calcul local sous CC BY-NC-SA. Après un arrêt thermique, le passage hip-hop a repris deux fenêtres CTC sauvegardées et a terminé les onze autres avec le même modèle. Cette reprise a pris 152,12 s sous un plafond CPU local de 22 %, avec environ 761 Mio de PSS de groupe, 75,5 °C au CPU et 0,22 % de PSI mémoire. Les durées de reprise décrivent l’invocation complétée et ne comprennent pas le travail du passage interrompu. [Corpus épinglé](https://huggingface.co/datasets/jamendolyrics/jamendolyrics/tree/de188c963fd4539bc769b3feb83582e5a9595e36) · [Licence CC BY-NC-SA](https://creativecommons.org/licenses/by-nc-sa/4.0/)

@@ -189,6 +189,22 @@ def read_cases(args):
                                   labels, path.parent / "manual.csv", path.parent / "lines.csv")]))
         return cases
 
+    if args.excerpts:
+        # Admission freezes both sound and local reference. Held-out excerpts
+        # use the same decoder and analysis as the historical fifty cases.
+        root = args.library.resolve(strict=True)
+        extract = runpy.run_path(str(HERE.with_name("qualify-parole-targeted.py")))["extract"]
+        cases = read(args.excerpts)
+        if not 1 <= len(cases) <= 100 or len({row["id"] for row in cases}) != len(cases):
+            raise ValueError("Manifeste d’extraits invalide")
+        for case in cases:
+            source = Path(case["path"])
+            if (extract(root, source) != (case["start"], case["end"], case["expected"])
+                    or digest(source) != case["audio_sha256"]
+                    or digest(source.with_suffix(".lrc")) != case["reference_sha256"]):
+                raise ValueError("L’audio ou le texte tenu à part a changé")
+        return cases
+
     previous = [row for row in map(json.loads, (args.previous / "result.jsonl").read_text().splitlines())]
     baselines = {row["id"]: row for row in previous}
     source = read(args.previous / "manifest.json")
@@ -407,7 +423,10 @@ def timed_score(case, heard):
 
 
 def turbo_worker(case_path, stem_path, output, lexicon, model, variants):
-    case, stem = read(case_path), read(stem_path)
+    case = read(case_path)
+    stem = read(stem_path) if stem_path else None
+    if stem is None and any(variant != "mix" for variant in variants):
+        raise ValueError("Une variante vocale exige sa piste séparée")
     compare = runpy.run_path(str(HERE.with_name("qualify-kara-singing.py")))["lexical_errors"]
     emit(phase="model")
     began = monotonic()
@@ -430,20 +449,20 @@ def turbo_worker(case_path, stem_path, output, lexicon, model, variants):
 
         with ExitStack() as stack:
             emit(phase="pcm")
-            if case["end"] is None:
-                mix_count, mix = stack.enter_context(pcm_file(Path(case["path"])))
-                voice_count, voice = stack.enter_context(pcm_file(Path(stem["vocals"])))
-                if abs(mix_count - voice_count) > RATE // 20:
-                    raise ValueError("Les pistes n’ont pas la même durée PCM")
-            else:
-                end, offset = case["end"], stem["offset"]
-                m = pcm(case["path"], origin, end)
-                v = pcm(stem["vocals"], origin - offset, end - offset)
-                mix_count, voice_count = len(m) // 2, len(v) // 2
-                if abs(mix_count - voice_count) > RATE // 50:
-                    raise ValueError("Les extraits n’ont pas la même durée PCM")
-                mix = lambda a, b: m[a * 2:b * 2]
-                voice = lambda a, b: v[a * 2:b * 2]
+            def input_pcm(source, offset=0.):
+                if case["end"] is None:
+                    return stack.enter_context(pcm_file(Path(source)))
+                raw = pcm(source, origin - offset, case["end"] - offset)
+                return len(raw) // 2, lambda a, b: raw[a * 2:b * 2]
+
+            mix_count, mix = input_pcm(case["path"])
+            # A mix-only witness must not depend on a successful separation.
+            # Compare the same sample counts whenever an actual stem is used.
+            if stem is not None:
+                voice_count, voice = input_pcm(stem["vocals"], stem["offset"])
+                tolerance = RATE // (20 if case["end"] is None else 50)
+                if abs(mix_count - voice_count) > tolerance:
+                    raise ValueError("Les entrées n’ont pas la même durée PCM")
             pcm_seconds = monotonic() - began - model_seconds
             window, beam = None, ()
             for variant in variants:
@@ -548,6 +567,7 @@ def main():
     parser.add_argument("--index", type=Path)
     parser.add_argument("--library", type=Path)
     parser.add_argument("--annotations", type=Path)
+    parser.add_argument("--excerpts", type=Path, help="Manifeste d’extraits indépendants signé par audio et LRC")
     parser.add_argument("--lexicon", action="store_true", help="Tester aussi le lexique historique hors évaluations")
     parser.add_argument("--profile", choices=("power-saver", "balanced", "performance"))
     parser.add_argument("--memory-psi", type=float, choices=(1., 2., 3.), default=1.,
@@ -566,8 +586,13 @@ def main():
     if args.summary:
         print(json.dumps(aggregate(args.workspace), ensure_ascii=False, indent=2, allow_nan=False))
         return
-    if (args.annotations is None and not all((args.previous, args.index, args.library))
-            or args.annotations is not None and (args.previous or args.index or args.library or args.lexicon)):
+    if args.annotations:
+        if args.previous or args.index or args.library or args.lexicon or args.excerpts:
+            parser.error("--annotations utilise son propre corpus")
+    elif args.excerpts:
+        if args.previous or args.index or args.lexicon or not args.library:
+            parser.error("Indiquer --excerpts avec --library")
+    elif not all((args.previous, args.index, args.library)):
         parser.error("Indiquer --previous, --index et --library, ou bien --annotations")
     args.workspace = args.workspace.resolve()
     if sys.byteorder != "little":
@@ -595,7 +620,8 @@ def main():
     if not selected or args.case and len(selected) != len(set(args.case)):
         parser.error("Cas inconnus ou absents")
     lexicon = args.previous / "corpus.jsonl" if args.lexicon else None
-    checkpoint = digest(CHECKPOINT)
+    needs_stems = args.phase == "demucs" or phases != {"mix"}
+    checkpoint = digest(CHECKPOINT) if needs_stems else None
     if args.stems_from:
         args.stems_from = args.stems_from.resolve(strict=True)
         prior = read(args.stems_from / "manifest.json")
@@ -628,14 +654,16 @@ def main():
             case_path = folder / "case.json"
             write(case_path, case)
             try:
-                if args.phase != "turbo":
+                if needs_stems and args.phase != "turbo":
                     prepare_stem(args, case, folder)
                 out = folder / "turbo.json"
                 if args.phase != "demucs" and not out.exists():
-                    separation = folder / "demucs.json"
-                    saved = read(separation)
-                    if digest(Path(saved["vocals"])) != saved["sha256"]:
-                        raise ValueError("Piste vocale modifiée entre deux exécutions")
+                    separation = ""
+                    if needs_stems:
+                        separation = folder / "demucs.json"
+                        saved = read(separation)
+                        if digest(Path(saved["vocals"])) != saved["sha256"]:
+                            raise ValueError("Piste vocale modifiée entre deux exécutions")
                     report = guarded(args, [sys.executable, "-B", str(HERE), "--turbo-worker",
                                             str(case_path), str(separation), str(out),
                                             str(lexicon.resolve()) if lexicon else "", str(args.model.resolve()),
@@ -661,7 +689,8 @@ if __name__ == "__main__":
             demucs_worker(*sys.argv[2:])
         elif sys.argv[1:2] == ["--turbo-worker"]:
             case, stem, output, lexicon, model, *variants = sys.argv[2:]
-            turbo_worker(Path(case), Path(stem), Path(output), Path(lexicon) if lexicon else None, Path(model), variants)
+            turbo_worker(Path(case), Path(stem) if stem else None, Path(output),
+                         Path(lexicon) if lexicon else None, Path(model), variants)
         else:
             main()
     except Interrupted as error:
