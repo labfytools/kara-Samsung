@@ -19,7 +19,7 @@ from _kara_turbo import ObservedWord
 from _parole_index import document, sidecar
 from _parole_maintenance import Maintenance
 from _parole_night import Desktop, Login, Night, mains_online
-from _parole_transcribe import proposals
+from _parole_transcribe import proposals, review_ranges
 
 
 class PowerTests(unittest.TestCase):
@@ -351,6 +351,14 @@ class NightTests(unittest.TestCase):
         parts = [dict(start=.9, end=2., text="Vrai chant", no_speech=.1),
                  dict(start=2.1, end=3.1, text="Paroles suggérées", no_speech=.1)]
         self.assertEqual(proposals(4., heard, parts), ("Vrai chant", "[00:01.000]Vrai chant", 1))
+        draft = {"duration": 4., "language": "fr", "audio": {"sha256": "fixture"},
+                 "model": {}, "settings": {}, "observation": {"input": "original", "acceleration": "vulkan"},
+                 "first_pass": {"language_request": "", "words": [[w.text, w.start, w.end, w.confidence, None]
+                                                                  for w in heard],
+                                "segments": [parts[0], *([parts[1]] * 25)]}}
+        self.assertEqual(review_ranges(draft), ((2.1, 3.1, "Paroles suggérées"),) * 20)
+        draft["first_pass"]["segments"] = [{"start": "invalid"}]
+        self.assertEqual(review_ranges(draft), ())
 
     def test_local_lrc_rejected_acoustically_gets_one_alternate_lookup(self):
         path = self.owner.index.root / "song.opus"

@@ -612,7 +612,23 @@ class GtkTests(Fixture):
         view.refresh_state()
         self.assertEqual(modifications, [True])
         self.assertEqual(view.song_selection.get_selected_item().data["id"], visible.data["id"])
-        view.details(view.songs.get_item(0).data)
+        draft = {"duration": 5., "language": "fr", "plain": "Brouillon vocal",
+                 "timed": "[00:01.000]Brouillon vocal", "audio": {"sha256": "fixture"},
+                 "model": {}, "settings": {}, "observation": {"input": "original", "acceleration": "vulkan"},
+                 "first_pass": {"language_request": "", "words": [],
+                                "segments": [{"start": .75, "end": 1.99, "no_speech": .12,
+                                              "text": "Passage à écouter"}]}}
+        window.maintenance.index.enqueue("transcription", visible.data["id"], "fixture")
+        with patch("_parole_transcribe.read_draft", return_value=draft):
+            view.details(view.songs.get_item(0).data)
+        self.assertIn("désactivé", window.seek_draft_review(path, .75))
+        with patch.dict(os.environ, {"KARA_SILENT": "0"}), patch.object(window, "player_command") as seek:
+            window.track, window.player_track_id, window.duration = path, "/org/mpris/Track/fixture", 5.
+            window.player_seen = app_module.time.monotonic()
+            self.assertIsNotNone(window.seek_draft_review(path.with_suffix(".wav"), .75))
+            self.assertIsNone(window.seek_draft_review(path, .75))
+            method, values = seek.call_args.args
+            self.assertEqual((method, values.unpack()), ("SetPosition", (window.player_track_id, 750_000)))
         window.open_import()
         self.assertTrue(window.album_import.get_reveal_child())
         self.assertEqual(window.album_import.get_root(), window.import_window)

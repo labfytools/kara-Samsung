@@ -182,6 +182,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.preparation_window = None
         self.music_window = None
         self.playback_state = 'Stopped'
+        self.player_track_id = None
         self.media_updated = 0.0
         self.preparation_only = False
         self.active_plan = {}
@@ -750,6 +751,20 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         self.bus.call(PLAYER, OBJECT, INTERFACE, method, parameters, None,
                       Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
+
+    def seek_draft_review(self, path, seconds):
+        if os.environ.get("KARA_SILENT") == "1":
+            return "Le lecteur est désactivé pour cette session."
+        if self.party.active is not None or self.validating or self.game_score.requested or self.remote_party.locked:
+            return "Le positionnement est indisponible pendant une préparation ou une partie."
+        if self.track != path or not self.player_track_id or time.monotonic() - self.player_seen > 2:
+            return "Sélectionne ce morceau dans Strawberry pour utiliser ses repères."
+        if not 0 <= seconds < self.duration:
+            return "Le repère est hors de la durée du morceau."
+        # SetPosition uses the owning MPRIS track id. Strawberry ignores a
+        # request for an id replaced between this check and its delivery.
+        self.player_command("SetPosition", GLib.Variant("(ox)", (self.player_track_id, round(seconds * 1_000_000))))
+        return None
 
     def player_seeked(self, _bus, _sender, _path, _interface, _member, parameters):
         # Seeked supplies a position on the player timeline. Reception anchors
@@ -1828,6 +1843,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         return False
 
     def clear_player(self):
+        self.player_track_id = None
         self.title.set_label("")
         self.artist.set_label("")
         self.playback_state = 'Stopped'
@@ -1893,6 +1909,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.duration = metadata.get("mpris:length", 0) / 1_000_000
         playback = properties.get("PlaybackStatus", "Stopped")
         self.playback_state = playback
+        track_id = metadata.get("mpris:trackid")
+        self.player_track_id = (track_id if isinstance(track_id, str)
+                                and GLib.Variant.is_object_path(track_id) else None)
         self.media_play.set_label('⏸ Pause' if playback == 'Playing' else '▶ Lecture')
         # Ne pas changer de chanson au milieu du tour d'un joueur.
         navigation = self.party.active is None

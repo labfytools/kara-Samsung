@@ -73,6 +73,8 @@ Turbo décode le mix sans contexte lexical et conserve ses observations dans le 
 
 Dans les détails du morceau, **Charger le brouillon Turbo** remplit l’éditeur pour le format manquant sélectionné. Écouter et corriger les paroles ou le minutage avant **Enregistrer**. L’enregistrement conserve la validation manuelle et protège une référence ajoutée entre-temps. Le brouillon ne change aucun fichier musical ni aucun LRC de la bibliothèque.
 
+Le volet **Passages à vérifier** affiche jusqu’à vingt segments écartés avec leur intervalle et la proposition de Turbo. Les boutons repositionnent dans Strawberry le morceau déjà sélectionné. Le parcours de vérification respecte les préparations et les tours Kara en cours. La correction se fait toujours dans l’éditeur du format choisi.
+
 ### Essai du brouillon Vulkan sur un extrait réel
 
 Parole a préparé un brouillon sur une copie WAV de 21,59 s dépourvue de tags de paroles et de fichiers associés. Le moteur Turbo seul a retenu deux lignes, écarté trois segments textuels incertains et conservé 62 observations de mots dans le cache privé en 21,82 s. Les deux lignes ont exactement les mêmes mots normalisés que le LRC de référence. Leurs débuts s’en écartent de 320 et 460 ms. Kara a relu la première passe sous les mêmes signatures audio, modèle et paramètres. Le fichier WAV a conservé la même empreinte et la bibliothèque d’essai est restée sans TXT ni LRC publiés.

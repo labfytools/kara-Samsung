@@ -745,7 +745,7 @@ class ParoleView:
                 widget, "Identité et provenance", json.dumps(provenance, ensure_ascii=False, indent=2))))
         path = Path(row["path"])
         versions = {}
-        from _parole_transcribe import read_draft
+        from _parole_transcribe import read_draft, review_ranges
 
         draft = (read_draft(self.maintenance.cache, path)
                  if any(item["kind"] == "transcription" for item in checks) else None)
@@ -806,6 +806,25 @@ class ParoleView:
                 status.set_text("Brouillon Turbo. Écoutez et corrigez le texte avant d’enregistrer.")
 
             editbar.append(button("Charger le brouillon Turbo", load_draft))
+        if draft and (ranges := review_ranges(draft)):
+            expander = Gtk.Expander(label="Passages à vérifier")
+            review = box()
+
+            def jump(_widget, start):
+                error = self.control.seek_draft_review(path, start)
+                status.set_text(error or "Repère envoyé à Strawberry")
+
+            def stamp(seconds):
+                minute, second = divmod(int(seconds), 60)
+                return f"{minute:02d}:{second:02d}"
+
+            for start, end, text in ranges:
+                line = box(Gtk.Orientation.HORIZONTAL, 6)
+                line.append(button(f"{stamp(start)} – {stamp(end)}", lambda widget, at=start: jump(widget, at)))
+                line.append(Gtk.Label(label=text, xalign=0, wrap=True, hexpand=True))
+                review.append(line)
+            expander.set_child(scroller(review, min_content_height=110, max_content_height=200))
+            panel.append(expander)
         if identification:
             found = json.loads(identification[0])
             if found.pop("token", None) == row["token"]:

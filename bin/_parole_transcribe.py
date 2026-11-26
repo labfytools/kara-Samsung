@@ -8,7 +8,7 @@ from pathlib import Path
 import signal
 import sys
 
-from _kara_prepare import MAX_MANIFEST, PreparedCache, Preparer, atomic, file_token
+from _kara_prepare import MAX_MANIFEST, PreparedCache, Preparer, atomic, failed_first_pass, file_token
 from _kara_turbo import digest
 from _kara_words import words
 from _paroles_lrc import MAX_LRC_BYTES
@@ -16,7 +16,7 @@ from _paroles_lrc import MAX_LRC_BYTES
 NAME = "transcription.json"
 
 
-def proposals(duration, heard, segments):
+def proposals(duration, heard, segments, *, review=None):
     """Only propose segment text supported by its own acoustic word times."""
     lines, last, omitted = [], -1, 0
     times = [word.start for word in heard]
@@ -30,10 +30,14 @@ def proposals(duration, heard, segments):
         if (not spelling or spelling != [w.text for w in interval] or
                 len(interval) < 2 or min(w.confidence for w in interval) < .55):
             omitted += 1
+            if review is not None and len(review) < 20:
+                review.append((start, end, text[:160]))
             continue
         ms = round(interval[0].start * 1000)
         if ms <= last:
             omitted += 1
+            if review is not None and len(review) < 20:
+                review.append((start, end, text[:160]))
             continue
         minute, remainder = divmod(ms, 60_000)
         second, fraction = divmod(remainder, 1000)
@@ -44,6 +48,19 @@ def proposals(duration, heard, segments):
     if len(timed.encode()) > MAX_LRC_BYTES or len(plain.encode()) > MAX_LRC_BYTES:
         raise ValueError("Brouillon de transcription trop volumineux.")
     return plain, timed, omitted
+
+
+def review_ranges(draft):
+    """Project private observations into a bounded list for manual listening."""
+    ranges = []
+    try:
+        observed = failed_first_pass(draft, draft["audio"]["sha256"], draft["model"], draft["settings"], "")
+        if observed:
+            duration, _, words, segments = observed
+            proposals(duration, words, segments, review=ranges)
+    except (KeyError, TypeError, ValueError):
+        return ()
+    return tuple(ranges)
 
 
 def read_draft(cache, song):
