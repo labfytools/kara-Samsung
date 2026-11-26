@@ -110,6 +110,11 @@ class InventoryTests(Fixture):
         self.assertEqual(row["lyrics"], "Strawberry")
         self.assertEqual(json.loads(row["info"])["plain"], "Tout commence ici")
         self.assertEqual(sha256(db.read_bytes()).digest(), before)
+        with closing(sqlite3.connect(db)) as source, source:
+            source.execute("ALTER TABLE songs ADD COLUMN genre")
+            source.execute("UPDATE songs SET genre='Rap français'")
+        self.scan(db=db)
+        self.assertEqual(json.loads(self.songs()[0]["info"])["tags"]["genre"], "Rap français")
         save_correction(self.index, row["id"], ".lrc", None, "[00:01.000]Tout commence ici")
         version = lrc_token(song.with_suffix(".lrc"))
         with self.assertRaises(ValueError):

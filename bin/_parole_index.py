@@ -514,7 +514,7 @@ def collection_reader(database, root, *, targeted=False):
             yield lambda paths: {}
             return
         columns = ("url title artist album albumartist lyrics length track disc year mtime filesize playcount "
-                   "musicbrainz_album_id musicbrainz_album_artist_id musicbrainz_recording_id").split()
+                   "musicbrainz_album_id musicbrainz_album_artist_id musicbrainz_recording_id genre").split()
         selected = ",".join(c if c in available else f"NULL AS {c}" for c in columns)
         where = " WHERE unavailable=0" if "unavailable" in available else ""
         if targeted:
@@ -691,7 +691,13 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                 old["duration"] if same_audio else 0)
             catalog_text = (strawberry["lyrics"] or "") if strawberry else ""
             catalog_matches = strawberry and (st.st_size, int(st.st_mtime)) == (strawberry["filesize"], strawberry["mtime"])
-            catalog_revision = encoded_key(tuple(strawberry) if strawberry else ())
+            # Append the genre to the existing signature only when the
+            # collection can supply it. Older Strawberry schemas keep the
+            # same revision and do not trigger another audio probe.
+            catalog_values = tuple(strawberry) if strawberry else ()
+            if strawberry and not strawberry["genre"]:
+                catalog_values = catalog_values[:-1]
+            catalog_revision = encoded_key(catalog_values)
             info = json.loads(old["info"]) if old else {}
             if (same_metadata and catalog_revision == info.get("catalogue") and not info.get("probe_error")):
                 tags = info["tags"]

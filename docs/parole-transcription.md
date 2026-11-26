@@ -14,6 +14,8 @@ Les titres d’évaluation sont retirés avant la sélection du lexique. Les ide
 
 Ajouter une option `--case` par titre équipé d’un LRC de référence. Le banc prend les premières lignes de chaque LRC et conserve la même fenêtre PCM pour tous les réglages. Il essaie le mix, puis la voix séparée si les pistes Demucs existent déjà. Un essai de genre requiert le genre du titre dans l’index. Le texte du LRC sert uniquement au découpage et à l’évaluation.
 
+L’inventaire Parole lit désormais le genre facultatif du catalogue Strawberry. Les pistes dont la collection fournit un genre sont mises à jour lors d’un inventaire. Les anciennes bases Strawberry sans cette colonne conservent leur comportement.
+
 ## Premier relevé sur ArchASP
 
 Le 26 novembre 2026, 8 899 enregistrements ont fourni du vocabulaire. Trois extraits tenus à l’écart, en rap français, rap américain et reggae, ont fourni 109 mots de référence. Les neuf lectures ont utilisé Vulkan sur le GPU AMD, avec le mix original. Le genre et les pistes Demucs réutilisables n’étaient pas disponibles dans l’index et le cache de ces trois cas.
