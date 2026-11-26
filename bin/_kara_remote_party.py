@@ -547,6 +547,8 @@ class RemoteParty:
             return
         active = control.party.active
         blackbox = control.blackbox.status(storage=True)
+        if preflight := getattr(control, "blackbox_preflight", None):
+            blackbox["preflight"] = preflight()
         music_limit = control.turn_music_restore if control.turn_music_restore is not None else control.music_volume
         audio = {**control.room_audio.status(),
                  "music_ceiling": round(100 * min(1., music_limit)) if music_limit is not None else 100}

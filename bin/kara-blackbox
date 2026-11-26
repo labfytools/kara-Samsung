@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import shutil
@@ -11,6 +12,7 @@ import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import time
 import wave
 
 from _kara_blackbox import (ROOT, TRACK_NAME, digest, events, float_header,
@@ -31,6 +33,8 @@ def matching(args, folder):
         if any(value is not None and item.get(field) != value
                for field, value in ((field, getattr(args, field))
                                     for field in ("turn", "player", "song", "component", "event", "id"))):
+            continue
+        if args.cycle is not None and item.get("cycle") != args.cycle or item["id"] <= args.after_id:
             continue
         if args.since is not None and item["monotonic_ns"] < args.since:
             continue
@@ -87,7 +91,7 @@ def open_window_track(folder, name):
         os.close(directory)
 
 
-def extract_window(folder, window, output_path):
+def extract_window(folder, window, output_path, *, reconstruct_gaps=False):
     data = window["data"]
     lower, upper = float(data["capture_begin"]), float(data["capture_end"])
     rate = 16000
@@ -118,11 +122,14 @@ def extract_window(folder, window, output_path):
         cursor = last
     if not coverage:
         raise ValueError("Cette fenêtre n’a pas de piste Whisper enregistrée.")
+    if coverage < frames and not reconstruct_gaps:
+        raise ValueError("Fenêtre discontinue. --reconstruct-gaps reproduit le remplissage silencieux du score.")
     with os.fdopen(os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as stream:
         with wave.open(stream, "wb") as target:
             target.setparams((1, 2, rate, frames, "NONE", "not compressed"))
             target.writeframes(pcm)
-    return {"window": data["window"], "coverage": coverage / frames, "frames": frames, "output": str(output_path)}
+    return {"window": data["window"], "coverage": coverage / frames, "frames": frames,
+            "zero_filled_frames": frames - coverage, "output": str(output_path)}
 
 
 def replay_whisper(args, folder, window):
@@ -150,8 +157,8 @@ def replay_whisper(args, folder, window):
     interpreter = python if python.is_file() else sys.executable
     with TemporaryDirectory(prefix="kara-replay-") as draft:
         clip = Path(draft) / "window.wav"
-        capture = extract_window(folder, window, clip)
-        if capture["coverage"] < .5:
+        capture = extract_window(folder, window, clip, reconstruct_gaps=args.reconstruct_gaps)
+        if capture["coverage"] < .9:
             raise ValueError("Couverture de la fenêtre insuffisante pour Whisper.")
         arguments = [str(interpreter), "-B", str(BIN / "_kara_blackbox_replay.py"), str(clip),
                      data["language"], str(window["position"]), str(data["track_end"]), "--device", args.device]
@@ -164,7 +171,8 @@ def replay_whisper(args, folder, window):
     score = next((row for row in events(folder / "events.jsonl")
                   if row["turn"] == window["turn"] and row["event"] == "line-decision"
                   and row["data"]["window"] == data["window"]), None)
-    output({"window": data["window"], "coverage": capture["coverage"], "replayed": replay,
+    output({"window": data["window"], "coverage": capture["coverage"],
+            "zero_filled_frames": capture["zero_filled_frames"], "replayed": replay,
             "original_observed": score["data"]["raw_observed"] if score else None,
             "original_classification": score["data"]["source"] if score else None})
 
@@ -174,13 +182,20 @@ def main():
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
                                           "score", "inspect", "replay", "extract", "extract-pcm", "replay-whisper",
-                                          "analyze", "delete", "prune"))
+                                          "analyze", "report", "export", "space", "compare", "replay-timeline",
+                                          "delete", "prune"))
     parser.add_argument("session", nargs="?", default="latest")
-    for field in ("turn", "player", "song", "component", "event"):
+    for field in ("cycle", "turn", "player", "song", "component", "event"):
         parser.add_argument("--" + field)
     for field in ("id", "since", "until"):
         parser.add_argument("--" + field, type=int)
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--after-id", type=int, default=0, help="reprendre le rejeu après cet événement")
+    parser.add_argument("--speed", type=float, help="cadence du rejeu de chronologie, p. ex. 1 ou 10")
+    parser.add_argument("--tolerance", type=float, action="append", default=[],
+                        help="tolérance candidate en secondes pour compare, répétable deux fois")
+    parser.add_argument("--reconstruct-gaps", action="store_true",
+                        help="appliquer explicitement le remplissage du moteur de score dans un WAV")
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--frames", type=int)
@@ -190,9 +205,19 @@ def main():
     parser.add_argument("--original", type=Path)
     args = parser.parse_args()
     try:
+        if args.speed is not None and (not isfinite(args.speed) or not 0.1 <= args.speed <= 1000):
+            raise ValueError("Cadence attendue de 0,1 à 1 000.")
+        if len(args.tolerance) > 2 or any(not isfinite(value) or not 0 <= value <= 5 for value in args.tolerance):
+            raise ValueError("Deux tolérances candidates au maximum, comprises entre 0 et 5 s.")
         available = [path.name for path in session_folders(args.root)]
         if args.action == "list":
             output(available)
+            return 0
+        if args.action == "space":
+            size = sum(path.stat().st_size for name in available
+                       for path in (args.root / name).rglob("*") if not path.is_symlink() and path.is_file())
+            output({"sessions": len(available), "bytes": size,
+                    "free_bytes": shutil.disk_usage(args.root).free if args.root.is_dir() else None})
             return 0
         if args.action == "prune":
             if args.days is None or not 1 <= args.days <= 3650:
@@ -222,6 +247,20 @@ def main():
             output(validate_recording(folder, read(folder / "manifest.json")))
         elif args.action == "analyze":
             print((folder / "REPORT.md").read_text(), end="")
+        elif args.action in ("report", "export"):
+            from _kara_blackbox_lab import analyze, redacted
+
+            manifest = read(folder / "manifest.json")
+            validate_recording(folder, manifest)
+            report = read(folder / "analysis.json") if "analysis.json" in manifest["files"] else analyze(folder)
+            result = redacted(report) if args.action == "export" else report
+            if args.output is None:
+                output(result)
+            else:
+                # Reserve the path without following links or overwriting a
+                # capture. The writer uses the same private mode as sessions.
+                with open(args.output, "x", opener=private_file, encoding="utf-8") as stream:
+                    json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
         elif args.action == "extract-pcm":
             if args.id is None or args.output is None:
                 raise ValueError("Indique un événement PCM (--id) et un fichier de sortie (--output).")
@@ -238,7 +277,7 @@ def main():
             if window is None:
                 raise ValueError("Fenêtre vocale introuvable.")
             if args.action == "extract":
-                output(extract_window(folder, window, args.output))
+                output(extract_window(folder, window, args.output, reconstruct_gaps=args.reconstruct_gaps))
             else:
                 replay_whisper(args, folder, window)
         elif args.action == "delete":
@@ -249,11 +288,16 @@ def main():
             from itertools import islice
             from _kara_blackbox import INCIDENTS
             kind = args.action
+            if kind in ("compare", "replay-timeline"):
+                validate_recording(folder, read(folder / "manifest.json"))
+            if kind == "compare" and not args.tolerance:
+                raise ValueError("Indique une ou deux tolérances candidates avec --tolerance.")
             rows = (item for item in matching(args, folder)
-                    if (kind in ("timeline",) or (kind == "incidents" and item["event"] in INCIDENTS)
+                    if (kind in ("timeline", "replay-timeline") or (kind == "incidents" and item["event"] in INCIDENTS)
                         or (kind == "turns" and item["event"] in ("turn-start", "turn-end"))
-                        or (kind in ("score", "replay") and item["event"] == "line-decision")))
+                        or (kind in ("score", "replay", "compare") and item["event"] == "line-decision")))
             count = 0
+            replay_wall = replay_start = None
             for item in islice(rows, max(0, args.limit)):
                 count += 1
                 if kind == "replay":
@@ -262,9 +306,27 @@ def main():
                                                      data["tolerance"], source=data["source"])
                     output({"event_id": item["id"], "turn": item["turn"], "same": decisions == data["decisions"],
                             "original": data["decisions"], "replayed": decisions})
+                elif kind == "compare":
+                    data = item["data"]
+                    choices = [data["tolerance"], *args.tolerance]
+                    variants = [score_reference_line(data["reference"], data["observed"], tolerance,
+                                                     source=data["source"]) for tolerance in choices]
+                    output({"event_id": item["id"], "turn": item["turn"], "cycle": item.get("cycle"),
+                            "historical": variants[0] == data["decisions"],
+                            "variants": dict(zip("ABC", ({"tolerance_s": tolerance, "result": result}
+                                                           for tolerance, result in zip(choices, variants))))})
+                elif kind == "replay-timeline":
+                    if args.speed is not None:
+                        if replay_wall is None:
+                            replay_wall, replay_start = time.monotonic_ns(), item["monotonic_ns"]
+                        delay = (replay_wall + (item["monotonic_ns"] - replay_start) / args.speed
+                                 - time.monotonic_ns()) / 1_000_000_000
+                        if delay > 0:
+                            time.sleep(delay)
+                    print(json.dumps(item, ensure_ascii=False, separators=(",", ":")), flush=True)
                 else:
                     output(item)
-            if kind == "replay" and not count:
+            if kind in ("replay", "compare") and not count:
                 raise ValueError("Aucune fenêtre de notation disponible pour le replay.")
         return 0
     except (ValueError, KeyError, OSError, wave.Error, subprocess.SubprocessError) as exc:

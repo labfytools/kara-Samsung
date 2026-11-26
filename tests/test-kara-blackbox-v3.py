@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import struct
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -88,6 +89,53 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(stamp["offset_uncertainty_ns"], 7_000_000)
         self.assertIsNone(stamp["physical_bound_ns"])
         self.assertIsNone(browser_anchor(1_200_000_000, 1_200_000_001, payload))
+
+    def test_multitrack_report_requires_contiguous_coincident_evidence(self):
+        self.box.queue_size = 2048
+        self.box.start(consent=True, voice=True, tracks=["wifi", "monitor"])
+        session = self.box.voice_session()
+        connection = "c" * 32
+        base = 10_000_000_000
+        for label, shifted, missing_track in [("a", 0, False), ("b", 8_000_000_000, False), ("d", 0, True)]:
+            turn = {**self.turn, "turn": label * 16}
+            self.box.emit("party", "turn-start", **turn)
+            for packet in range(300):
+                first = packet * 960
+                stamp = base + packet * 20_000_000
+                self.box.pcm("wifi", 48000, 1, bytes(1920), **turn, connection=connection, sequence=packet,
+                             packet_timing={"frame_end": first + 960})
+                if not missing_track:
+                    clock = dict(frame=first, monotonic_ns=stamp + shifted, xrun=0, quantum=960, route=1,
+                                 epoch=1, driver=7, present=6, spa_headers=6)
+                    self.box.pcm("monitor", 48000, 2, bytes(7680), **turn, recording_session=session, clock=clock)
+                if packet in (30, 270):
+                    self.box.emit("clock", "mobile-anchor", **turn, rate=48000, connection=connection,
+                                  context_frame=first, renderer_frame_min_ns=stamp - 1000,
+                                  renderer_frame_max_ns=stamp + 1000)
+            self.box.emit("party", "turn-end", **turn)
+        self.box.stop(wait=True)
+        folder = self.box.root / session
+        manifest = json.loads((folder / "manifest.json").read_text())
+        self.assertTrue(validate_recording(folder, manifest)["valid"])
+        report = json.loads((folder / "analysis.json").read_text())
+        cycles = report["cycles"]
+        shared = cycles[cycle_id(session, "a" * 16)]
+        self.assertEqual(shared["aec_state"], "software_overlap")
+        self.assertIsNone(shared["physical_alignment_bound_ns"])
+        self.assertEqual(shared["overlap"]["monitor"]["duration_ns"], 4_799_998_000)
+        for label in ("b", "d"):
+            other = cycles[cycle_id(session, label * 16)]
+            self.assertEqual(other["overlap"], {})
+            self.assertEqual(other["aec_state"], "missing_timing_or_tracks")
+        cli = [sys.executable, "-B", str(Path(__file__).resolve().parents[1] / "bin/kara-blackbox"),
+               "--root", str(self.box.root)]
+        exported = subprocess.check_output([*cli, "export", session], text=True)
+        self.assertNotIn(session, exported)
+        self.assertNotIn(self.turn["song"], exported)
+        self.assertEqual(json.loads(exported)["aec_states"], {"software_overlap": 1, "missing_timing_or_tracks": 2})
+        first = json.loads(subprocess.check_output(
+            [*cli, "replay-timeline", session, "--cycle", cycle_id(session, "b" * 16), "--limit", "1"], text=True))
+        self.assertEqual(first["event"], "turn-start")
 
 
 if __name__ == "__main__":

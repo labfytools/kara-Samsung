@@ -78,10 +78,16 @@ class StemPlayback:
                 if layout.get_string("layout") == "interleaved" and encoding in ("S16LE", "F32LE"):
                     segment = pad.get_sticky_event(Gst.EventType.SEGMENT, 0)
                     running = segment.parse_segment().to_running_time(Gst.Format.TIME, buffer.pts) if segment else None
+                    sink = pad.get_parent_element()
+                    clock = sink.get_clock()
+                    before = time.monotonic_ns()
+                    native = clock.get_time() if clock else None
+                    after = time.monotonic_ns()
                     observer(layout.get_value("rate"), layout.get_value("channels"),
                              buffer.extract_dup(0, buffer.get_size()), encoding.lower(),
                              {"pts_ns": buffer.pts, "running_ns": running, "flags": int(buffer.get_flags()),
-                              "pipeline_base_ns": pad.get_parent_element().get_base_time()})
+                              "pipeline_base_ns": sink.get_base_time(), "pipeline_clock_ns": native,
+                              "host_before_ns": before, "host_after_ns": after})
         return Gst.PadProbeReturn.OK
 
     @staticmethod

@@ -704,6 +704,8 @@
     $("bb-disk").textContent = Number.isFinite(disk) ? (disk / 1e9).toFixed(1) + " Go disponibles" : "";
     if (party.blackbox?.unavailable?.length) $("bb-disk").textContent += " · " + party.blackbox.unavailable.join(", ");
     if (party.blackbox?.error && party.blackbox.active) $("bb-disk").textContent += " · " + party.blackbox.error;
+    $("bb-preflight").textContent = Object.entries(party.blackbox?.preflight || {}).map(([name, status]) =>
+      name + " · " + status).join("\n");
     $("bb-status").textContent = party.blackbox?.active ? "● Collecte en cours" :
       party.blackbox?.finalizing ? "Finalisation…" : party.blackbox?.error || (party.blackbox?.latest ?
         "Dernière session · " + party.blackbox.latest.events + " événements · " + party.blackbox.latest.incidents + " incidents" +
@@ -723,9 +725,11 @@
     if (state.party.blackbox?.active) await command("blackbox-stop");
     else {
       const voice = $("bb-voice").checked;
+      const tracks = Array.from($("bb-tracks").querySelectorAll("input:checked"), input => input.value);
       const subject = voice ? "les diagnostics et les pistes audio sélectionnées pendant les tours" : "les diagnostics";
-      if (confirm("Confirmer l’accord des participants et des responsables des mineurs pour " + subject + " ?")) {
-        const tracks = Array.from($("bb-tracks").querySelectorAll("input:checked"), input => input.value);
+      const pair = !voice || tracks.includes("wifi") && (tracks.includes("monitor") || tracks.includes("playback"));
+      const check = pair ? "" : "\nPrévol AEC incomplet. Sélectionne le micro reçu et une référence de sortie pour les comparer.";
+      if (confirm("Confirmer l’accord des participants et des responsables des mineurs pour " + subject + " ?" + check)) {
         await command("blackbox-start", {consent: true, voice, tracks});
         $("bb-voice").checked = false;
       }

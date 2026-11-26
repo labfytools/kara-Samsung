@@ -209,6 +209,12 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
                 f"- Événements perdus : {dropped}\n\n"
                 "Les identifiants de preuve figurent dans `incidents.jsonl`.\n")
     names = ["events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"]
+    if modern:
+        from _kara_blackbox_lab import analyze
+
+        analysis = analyze(folder)
+        atomic_json(folder / "analysis.json", analysis)
+        names.append("analysis.json")
     audio = folder / "audio"
     if not audio.is_symlink():
         for path in sorted(audio.glob("*.wav")):
@@ -537,7 +543,8 @@ class BlackBox:
                 item["data"].update(clock={key: clock[key] for key in GRAPH_CLOCK_FIELDS}, sample_format="f32le")
             if track == "playback":
                 item["data"].update(sample_format=sample_format, playback_timing={
-                    key: playback_timing[key] for key in ("pts_ns", "running_ns", "pipeline_base_ns", "flags")
+                    key: playback_timing[key] for key in ("pts_ns", "running_ns", "pipeline_base_ns", "flags",
+                                                          "pipeline_clock_ns", "host_before_ns", "host_after_ns")
                     if type(playback_timing.get(key)) is int and 0 <= playback_timing[key] < 2 ** 63})
             if packet_timing is not None and track in ("wifi", "whisper"):
                 item["data"]["packet_timing"] = {
@@ -704,7 +711,7 @@ def validate_recording(folder, manifest):
         path = folder / name
         if path.is_symlink():
             raise ValueError("Chemin de capture invalide.")
-        if name not in ("events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"):
+        if name not in ("events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md", "analysis.json"):
             if not name.startswith("audio/") or not TRACK_NAME.fullmatch(name.removeprefix("audio/")) or path.parent.is_symlink():
                 raise ValueError("Chemin de capture invalide.")
             audio[name] = wave_layout(path)

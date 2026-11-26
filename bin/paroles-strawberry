@@ -552,6 +552,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             detail += ("Deep Analysis enregistre le microphone du joueur et la sortie PipeWire pendant les tours. "
                        "Le micro témoin peut être sélectionné explicitement depuis Admin sur mobile. "
                        "Obtiens l’accord explicite de chaque participant. Prévois 6 Go par heure de jeu.")
+            detail += "\n\n" + "\n".join(
+                f"{label} · {state}" for label, state in self.blackbox_preflight().items())
             if status["latest"]:
                 detail += f"\n\nDernière session : {status['latest']['session']}"
             dialog = Gtk.AlertDialog(message="Activer BlackBox ?", detail=detail,
@@ -567,6 +569,29 @@ class LyricsWindow(Gtk.ApplicationWindow):
                     Gtk.AlertDialog(message="BlackBox indisponible", detail=str(error)).show(self)
 
             dialog.choose(self, None, confirmed)
+
+    def blackbox_preflight(self):
+        from _kara_blackbox import MIN_FREE
+        from _kara_game import WORKER_PYTHON
+
+        status = self.blackbox.status(storage=True)
+        free = status["free_bytes"]
+        mobile = self.room_audio.status()["available"]
+        received = self.room_audio.receiving(recent=True)
+        sink = self.room_audio.selected_sink()
+        references = bool(self.active_reference or self.prepared_stems)
+        tv = self.receiver and time.monotonic() - self.receiver.tv_seen < 4
+        return {
+            "Espace disque": ("À vérifier" if free is None else "Prêt" if free >= MIN_FREE + 65536 else "Bloquant"),
+            "Serveur micro": "Prêt" if mobile else "Indisponible",
+            "Microphone du tour": ("Prêt" if received and self.room_audio.consented() else
+                                   "Accord à donner" if received else "À connecter"),
+            "Références musicales": "Prêtes" if references else "À préparer",
+            "Sortie PipeWire": "Route choisie" if sink else "À vérifier au tour",
+            "Turbo": "Actif" if self.game_score.ready else "À charger" if WORKER_PYTHON.is_file() else "Indisponible",
+            "Tizen": "Connecté" if tv else "Facultatif · non connecté",
+            "Horloges et paire AEC": "Recouvrement et formats à mesurer sur un tour consentant",
+        }
 
     def update_party_services(self):
         state = self.blackbox.status()
