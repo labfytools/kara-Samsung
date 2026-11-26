@@ -48,6 +48,24 @@ La variante diminue le PSI et le temps sur cet essai. Son PSS plus élevé et le
 
 Les trois premiers extraits du manifeste, en rock et dans les deux groupes de rap, ont fourni 52 mots de référence. Le mix a rendu 25 erreurs, la voix brute et la voix normalisée 30 chacune et la segmentation adaptative 31. La relecture ciblée et la relecture phonétique ont laissé toutes les graphies du stem en place. L’écart entre le mix et le stem est concentré sur le rap américain du pilote. Ce résultat décrit ces trois cas et motive une qualification par genre.
 
+### Détection d’activité sur un titre entier
+
+Un second banc a comparé les niveaux RMS, le rapport de niveau entre le stem et le mix, et Silero VAD sur le même titre complet de 193,68 s. Chaque décision s’applique à un intervalle de 100 ms. Le centre appartient soit à un mot annoté, soit à un intervalle éloigné d’au moins 500 ms des annotations. Les 1 401 intervalles de la première catégorie et les 201 de la seconde déterminent les fractions du tableau. La seconde catégorie peut contenir des sons vocaux non annotés.
+
+| Détecteur | Intervalles annotés conservés | Intervalles éloignés rejetés |
+| --- | ---: | ---: |
+| RMS du stem au-dessus de −43 dBFS | 99,64 % | 76,12 % |
+| RMS du stem au-dessus de −36 dBFS | 99,07 % | 80,10 % |
+| Rapport stem et mix au-dessus de −10 dB | 91,93 % | 58,71 % |
+| Silero à 0,50, mix | 54,03 % | 97,51 % |
+| Silero à 0,50, stem | 97,50 % | 92,54 % |
+
+Silero CPU à un fil prend environ une seconde par entrée. À 0,50, il retirerait près de la moitié des intervalles annotés du mix et environ 2,5 % de ceux du stem. Le RMS reste un candidat pour choisir des frontières, avec chevauchement et conservation du signal complet. Une règle qui supprime des passages doit d’abord être mesurée sur davantage de genres, de chœurs et de voix faibles.
+
+```sh
+python3 -B tests/qualify-parole-activity.py mix.mp3 vocals.flac manual.csv
+```
+
 ## Moteurs et pistes de recherche
 
 | Piste | Compatibilité et portée |

@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Mesurer la part des paroles annotées conservée par des seuils d’activité vocale sur chanson entière.
 - Rejouer les pistes AEC BlackBox lorsque le moniteur et le témoin partagent leurs cycles PipeWire.
 - Ajouter le banc reprenable de comparaison du mix, du stem vocal et de ses variantes, avec repères indépendants et mesures mémoire.
 - Afficher les passages écartés d’un brouillon et permettre de rejoindre leurs repères dans Strawberry.
