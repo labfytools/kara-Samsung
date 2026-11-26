@@ -78,6 +78,8 @@ Les durées A à E cumulent les mesures du décodeur par variante, hors chargeme
 
 Un rééchantillonnage descriptif de 4 000 tirages appariés par titre, avec quotas de genre fixes, estime l’écart voix moins mix entre −4,05 et +8,05 points pour l’intervalle à 95 %. Pour le découpage, l’intervalle va de +0,15 à +10,77 points. La sélection par confiance a essayé des marges entre 0 et 0,12 avec un rapport de nombres de mots entre 80 et 120 % du mix. Le choix de la règle a été entraîné sur les autres genres à chaque tour. Cette sélection donne 47,53 % de WER. Un choix rétrospectif par titre entre le mix, la voix brute et la voix filtrée descendrait à 40,17 %. Il utilise les références et borne seulement le gain possible entre ces trois hypothèses. Les effectifs de deux à quatre titres demandent davantage de données avant de qualifier un réglage spécifique au genre.
 
+Pour les 13 extraits dont le texte de référence a la densité la plus élevée, à partir de 2,66 mots par seconde sur l’intervalle entier, le mix est à 44,27 % de WER et le stem adaptatif à 45,06 %. Dans les 24 extraits du milieu de la distribution, le WER passe de 46,70 % à 55,16 % et les suppressions de 130 à 231. Cette densité comprend les silences et n’équivaut ni au débit vocal instantané ni au tempo musical.
+
 Les 47 nouvelles séparations ont duré 32,45 s en médiane, avec des pics PSS de groupe de 1 189 à 1 514 Mio et une température CPU maximale de 57,38 °C pendant les traitements terminés. Trois séparations ont été reprises du pilote. Les pics PSS échantillonnés pendant les phases Turbo terminées vont de 160 à 258 Mio. Les compteurs DRM du décodeur F16 indiquent jusqu’à 2 089 Mio de GTT résident. Le GTT de l’hôte a atteint jusqu’à 7,14 Gio pendant les phases Turbo terminées. La mémoire disponible minimale est restée à 4,24 Gio sur ces phases. Parmi les 11 reports, 10 correspondent au PSI et un à la réserve disponible. Deux reports se produisent dans Demucs et neuf dans Turbo, parmi le chargement du modèle, les buffers PCM et le décodage du mix.
 
 Sur la chanson entière de 193,68 s, le premier essai Demucs avec fenêtres de cinq secondes s’est arrêté après environ treize secondes pendant la séparation. Le PSI valait 1,24 % pour 5,40 Gio disponibles et 54,5 °C côté CPU. Le réglage de cinq secondes n’est ainsi pas qualifié au seuil de production.
@@ -124,6 +126,24 @@ Le décalage estimé sur le stem varie de −123 à −106 ms suivant le bloc. L
 python3 -B tests/qualify-parole-clock-drift.py /dossier/prive/es-recuerdo/case.json vocals
 ```
 
+### Extension à la pop anglaise et au country français
+
+Les fichiers de référence proviennent de JamendoLyrics MultiLang. Les lignes dérivent des annotations manuelles des mots. Les débuts de sous-tokens créés par la normalisation ne reçoivent pas de repère manuel inventé. Sur le titre pop, 334 débuts sont évaluables pour 376 mots de référence. Sur le titre country, 315 le sont pour 369 mots. [Annotations JamendoLyrics MultiLang](https://huggingface.co/datasets/jamendolyrics/jamendolyrics)
+
+| Titre et moteur | Entrée | WER | CER | Temps du décodeur | Tous les débuts de mot à ±500 ms | Tous les débuts de ligne à ±500 ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Cortez, *Feel (Stripped)* · 240,56 s · F16 | Mix | 15,96 % | 13,64 % | 105,69 s | 76,95 % | 85,71 % |
+| Même titre · F16 | Voix | 19,68 % | 16,70 % | 105,95 s | 73,95 % | 85,71 % |
+| Même titre · F16 | Découpage | 15,16 % | 12,17 % | 271,33 s | 80,24 % | 85,71 % |
+| Même titre · Q5 | Mix | 16,49 % | 13,77 % | 120,20 s | 77,25 % | 88,10 % |
+| Même titre · Q5 | Voix | 18,88 % | 15,93 % | 120,06 s | 74,85 % | 83,33 % |
+| FLO, *l’abandon* · 209,70 s · Q5 | Mix | 74,53 % | 72,78 % | 98,57 s | 26,35 % | 30,23 % |
+| Même titre · Q5 | Voix | 57,45 % | 53,23 % | 110,89 s | 44,44 % | 46,51 % |
+
+Sur la pop, l’alignement F16 du découpage affiche encore un pire début de mot à 1 875 ms. Le p95 de fin de ligne est de 985 ms sur les repères appariés. Sur le country, la voix isolée réduit les suppressions de 262 à 183. Le p95 des débuts de mots appariés vaut 363 ms avec seulement 140 débuts retrouvés sur 315. Un seuil de publication doit tenir compte de cette couverture. Tous ces passages ont émis zéro mot dans les grands intervalles entre annotations.
+
+Les trois décodages Q5 sur chansons entières ont fini au seuil de PSI de 1 % avec leurs séparations déjà disponibles. Sur les titres anglais et français, les pics enregistrés sont de 0,06 % et 0,36 %. Les réserves minimales mesurées sont de 5,33 Gio et 5,20 Gio. La tentative F16 espagnole a été arrêtée à environ 4 Gio disponibles pendant la lecture de la voix. La tentative F16 française a été interrompue par une variation de capot ou d’alimentation. Ces essais laissent ouverte la qualification complète de Demucs au seuil de production. Le titre pop n’indique pas un gain de vitesse lié à la quantification.
+
 ### Détection d’activité sur un titre entier
 
 Un second banc a comparé les niveaux RMS, le rapport de niveau entre le stem et le mix, et Silero VAD sur le même titre complet de 193,68 s. Chaque décision s’applique à un intervalle de 100 ms. Le centre appartient soit à un mot annoté, soit à un intervalle éloigné d’au moins 500 ms des annotations. Les 1 401 intervalles de la première catégorie et les 201 de la seconde déterminent les fractions du tableau. La seconde catégorie peut contenir des sons vocaux non annotés.
@@ -150,6 +170,7 @@ python3 -B tests/qualify-parole-activity.py mix.mp3 vocals.flac manual.csv
 | Séparation comme détecteur d’activité | Les expériences publiées de Syed et al. justifient un témoin à segmentation guidée par les voix sur les morceaux longs. Elles motivent le comparatif local avec lecture de l’intégralité des cœurs. Elles ne prédisent pas un gain sur chaque genre ou sur chaque extrait. [Étude de séparation et transcription](https://arxiv.org/abs/2506.15514) |
 | Silero VAD | Code et poids sous licence MIT. Un petit modèle est disponible localement. C’est un détecteur de parole. La sensibilité aux voyelles tenues, aux voix faibles et aux chœurs doit être mesurée avant de retirer du signal. [Dépôt Silero](https://github.com/snakers4/silero-vad) |
 | SOFA | Alignement forcé spécialisé pour le chant, code MIT et export ONNX. Le texte est requis, avec une conversion adaptée en phonèmes. Le dictionnaire de démonstration vise le mandarin et les performances sur le rap français restent à établir. [SOFA](https://github.com/qiuqiao/SOFA) |
+| WhisperX | Code BSD-2-Clause et étape d’alignement distincte par Wav2Vec2. Les modèles documentés distinguent anglais, français et espagnol. Cette étape fournirait un témoin d’alignement indépendant du DTW de Turbo. Elle nécessite de qualifier les poids et le coût de traitement local sur le chant. [WhisperX](https://github.com/m-bain/whisperX) · [Modèles d’alignement](https://github.com/m-bain/whisperX/blob/main/whisperx/alignment.py) |
 | MMS et adaptation LoRA | MMS fournit un témoin multilingue CTC dont le modèle de grande taille est sous CC BY-NC. Une étude sur l’adaptation LoRA à la musique polyphonique indique une amélioration expérimentale. Les poids appropriés, leur licence, la mémoire et le débit sur ArchASP demandent des vérifications avant intégration. [MMS](https://huggingface.co/facebook/mms-1b-all) · [Étude LoRA](https://arxiv.org/abs/2506.02339) |
 
 ## Reproduction du comparatif
