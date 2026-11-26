@@ -1130,7 +1130,7 @@ def process_track(path, client, preview, synced=False, publication_root=None):
 
 
 def process_import_track(path, client, index, settings, excluded, locks, activity, strawberry, *, notify=None):
-    from _parole_index import MEDIA, SIDECAR, document, sidecar as read_sidecar
+    from _parole_index import MEDIA, SIDECAR, document, reference_proof, sidecar as read_sidecar
 
     version = track_version(path)
     with index.db() as db:
@@ -1169,23 +1169,23 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
         with lock:
             activity(synced, 1)
             try:
-                value, _ = client.find(*signature, synced=synced, local_text=local_text,
-                                       registry=index, strict=True, context=context)
+                value, provider = client.find(*signature, synced=synced, local_text=local_text,
+                                              registry=index, strict=True, context=context)
             except ServiceUnavailable:
-                return "temporary", None
+                return "temporary", None, None
             except AmbiguousLyrics:
-                return "review", None
+                return "review", None, None
             finally:
                 activity(synced, -1)
-            return ("missing" if value is None else "found" if value else "instrumental"), value
+            return ("missing" if value is None else "found" if value else "instrumental"), value, provider
 
-    plain, text = (("present", None) if plain_present else
-                   lookup(False) if settings["lyrics"] and path.suffix.lower() in STREAM_TAGS | FILE_TAGS
-                   else ("missing", None))
+    plain, text, plain_provider = (("present", None, None) if plain_present else
+                                   lookup(False) if settings["lyrics"] and path.suffix.lower() in STREAM_TAGS | FILE_TAGS
+                                   else ("missing", None, None))
     if text:
         def published(current, saved, previous):
             notify(path, MEDIA, {"token": document(current), "tags": saved,
-                                 "same_streams_as": document(previous)})
+                                 "same_streams_as": document(previous), "lyrics_provider": plain_provider})
 
         try:
             with resource_slot(index.root / INBOX / ".kara-traitements", PROCESSING, timeout=12):
@@ -1195,6 +1195,7 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
     # Publish verified plain text before a possibly slower timing request.
     # The same client keeps the validated text and its shared provider result.
     local_text = local_text or text or ""
+    timed_provider = "Strawberry"
     if lrc_exists:
         timed, lrc = ("present" if lrc_present else "review"), None
     elif not settings["lrc"]:
@@ -1202,17 +1203,18 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
     elif embedded := catalog_transcript(local_text, duration, synced=True):
         timed, lrc = "found", embedded
     else:
-        timed, lrc = lookup(True)
+        timed, lrc, timed_provider = lookup(True)
     if lrc:
         try:
             with shared_mutation(index.root):
                 if track_version(path) != version or path.resolve() != path:
                     raise ValueError("fichier modifié pendant la recherche")
                 saved = save_lrc(lrc_path, lrc)
+                proof = reference_proof(path, ".lrc", version, timed_provider, external=timed_provider != "Strawberry")
             if not saved:
                 timed = "present"
             elif notify:
-                notify(path, SIDECAR, None)
+                notify(path, SIDECAR, proof)
         except (OSError, ValueError):
             timed = "temporary"
     return plain, timed

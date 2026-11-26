@@ -23,6 +23,7 @@ from _parole_taglib import helper as taglib_helper, read as taglib_read
 
 REFERENCE_REUSE_SECONDS = 86_400
 MEDIA, SIDECAR, PREPARATION, REMOVE, ARTWORK = (1 << i for i in range(5))
+LEXICON = "lexicon"
 EVENT_BATCH = 64
 EVENT_DELAY = .25
 EVENT_MAX_DELAY = 1.5
@@ -122,6 +123,21 @@ def document(value):
 
 def encoded_key(*parts):
     return sha256(document(parts).encode()).hexdigest()
+
+
+def queue_lexicon(db, identity, now):
+    # A newer receipt supersedes even a claim already computing forms. The
+    # worker can settle only the exact revision it claimed.
+    db.execute("""INSERT INTO tasks(kind,subject,state,priority,due,revision,updated,payload)
+                  VALUES(?,?,'queued',30,?,?,?,'{}')
+                  ON CONFLICT(kind,subject) DO UPDATE SET state='queued',due=excluded.due,
+                    revision=excluded.revision,updated=excluded.updated,attempts=0,detail=''
+               """, (LEXICON, identity, now, uuid4().hex, now))
+
+
+def forget_lexicon(db, identity):
+    db.execute("DELETE FROM tasks WHERE kind=? AND subject=?", (LEXICON, identity))
+    db.execute("DELETE FROM reviews WHERE kind=? AND subject=?", (LEXICON, identity))
 
 
 class Index:
@@ -369,12 +385,19 @@ class Index:
         now = time() if now is None else now
         serial = uuid4().hex
         proofs = {} if proofs is None else proofs
+        # A newer audio proof replaces the full tag set. Text receipts are
+        # merged separately and each one still has to match both disk versions.
         db.executemany("""
             INSERT INTO index_events VALUES(?,?,?,?,?,0,0,?)
             ON CONFLICT(path) DO UPDATE SET mask=index_events.mask | excluded.mask,
                 serial=excluded.serial,
                 due=min(excluded.due, index_events.first + ?), attempts=0,
-                combined=index_events.combined+1, proof=coalesce(excluded.proof,index_events.proof)
+                combined=index_events.combined+1,
+                proof=CASE WHEN json_type(excluded.proof,'$.token')='text' THEN
+                    json_set(excluded.proof,'$.references',json_patch(
+                        coalesce(json_extract(index_events.proof,'$.references'),'{}'),
+                        coalesce(json_extract(excluded.proof,'$.references'),'{}')))
+                    ELSE coalesce(json_patch(index_events.proof,excluded.proof),excluded.proof,index_events.proof) END
         """, ((path, mask, serial, proofs.get(path, {}).get("published", now),
                now + (REMOVAL_DELAY if mask & REMOVE else EVENT_DELAY),
                document(proofs[path]) if path in proofs else None, EVENT_MAX_DELAY) for path in paths))
@@ -701,6 +724,8 @@ class Index:
                 self.record_activity(db, now, ("validated_lrc" if suffix == ".lrc" else "validated_lyrics",))
             if path is not None:
                 self.notify([path], SIDECAR, db=db)
+                if changed:
+                    queue_lexicon(db, identity, now)
 
     def exclude(self, kind, subject):
         with self.db() as db:
@@ -715,11 +740,15 @@ class Index:
         with self.db() as db:
             return db.execute("SELECT * FROM songs WHERE id=?", (identity,)).fetchone()
 
-    def update(self, identity, **fields):
+    def update(self, identity, *, expected=None, lexicon=False, **fields):
         assert set(fields) <= {"lyrics", "lrc", "kara", "info", "cache", "audio", "side", "previous", "checked"}
         with self.db() as db:
-            db.execute(f"UPDATE songs SET {','.join(name+'=?' for name in fields)} WHERE id=?",
-                       (*fields.values(), identity))
+            match = " AND token=? AND checked=?" if expected is not None else ""
+            args = (expected["token"], expected["checked"]) if expected is not None else ()
+            changed = db.execute(f"UPDATE songs SET {','.join(name+'=?' for name in fields)} WHERE id=?{match}",
+                                 (*fields.values(), identity, *args)).rowcount
+            if changed and lexicon:
+                queue_lexicon(db, identity, time())
 
     def source_enabled(self, identity):
         with self.db() as db:
@@ -852,6 +881,13 @@ def sidecar_token(path):
         return ""
     except OSError:
         return "invalid"
+
+
+def reference_proof(path, suffix, audio, provider, *, external=False):
+    # The caller captures the final linked sidecar while its audio is pinned
+    # by the mutation lease. The proof contains versions and attribution only.
+    return {"references": {suffix: {"audio": document(audio), "sidecar": sidecar_token(path.with_suffix(suffix)),
+                                     "provider": provider, "external": external}}}
 
 
 def local_state(path, embedded, duration, old, info, stable, measure, *, exact_duration=None):
@@ -1059,6 +1095,9 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                 counts["changed"] += written
                 if written:
                     planned.append(song["path"])
+                    if song["lexicon"] or song["lexicon_dirty"] and db.execute(
+                            "SELECT 1 FROM tasks WHERE kind=? AND subject=?", (LEXICON, song["id"])).fetchone():
+                        queue_lexicon(db, song["id"], now)
                 elif song["path"] in events:
                     retry.add(song["path"])
                 # Keep the canonical edition and recording IDs when a known
@@ -1074,6 +1113,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                 counts["missing"] += deleted
                 if deleted:
                     db.execute("UPDATE tasks SET state='excluded' WHERE subject=? AND state!='running'", (song["id"],))
+                    forget_lexicon(db, song["id"])
                 elif db.execute("SELECT 1 FROM songs WHERE path=?", (song["path"],)).fetchone():
                     retry.add(song["path"])
             if planned and plan_events:
@@ -1247,6 +1287,25 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     else:
                         with measure("cache"):
                             cache, kara, report = inspect_cache(path, old, token, side)
+                    side_versions = json.loads(side) if side else [None, None]
+                    references = proof.get("references", {})
+                    provenance = {}
+                    for offset, (suffix, field) in enumerate(((".lrc", "lrc_provider"), (".txt", "text_provider"))):
+                        fact = references.get(suffix, {})
+                        if (side_versions[offset] not in ("", "invalid", None)
+                                and fact.get("audio") == token and fact.get("sidecar") == side_versions[offset]
+                                and isinstance(provider := fact.get("provider"), str) and provider):
+                            provenance[field] = provider
+                            if suffix == ".lrc" and lrc == "local" and fact.get("external") is True:
+                                lrc = "externe"
+                    if proof_tags is not None and isinstance(provider := proof.get("lyrics_provider"), str) and provider:
+                        provenance["lyrics_provider"] = provider
+                    same_streams = same_audio or (proof_tags is not None and old is not None and
+                                                 proof.get("same_streams_as") == old["token"])
+                    audio = old["audio"] if same_streams else ""
+                    pcm = proof.get("pcm") if proof_tags is not None else None
+                    if isinstance(pcm, str) and len(pcm) == 64 and all(c in "0123456789abcdef" for c in pcm):
+                        audio = pcm
                     artwork_changed = False
                     if (event and mask & ARTWORK) or (not event and "artwork" in info):
                         with measure("artwork"):
@@ -1258,7 +1317,8 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     if (same_path and stable and same_catalogue and side == old["side"] and cache == old["cache"]
                             and kara == old["kara"] and lyrics == old["lyrics"] and lrc == old["lrc"]
                                 and plays == old["plays"] and not artwork_changed and not info.get("probe_error")
-                                and timing_pending == bool(info.get("timing_pending"))):
+                                and timing_pending == bool(info.get("timing_pending")) and audio == old["audio"]
+                                and all(info.get(field) == value for field, value in provenance.items())):
                         counts["unchanged"] += 1
                         if event:
                             settled.add(pathname)
@@ -1279,12 +1339,13 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     release_id = tags.get("albumid") or tags.get("musicbrainzalbumid") or ""
                     year = integer(str(tags.get("year") or tags.get("date") or "")[:4])
                     edition = encoded_key(owner, album, release_id or year, str(path.parent))
-                    same_streams = same_audio or (proof_tags is not None and old is not None and
-                                                 proof.get("same_streams_as") == old["token"])
                     if not same_streams or embedded != info.get("plain", ""):
                         info.pop("lyrics_provider", None)
-                    if not same_streams or json.loads(side)[0] != json.loads(old["side"])[0]:
-                        info.pop("lrc_provider", None)
+                    old_side = json.loads(old["side"]) if old and old["side"] else [None, None]
+                    for offset, field in enumerate(("lrc_provider", "text_provider")):
+                        if not same_streams or side_versions[offset] != old_side[offset]:
+                            info.pop(field, None)
+                    info.update(provenance)
                     info.update(tags={k: v for k, v in tags.items() if k not in LYRIC_KEYS},
                                 plain=embedded, catalogue=catalogue_revision, report=report)
                     pending.append(dict(id=old["id"] if old else uuid4().hex, path=str(path), token=token,
@@ -1296,7 +1357,9 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                         artist_id=artist_id, release_id=release_id, plays=plays, lyrics=lyrics, lrc=lrc,
                                         kara=kara, search=key(" ".join((title, artist, owner, album))), seen=generation,
                                         added=old["added"] if old else now, checked=now, info=document(info),
-                                        audio=old["audio"] if same_streams else "", canonical_previous=canonical_previous,
+                                        audio=audio, canonical_previous=canonical_previous,
+                                        lexicon=bool(event and mask & (MEDIA | SIDECAR) and (embedded or provenance)),
+                                        lexicon_dirty=not event or bool(mask & (MEDIA | SIDECAR)),
                                         old_token=old["token"] if old else None, old_checked=old["checked"] if old else None))
                     if event:
                         settled.add(pathname)
@@ -1340,6 +1403,8 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     with measure("sqlite_lock"):
                         db.execute("BEGIN IMMEDIATE")
                     counts["transactions"] += 1
-                    counts["missing"] += db.executemany(
-                        "DELETE FROM songs WHERE id=? AND path=? AND token=? AND checked=?", absent).rowcount
+                    for row in absent:
+                        if db.execute("DELETE FROM songs WHERE id=? AND path=? AND token=? AND checked=?", row).rowcount:
+                            forget_lexicon(db, row[0])
+                            counts["missing"] += 1
     return dict(counts, phase_seconds=dict(phases), phase_calls=dict(calls))

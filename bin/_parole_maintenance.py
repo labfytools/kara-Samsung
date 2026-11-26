@@ -31,6 +31,7 @@ from _parole_index_watch import Watch
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
 from _parole_import_enrichment import paths_for as enrichment_paths
+from _parole_lexicon import refresh_one as refresh_lexicon
 from _parole_local_reference import SOURCE as LOCAL_SOURCE
 from _parole_night import Night
 from _parole_process import Interrupted, run
@@ -162,7 +163,6 @@ class Maintenance:
         self.interrupt = Event()
         self.scan_now = Event()
         self.index_wake = Event()
-        self.index_lock = Lock()
         self.index_progress = None
         self.priority = False
         self.index_priority = False
@@ -451,6 +451,27 @@ class Maintenance:
         finally:
             watch.close()
 
+    def lexicon_loop(self):
+        # Only this low-priority worker tokenizes text. Index transactions
+        # enqueue versioned work and leave provider or audio workers running.
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, max(8, os.getpriority(os.PRIO_PROCESS, 0)))
+        except OSError:
+            pass
+        while not self.shutdown.is_set():
+            try:
+                settings = self.index.settings(wait=.15)
+
+                def stopped():
+                    return self.shutdown.is_set() or settings["paused"] or bool(self.index_limit(settings))
+
+                if refresh_lexicon(self.index, time(), stopped):
+                    continue
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+                self.journal.emit("LYRICS", "Lexique temporairement indisponible", "WARNING")
+                self.shutdown.wait(5)
+            self.shutdown.wait(.5)
+
     def index_turn(self, watch=None):
         if self.index_stopped():
             return .5
@@ -482,10 +503,9 @@ class Maintenance:
         self.metrics["index_pending"] = backlog
         if events:
             started = monotonic()
-            with self.index_lock:
-                result = inventory(self.index, self.collection, self.inspect_cache, self.index_stopped,
-                                   lambda *_: None, events=events, allow_probe=not limit,
-                                   plan_events=lambda db, paths: self.plan_events(db, settings, paths))
+            result = inventory(self.index, self.collection, self.inspect_cache, self.index_stopped,
+                               lambda *_: None, events=events, allow_probe=not limit,
+                               plan_events=lambda db, paths: self.plan_events(db, settings, paths))
             duration = monotonic() - started
             self.metrics.update(index_last=result, index_seconds=duration)
             if result["changed"] or result["missing"]:
@@ -716,14 +736,15 @@ class Maintenance:
     def refresh_song(self, song, **changes):
         if not song:
             return
-        with self.index_lock:
-            inventory(self.index, self.collection, self.inspect_cache, self.shutdown.is_set,
-                      lambda *_: None, paths=[Path(song["path"])])
-            fresh = self.index.song(song["id"])
-            if fresh:
-                details = json.loads(fresh["info"])
-                details.update(changes.pop("provenance", {}))
-                self.index.update(song["id"], checked=time(), info=document(details), **changes)
+        path = Path(song["path"])
+        inventory(self.index, self.collection, self.inspect_cache, self.shutdown.is_set,
+                  lambda *_: None, paths=[path])
+        fresh = self.index.song(song["id"])
+        if fresh and changes and fresh["path"] == str(path) and document(file_token(path)) == fresh["token"]:
+            details = json.loads(fresh["info"])
+            details.update(changes.pop("provenance", {}))
+            self.index.update(song["id"], expected=fresh, lexicon="lrc" in changes, checked=time(),
+                              info=document(details), **changes)
         self.changed()
 
     def do_song(self, task, result):
@@ -733,28 +754,24 @@ class Maintenance:
             return "excluded", "disparu", 0
         outcome = result["state"]
         if outcome == "rescan":
-            self.refresh_song(song)
+            self.index.notify([song["path"]])
+            self.index_wake.set()
             return "temporary", outcome, 10
         if outcome == "found":
             provider = result["source"]
+            # The child already delivered the verified file to V2. Network
+            # settlement accounts for the result without waiting on inventory.
+            self.index_wake.set()
             if provider == LOCAL_SOURCE:
-                self.refresh_song(song, audio=result["audio"], provenance={f"{kind}_provider": provider})
                 self.journal.emit(kind.upper(), f"Référence PCM locale intégrée · {song['title']}")
                 return "done", "référence PCM locale", 0
-            elif kind == "lrc":
-                # A successful worker has materialized a missing sidecar.
-                # Keep « intégré » for tracks still awaiting extraction.
-                self.refresh_song(song, lrc="local" if provider == "Strawberry" else "externe",
-                                  provenance={"lrc_provider": provider})
-            else:
-                self.refresh_song(song, lyrics="Strawberry", audio=result["audio"],
-                                  provenance={"lyrics_provider": provider})
             self.journal.emit("SUCCESS", f"{song['title']} · {'LRC' if kind == 'lrc' else 'Paroles'} vérifiés")
         elif outcome == "instrumental":
             self.index.update(identity, lyrics="instrumental", checked=time())
             self.changed()
         elif outcome == "present":
-            self.refresh_song(song)
+            self.index.notify([song["path"]])
+            self.index_wake.set()
         elif outcome == "local_miss":
             return "temporary", LOCAL_REFERENCE_MISS, 0
         elif outcome in ("temporary", "network", "unavailable", "limited"):
@@ -1527,9 +1544,11 @@ class Maintenance:
                     self.recover_night_drafts()
                 self.journal.emit("SYSTEM", "Maintenance de Parole démarrée")
                 index_thread = Thread(target=self.index_loop, name="parole-index", daemon=False)
+                lexicon_thread = Thread(target=self.lexicon_loop, name="parole-lexicon", daemon=False)
                 enrichment_threads = [Thread(target=self.import_enrichment_loop, args=(kind,),
                                              name=f"parole-{kind[7:]}", daemon=False) for kind in IMPORT_ENRICHMENT]
-                for thread in (index_thread, *enrichment_threads):
+                workers = (index_thread, lexicon_thread, *enrichment_threads)
+                for thread in workers:
                     thread.start()
                 try:
                     while not self.shutdown.is_set():
@@ -1545,7 +1564,7 @@ class Maintenance:
                 finally:
                     self.shutdown.set()
                     self.index_wake.set()
-                    for thread in (index_thread, *enrichment_threads):
+                    for thread in workers:
                         thread.join()
         finally:
             self.owner = None

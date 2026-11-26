@@ -7,11 +7,12 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+from time import time
 from unicodedata import normalize
 
 from _kara_prepare import file_token
 from _kara_words import FORM, IGNORED_HINTS, detect_language, words
-from _parole_index import document, key, sidecar
+from _parole_index import LEXICON, document, key, sidecar, sidecar_token
 from _parole_music_identity import isrc, mbid
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
@@ -55,30 +56,39 @@ def reviewed_text(row, root, approvals):
     return ""
 
 
-def origin(row, info, root, approvals=None):
+def origin(row, info, root, approvals=None, *, trusted_only=False):
     if text := reviewed_text(row, root, approvals):
         return "Correction manuelle validée", text
     # Generated or uncertain material is excluded even when its timing is
     # structurally valid. This keeps model output out of its own corpus.
-    providers = [str(info.get(name, "")).casefold() for name in ("lyrics_provider", "lrc_provider")]
+    providers = [str(info.get(name, "")).casefold() for name in ("lyrics_provider", "lrc_provider", "text_provider")]
     if any("turbo" in name or "whisper" in name or "transcription" in name for name in providers):
         return "", ""
     if row["lrc"] == "généré":
         return "", ""
-    if row["lyrics"] == "Strawberry" and isinstance(info.get("plain"), str) and info["plain"].strip():
+    if (trusted_only or row["lyrics"] == "Strawberry") and isinstance(info.get("plain"), str) and info["plain"].strip():
         if len(info["plain"].encode()) <= MAX_LRC_BYTES:
-            return "Strawberry ou tags intégrés", info["plain"]
-    if row["lrc"] in {"local", "externe"} and row["id"] + ".lrc" not in (approvals or {}):
+            return info.get("lyrics_provider") or "Strawberry ou tags intégrés", info["plain"]
+    versions = json.loads(row["side"]) if trusted_only and row["side"] else [None, None]
+    if trusted_only and info.get("text_provider") and row["id"] + ".txt" not in (approvals or {}):
+        version, text = sidecar(Path(row["path"]), ".txt")
+        if version == versions[1] and text.strip():
+            return info["text_provider"], text
+    if (row["lrc"] in {"local", "externe"} and row["id"] + ".lrc" not in (approvals or {})
+            and (not trusted_only or info.get("lrc_provider"))):
         path = Path(row["path"])
         try:
             usable = path.is_relative_to(root) and path.resolve() == path
         except (OSError, RuntimeError):
             usable = False
         if usable:
-            _, text = sidecar(path, ".lrc")
+            token, text = sidecar(path, ".lrc")
+            if trusted_only and token != versions[0]:
+                return "", ""
             lines = [(stamp, line) for stamp, line in parse_lrc(text) if line.strip()]
             if lines and row["duration"] > 0 and lines[-1][0] <= row["duration"] + 3:
-                return "LRC local validé structurellement", "\n".join(line for _, line in lines)
+                source = info.get("lrc_provider") if trusted_only else "LRC local validé structurellement"
+                return source, "\n".join(line for _, line in lines)
     return "", ""
 
 
@@ -91,6 +101,78 @@ def recording_keys(row, info):
 
 def identities(row, info):
     return {("id", row["id"]), ("credit", (key(row["owner"]), key(row["title"])))} | recording_keys(row, info)
+
+
+def make_record(row, info, source, text, genres=None):
+    if not (forms := lexical_forms(text)):
+        return None
+    tag = ((genres or {}).get(row["path"]) or info.get("tags", {}).get("genre") or "").strip()
+    return dict(song=row["id"], source=source, confidence="local", digest=text_digest(text),
+                language=detect_language(words(text)), genre=tag, artist=row["owner"], album=row["edition"],
+                forms=forms, lines=sum(bool(line.strip()) for line in text.splitlines()),
+                recording=sorted(f"{kind}:{value}" for kind, value in recording_keys(row, info)))
+
+
+def current_files(path, root):
+    if not path.is_relative_to(root) or path.resolve(strict=True) != path:
+        raise ValueError("Chemin lexical hors bibliothèque")
+    return document(file_token(path)), tuple(sidecar_token(path.with_suffix(suffix)) for suffix in (".lrc", ".txt"))
+
+
+def refresh_one(index, now, stop):
+    if stop() or not index.work_due((LEXICON,), now) or (task := index.claim((LEXICON,), now)) is None:
+        return False
+    identity = task["subject"]
+    try:
+        with index.db() as db:
+            row = db.execute("SELECT * FROM songs WHERE id=?", (identity,)).fetchone()
+            approvals = {subject: json.loads(value) for subject, value in db.execute(
+                """SELECT subject,value FROM reviews WHERE kind='transcription_validation' AND state='validated'
+                   AND subject IN (?,?)""", (identity + ".txt", identity + ".lrc"))}
+        if row is None:
+            index.finish(task, "excluded", "piste disparue")
+            return True
+        path = Path(row["path"])
+        version = current_files(path, index.root)
+        if version[0] != row["token"]:
+            index.finish(task, "temporary", "version audio en attente d’indexation", 1)
+            return True
+        info = json.loads(row["info"])
+        source, text = origin(row, info, index.root, approvals, trusted_only=True)
+        value = make_record(row, info, source, text) if text else None
+        if stop():
+            index.finish(task, "suspended", "ressources prioritaires", refund_attempt=True)
+            return True
+        with index.db() as db:
+            # The claim, index row and two sidecar stamps must still match.
+            # Settle the claim and replace only this record in one transaction.
+            db.execute("BEGIN IMMEDIATE")
+            live = db.execute("SELECT state,revision FROM tasks WHERE kind=? AND subject=?",
+                              (LEXICON, identity)).fetchone()
+            if live is None or tuple(live) != ("running", task["revision"]):
+                return True
+            if (db.execute("SELECT * FROM songs WHERE id=?", (identity,)).fetchone() != row
+                    or current_files(path, index.root) != version):
+                db.execute("UPDATE tasks SET state='temporary',due=? WHERE kind=? AND subject=?",
+                           (time() + 1, LEXICON, identity))
+                return True
+            if value:
+                db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,'ready',?,?)",
+                           (LEXICON, identity, time(), document(value)))
+            else:
+                db.execute("DELETE FROM reviews WHERE kind=? AND subject=?", (LEXICON, identity))
+            db.execute("UPDATE tasks SET state='done',updated=? WHERE kind=? AND subject=?", (time(), LEXICON, identity))
+    except (OSError, ValueError, TypeError, KeyError, IndexError, sqlite3.Error):
+        index.finish(task, "temporary", "version de référence indisponible", min(300, 2 ** min(task["attempts"], 8)))
+    return True
+
+
+def incremental_records(index):
+    """Read the completed, per-track lexical contributions in stable order."""
+    with index.db() as db:
+        for (value,) in db.execute("""SELECT reviews.value FROM reviews JOIN tasks USING(kind,subject)
+                                     WHERE reviews.kind=? AND tasks.state='done' ORDER BY reviews.subject""", (LEXICON,)):
+            yield json.loads(value)
 
 
 def records(index_path, root, *, exclude=(), genres=None):
@@ -119,14 +201,8 @@ def records(index_path, root, *, exclude=(), genres=None):
             source, text = origin(row, info, root, approvals)
             if not text or text_digest(text) in blocked_text:
                 continue
-            lines = [line for line in text.splitlines() if line.strip()]
-            forms = lexical_forms(text)
-            if forms:
-                tag = ((genres or {}).get(row["path"]) or info.get("tags", {}).get("genre") or "").strip()
-                yield dict(song=row["id"], source=source, confidence="local", digest=text_digest(text),
-                           language=detect_language(words(text)), genre=tag, artist=row["owner"],
-                           album=row["edition"], forms=forms, lines=len(lines),
-                           recording=sorted(f"{kind}:{value}" for kind, value in recording_keys(row, info)))
+            if value := make_record(row, info, source, text, genres):
+                yield value
 
 
 def text_digest(text):

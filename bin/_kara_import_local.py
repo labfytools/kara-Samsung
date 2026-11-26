@@ -6,7 +6,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from stat import S_IFDIR, S_IFREG, S_IFMT, S_ISREG
 from struct import unpack_from
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from zipfile import BadZipFile, ZipFile
 import os
@@ -14,6 +14,7 @@ import os
 from _kara_import_resources import ImportSuspended, MAX_MEDIA, PROCESSING, check_space, checkpoint, current_pause
 from _kara_import_result import ImportIssue
 from _musique_oz import AUDIO, share_file, shared_mutation
+from _parole_index import reference_proof
 from _parole_import_providers import MANUAL
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
@@ -344,7 +345,7 @@ def resume_verified_entry(entry, destination, stop):
 
 def publish_sidecar(entry, target, *, audio, root):
     if target.exists() or target.is_symlink():
-        return False
+        return None
     version = stamp(audio.lstat())
     lyrics = target.suffix == ".lrc"
     limit = MAX_LRC_BYTES if lyrics else 8 * BLOCK
@@ -364,23 +365,26 @@ def publish_sidecar(entry, target, *, audio, root):
             if image.format != "JPEG" or image.width * image.height > 30_000_000:
                 raise ValueError("Format ou dimensions de la pochette locale invalides.")
             image.verify()
-    with NamedTemporaryFile(dir=target.parent, prefix=".import-local-") as draft:
-        draft.write(content)
-        draft.flush()
-        os.fsync(draft.fileno())
-        share_file(draft.name, target)
+    with TemporaryDirectory(dir=target.parent, prefix=".import-local-") as temporary:
+        draft = Path(temporary) / target.name
+        with draft.open("xb") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        share_file(draft, target)
         # ZIP reads and image verification can be slow. The library lock
         # covers only the final link to the still-current audio destination.
         with shared_mutation(root, wait=True):
             if audio.resolve() != audio or stamp(audio.lstat()) != version:
                 raise ValueError("Le morceau a changé pendant la copie du fichier associé.")
             try:
-                os.link(draft.name, target)
+                os.link(draft, target)
             except FileExistsError:
-                return False
+                return None
+            draft.unlink()
             fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-        return True
+            return reference_proof(audio, ".lrc", version, "Sélection locale") if lyrics else {}

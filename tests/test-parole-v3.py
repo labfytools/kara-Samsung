@@ -24,7 +24,7 @@ from _kara_audio_identity import pcm_digest
 from _kara_prepare import lrc_token
 from _parole_catalogue import check_album, check_discography, check_recording, compare
 from _parole_codex import authenticate, daily_slot, validate
-from _parole_index import Index, inventory, encoded_key, revision
+from _parole_index import SIDECAR, Index, inventory, encoded_key, reference_proof, revision
 from _parole_maintenance import Journal, Maintenance
 from _parole_process import Interrupted, run
 from _parole_sources import LyricsEndpoint, discover, external_ips, public_url, seed, controls, validate_endpoint
@@ -64,6 +64,62 @@ class Fixture(unittest.TestCase):
 
 
 class InventoryTests(Fixture):
+    def test_incremental_lexicon_updates_only_the_changed_version_and_recovers_claim(self):
+        from _kara_prepare import file_token
+        from _parole_lexicon import incremental_records, make_record, refresh_one
+
+        first = self.audio("01.flac")
+        other = self.audio("02.flac", title="Autre", lyrics="Refrain conservé ailleurs")
+        first.with_suffix(".lrc").write_text("[00:01.00]Refrain du fournisseur\n")
+
+        def deliver():
+            _, events = self.index.events(time() + 2)
+            self.scan(events=events)
+
+        def drain():
+            while refresh_one(self.index, time(), lambda: False):
+                pass
+
+        self.index.notify([first, other])
+        proof = reference_proof(first, ".lrc", file_token(first), "LRCLIB", external=True)
+        self.index.notify([first], SIDECAR, proofs={str(first): proof})
+        deliver()
+        by_path = {Path(row["path"]): row for row in self.songs()}
+        first_id, other_id = by_path[first]["id"], by_path[other]["id"]
+        claimed = self.index.claim(("lexicon",), time())
+        self.assertIsNotNone(claimed)
+        self.index = Index(self.root, self.base / "state")
+        self.index.recover()
+        drain()
+        by_id = {record["song"]: record for record in incremental_records(self.index)}
+        self.assertEqual(by_id[first_id]["source"], "LRCLIB")
+        self.assertEqual(set(by_id), {first_id, other_id})
+        with self.index.db() as db:
+            unchanged = tuple(db.execute("SELECT * FROM reviews WHERE kind='lexicon' AND subject=?", (other_id,)).fetchone())
+
+        save_correction(self.index, first_id, ".txt", None, "Premier texte validé")
+
+        def supersede(*args):
+            save_correction(self.index, first_id, ".txt", lrc_token(first.with_suffix(".txt")), "Correction nouvelle")
+            return make_record(*args)
+
+        with patch("_parole_lexicon.make_record", side_effect=supersede):
+            self.assertTrue(refresh_one(self.index, time(), lambda: False))
+        self.assertEqual([record["song"] for record in incremental_records(self.index)], [other_id])
+        deliver()
+        drain()
+        by_id = {record["song"]: record for record in incremental_records(self.index)}
+        self.assertIn("nouvelle", by_id[first_id]["forms"])
+        first.with_suffix(".txt").write_text("Texte jamais approuvé")
+        first.with_suffix(".lrc").write_text("[00:02.00]Minutage jamais approuvé\n")
+        self.index.notify([first], SIDECAR)
+        deliver()
+        drain()
+        self.assertEqual([record["song"] for record in incremental_records(self.index)], [other_id])
+        with self.index.db() as db:
+            self.assertEqual(tuple(db.execute("SELECT * FROM reviews WHERE kind='lexicon' AND subject=?",
+                                              (other_id,)).fetchone()), unchanged)
+
     def test_import_text_is_published_before_timed_lookup(self):
         from threading import Lock
 
@@ -594,6 +650,8 @@ class SourceTests(Fixture):
                 self.assertEqual(owner.output.call_args.args[0][-1], "--local-reference-only")
                 self.assertEqual(path.with_suffix(".lrc").read_text(), embedded + "\n")
                 self.assertEqual(path.read_bytes(), before)
+                with patch("_parole_maintenance.time", return_value=time() + 2):
+                    owner.index_turn()
                 self.assertEqual(self.index.song(song["id"])["lrc"], "local")
                 self.assertFalse(self.index.work_due(("lrc",), time(), local_reference=True))
                 self.assertFalse(self.index.network_yield())

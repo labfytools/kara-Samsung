@@ -1015,8 +1015,9 @@ def local_sidecars(tracks, entries, root, progress, *, covers=True):
         for member, destination, mask in assets:
             if member in entries:
                 try:
-                    if publish_sidecar(entries[member], destination, audio=track, root=root) and progress.measure_index:
-                        progress.measure_index.notify([track], mask)
+                    proof = publish_sidecar(entries[member], destination, audio=track, root=root)
+                    if proof is not None and progress.measure_index:
+                        progress.measure_index.notify([track], mask, proofs={str(track): proof} if proof else None)
                 except (OSError, ValueError, BadZipFile, RuntimeError, sqlite3.Error) as error:
                     record_error(progress, f"Fichier local associé · {member}", ImportIssue("path", str(error)))
 
