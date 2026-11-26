@@ -771,11 +771,15 @@ class AlbumImportTests(unittest.TestCase):
         _, partial, _ = self.run_import(offers[0]["url"], env=env, expected=1)
         self.assertEqual(partial[0]["added"], 1)
         original = partial[0]["tracks"][0]
+        # The first two tracks have independent transfer slots. Preserve
+        # the observed order while checking that the retry adds only Jamendo.
+        initial_requests = self.requests.read_text().splitlines()
+        self.assertCountEqual(initial_requests, ["01.flac", "02.flac"])
         index.configure(import_strategy="preferred", import_preferred=JAMENDO)
         _, complete, _ = self.run_import(create_plan(index, offers), env=env)
         self.assertEqual((complete[0]["status"], complete[0]["provider"], complete[0]["added"]), ("success", JAMENDO, 1))
         self.assertIn(original, complete[0]["tracks"])
-        self.assertEqual(self.requests.read_text().splitlines(), ["01.flac", "02.flac", "39012"])
+        self.assertEqual(self.requests.read_text().splitlines(), [*initial_requests, "39012"])
 
     def test_canonical_provenance_follows_a_renamed_file_and_avoids_a_second_copy(self):
         track = self.temp / "canonical-source" / "01.flac"
