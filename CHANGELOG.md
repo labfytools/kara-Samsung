@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Ajouter le banc reprenable de comparaison du mix, du stem vocal et de ses variantes, avec repères indépendants et mesures mémoire.
 - Afficher les passages écartés d’un brouillon et permettre de rejoindre leurs repères dans Strawberry.
 - Afficher le 95e percentile de latence des fournisseurs et mesurer les refus LRCLIB liés à une édition différente.
 - Qualifier pour le lexique les corrections manuelles dont l’audio et les paroles ont gardé la version validée.

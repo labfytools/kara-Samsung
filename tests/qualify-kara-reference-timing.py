@@ -25,13 +25,17 @@ def summarize(truth, observed):
                     if expected is not None and supplied is not None)
     annotated = sum(expected is not None for expected in truth)
     seen = len(deltas)
+    within = {limit: sum(delta <= limit + 1e-8 for delta in deltas) for limit in (250, 500, 1000)}
     return {
         "total": len(truth), "non_evaluable": len(truth) - annotated,
         "annotated": annotated, "evaluated": seen, "absent": annotated - seen,
         "coverage": seen / annotated if annotated else None,
         "median_ms": median(deltas) if seen else None,
+        "p90_ms": deltas[ceil(.90 * seen) - 1] if seen else None,
         "p95_ms": deltas[ceil(.95 * seen) - 1] if seen else None,
-        "within_500_ms": sum(delta <= 500 + 1e-8 for delta in deltas) / seen if seen else None,
+        "max_ms": deltas[-1] if seen else None,
+        **{f"within_{limit}_ms": count / seen if seen else None for limit, count in within.items()},
+        "coverage_within_500_ms": within[500] / annotated if annotated else None,
     }
 
 
