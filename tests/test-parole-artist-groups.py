@@ -1,16 +1,21 @@
 #!/usr/bin/python3 -B
 """Exerce les renommages réels et la conservation des reçus."""
 from pathlib import Path
+import json
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from time import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _kara_import_queue import ImportQueue
-from _musique_oz import album_group, grouped_path
+from _kara_audio_identity import pcm_digest
+from _musique_oz import album_group, grouped_path, probe
 from _parole_artist_groups import apply, last_group, preview, recover, undo
+from _parole_artist_tags import repair
 from _parole_index import Index, inventory
 
 
@@ -77,6 +82,44 @@ class ArtistGroups(unittest.TestCase):
         self.assertEqual(self.queue.settings(), (False, 4))
         destination = self.root / plan["moves"][0]["destination"] / self.track.name
         self.assertEqual(self.queue.outcomes(self.job)[self.url]["tracks"], [str(destination)])
+
+    def test_existing_tag_repair_requires_approval_saves_original_and_preserves_pcm(self):
+        path = self.target / "Exodus" / "02.flac"
+        subprocess.run(("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=0.4:f=515",
+                        "-metadata", "artist=Bob Marley & The Wailers, Invité",
+                        "-metadata", "album_artist=Bob Marley & The Wailers",
+                        "-metadata", "album=Exodus", "-metadata", "title=Témoin", str(path)), check=True)
+        before = path.read_bytes()
+        pcm = pcm_digest(path)
+        inventory(self.index, None, lambda *_: ("", "absent", {}), lambda: False, lambda _: None, paths=[path])
+        with self.index.db() as db:
+            identity = db.execute("SELECT id FROM songs WHERE path=?", (str(path),)).fetchone()[0]
+        self.index.update(identity, audio=pcm)
+        self.assertEqual(repair(self.index, path, apply=True, state=self.state), "sans correction autorisée")
+        with self.index.db() as db:
+            db.execute("INSERT INTO associations VALUES(?, ?, ?, ?)",
+                       (self.source.parent.name, "Exodus", self.target.name, "validation-fixture"))
+        with patch("_parole_artist_tags.has_preparation", return_value=True):
+            self.assertEqual(repair(self.index, path, apply=True, state=self.state), "préparation à réassocier")
+        with patch("_parole_artist_tags.verify_audio", side_effect=ValueError("preuve PCM absente")):
+            with self.assertRaisesRegex(ValueError, "PCM"):
+                repair(self.index, path, apply=True, state=self.state)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(repair(self.index, path, apply=True, state=self.state), "corrigée")
+        receipt, = (self.state / "kara/albumartist-backups").iterdir()
+        self.assertEqual((receipt / "original.flac").read_bytes(), before)
+        self.assertEqual(json.loads((receipt / "manifest.json").read_text())["pcm"], pcm)
+        self.assertEqual(pcm_digest(path), pcm)
+        self.assertEqual(probe(path)[0]["artist"], "Bob Marley & The Wailers, Invité")
+        self.assertEqual(probe(path)[0]["albumartist"], "Bob Marley")
+        _, events = self.index.events(time()+2)
+        result = inventory(self.index, None, lambda *_: ("", "absent", {}), lambda: False,
+                           lambda _: None, events=events, reader=lambda _: self.fail("métadonnées déjà vérifiées"))
+        self.assertEqual((result["receipts"], result["delivered"]), (1, 1))
+        row = self.index.song(identity)
+        self.assertEqual((row["owner"], row["artist"], row["audio"]),
+                         ("Bob Marley", "Bob Marley & The Wailers, Invité", pcm))
+        self.assertEqual(repair(self.index, path, apply=True, state=self.state), "sans correction autorisée")
 
 
 if __name__ == "__main__":

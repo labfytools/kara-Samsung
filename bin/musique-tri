@@ -16,12 +16,11 @@ from time import time
 
 from _kara_import_local import stamp
 from _kara_import_resources import ImportPause, ImportSuspended, checkpoint, run_checked
-from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file, audio_files,
-                         canonical_album_artist, component, mutation_report, probe, share_file, shared_mutation,
-                         SHARED_LIBRARY, source_video, title_pair)
+from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, album_groups, audio_file, audio_files,
+                         canonical_album_artist, component, index_file, manual_album_artist, mutation_report,
+                         probe, share_file, shared_mutation, SHARED_LIBRARY, source_video, title_pair)
+from _parole_artist_tags import WRITABLE as TAG_WRITABLE, has_preparation, remux, save_original, verify_audio
 from _parole_index import revision
-
-TAG_WRITABLE = {".opus", ".ogg", ".oga", ".flac", ".m4a", ".mp3"}
 
 
 def same_content(first, second):
@@ -142,28 +141,28 @@ def album_artists(items, root):
     return resolved
 
 
-def write_tags(source, target, tags, updates, recover=False):
-    ffmpeg_keys = {"albumartist": "album_artist", "album": "album"}
-    metadata = []
-    for key, value in updates.items():
-        assignment = f"{ffmpeg_keys[key]}={value}"
-        metadata.extend(("-metadata", assignment, "-metadata:s:a:0", assignment))
+def write_tags(source, target, tags, updates, recover=False, *, approved=False, backup=False):
+    token = revision(source.lstat())
+    if backup and has_preparation(source):
+        raise ValueError("une préparation liée à ce fichier doit être préservée")
     with TemporaryDirectory(dir=target.parent, prefix=".tri-") as temp:
         draft = Path(temp) / source.name
-        run_checked(
-            ("ffmpeg", "-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file,pipe",
-             "-i", str(source), "-map", "0", "-c", "copy", *metadata, str(draft)),
-            capture_output=True, check=True, timeout=60,
-        )
-        expected = tags | updates
-        new_tags, _ = probe(draft, include_duration=True, include_codec=True)
-        if any(new_tags.get(key) != value for key, value in expected.items()
-               if key not in ("encoder", "duration_seconds", "codec")):
-            raise ValueError("vérification des tags après copie sans réencodage échouée")
+        new_tags = remux(source, draft, tags, updates)
+        if approved or backup:
+            pcm = verify_audio(source, draft, preserve_all=backup)
+            if backup:
+                save_original(source, draft, token, pcm)
+                if has_preparation(source):
+                    raise ValueError("une préparation a été publiée pendant la vérification")
+        if revision(source.lstat()) != token:
+            raise ValueError("fichier modifié pendant la vérification")
         shutil.copymode(source, draft)
         share_file(draft, target)
         if source == target:
+            with draft.open("rb") as output:
+                os.fsync(output.fileno())
             os.replace(draft, target)
+            sync_dir(target.parent)
         else:
             (publish_import if recover else os.link)(draft, target)
             source.unlink()
@@ -182,21 +181,26 @@ def target_parts(source, tags, artist, album):
 
 
 def classify(source, tags, album_artist, album_title, root, preview, reserved, importing, known_sources,
-             receipt=None, preserve_tags=False, folder_hint=None, filing_artist=None):
+             receipt=None, preserve_tags=False, folder_hint=None, filing_artist=None, approved_artist=None):
+    album_artist = approved_artist or album_artist
     artist, album, name, extension = target_parts(source, tags, album_artist, album_title)
     updates = {}
     if album_title != tags.get("album"):
         if extension not in TAG_WRITABLE:
             raise ValueError("renommage de l’album indisponible pour ce format")
         updates["album"] = album_title
-    if (not preserve_tags and album_artist and album_title and extension in TAG_WRITABLE
-            and tags.get("albumartist") != album_artist):
-        updates["albumartist"] = album_artist
+    if album_artist and album_title and tags.get("albumartist") != album_artist:
+        if approved_artist and extension not in TAG_WRITABLE:
+            raise ValueError("format non réinscriptible pour le regroupement validé")
+        if (approved_artist or not preserve_tags) and extension in TAG_WRITABLE:
+            updates["albumartist"] = album_artist
     if folder_hint:
         # An equivalent supplier is adding positions to the already published
         # edition. Routing through its folder must not rewrite source credits.
+        if approved_artist and folder_hint[0] != artist:
+            raise ValueError("L’édition déjà publiée contredit le classement manuel.")
         artist, album = folder_hint
-    if filing_artist:
+    if filing_artist and not approved_artist:
         artist = component(filing_artist, artist)
     artist_dir = root / artist
     folder = artist_dir / album
@@ -219,6 +223,21 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
             os.fsync(journal.fileno())
         sync_dir(receipt.parent)
 
+    def keep_existing(target):
+        verified = None
+        if approved_artist:
+            verified, _ = probe(target, include_duration=True, include_codec=True)
+        retag = verified is not None and verified.get("albumartist") != approved_artist
+        if retag and manual_album_artist(album_groups(index_file(root)), verified) != approved_artist:
+            raise ValueError("le fichier existant ne relève pas du regroupement validé")
+        remember(target)
+        if retag:
+            verified = write_tags(target, target, verified, {"albumartist": approved_artist},
+                                  approved=True, backup=True)
+        source.unlink()
+        mutation_report(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
+        return target, False, verified
+
     if video:
         # A retry may choose a different codec or have new tags. Reuse the same
         # source at the same album position, under the shared library lock.
@@ -236,26 +255,23 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
                     sources.setdefault((existing_video, (disc, track), None if track else existing.stem), existing)
         existing = known_sources[folder].get(identity)
         if existing is not None and source != existing and audio_file(existing):
-            remember(existing)
-            source.unlink()
-            mutation_report(f"Déjà dans la bibliothèque : {existing.relative_to(root)}")
-            return existing, False, None
+            return keep_existing(existing)
     for attempt in range(1, 10_000):
         suffix = "" if attempt == 1 else f" [{attempt}]"
         target = folder / (name + suffix + extension)
         if source == target:
             if updates:
                 if not preview:
-                    write_tags(source, target, tags, updates)
+                    new_tags = write_tags(source, target, tags, updates, approved=bool(approved_artist), backup=True)
+                else:
+                    new_tags = None
                 mutation_report(f"{source.name} · tags de l’album : {album_artist} / {album_title}")
+                return target, False, new_tags
             return target, False, None
         if target in reserved or target.exists() or target.is_symlink():
             if importing and not preview and (same_content(source, target)
                     or not preserve_tags and same_import_track(source, target, tags)):
-                remember(target)
-                source.unlink()
-                mutation_report(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
-                return target, False, None
+                return keep_existing(target)
             if same_content(source, reserved.get(target, target)):
                 mutation_report(f"Identique, conservé à la source : {source.name}")
                 return (target if target.is_file() else None), False, None
@@ -265,7 +281,9 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
             try:
                 remember(target)
                 if updates:
-                    published_tags = write_tags(source, target, tags, updates, receipt is not None)
+                    published_tags = write_tags(source, target, tags, updates, receipt is not None,
+                                                approved=bool(approved_artist),
+                                                backup=not importing and source.is_relative_to(root))
                 else:
                     move_track(source, target, receipt is not None)
                     published_tags = tags
@@ -359,6 +377,7 @@ def main():
                 failures += 1
                 mutation_report(f"Erreur pour {track.name} : {error}", file=sys.stderr)
         artists = album_artists(items, root)
+        rules = album_groups(index_file(root))
         reserved = {}
         known_sources = {}
         destinations = set()
@@ -379,7 +398,8 @@ def main():
                                          known_sources, args.reprise_interne if importing else None,
                                          preserve_tags=args.garder_tags_import,
                                          folder_hint=args.dossier_import if importing else None,
-                                         filing_artist=args.classement_artiste if importing else None)
+                                         filing_artist=args.classement_artiste if importing else None,
+                                         approved_artist=manual_album_artist(rules, tags))
                 if target is not None:
                     destinations.add(str(target))
                     if args.rapport_detaille and published_tags is not None:

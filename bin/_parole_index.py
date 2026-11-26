@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from _kara_paths import STATE
 from _kara_prepare import file_token
-from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, grouped_artist, probe
+from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, manual_album_artist, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _parole_taglib import helper as taglib_helper, read as taglib_read
 
@@ -1275,7 +1275,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     owner = tags.get("albumartist") or artist
                     album = tags.get("album") or ""
                     artist_id = tags.get("artistid") or tags.get("musicbrainzalbumartistid") or ""
-                    owner = grouped_artist(group_rules, owner, album, artist_id) or owner
+                    owner = manual_album_artist(group_rules, tags) or owner
                     release_id = tags.get("albumid") or tags.get("musicbrainzalbumid") or ""
                     year = integer(str(tags.get("year") or tags.get("date") or "")[:4])
                     edition = encoded_key(owner, album, release_id or year, str(path.parent))

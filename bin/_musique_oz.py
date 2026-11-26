@@ -145,6 +145,15 @@ def grouped_artist(rules, credit, album, artist_id=None):
             return owner
 
 
+def manual_album_artist(rules, tags):
+    # Album-specific approval is evidence for the complete original credit.
+    # A filing hint or a shared lead artist does not extend that approval.
+    credit, album = title_pair(tags)
+    if credit and album:
+        identity = tags.get("musicbrainzalbumartistid") or tags.get("artistid")
+        return grouped_artist(rules, credit, album, identity)
+
+
 def album_group(credit, album, *, database=None, artist_id=None):
     return grouped_artist(album_groups(database or index_file(SHARED_LIBRARY)), credit, album, artist_id)
 

@@ -3,6 +3,7 @@
 ## En développement
 
 - Lire les tags ordinaires de l’index avec TagLib lorsque le lecteur est disponible, et conserver le repli FFprobe.
+- Appliquer le classement manuel au tag d’album des imports concernés et vérifier le PCM avant une correction sauvegardée.
 
 - Réutiliser les versions des paroles et des métadonnées pendant la réconciliation de Parole et éviter les écritures SQLite pour les pistes inchangées.
 - Intégrer les publications et enrichissements d’import dans une file durable fusionnée par piste, avec réutilisation des tags vérifiés.

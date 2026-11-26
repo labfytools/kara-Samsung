@@ -36,8 +36,8 @@ from _kara_import_resources import (AUDIO_PROVIDERS, CATALOGUE, MAX_DOWNLOADS, M
                                    current_pause, defer_service, download_admission, download_event, download_scope, lease, resource_slot, terminate_group,
                                    memory_download_limit, observe_youtube, track_results, wait_service, watch_download)
 from _kara_paths import BIN, DATA, catalogue_command
-from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, audio_file, audio_files, grouped_path, probe,
-                         shared_mutation, source_video)
+from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, album_groups, audio_file, audio_files, component,
+                         grouped_path, index_file, manual_album_artist, probe, shared_mutation, source_video)
 from _parole_import_providers import ARCHIVE, AUDIO_HOSTS, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_import_enrichment import schedule as schedule_enrichment
@@ -933,6 +933,20 @@ def file_sha(path):
         return file_digest(source, "sha256").hexdigest()
 
 
+def matches_manual_retag(record, path, root, artist):
+    # A first publication may differ byte-for-byte if an album association
+    # authorized a tag change. Accept that only for the approved owner and
+    # unchanged original credits and position. The caller still proves PCM.
+    original = record.get("tags", {})
+    if not artist or path.relative_to(root).parts[0] != component(artist, ""):
+        return False
+    actual, _ = probe(path)
+    return (actual.get("albumartist") == artist
+            and all(actual.get(key) == original.get(key) for key in ("title", "artist", "album"))
+            and all(position(actual.get(key) or actual.get(key + "number")) ==
+                    position(original.get(key) or original.get(key + "number")) for key in ("disc", "track")))
+
+
 def local_destination(record, candidates, root):
     # The sorter journals the intended target before publishing with an
     # exclusive link. An occupied name or a torn publication proves nothing.
@@ -948,7 +962,11 @@ def local_destination(record, candidates, root):
             if known and revision == record.get("published_revision"):
                 return target
             matches = file_sha(target) == record["sha256"]
-            if known and not matches:
+            approved = manual_album_artist(album_groups(index_file(root)), record.get("tags", {}))
+            if approved and not known:
+                if not matches_manual_retag(record, target, root, approved):
+                    continue
+            if not matches and (known or approved):
                 with resource_slot(root / INBOX / ".kara-traitements", PROCESSING):
                     matches = pcm_digest(target) == record["pcm"]
             if matches:
@@ -1066,17 +1084,27 @@ def reuse_duplicate(index, name, record, folder, inbox, progress):
             if not matches and allow_pcm:
                 with resource_slot(inbox / ".kara-traitements", PROCESSING):
                     matches = pcm_digest(target) == record["pcm"]
-            if matches:
-                record.update(path=str(target), published_revision=stamp(target.stat()), canonical_reference=identity)
-                # Only our own staging copy can be discarded. The library
-                # path and all existing associations and sidecars stay owned.
-                (folder / record["stage"]).unlink()
-                notice = f"Doublon évité · {record['tags'].get('title', name)}"
-                progress.log("Identité canonique", notice)
-                progress.announce_provider("Identité canonique", notice)
-                return target
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
+        if matches:
+            approved = manual_album_artist(album_groups(index.path), record["tags"])
+            if approved:
+                tags, _ = probe(target)
+                if target.relative_to(index.root).parts[0] != component(approved, ""):
+                    raise ImportIssue("path", "La piste existante est hors de son classement manuel.")
+                if tags.get("albumartist") != approved:
+                    from _parole_artist_tags import repair
+
+                    if repair(index, target, apply=True) != "corrigée":
+                        raise ImportIssue("path", "La piste existante exige une correction de classement protégée.")
+            record.update(path=str(target), published_revision=stamp(target.stat()), canonical_reference=identity)
+            # Only the import staging copy can be discarded. The original
+            # performer credit and any sidecars stay attached to the target.
+            (folder / record["stage"]).unlink()
+            notice = f"Doublon évité · {record['tags'].get('title', name)}"
+            progress.log("Identité canonique", notice)
+            progress.announce_provider("Identité canonique", notice)
+            return target
     return None
 
 

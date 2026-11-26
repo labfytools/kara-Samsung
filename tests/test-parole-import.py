@@ -414,6 +414,39 @@ class AlbumImportTests(unittest.TestCase):
                         "-metadata", f"title=Son local {number}", "-metadata", f"track={number}", str(path)],
                        check=True)
 
+    def test_local_import_applies_only_the_approved_album_artist(self):
+        source = self.temp / "Édition fournisseur" / "01.flac"
+        self.make_local_track(source, 1, album="Réédition confirmée")
+        original = source.read_bytes()
+        index = Index(self.library, self.temp / "state")
+        with index.db() as db:
+            db.execute("INSERT INTO associations VALUES(?,?,?,?)",
+                       (self.config["artist"], "Réédition confirmée", "Artiste canonique", "validation-fixture"))
+        queue = ImportQueue(self.temp / "state", self.library)
+        url = source.as_uri()
+        identity = queue.enqueue([("Réédition confirmée", url)])
+        self.assertTrue(queue.claim(identity))
+        with lease(queue.directory / f"{identity}.lock") as fd:
+            worker = self.managed_worker(queue, identity, fd)
+        output, errors = worker.communicate(timeout=30)
+        self.assertEqual(worker.returncode, 0, (output, errors))
+        outcome = queue.outcomes(identity)[url]
+        self.assertTrue(outcome["audio_complete"])
+        target, = map(Path, outcome["tracks"])
+        self.assertEqual(target.relative_to(self.library).parts[:2], ("Artiste canonique", "Réédition confirmée"))
+        tags, _ = probe(target)
+        self.assertEqual((tags["artist"], tags["albumartist"], tags["title"]),
+                         (self.config["artist"], "Artiste canonique", "Son local 1"))
+        self.assertEqual(pcm_digest(source), pcm_digest(target))
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(outcome["provenance"][0]["tags"]["artist"], self.config["artist"])
+
+        other = self.temp / "Édition hors règle" / "01.flac"
+        self.make_local_track(other, 1, album="Édition hors règle")
+        _, outcomes, _ = self.run_import(other.as_uri())
+        separate, = map(Path, outcomes[0]["tracks"])
+        self.assertEqual(separate.relative_to(self.library).parts[0], self.config["artist"])
+
     def test_local_directory_managed_job_resumes_one_missing_track(self):
         source = self.temp / "Édition d’origine"
         first, second = (source / name for name in ("01.flac", "02.flac"))
