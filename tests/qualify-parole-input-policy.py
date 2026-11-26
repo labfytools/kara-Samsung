@@ -36,7 +36,13 @@ def entries(workspace, clip=None):
     items = []
     manifest = read(workspace / "manifest.json")
     for case in manifest["cases"]:
-        folder = workspace / case["id"] / "observations"
+        stage = workspace / case["id"]
+        receipt = stage / "turbo.json"
+        # Each variant is resumable on its own. A guard may still interrupt
+        # the campaign after both observations and before final settlement.
+        if not receipt.is_file() or not read(receipt)["events"][-1].get("complete"):
+            continue
+        folder = stage / "observations"
         if not all((folder / f"{name}.json").is_file() for name in ("mix", "vocals")):
             continue
         mix, vocals = (read(folder / f"{name}.json") for name in ("mix", "vocals"))
