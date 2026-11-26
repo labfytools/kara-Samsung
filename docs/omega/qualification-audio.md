@@ -48,6 +48,27 @@ La variante diminue le PSI et le temps sur cet essai. Son PSS plus élevé et le
 
 Les trois premiers extraits du manifeste, en rock et dans les deux groupes de rap, ont fourni 52 mots de référence. Le mix a rendu 25 erreurs, la voix brute et la voix normalisée 30 chacune et la segmentation adaptative 31. La relecture ciblée et la relecture phonétique ont laissé toutes les graphies du stem en place. L’écart entre le mix et le stem est concentré sur le rap américain du pilote. Ce résultat décrit ces trois cas et motive une qualification par genre.
 
+### Turbo Q5 sur une chanson entière
+
+Turbo Q5_0 a terminé les trois variantes sur le titre espagnol de 193,68 s, avec la séparation validée réutilisée et le seuil de PSI de 1 %. Le poids officiel occupe environ 548 Mio et porte le SHA-256 `394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2`. Les écarts entre variantes comparent la préparation du signal avec le même poids sur le même titre. La tentative F16 avait été interrompue et les conditions de l’hôte avaient changé. [Poids Turbo Q5_0 officiel](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-large-v3-turbo-q5_0.bin)
+
+| Entrée Q5_0 | WER sur 458 mots | CER | Substitutions / suppressions / insertions | Passages incertains | Temps de décodage |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mix | 8,08 % | 5,54 % | 10 / 17 / 10 | 21 | 86,33 s |
+| Voix isolée | 6,77 % | 4,43 % | 9 / 13 / 9 | 20 | 77,51 s |
+| Voix isolée et découpage adaptatif | 12,23 % | 10,11 % | 12 / 36 / 8 | 32 | 194,75 s |
+
+Aucune variante n’a produit de mots dans les intervalles de plus de deux secondes entre annotations. Le PSS maximal du groupe a atteint 247 Mio pour un RSS de 316 Mio. Le minimum disponible a été de 4,60 Gio, pour un PSI maximal de 0,18 %. Les températures maximales observées ont été de 64,25 °C côté CPU et 51 °C côté GPU. Le GTT maximal de l’hôte a atteint 6,01 Gio. Les compteurs DRM ont attribué jusqu’à 1 016 Mio de GTT résident au client du décodeur. Le parcours complet a pris environ 362 s, avec 4 256 pages écrites en swap sur l’hôte pendant la mesure.
+
+| Repère indépendant | Mix couvert / p95 / total à ±500 ms | Voix isolée couverte / p95 / total à ±500 ms | Découpage couvert / p95 / total à ±500 ms |
+| --- | ---: | ---: | ---: |
+| Début de mot | 93,89 % / 419 ms / 91,70 % | 95,20 % / 440 ms / 92,79 % | 89,52 % / 404 ms / 87,99 % |
+| Fin de mot | 91,05 % / 463 ms / 87,55 % | 92,79 % / 503 ms / 87,99 % | 88,86 % / 468 ms / 85,15 % |
+| Début de ligne | 96,08 % / 359 ms / 96,08 % | 94,12 % / 359 ms / 92,16 % | 90,20 % / 340 ms / 90,20 % |
+| Fin de ligne | 74,51 % / 877 ms / 68,63 % | 84,31 % / 741 ms / 72,55 % | 86,27 % / 517 ms / 80,39 % |
+
+Le p95 porte sur les repères retrouvés. La dernière valeur de chaque cellule conserve toutes les annotations au dénominateur. Le découpage a perdu 26 débuts de mots face au stem continu malgré un p95 calculé sur les repères restants plus bas. Le pire écart de début de mot sur le stem continu atteint 1 761 ms. Ces mesures font du stem continu un candidat à comparer sur d’autres genres et laissent l’objectif de 500 ms ouvert.
+
 ### Détection d’activité sur un titre entier
 
 Un second banc a comparé les niveaux RMS, le rapport de niveau entre le stem et le mix, et Silero VAD sur le même titre complet de 193,68 s. Chaque décision s’applique à un intervalle de 100 ms. Le centre appartient soit à un mot annoté, soit à un intervalle éloigné d’au moins 500 ms des annotations. Les 1 401 intervalles de la première catégorie et les 201 de la seconde déterminent les fractions du tableau. La seconde catégorie peut contenir des sons vocaux non annotés.
