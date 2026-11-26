@@ -822,7 +822,9 @@ class Maintenance:
         if self.state_root is not None:
             env["XDG_STATE_HOME"] = str(self.state_root)
         if self.night_running and import_owner is None:
-            env["KARA_DEMUCS_THREADS"] = "2"
+            # Use the existing six-thread engine for unattended closed-lid
+            # work; preserve the quieter policy when the screen can be used.
+            env["KARA_DEMUCS_THREADS"] = "6" if self.night.desktop and self.night.desktop.lid else "2"
         # All input paths are program arguments; no shell evaluates titles or paths.
         retain = tuple(fd for fd in (self.owner, import_owner) if fd is not None)
         return run(command, stop=self.stopped if stop is None else stop, timeout=timeout, event=observer, env=env, maximum=maximum,

@@ -69,7 +69,7 @@ def multimedia_active():
 
 
 # PSI is a stall-time indicator, not a fraction of RAM in use. For
-# unattended heavy work with the lid closed, record stalls without treating
+# unattended work with the lid closed, record stalls without treating
 # PSI alone as memory exhaustion. The absolute reserve remains mandatory.
 MEMORY_RETRY_SECONDS = 30.
 
@@ -92,7 +92,7 @@ def memory_psi(text):
 
 
 def memory_limits(*, closed=False, running=False, light=False):
-    return (None, None) if closed and not light else (1., 1.)
+    return (None, None) if closed else (1., 1.)
 
 
 def thermal_admission(settings, cpu_t, gpu_t, *, nocturnal=False, closed=False):
@@ -302,6 +302,13 @@ class Resources:
             if closed and not running and now < self.memory_retry_at:
                 self.reason = "Pause mémoire après interruption · reprise différée"
                 return light and self.can_start_light
+            # A secured closed lid on AC is dedicated to batch work. Load
+            # percentages are observations, not resource exhaustion. Keep
+            # thermal, memory, storage and foreground checks above.
+            if closed:
+                self.reason = "Mode capot fermé · calcul prioritaire"
+                self.can_start = self.can_start_light
+                return running or self.can_start
             for ok, reason in (
                 (load is not None and load < settings["cpu"], "CPU occupé"),
                 (disk is not None and disk < settings["disk_busy"], "Disque occupé"),

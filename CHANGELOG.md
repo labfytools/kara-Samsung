@@ -7,6 +7,7 @@
 - Permettre un plafond thermique nocturne explicite de 95 °C, sans relever les valeurs par défaut.
 - Distinguer la pression mémoire partielle et complète pendant les calculs nocturnes, avec une pause globale après interruption.
 - Traiter le PSI comme indicateur pour les calculs lourds capot fermé, sans supprimer les réserves de RAM.
+- Prioriser le calcul capot fermé sans plafond de charge CPU/GPU/disque et utiliser six threads Demucs.
 
 - Afficher en parallèle les débits et la vérification USB ainsi que l’indexation Android, avec un bilan des temps par phase dans la console.
 - Publier les pistes vérifiées pendant les transferts suivants et livrer leur reçu à l’index V2 dès le tri.

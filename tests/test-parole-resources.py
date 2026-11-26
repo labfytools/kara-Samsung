@@ -40,7 +40,7 @@ class ResourceTests(unittest.TestCase):
                 memory_psi(text)
         self.assertEqual(memory_limits(closed=True, running=True), (None, None))
         self.assertEqual(memory_limits(closed=True, running=False), (None, None))
-        self.assertEqual(memory_limits(closed=True, running=True, light=True), (1., 1.))
+        self.assertEqual(memory_limits(closed=True, running=True, light=True), (None, None))
         self.assertEqual(memory_limits(closed=False, running=True), (1., 1.))
 
     def test_closed_running_memory_policy_and_cooldown(self):
@@ -75,28 +75,37 @@ class ResourceTests(unittest.TestCase):
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True))
             self.assertTrue(resources.memory_observation["psi_advisory"])
             self.assertEqual(resources.memory_observation["full_avg10"], 25.)
-            self.assertFalse(resources.check(DEFAULTS, nocturnal=True, lid=True, light=True))
+            # Full utilization does not prevent an unattended admission.
+            readings[str(busy)] = "100"
+            readings["/proc/stat"] = "cpu 1002 0 2 150 0 0 0 0"
+            resources.disk_load.return_value = 100
+            clock.return_value = 104.
+            self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True))
+            self.assertEqual(resources.reason, "Mode capot fermé · calcul prioritaire")
+            readings[str(busy)] = "0"
+            resources.disk_load.return_value = 0
+            self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True, light=True))
             self.assertTrue(resources.check(DEFAULTS, running=True, nocturnal=True, lid=True))
             self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True, lid=False))
             # Sufficient RAM to continue, but not to admit a new heavy task.
             readings["/proc/meminfo"] = "MemAvailable: 3145728 kB"
-            clock.return_value = 104.
+            clock.return_value = 106.
             self.assertFalse(resources.check(DEFAULTS, nocturnal=True, lid=True))
             self.assertTrue(resources.check(DEFAULTS, running=True, nocturnal=True, lid=True))
             readings["/proc/meminfo"] = "MemAvailable: 1310720 kB"
-            clock.return_value = 106.
+            clock.return_value = 108.
             self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True, lid=True))
             self.assertIn("réserve", resources.memory_detail)
             self.assertIn("informatif", resources.memory_detail)
-            self.assertEqual(resources.memory_retry_at, 136.)
+            self.assertEqual(resources.memory_retry_at, 138.)
             readings["/proc/meminfo"] = "MemAvailable: 6324224 kB"
             readings["/proc/pressure/memory"] = "some avg10=0.10\nfull avg10=0.05"
-            clock.return_value = 108.
+            clock.return_value = 110.
             self.assertFalse(resources.check(DEFAULTS, nocturnal=True, lid=True))
             self.assertIn("Pause mémoire", resources.reason)
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True, light=True))
-            clock.return_value = 138.
-            readings["/proc/stat"] = "cpu 3 0 3 250 0 0 0 0"
+            clock.return_value = 140.
+            readings["/proc/stat"] = "cpu 1003 0 3 250 0 0 0 0"
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True))
 
     def test_stem_shared_blocks_do_not_count_twice_against_the_cap(self):
