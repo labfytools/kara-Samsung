@@ -81,6 +81,17 @@ class InventoryTests(Fixture):
         self.scan()
         self.assertEqual(list(records(self.index.path, self.root)), [])
 
+    def test_validation_receipts_preserve_the_origin_of_each_format(self):
+        self.audio()
+        self.scan()
+        song, = self.songs()
+        save_correction(self.index, song["id"], ".txt", None, "Texte saisi manuellement")
+        save_correction(self.index, song["id"], ".lrc", None, "[00:01.000]Brouillon corrigé", draft=True)
+        with self.index.db() as db:
+            rows = db.execute("""SELECT substr(subject,-4),json_extract(value,'$.source') FROM reviews
+                                WHERE kind='transcription_validation' AND state='validated'""")
+            self.assertEqual(dict(rows), {".txt": "Correction manuelle", ".lrc": "Turbo, validé manuellement"})
+
     def test_lexicon_excludes_held_out_content_and_generated_lrc(self):
         from _parole_lexicon import records, select_prompt
 

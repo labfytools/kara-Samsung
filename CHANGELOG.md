@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Conserver la provenance réelle des corrections de texte et de minutage, avec ou sans brouillon Turbo.
 - Donner un tour aux références locales même lorsque le réseau est disponible et exporter les LRC déjà intégrés sans requête fournisseur.
 - Attendre que Kara possède son nom D-Bus avant de terminer le démarrage du service.
 - Traiter les correspondances PCM locales même quand les quotas des fournisseurs sont épuisés.

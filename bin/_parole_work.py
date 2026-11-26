@@ -385,14 +385,14 @@ def save_correction(index, identity, suffix, original_version, text, *, expected
         if lrc_token(target) != original_version or document(file_token(audio)) != song["token"]:
             raise ValueError("Le morceau ou le texte a changé. Rouvre les détails.")
         with NamedTemporaryFile(dir=target.parent, prefix=".parole-correction-", delete=False) as file:
-            draft = Path(file.name)
+            temporary = Path(file.name)
             try:
                 file.write(raw)
                 file.flush()
                 os.fsync(file.fileno())
-                share_file(draft, target)
+                share_file(temporary, target)
                 if original_version is None:
-                    os.link(draft, target)
+                    os.link(temporary, target)
                 else:
                     backup = index.folder / "corrections" / identity
                     backup.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -400,16 +400,17 @@ def save_correction(index, identity, suffix, original_version, text, *, expected
                         atomic(backup / (str(time_ns()) + suffix), source.read(MAX_LRC_BYTES + 1))
                     if lrc_token(target) != original_version:
                         raise ValueError("Texte modifié pendant la sauvegarde")
-                    os.replace(draft, target)
+                    os.replace(temporary, target)
                 directory = os.open(target.parent, os.O_DIRECTORY)
                 try:
                     os.fsync(directory)
                 finally:
                     os.close(directory)
             finally:
-                draft.unlink(missing_ok=True)
-        # A receipt qualifies the exact version saved by this action. If a
-        # crash precedes the receipt, the correction remains safely on disk.
+                temporary.unlink(missing_ok=True)
+        # The receipt qualifies the exact version saved and the origin of the
+        # editor contents. Publication staging does not establish provenance.
+        # If a crash precedes the receipt, the correction remains on disk.
         version, saved = sidecar(audio, suffix)
         if saved.encode() != raw or document(file_token(audio)) != song["token"]:
             raise ValueError("Le morceau ou la correction a changé après l’écriture")
