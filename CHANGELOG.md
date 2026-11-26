@@ -5,6 +5,7 @@
 - Réarmer la préparation nocturne sur secteur stable capot fermé et confirmer les coupures transitoires sans poursuivre les calculs sur batterie.
 - Autoriser une durée nocturne illimitée explicitement choisie (`0`), avec les protections énergétiques et matérielles conservées.
 - Permettre un plafond thermique nocturne explicite de 95 °C, sans relever les valeurs par défaut.
+- Distinguer la pression mémoire partielle et complète pendant les calculs nocturnes, avec une pause globale après interruption.
 
 - Afficher en parallèle les débits et la vérification USB ainsi que l’indexation Android, avec un bilan des temps par phase dans la console.
 - Publier les pistes vérifiées pendant les transferts suivants et livrer leur reçu à l’index V2 dès le tri.

@@ -68,6 +68,33 @@ def multimedia_active():
     return b"Corked: no" in query.stdout
 
 
+# PSI is a stall-time indicator, not a fraction of RAM in use. Allow
+# modest contention only for an already admitted closed-lid heavy task.
+# Other admission policies and the absolute memory reserve stay unchanged.
+MEMORY_RETRY_SECONDS = 30.
+
+
+def memory_psi(text):
+    values = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] in ("some", "full"):
+            sample = next((item[6:] for item in fields[1:] if item.startswith("avg10=")), None)
+            if sample is None or fields[0] in values:
+                raise ValueError("PSI mémoire invalide")
+            value = float(sample)
+            if not 0 <= value <= 100:
+                raise ValueError("PSI mémoire invalide")
+            values[fields[0]] = value
+    if set(values) != {"some", "full"}:
+        raise ValueError("PSI mémoire incomplet")
+    return values["some"], values["full"]
+
+
+def memory_limits(*, closed=False, running=False, light=False):
+    return (5., 3.) if closed and running and not light else (1., 1.)
+
+
 def thermal_admission(settings, cpu_t, gpu_t, *, nocturnal=False, closed=False):
     cpu_limit = settings["night_cpu_temperature" if nocturnal else "temperature"]
     gpu_limit = settings["night_gpu_temperature" if nocturnal else "temperature"]
@@ -94,10 +121,11 @@ class Resources:
         self.storage = {}
         self.sample = 0
         self.index_pressure = None
-        self.sample_closed = False
+        self.sample_policy = None
         self.can_start = self.can_start_light = self.can_continue = False
         self.reason = "Mesure des ressources"
         self.memory_detail = None
+        self.memory_retry_at = 0.
 
     def close(self):
         proc, self.listener = self.listener, None
@@ -183,7 +211,8 @@ class Resources:
             self.memory_detail = None
             return False
         closed = nocturnal and lid
-        if closed == self.sample_closed and now < self.sample + 1.5:
+        policy = (nocturnal, closed, running, light) if running else (nocturnal, closed, running)
+        if policy == self.sample_policy and now < self.sample + 1.5:
             return self.can_continue if running else (self.can_start_light if light else self.can_start)
         self.can_start = self.can_start_light = self.can_continue = False
         self.memory_detail = None
@@ -217,7 +246,7 @@ class Resources:
             load = 100 * (1 - (cpu_sample[1] - cpu[1]) / max(1, cpu_sample[0] - cpu[0])) if cpu else None
             available = int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines()
                                  if line.startswith("MemAvailable:"))) / 1024
-            pressure = float(Path("/proc/pressure/memory").read_text().splitlines()[0].split()[1].split("=")[1])
+            pressure, full_pressure = memory_psi(Path("/proc/pressure/memory").read_text())
             gpus = [int(p.read_text()) for p in Path("/sys/class/drm").glob("card[0-9]*/device/gpu_busy_percent")]
             sensors = {}
             for device in Path("/sys/class/hwmon").glob("hwmon*"):
@@ -230,12 +259,16 @@ class Resources:
             disk = self.disk_load(now)
             self.index_pressure = (now, load, available, pressure, disk)
             self.sample = now
-            self.sample_closed = closed
+            self.sample_policy = policy
             # During the task its own CPU/GPU/disk load is expected. User
             # activity, power, pressure, temperature and remaining space
             # still revoke admission and trigger process-group cleanup.
             minimum = min(settings["memory_mib"], settings["running_memory_mib"]) if running else settings["memory_mib"]
-            memory_ok = available >= minimum and pressure < 1
+            some_limit, full_limit = memory_limits(closed=closed, running=running, light=light)
+            pressure_ok = pressure < some_limit and full_pressure < full_limit
+            memory_ok = available >= minimum and pressure_ok
+            if closed and running and not light and not memory_ok:
+                self.memory_retry_at = now + MEMORY_RETRY_SECONDS
             for ok, reason in (
                 (idle, "Session active"), (power, "Alimentation secteur requise"),
                 (memory_ok, "Mémoire ou pression mémoire"),
@@ -247,10 +280,11 @@ class Resources:
                     if reason == "Mémoire ou pression mémoire":
                         # PSI is system-wide and can trigger with ample freeable
                         # memory. Record both observations from this decision.
-                        cause = ("réserve et PSI" if available < minimum and pressure >= 1
+                        cause = ("réserve et PSI" if available < minimum and not pressure_ok
                                  else "réserve" if available < minimum else "PSI")
                         self.memory_detail = (f"{cause} · {available:.0f} Mio disponibles (minimum {minimum})"
-                                              f" · PSI mémoire some avg10 {pressure:.2f} % (seuil 1 %)")
+                                              f" · PSI mémoire some avg10 {pressure:.2f} % (seuil {some_limit:g} %),"
+                                              f" full avg10 {full_pressure:.2f} % (seuil {full_limit:g} %)")
                     return False
             if multimedia_active():
                 self.reason = "Flux multimédia actif"
@@ -259,6 +293,9 @@ class Resources:
             # Network maintenance needs the same safety measurements and
             # launch memory floor, but does not need a free compute slot.
             self.can_start_light = available >= settings["memory_mib"]
+            if closed and not running and now < self.memory_retry_at:
+                self.reason = "Pause mémoire après interruption · reprise différée"
+                return light and self.can_start_light
             for ok, reason in (
                 (load is not None and load < settings["cpu"], "CPU occupé"),
                 (disk is not None and disk < settings["disk_busy"], "Disque occupé"),
