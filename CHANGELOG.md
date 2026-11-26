@@ -21,6 +21,7 @@
 - Comparer le moteur SPA de PipeWire Echo Cancel hors ligne et vérifier les empreintes des trames communes aux candidats.
 - Comparer Turbo, CTC et les variantes phonétiques sur le même PCM BlackBox, avec WER sur transcription humaine fournie.
 - Diagnostiquer le budget de plusieurs heures, les cas négatifs du score et la reprise d’une capture synthétique interrompue avant l’essai physique.
+- Rendre l’accès à BlackBox Studio visible dans les paramètres de maintenance de Parole.
 
 - Réserver la préparation nocturne aux références locales ou déjà obtenues tant que les fournisseurs de références sont indisponibles.
 - Répéter un extrait de brouillon trois fois et le ralentir à 80 % en préservant la hauteur, avec arrêt sur reprise de Kara ou de Strawberry.

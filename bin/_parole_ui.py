@@ -1095,6 +1095,7 @@ class ParoleView:
 
         new = lambda: box(css_classes=["panel-content"])
         general = new()
+        general.append(button("Ouvrir BlackBox Studio", self.control.show_blackbox_studio))
         toggles(general, (("startup", "Inventaire automatique au lancement"), ("lyrics", "Rechercher les paroles manquantes"),
                           ("lrc", "Rechercher les LRC"), ("generate", "Générer un LRC depuis les paroles"),
                           ("albums", "Vérifier les albums"), ("discography", "Vérifier les discographies"),
