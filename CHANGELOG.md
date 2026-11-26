@@ -3,6 +3,7 @@
 ## En développement
 
 - Identifier chaque cycle et flux BlackBox V3, pseudonymiser les joueurs, publier les blocs WAV atomiquement et réserver le micro témoin à une sélection explicite.
+- Capturer le PCM reçu avant le filtrage réseau et le mix Kara après les faders, borner la synchronisation réseau par échange d’horloges et exiger l’accord individuel pendant le tour.
 
 - Réserver la préparation nocturne aux références locales ou déjà obtenues tant que les fournisseurs de références sont indisponibles.
 - Répéter un extrait de brouillon trois fois et le ralentir à 80 % en préservant la hauteur, avec arrêt sur reprise de Kara ou de Strawberry.

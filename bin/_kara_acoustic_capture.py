@@ -69,11 +69,19 @@ class AcousticTurn:
     def alive(self):
         return any(thread.is_alive() for thread in self.threads)
 
-    def report(self, track, state, **data):
+    def report(self, track, state, *, epoch=None, **data):
         self.recorder.emit("acoustic", "tap", **self.context, recording_session=self.session,
-                           track=track, state=state, epoch=self.epoch, **data)
+                           track=track, state=state, epoch=self.epoch if epoch is None else epoch, **data)
 
     def read(self, track):
+        for attempt in range(3):
+            epoch = self.epoch if attempt == 0 else monotonic_ns()
+            if attempt:
+                self.report(track, "requested", epoch=epoch)
+            if not self.read_aperture(track, epoch) or self.stop_flag.wait(.25) or self.cancelled():
+                break
+
+    def read_aperture(self, track, epoch):
         reason = "capture_ended"
         stored, missing = 0, 0
         if track == "monitor" and not self.sink:
@@ -99,10 +107,10 @@ class AcousticTurn:
                         if self.cancelled():
                             break
                         if not stored:
-                            self.report(track, "running", first_frame=graph.cycle["frame"],
+                            self.report(track, "running", epoch=epoch, first_frame=graph.cycle["frame"],
                                         driver=graph.cycle["driver"])
                         self.recorder.pcm(track, RATE, channels, block, **self.context,
-                                          clock={**graph.cycle, "epoch": self.epoch},
+                                          clock={**graph.cycle, "epoch": epoch},
                                           recording_session=self.session)
                         stored += graph.cycle["quantum"]
         except CaptureError as error:
@@ -112,10 +120,15 @@ class AcousticTurn:
         except (OSError, ValueError, SubprocessError):
             reason = "pipewire_capture_failed"
         if reason == "capture_ended" and stored:
-            self.report(track, "stopped", submitted_frames=stored, missing_frames=missing)
+            self.report(track, "stopped", epoch=epoch, submitted_frames=stored, missing_frames=missing)
         else:
-            self.report(track, "unavailable", reason=reason if reason != "capture_ended" else "no_capture_pcm",
+            self.report(track, "unavailable", epoch=epoch, reason=reason if reason != "capture_ended" else "no_capture_pcm",
                         submitted_frames=stored, missing_frames=missing)
+        # A lost monitor buffer or a clock reset closes the old range. A
+        # bounded re-open retains later valid audio under a fresh epoch.
+        return track == "monitor" and not self.cancelled() and reason in (
+            "pcm_missing_or_invalid", "graph_clock_changed", "endpoint_clock_changed", "graph_sample_gap",
+            "graph_xrun", "graph_clock_unusable")
 
 
 class AcousticCapture:

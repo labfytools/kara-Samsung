@@ -162,6 +162,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.bb_line = None
         self.tv_line_revision = 0
         self.bb_turn = None
+        self.bb_output_capture = None
+        self.bb_audio_playing = False
         self.remote_party = RemoteParty(self)
         self.room_audio = RoomAudio(self.blackbox)
         self.acoustic = AcousticCapture(self.blackbox)
@@ -521,7 +523,24 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def stop_blackbox(self, reason="manual", *, wait=False):
         self.acoustic.update()
+        self.capture_output()
         self.blackbox.stop(reason, wait=wait)
+
+    def capture_output(self, context=None):
+        session = self.blackbox.voice_session("playback") if context else None
+        signature = (session, context["turn"]) if session else None
+        if self.bb_output_capture == signature:
+            return
+        self.bb_output_capture = signature
+        if signature is None:
+            self.vocal_effect.observe_output(None)
+            return
+
+        def submit(rate, channels, block, encoding, timing):
+            self.blackbox.pcm("playback", rate, channels, block, **context, recording_session=session,
+                              sample_format=encoding, playback_timing=timing)
+
+        self.vocal_effect.observe_output(submit)
 
     def toggle_blackbox(self, _button):
         status = self.blackbox.status()
@@ -532,7 +551,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             detail += "Le mode diagnostics enregistre les événements, les paroles et la notation. "
             detail += ("Deep Analysis enregistre le microphone du joueur et la sortie PipeWire pendant les tours. "
                        "Le micro témoin peut être sélectionné explicitement depuis Admin sur mobile. "
-                       "Obtiens l’accord explicite de chaque participant. Prévois environ 4 à 5 Go par heure de jeu.")
+                       "Obtiens l’accord explicite de chaque participant. Prévois 6 Go par heure de jeu.")
             if status["latest"]:
                 detail += f"\n\nDernière session : {status['latest']['session']}"
             dialog = Gtk.AlertDialog(message="Activer BlackBox ?", detail=detail,
@@ -1479,6 +1498,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if player is None:
             return
         self.acoustic.update()
+        self.capture_output()
+        self.room_audio.record_playing(False)
+        self.bb_audio_playing = False
         if pause and self.track == player.song.path and self.rate > 0:
             self.player_command("Pause")
         played = self.turn_phase in ("playing", "finishing")
@@ -2143,13 +2165,19 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.remote_party.tick(now)
         player = self.party.active
         context = self.game_score.diagnostic_turn
-        if (os.environ.get("KARA_SILENT") != "1" and self.turn_phase == "playing"
-                and player and self.track == player.song.path and self.rate > 0 and context):
+        playing = bool(os.environ.get("KARA_SILENT") != "1" and self.turn_phase == "playing"
+                       and player and self.track == player.song.path and self.rate > 0 and context)
+        if playing != self.bb_audio_playing:
+            self.bb_audio_playing = playing
+            self.room_audio.record_playing(playing)
+        if playing:
             sink = self.room_audio.selected_sink()
-            if not self.remote_party.opened_early or not player.mobile_id or self.room_audio.consented():
+            if player.mobile_id and self.room_audio.consented():
                 self.acoustic.update(context, sink)
+                self.capture_output(context)
             else:
                 self.acoustic.update()
+                self.capture_output()
             if now >= self.next_capture_clock and self.blackbox.active():
                 self.next_capture_clock = now + 1.
                 self.blackbox.emit("audio", "music-clock", **context, position=self.base_position,
@@ -2157,6 +2185,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                    playback_rate=self.rate)
         else:
             self.acoustic.update()
+            self.capture_output()
         if self.game_toggle.get_active() and self.turn_phase in ("", "playing"):
             self.game_score.tick(self.times, self.duration, position, self.rate, now,
                                  self.word_times, self.word_ends, source=self.scoring_source())

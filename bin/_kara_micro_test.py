@@ -22,6 +22,7 @@ import numpy as np
 from scipy.signal import firwin, resample_poly
 from aiohttp import WSMsgType, web
 from _kara_audio_calibration import ANALOG_TARGET, await_owned, calibration_audio, close_process, selected_target
+from _kara_blackbox_clock import browser_anchor
 from _kara_monitor_profiles import DEFAULTS, PROFILE_PATH, PROFILES, device_key, output_port, read_profiles
 from _kara_voice_latency import RelativeTransit, SubmissionCadence, TimingWindow, TransportFreshness, player_backlog
 
@@ -207,6 +208,15 @@ def browser_diagnostics(message):
         value = capture.get(key)
         if type(value) is bool or (key == "echoCancellation" and value in ("all", "remote-only")):
             settings[key] = value
+    for key in ("requested_echo", "requested_noise", "requested_auto_gain"):
+        if type(capture.get(key)) is bool:
+            settings[key] = capture[key]
+    if capture.get("platform") in ("android", "ios", "other"):
+        settings["platform"] = capture["platform"]
+    if capture.get("browser") in ("chromium", "firefox", "safari", "other"):
+        settings["browser"] = capture["browser"]
+    if capture.get("client_revision") == 3:
+        settings["client_revision"] = 3
     delivery = numbers(client, ("sent", "dropped", "worklet_duplicates", "worklet_missing_frames",
                                 "max_quantum_frames", "worklet_frames_per_s",
                                 "buffered_bytes", "buffered_bytes_max"))
@@ -420,6 +430,8 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
         pulse_status = {"pulse_underruns": 0 if experimental else None, "pulse_buffer_bytes": None}
         monitor_enabled = True
         disconnect_reason = "closed"
+        clock_probe = None
+        clock_sequence = 0
         queue = asyncio.Queue(maxsize=queue_packets)
         history = np.zeros(RESAMPLE_DOWN, dtype=np.float32) if experimental and capture_rate == 44100 else None
         audio_stats = {"rms": 0.0, "peak": 0.0, "clipped": 0, "frames": 0}
@@ -634,12 +646,16 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                                 if not pcm_bytes // 2 <= frame_end < 2 ** 53:
                                     delivery_stats["invalid_packets"] += 1
                                     continue
+                            if route:
+                                room_audio.record_received(route, memoryview(data)[header:], capture_rate,
+                                                           received_at, seq, send_ms, frame_end)
                             previous = transport["last_seq"]
                             # TCP preserves order. Never replay a duplicate or
                             # move the sequence cursor back on a malformed client.
                             step = seq + 1 if previous is None else (seq - previous) & 0xffffffff
                             if previous is not None and (step == 0 or step >= 0x80000000):
                                 transport["reordered"] += 1
+                                delivery_stats["duplicate_packets"] = delivery_stats.get("duplicate_packets", 0) + (step == 0)
                                 continue
                             transport["missing"] += step - 1
                             transport["last_seq"] = seq
@@ -689,6 +705,19 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                     else:
                         delivery_stats["invalid_packets"] += 1
                 elif msg.type == WSMsgType.TEXT:
+                    if route and msg.data.startswith("clock:") and len(msg.data) <= 512:
+                        received_ns = time.monotonic_ns()
+                        try:
+                            response = json.loads(msg.data[6:])
+                        except (ValueError, RecursionError):
+                            continue
+                        if isinstance(response, dict) and clock_probe and response.get("id") == clock_probe[0]:
+                            anchor = browser_anchor(clock_probe[1], received_ns, response)
+                            clock_probe = None
+                            if anchor:
+                                room_audio.diagnostics.emit("clock", "mobile-anchor", **route.context,
+                                                            connection=route.connection, rate=capture_rate, **anchor)
+                        continue
                     if msg.data == "stop":
                         disconnect_reason = "user"
                         break
@@ -719,7 +748,7 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                             if mobile is not None:
                                 if route:
                                     room_audio.diagnostics.emit("audio", "browser-capture", **route.context,
-                                                                **mobile)
+                                                                connection=route.connection, **mobile)
                                 else:
                                     snapshot.update(mobile)
                     if msg.data.startswith("volume:") and len(msg.data) <= 12:
@@ -758,6 +787,7 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                                             "transport_excess_max_ms": relative["max"] or 0,
                                             "sequence_missing": transport["missing"],
                                             "sequence_reordered": transport["reordered"],
+                                            "duplicate_packets": delivery_stats.get("duplicate_packets", 0),
                                             "queue_drops": delivery_stats["queue_drops"],
                                             "transport_stale_drops": delivery_stats["transport_stale_drops"],
                                             "invalid_packets": delivery_stats["invalid_packets"],
@@ -796,6 +826,12 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                             levels["return_fader_gain"] = route.gain
                             levels["return_peak_limit"] = peak
                             room_audio.metrics(route, levels)
+                            if (room_audio.diagnostics.active()
+                                    and (clock_probe is None or time.monotonic_ns() - clock_probe[1] > 2_000_000_000)
+                                    and int(now / 2) != clock_sequence):
+                                clock_sequence = int(now / 2)
+                                clock_probe = (clock_sequence, time.monotonic_ns())
+                                levels["clock_probe"] = clock_sequence
                         await ws.send_json(levels)
                 else:
                     break
@@ -821,6 +857,11 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                 await await_owned(asyncio.create_task(cleanup()))
             finally:
                 if route:
+                    room_audio.diagnostics.emit("audio", "transport-end", **route.context,
+                                                connection=route.connection, received=delivery_stats["rx_packets"],
+                                                missing=transport["missing"], reordered=transport["reordered"],
+                                                duplicates=delivery_stats.get("duplicate_packets", 0),
+                                                invalid=delivery_stats["invalid_packets"], rate=capture_rate)
                     room_audio.detach(route, ws, reason=disconnect_reason, code=ws.close_code)
                 if ACTIVE_SESSION["ws"] is ws:
                     ACTIVE_SESSION["ws"] = None

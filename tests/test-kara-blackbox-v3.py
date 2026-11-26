@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_blackbox import BlackBox, atomic_json, cycle_id, digest, events, validate_recording
+from _kara_blackbox_clock import browser_anchor
 
 
 class RecordingTests(unittest.TestCase):
@@ -76,6 +77,17 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(validate_recording(folder, manifest)["status"], "incomplete")
         self.assertEqual([row["id"] for row in events(folder / "events.jsonl")], [1, 3])
         self.assertEqual(self.box.status()["latest"]["unrecoverable_pcm_events"], 1)
+
+    def test_asymmetric_clock_exchange_preserves_interval(self):
+        # Server clock = browser clock + 1 s. Network delays are 2 and
+        # 12 ms, so the midpoint is biased by 5 ms even with perfect clocks.
+        payload = dict(received_ms=202., context_begin_ms=202.1, context_end_ms=202.3,
+                       sent_ms=203., context_frame=9600)
+        stamp = browser_anchor(1_200_000_000, 1_215_000_000, payload)
+        self.assertEqual((stamp["offset_min_ns"], stamp["offset_max_ns"]), (998_000_000, 1_012_000_000))
+        self.assertEqual(stamp["offset_uncertainty_ns"], 7_000_000)
+        self.assertIsNone(stamp["physical_bound_ns"])
+        self.assertIsNone(browser_anchor(1_200_000_000, 1_200_000_001, payload))
 
 
 if __name__ == "__main__":

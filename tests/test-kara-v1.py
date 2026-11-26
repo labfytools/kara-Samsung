@@ -47,9 +47,15 @@ class BlackBoxTests(unittest.TestCase):
                 route = audio.route
                 now = time.monotonic()
                 samples = bytes(1920)
+                audio.record_playing(True)
+                audio.record_received(route, samples, 48000, now, 0, now * 1000, None)
                 audio.pcm(route, samples, 48000, now, 0, now * 1000)
                 self.assertFalse(audio.consented())
                 audio.ticket("owner", consent=True)
+                audio.record_playing(False)
+                audio.record_received(route, samples, 48000, now + .01, 1, (now + .01) * 1000, None)
+                audio.record_playing(True)
+                audio.record_received(route, samples, 48000, now + .02, 1, (now + .02) * 1000, None)
                 audio.pcm(route, samples, 48000, now + .02, 1, (now + .02) * 1000)
                 audio.return_pcm(route, samples, 1)
                 self.assertEqual(audio.applied(route), 0)
@@ -662,7 +668,10 @@ class RoomTests(unittest.TestCase):
         self.addCleanup(reader.close)
         self.addCleanup(room.close_turn)
         data = struct.pack("<h", 1000) * 960
+        room.record_playing(True)
+        room.route.recording_consent = True
         for sequence in range(256):
+            room.record_received(room.route, data, 48000, 10 + sequence / 50, sequence, 1000 + 20 * sequence, None)
             room.pcm(room.route, data, 48000, 10 + sequence / 50, sequence, 1000 + 20 * sequence)
         self.assertTrue(room.receiving())
         self.assertEqual(room.route.failed_blocks, 0)

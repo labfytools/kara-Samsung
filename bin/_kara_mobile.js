@@ -739,7 +739,8 @@
 
 
   for (const [value, title] of [["wifi", "Audio reçu des téléphones"], ["whisper", "Signal analysé par Whisper"],
-    ["return", "Retour vocal numérique"], ["monitor", "Monitor PipeWire"], ["witness", "Micro témoin du Vivobook"]]) {
+    ["return", "Retour vocal numérique"], ["playback", "Mix Kara à l’entrée de la sortie"],
+    ["monitor", "Monitor PipeWire"], ["witness", "Micro témoin du Vivobook"]]) {
     const label = element("label");
     const input = element("input");
     input.type = "checkbox"; input.checked = value !== "witness"; input.value = value;
@@ -929,8 +930,15 @@
       processor.connect(target); target.connect(context.destination);
       const limit = (Math.round(context.sampleRate * settings.block_ms / 1000) * 2 + 24) *
         settings.queue_max_ms / settings.block_ms;
+      const counters = {sent: 0, dropped: 0, buffered_bytes_max: 0};
       processor.port.onmessage = event => {
-        if (mic !== owner || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount + 24 + event.data.pcm.byteLength > limit) return;
+        if (mic !== owner) return;
+        const queued = socket.bufferedAmount + 24 + event.data.pcm.byteLength;
+        counters.buffered_bytes_max = Math.max(counters.buffered_bytes_max, queued);
+        if (socket.readyState !== WebSocket.OPEN || queued > limit) {
+          counters.dropped++;
+          return;
+        }
         const frame = new Uint8Array(24 + event.data.pcm.byteLength);
         frame.set([75,84,83,50]);
         const header = new DataView(frame.buffer);
@@ -939,9 +947,18 @@
         header.setUint32(16, event.data.endFrame % (2 ** 32), true);
         header.setUint32(20, Math.floor(event.data.endFrame / (2 ** 32)), true);
         frame.set(new Uint8Array(event.data.pcm), 24); socket.send(frame);
+        counters.sent++;
       };
       socket.onmessage = event => {
+        const received = performance.now();
         const data = JSON.parse(event.data);
+        if (Number.isSafeInteger(data.clock_probe) && socket.readyState === WebSocket.OPEN) {
+          const begin = performance.now();
+          const frame = Math.round(context.currentTime * context.sampleRate);
+          const end = performance.now();
+          socket.send("clock:" + JSON.stringify({id: data.clock_probe, received_ms: received,
+            context_begin_ms: begin, context_end_ms: end, context_frame: frame, sent_ms: performance.now()}));
+        }
         if (data.levels) {
           $("micro-level").value = data.rms;
           if (owner.resetPending) {
@@ -955,15 +972,31 @@
       };
       $("voice").value = ticket.volume;
       $("voice-applied").value = settings.applied_percent + " %";
-      owner.meter = setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send("levels"); }, 400);
       owner.ready = true; micMessage = "";
-      const applied = acquired.getAudioTracks()[0].getSettings();
-      socket.send("diagnostics:" + JSON.stringify({capture: {
-        context_rate_hz: context.sampleRate, base_latency_ms: context.baseLatency * 1000,
-        latency: applied.latency, sampleRate: applied.sampleRate, channelCount: applied.channelCount,
-        echoCancellation: applied.echoCancellation, noiseSuppression: applied.noiseSuppression,
-        autoGainControl: applied.autoGainControl
-      }, client: {}}));
+      const agent = navigator.userAgent || "";
+      const platform = /Android/.test(agent) ? "android" : /iPhone|iPad|iPod/.test(agent) ? "ios" : "other";
+      const browser = /Firefox|FxiOS/.test(agent) ? "firefox" : /Chrome|Chromium|CriOS/.test(agent) ?
+        "chromium" : /Safari/.test(agent) ? "safari" : "other";
+      function sendDiagnostics() {
+        const applied = acquired.getAudioTracks()[0].getSettings();
+        socket.send("diagnostics:" + JSON.stringify({capture: {
+          client_revision: 3, platform, browser, requested_echo: ticket.echo, requested_noise: ticket.noise,
+          requested_auto_gain: false, context_rate_hz: context.sampleRate, base_latency_ms: context.baseLatency * 1000,
+          latency: applied.latency, sampleRate: applied.sampleRate, channelCount: applied.channelCount,
+          echoCancellation: applied.echoCancellation, noiseSuppression: applied.noiseSuppression,
+          autoGainControl: applied.autoGainControl
+        }, client: {...counters, buffered_bytes: socket.bufferedAmount}}));
+      }
+      let nextDiagnostics = performance.now() + 4000;
+      owner.meter = setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        socket.send("levels");
+        if (state?.party.recording && performance.now() >= nextDiagnostics) {
+          sendDiagnostics();
+          nextDiagnostics = performance.now() + 4000;
+        }
+      }, 400);
+      sendDiagnostics();
       context.onstatechange = () => {
         if (mic === owner && owner.ready && context.state !== "running") {
           stopMicrophone("audio-suspended");

@@ -49,6 +49,40 @@ class StemPlayback:
         self.playing = False
         self.strength = 1
         self.error = ""
+        self.observer = None
+        self.probe = None
+
+    def observe_output(self, observer):
+        self.observer = observer
+        if self.pipeline is not None:
+            self._update_probe()
+
+    def _update_probe(self):
+        pad = self.pipeline.get_by_name("out").get_static_pad("sink")
+        if self.observer and self.probe is None:
+            self.probe = pad.add_probe(Gst.PadProbeType.BUFFER, self._observe_pcm)
+        elif self.observer is None and self.probe is not None:
+            pad.remove_probe(self.probe)
+            self.probe = None
+
+    def _observe_pcm(self, pad, info):
+        # Observe the negotiated PCM at the sink input after the master fader.
+        # Never change the negotiated graph or hold an audio buffer for I/O.
+        observer = self.observer
+        if observer is not None:
+            buffer = info.get_buffer()
+            caps = pad.get_current_caps()
+            if buffer is not None and caps and 0 < buffer.get_size() <= 65536:
+                layout = caps.get_structure(0)
+                encoding = layout.get_string("format")
+                if layout.get_string("layout") == "interleaved" and encoding in ("S16LE", "F32LE"):
+                    segment = pad.get_sticky_event(Gst.EventType.SEGMENT, 0)
+                    running = segment.parse_segment().to_running_time(Gst.Format.TIME, buffer.pts) if segment else None
+                    observer(layout.get_value("rate"), layout.get_value("channels"),
+                             buffer.extract_dup(0, buffer.get_size()), encoding.lower(),
+                             {"pts_ns": buffer.pts, "running_ns": running, "flags": int(buffer.get_flags()),
+                              "pipeline_base_ns": pad.get_parent_element().get_base_time()})
+        return Gst.PadProbeReturn.OK
 
     @staticmethod
     def pactl(*args):
@@ -136,6 +170,7 @@ class StemPlayback:
         self.pipeline.get_by_name("voicefile").set_property("location", str(stems[1]))
         if output is not None:
             self.pipeline.get_by_name("out").set_property("device", output)
+        self._update_probe()
         # The two branches use segment time from the same pipeline. Gain
         # changes insert control points and never seek or flush the decoders.
         if self.turn_mix is None:
@@ -273,6 +308,7 @@ class StemPlayback:
                 self.bus = self.bus_handler = None
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
+            self.probe = None
         self.controls.clear()
         self.ramps.clear()
         if self.module is not None:

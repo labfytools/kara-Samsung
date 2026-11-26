@@ -24,3 +24,22 @@ Kara conserve le dossier de session et le journal append-only. Le schéma V3 ajo
 Un WAV s’écrit sous suffixe `.part`, est synchronisé avec son en-tête définitif, puis renommé et publié. La fin de session publie le manifeste après les index et rapporte les pertes. Lors d’une interruption, la reprise répare les brouillons RIFF lisibles et conserve les événements dont la plage PCM est encore présente. Elle préserve les identifiants et les événements suivants, et compte séparément les références PCM irrécupérables. Les captures V1 restent lisibles avec leurs métadonnées d’origine.
 
 Le manifeste distingue l’état du journal de l’état de couverture des pistes. Les références musicales locales peuvent être réutilisées par empreinte. Le monitor PipeWire représente le mix numérique accessible au noeud de sortie et peut inclure d’autres lecteurs. La grille interne, la latence des périphériques et le son dans la pièce ont des points de mesure distincts. Le micro témoin est désélectionné par défaut et requiert une sélection explicite.
+
+## Points de capture et rapprochement des horloges
+
+| Piste | Source V3 | Limite |
+| --- | --- | --- |
+| `MIC_RAW` | Indisponible | Le navigateur choisit une entrée, expose certaines contraintes puis livre un signal pouvant déjà inclure des traitements de l’OS ou du navigateur. Le worklet applique le gain et produit du PCM16 avant l’émission. |
+| `MIC_RECEIVED` | `wifi` | Charge PCM à la réception WSS après validation de l’enveloppe, avant le contrôle de fraîcheur et l’acceptation du numéro de séquence. Inclut les doublons et les rejets d’ordre reçus avec une enveloppe valide. |
+| `MUSIC_REFERENCE` et `ORIGINAL_VOCAL` | Stems locaux identifiés par empreinte | Les éventuels changements de niveau sont journalisés séparément. |
+| `PLAYBACK_REFERENCE` | `playback` | Buffer PCM au pad d’entrée du sink GStreamer, après le mélange instrumental et guide et leurs faders. Capture passive PCM16 ou float32 selon la négociation. Le retour micro et les effets externes ont des points de mesure distincts. |
+| `MIC_AEC` | Indisponible comme piste séparée | L’annulation demandée au navigateur peut déjà être incluse dans le signal reçu. Le navigateur expose la configuration rapportée, pas un couple PCM avant/après. |
+| `MIC_PROCESSED` | `whisper` | Datagrammes rééchantillonnés et acceptés pour le score, avec positions utilisées par le worker. Le nom historique de piste est conservé. |
+| `TURBO_INPUT` | À distinguer des datagrammes `whisper` | Le worker reconstruit la fenêtre, filtre, normalise et segmente avant le décodeur. |
+| `PLAYER_MONITOR` | `return` | PCM soumis au retour numérique, avant consommation matérielle. |
+| `OUTPUT_MONITOR` | `monitor` | Sortie PipeWire observée, incluant éventuellement le retour et d’autres applications. Une panne transitoire autorise deux nouvelles ouvertures passives avec des epochs distincts. |
+| `ACOUSTIC_WITNESS` | `witness` | Micro indépendant, sélection explicite depuis Admin. |
+
+La capture vocale mobile requiert l’accord envoyé lors de chaque activation WSS. Le PCM est admis pendant la lecture du tour consentant. Les paquets de chauffe, le compte à rebours et les pauses ne sont pas enregistrés par la BlackBox. Les tours locaux sans accord mobile n’ouvrent pas de tap BlackBox. Les identifiants de connexion BlackBox sont aléatoires et indépendants des tickets d’accès.
+
+La réception WSS garde le numéro de séquence, la position de fin du worklet et l’heure d’émission du navigateur lorsqu’elles existent. Le journal retient aussi le temps de réception, les ancres du lecteur et les repères du pad GStreamer. Un échange WSS journalise deux temps monotones serveur et l’intervalle du navigateur autour de la lecture de `AudioContext.currentTime`. Sous l’hypothèse de délais non négatifs, ces temps bornent l’écart d’horloge logiciel. Le milieu de l’intervalle est une estimation. Le quantum de rendu, les traitements de capture, les tampons et l’ADC/DAC restent des sources d’incertitude pour le temps physique. La sortie Bluetooth et l’affichage physique doivent faire l’objet de mesures distinctes. Les versions historiques du client continuent d’émettre et de recevoir leurs messages habituels.

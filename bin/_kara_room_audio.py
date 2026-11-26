@@ -3,7 +3,7 @@ import asyncio
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 import os
-from secrets import token_urlsafe
+from secrets import token_hex, token_urlsafe
 import socket
 import struct
 from subprocess import SubprocessError
@@ -42,8 +42,9 @@ class Route:
     last_arrival: float = 0.
     muted: bool = False
     return_enabled: bool = True
-    recording_consent: bool = True
-    require_consent: bool = False
+    recording_consent: bool = False
+    recording_on: bool = False
+    connection: str | None = None
     next_metrics: float = 0.
     counters: dict = field(default_factory=dict)
     gain: float = 0.
@@ -220,8 +221,6 @@ class RoomAudio:
             volume = self.preferences.get((owner, device),
                                           self.default_preferences.get(owner, min(100, settings["volume_percent"])))
             self.route = Route(owner, player, turn, song, sink, device, settings, volume, sender, scoring=scoring)
-            self.route.recording_consent = not require_consent
-            self.route.require_consent = require_consent
             self.route.return_enabled = not require_consent
         self.diagnostics.emit("audio", "route", player=player, turn=turn, song=song, output=sink,
                               profile=settings["profile"], guard=True, requested_percent=volume, scoring=scoring,
@@ -246,6 +245,13 @@ class RoomAudio:
             route = self.route
             return bool(route and route.receiving and (not recent or time.monotonic() - route.last_arrival < 1.5))
 
+    def record_playing(self, playing):
+        # Warm-up and the countdown still feed the live application. The
+        # recorder starts only at the playing aperture of the current tour.
+        with self.lock:
+            if self.route:
+                self.route.recording_on = playing
+
     def selected_sink(self):
         with self.lock:
             return self.route.sink if self.route else None
@@ -258,7 +264,7 @@ class RoomAudio:
             if route.claimed is not None or route.claim is None and time.monotonic() < route.armed_until:
                 raise RoomError("Ton microphone est déjà connecté.", 409)
             route.claim = token_urlsafe(24)
-            route.recording_consent = not route.require_consent or consent is True
+            route.recording_consent = consent is True
             route.armed_until = time.monotonic() + 45.
             return {"url": self.url, "ticket": route.claim, "volume": route.volume,
                     "capture": route.settings["mic_gain_percent"], "echo": route.settings["chrome_echo"],
@@ -281,13 +287,17 @@ class RoomAudio:
             if route is not self.route or route.claimed is not None:
                 return False
             route.claimed = ws
+            route.connection = token_hex(16)
             route.receiving = False
             route.gain = 0.
             route.seq = None
             route.clock_excess = None
             route.frame_origin = None
             route.frame_end = None
-            self.diagnostics.emit("audio", "microphone-connected", **route.context)
+            route.next_metrics = 0.
+            route.counters.clear()
+            self.diagnostics.emit("audio", "microphone-connected", **route.context,
+                                  connection=route.connection, voice_consent=route.recording_consent)
             return True
 
     def detach(self, route, ws, *, reason="closed", code=None):
@@ -295,7 +305,9 @@ class RoomAudio:
             if route.claimed is ws:
                 route.claimed = None
                 route.receiving = False
-                self.diagnostics.emit("audio", "disconnect", **route.context, reason=reason, code=code)
+                self.diagnostics.emit("audio", "disconnect", **route.context, reason=reason, code=code,
+                                      connection=route.connection)
+                route.recording_consent = False
             route.armed_until = 0.
 
     def metrics(self, route, levels):
@@ -303,7 +315,7 @@ class RoomAudio:
         if clock < route.next_metrics:
             return
         route.next_metrics = clock + 2
-        self.diagnostics.emit("audio", "sample", **route.context, levels=levels)
+        self.diagnostics.emit("audio", "sample", **route.context, levels=levels, connection=route.connection)
         for counter, kind in (("queue_drops", "overflow"), ("transport_stale_drops", "capture-gap"),
                               ("sequence_missing", "capture-gap"), ("pulse_underruns", "xrun"),
                               ("clipped", "clipping")):
@@ -312,17 +324,28 @@ class RoomAudio:
                 continue
             increase = current - route.counters.get(counter, 0)
             if increase > 0:
-                self.diagnostics.emit("audio", kind, **route.context, counter=counter, increase=increase)
+                self.diagnostics.emit("audio", kind, **route.context, counter=counter, increase=increase,
+                                      connection=route.connection)
             route.counters[counter] = current
 
     def return_pcm(self, route, pcm, sequence):
         with self.lock:
-            if route is self.route and route.recording_consent:
-                self.diagnostics.pcm("return", 48000, 2, pcm, sequence=sequence, **route.context)
+            if route is self.route and route.recording_on and route.recording_consent:
+                self.diagnostics.pcm("return", 48000, 2, pcm, sequence=sequence, **route.context,
+                                     connection=route.connection)
 
     def consented(self):
         with self.lock:
             return bool(self.route and self.route.recording_consent)
+
+    def record_received(self, route, data, rate, received, sequence, send_ms, frame_end):
+        # Capture decoded WebSocket payload before freshness, frame ordering,
+        # bridge and scoring. Rejections remain observable at their own boundary.
+        with self.lock:
+            if route is self.route and route.recording_on and route.recording_consent:
+                self.diagnostics.pcm("wifi", rate, 1, data, sequence=sequence, **route.context,
+                                     connection=route.connection,
+                                     packet_timing={"frame_end": frame_end, "send_ms": send_ms, "received_s": received})
 
     def allowed(self, route, ws):
         with self.lock:
@@ -488,9 +511,6 @@ class RoomAudio:
             route.seq = sequence
             route.sent += 1
             timing = {"frame_end": frame_end, "send_ms": send_clock, "received_s": received}
-            if route.recording_consent:
-                self.diagnostics.pcm("wifi", rate, 1, data, capture_end=end, sequence=sequence,
-                                     packet_timing=timing, **route.context)
-                if route.scoring:
-                    self.diagnostics.pcm("whisper", 16000, 1, pcm, capture_end=end, sequence=sequence,
-                                         packet_timing=timing, **route.context)
+            if route.recording_on and route.recording_consent and route.scoring:
+                self.diagnostics.pcm("whisper", 16000, 1, pcm, capture_end=end, sequence=sequence,
+                                     packet_timing=timing, connection=route.connection, **route.context)

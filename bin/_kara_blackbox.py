@@ -36,11 +36,12 @@ AUDIO_SEGMENT_BYTES = 16 * 1024 * 1024
 GRAPH_TRACKS = ("monitor", "witness")
 GRAPH_CLOCK_FIELDS = ("driver", "frame", "monotonic_ns", "xrun", "quantum", "present",
                       "spa_headers", "route", "epoch")
-TRACK_NAME = re.compile(r"[a-f0-9]{16}-(?:wifi|whisper|return|monitor|witness)-[0-9]{4}\.wav")
-TRACKS = ("wifi", "whisper", "return", *GRAPH_TRACKS)
+TRACK_NAME = re.compile(r"[a-f0-9]{16}-(?:wifi|whisper|return|monitor|witness|playback)-[0-9]{4}\.wav")
+TRACKS = ("wifi", "whisper", "return", "playback", *GRAPH_TRACKS)
 DEFAULT_TRACKS = tuple(track for track in TRACKS if track != "witness")
 STREAM_ROLES = {"wifi": "MIC_RECEIVED", "whisper": "MIC_PROCESSED", "return": "PLAYER_MONITOR",
-                "monitor": "OUTPUT_MONITOR", "witness": "ACOUSTIC_WITNESS"}
+                "monitor": "OUTPUT_MONITOR", "witness": "ACOUSTIC_WITNESS",
+                "playback": "PLAYBACK_REFERENCE"}
 FLOAT_WAV = struct.Struct("<4sI4s4sIHHIIHH4sII4sI")
 INCIDENTS = {"error", "disconnect", "interrupted", "capture-gap", "overflow",
              "partial", "xrun", "write-error", "marker", "tv-timeout", "clipping"}
@@ -240,7 +241,7 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
                     stream["state"] = "incomplete"
                 elif not stream["frames"] and "unavailable" in graph.get("states", ()):
                     stream["state"] = "unusable"
-            for role in ("MIC_RAW", "PLAYBACK_REFERENCE", "MIC_AEC", "TURBO_INPUT"):
+            for role in ("MIC_RAW", "MIC_AEC", "TURBO_INPUT"):
                 cycle["streams"].setdefault(role, {"state": "not_applicable"})
             for role, name in (("MUSIC_REFERENCE", "instrumental"), ("ORIGINAL_VOCAL", "original_voice")):
                 reference = cycle.get("references", {}).get(name)
@@ -494,15 +495,20 @@ class BlackBox:
                 record.dropped += 1
 
     def pcm(self, track, rate, channels, block, *, turn, player, song, sequence=None, capture_end=None,
-            clock=None, recording_session=None, packet_timing=None):
+            clock=None, recording_session=None, packet_timing=None, connection=None,
+            sample_format=None, playback_timing=None):
         # Explicit voice consent is independent of metadata collection. This
         # admission check lives before the copy and never performs file I/O.
         if track not in TRACKS or not isinstance(turn, str) or not TURN.fullmatch(turn):
             return
         graph = track in GRAPH_TRACKS
-        width = 4 if graph else 2
+        floating = graph or track == "playback" and sample_format == "f32le"
+        width = 4 if floating else 2
         if (rate not in (16000, 44100, 48000) or channels not in (1, 2)
-                or not 0 < len(block) <= (65536 if graph else 4096) or len(block) % (channels * width)):
+                or not 0 < len(block) <= (65536 if graph or track == "playback" else 4096)
+                or len(block) % (channels * width)):
+            return
+        if track == "playback" and (sample_format not in ("f32le", "s16le") or not playback_timing):
             return
         if graph and (not clock or not recording_session or rate != 48000
                       or channels != (2 if track == "monitor" else 1)
@@ -529,11 +535,17 @@ class BlackBox:
                                 "stream": f"{cycle_id(record.identity, turn)}/{track}"})
             if graph:
                 item["data"].update(clock={key: clock[key] for key in GRAPH_CLOCK_FIELDS}, sample_format="f32le")
+            if track == "playback":
+                item["data"].update(sample_format=sample_format, playback_timing={
+                    key: playback_timing[key] for key in ("pts_ns", "running_ns", "pipeline_base_ns", "flags")
+                    if type(playback_timing.get(key)) is int and 0 <= playback_timing[key] < 2 ** 63})
             if packet_timing is not None and track in ("wifi", "whisper"):
                 item["data"]["packet_timing"] = {
                     key: packet_timing[key] for key in ("frame_end", "send_ms", "received_s")
                     if type(packet_timing.get(key)) in (int, float) and isfinite(packet_timing[key])
                 }
+            if isinstance(connection, str) and re.fullmatch(r"[a-f0-9]{32}", connection):
+                item["data"]["connection"] = connection
             try:
                 record.pending.put_nowait((item, bytes(block)))
             except Full:
@@ -558,7 +570,7 @@ def wave_layout(path):
         if len(raw) == FLOAT_WAV.size and raw[20:22] == b"\x03\x00":
             parts = FLOAT_WAV.unpack(raw)
             channels, rate, frames, size = parts[6], parts[7], parts[13], parts[15]
-            if (channels not in (1, 2) or rate != 48000 or size != 4 * channels * frames
+            if (channels not in (1, 2) or rate not in (16000, 44100, 48000) or size != 4 * channels * frames
                     or raw != float_header(rate, channels, size)
                     or path.stat().st_size != FLOAT_WAV.size + size):
                 raise ValueError("En-tête ou taille WAV flottant invalide.")
@@ -576,7 +588,7 @@ def recover_wave(path):
         if len(header) == FLOAT_WAV.size and header[20:22] == b"\x03\x00":
             parts = FLOAT_WAV.unpack(header)
             channels, rate = parts[6:8]
-            if channels not in (1, 2) or rate != 48000 or parts[11:13] != (b"fact", 4):
+            if channels not in (1, 2) or rate not in (16000, 44100, 48000) or parts[11:13] != (b"fact", 4):
                 return False
             size = path.stat().st_size - FLOAT_WAV.size
             size -= size % (4 * channels)
@@ -713,7 +725,8 @@ def validate_recording(folder, manifest):
             data = item["data"]
             rate, channels, frames, width, _ = audio[data["file"]]
             graph = data["track"] in GRAPH_TRACKS
-            if (data["rate"], data["channels"], width) != (rate, channels, 4 if graph else 2) or not (
+            expected_width = 4 if graph or modern and data.get("sample_format") == "f32le" else 2
+            if (data["rate"], data["channels"], width) != (rate, channels, expected_width) or not (
                     0 <= data["sample"] < data["sample"] + data["frames"] <= frames):
                 raise ValueError("Index PCM invalide.")
             if modern:
@@ -784,14 +797,16 @@ class Recording:
         key = item["turn"], data["track"]
         number, segment = self.segments.get(key, (0, None))
         rate, channels = data["rate"], data["channels"]
-        if not segment or segment.size + len(block) > AUDIO_SEGMENT_BYTES or (rate, channels) != (segment.rate, segment.channels):
+        width = 4 if data.get("sample_format") == "f32le" else 2
+        if (not segment or segment.size + len(block) > AUDIO_SEGMENT_BYTES
+                or (rate, channels, width) != (segment.rate, segment.channels, segment.width)):
             if segment:
                 segment.close()
                 number += 1
             audio = self.folder / "audio"
             audio.mkdir(mode=0o700, exist_ok=True)
             segment = Segment(audio / f"{key[0]}-{key[1]}-{number:04}.wav", rate, channels,
-                              floating=key[1] in GRAPH_TRACKS)
+                              floating=width == 4)
             self.segments[key] = number, segment
         data.update(file=f"audio/{segment.path.name}", sample=segment.write(block),
                     frames=len(block) // (segment.width * channels))

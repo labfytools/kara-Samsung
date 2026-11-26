@@ -49,8 +49,11 @@ class MixTests(unittest.TestCase):
         measured = []
         for music, guide in ((100, 0), (0, 100), (100, 100)):
             effect = StemPlayback()
+            observed = {}
             try:
                 effect.set_turn_mix(music, guide, 100)
+                effect.observe_output(lambda rate, channels, block, encoding, clock:
+                                      observed.update({clock["pts_ns"]: (rate, channels, block, encoding)}))
                 effect._set_pipeline(self.stems, None)
                 self.assertNotEqual(effect.pipeline.set_state(Gst.State.PLAYING), Gst.StateChangeReturn.FAILURE)
                 effect.playing = True
@@ -60,7 +63,9 @@ class MixTests(unittest.TestCase):
                     sample = sink.emit("try-pull-sample", Gst.SECOND)
                     self.assertIsNotNone(sample)
                     buffer = sample.get_buffer()
-                    buffers.append(np.frombuffer(buffer.extract_dup(0, buffer.get_size()), dtype="<f4").reshape(-1, 2))
+                    pcm = buffer.extract_dup(0, buffer.get_size())
+                    self.assertEqual(observed[buffer.pts], (RATE, 2, pcm, "f32le"))
+                    buffers.append(np.frombuffer(pcm, dtype="<f4").reshape(-1, 2))
                 signal = np.concatenate(buffers)
                 measured.append(np.sqrt(np.mean(signal ** 2, axis=0)))
                 # Exercise live timestamped control-point installation on the
@@ -121,12 +126,16 @@ class ReturnTests(unittest.TestCase):
         for rate in (44100, 48000):
             with self.subTest(rate=rate):
                 rows.clear()
-                settings = {"volume_percent": 50, "profile": "balanced"}
+                settings = {"volume_percent": 50, "profile": "balanced", "mic_gain_percent": 100,
+                            "chrome_echo": True, "chrome_noise": False}
                 with patch.object(room, "_route_settings", return_value=("bluez_output.test", "test", settings)):
                     reader = room.open_turn("owner", "Joueur", "tour", "Titre")
                 try:
                     route = room.route
+                    room.runner = object()
+                    room.ticket("owner", consent=True)
                     self.assertTrue(room.attach(route, object()))
+                    room.record_playing(True)
                     frames = rate // 100
                     payload = struct.pack("<h", 500) * frames
                     for sequence in range(400):
@@ -144,6 +153,7 @@ class ReturnTests(unittest.TestCase):
                     previous = route.last_sample
                     ws = route.claimed
                     room.detach(route, ws, reason="background", code=1000)
+                    room.ticket("owner", consent=True)
                     self.assertTrue(room.attach(route, object()))
                     room.pcm(route, payload, rate, 1006., 0, 8., frames)
                     stamp, = struct.unpack_from("<d", reader.recv(649))
