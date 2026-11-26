@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Annuler une correction de brouillon sans écriture et garder l’historique d’annulation dans le format en cours.
 - Distinguer les publications locales, les brouillons, les validations et les reports dans le bilan horaire, quotidien et capot fermé.
 - Conserver la provenance réelle des corrections de texte et de minutage, avec ou sans brouillon Turbo.
 - Donner un tour aux références locales même lorsque le réseau est disponible et exporter les LRC déjà intégrés sans requête fournisseur.

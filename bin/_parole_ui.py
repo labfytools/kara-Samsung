@@ -769,6 +769,15 @@ class ParoleView:
                  if any(item["kind"] == "transcription" for item in checks) else None)
         draft_format = None
 
+        def replace_text(value):
+            # A format change or cancellation starts a fresh undo history.
+            # Ctrl+Z must never restore another format into this buffer.
+            buffer.begin_irreversible_action()
+            try:
+                buffer.set_text(value)
+            finally:
+                buffer.end_irreversible_action()
+
         def reload_text(*_):
             nonlocal draft_format
             draft_format = None
@@ -781,15 +790,19 @@ class ParoleView:
                     from _paroles_lrc import parse_lrc
                     value = "\n".join(line for _, line in parse_lrc(sidecar(path, ".lrc")[1]) if line)
             view.set_editable(False)
+            forms.set_sensitive(True)
             edit.set_sensitive(version != "invalid")
             save.set_sensitive(False)
-            buffer.set_text(value)
+            cancel.set_sensitive(False)
+            replace_text(value)
             status.set_text("Fichier illisible ou trop volumineux" if version == "invalid" else "")
 
         def start_edit(_):
+            forms.set_sensitive(False)
             view.set_editable(True)
             view.grab_focus()
             save.set_sensitive(True)
+            cancel.set_sensitive(True)
 
         status = Gtk.Label(xalign=0, wrap=True)
         edit = button("Corriger", start_edit)
@@ -805,23 +818,28 @@ class ParoleView:
                 return
             self.maintenance.rescan()
             reload_text()
-            status.set_text("Correction enregistrée")
+            status.set_text("Minutage validé" if suffix == ".lrc" else "Texte validé")
 
         save = button("Enregistrer", commit)
+        cancel = button("Annuler la correction", reload_text)
         editbar.append(edit)
         editbar.append(save)
+        editbar.append(cancel)
         if draft and draft["plain"]:
             def load_draft(_):
                 nonlocal draft_format
+                if view.get_editable():
+                    status.set_text("Enregistre ou annule la correction en cours.")
+                    return
                 suffix = ".lrc" if forms.get_selected() else ".txt"
                 field = "lrc" if suffix == ".lrc" else "lyrics"
                 if row[field] != "absent" or sidecar(path, suffix)[0]:
                     status.set_text("Une référence existe déjà pour ce format.")
                     return
                 draft_format = suffix
-                buffer.set_text(draft["timed"] if suffix == ".lrc" else draft["plain"])
+                replace_text(draft["timed"] if suffix == ".lrc" else draft["plain"])
                 start_edit(None)
-                status.set_text("Brouillon Turbo. Écoutez et corrigez le texte avant d’enregistrer.")
+                status.set_text("Minutage du brouillon à vérifier." if suffix == ".lrc" else "Texte du brouillon à vérifier.")
 
             editbar.append(button("Charger le brouillon Turbo", load_draft))
         if draft and (ranges := review_ranges(draft)):

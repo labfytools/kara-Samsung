@@ -73,6 +73,8 @@ Turbo décode le mix sans contexte lexical et conserve ses observations dans le 
 
 Dans les détails du morceau, **Charger le brouillon Turbo** remplit l’éditeur pour le format manquant sélectionné. Écouter et corriger les paroles ou le minutage avant **Enregistrer**. L’enregistrement conserve la validation manuelle et protège une référence ajoutée entre-temps. Le brouillon ne change aucun fichier musical ni aucun LRC de la bibliothèque.
 
+**Annuler la correction** recharge le dernier texte enregistré. `Ctrl+Z` annule les saisies dans le format en cours. Enregistrer ou annuler avant de passer du texte au minutage. La confirmation indique le format validé.
+
 Le volet **Passages à vérifier** affiche jusqu’à vingt segments écartés avec leur intervalle et la proposition de Turbo. Les boutons repositionnent dans Strawberry le morceau déjà sélectionné. Le parcours de vérification respecte les préparations et les tours Kara en cours. La correction se fait toujours dans l’éditeur du format choisi.
 
 ### Essai du brouillon Vulkan sur un extrait réel
