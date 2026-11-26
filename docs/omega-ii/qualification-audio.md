@@ -80,3 +80,39 @@ Le témoin remplace aussi huit mots courants par chanson, par exemple `you` par 
 *Embers* a terminé en 200,40 s après reprise sous le plafond CPU local de 22 %. Le PSS de groupe culmine à 759 Mio et le PSI à 0,22 %. Le second passage intégral de *Feel* avec le filtre géométrique prend 209,71 s sous le même plafond, avec 760 Mio de PSS et 0,18 % de PSI. Les deux passages achevés utilisent le modèle ONNX et le vocabulaire signés. Les fenêtres du passage interrompu de *Embers* comptent dans le travail initial et sont relues par sa reprise.
 
 Dans un environnement local contenant NumPy 2.2.6 et ONNX Runtime 1.24.4, [le banc CTC](../../tests/qualify-parole-ctc.py) utilise un manifeste de chanson entière avec les empreintes audio et des trois fichiers d’annotation indépendants. [Le banc de contre-épreuves](../../tests/qualify-parole-ctc-evidence.py) reprend le reçu et ses fenêtres acoustiques. Le fait de changer l’audio, les poids, le vocabulaire ou la version du banc invalide la reprise. Les normalisations sont en anglais. Le lexique et la référence attendue ne sont jamais fournis au modèle acoustique.
+
+## Kara, écho et préservation de la voix
+
+Le parcours microphone local de `_kara_voice.py` demande une source PipeWire d’annulation d’écho en mode moniteur et revient au microphone si elle est indisponible. Le chemin mobile peut demander le traitement du navigateur et rapporte les réglages appliqués. Le mode `remote-only` du navigateur vise les pistes WebRTC reçues. Le mode `all` demande de retirer les signaux joués par le système. La version et le chemin effectivement utilisés doivent être relevés lors d’un témoin. Le module PipeWire associe une capture à un signal de lecture. La bibliothèque SPA WebRTC de ce poste charge `webrtc-audio-processing-1.so.3`, comme le témoin AEC3, mais l’horloge des nœuds, le rééchantillonnage et le chemin de lecture restent spécifiques au graphe. [Module PipeWire](https://docs.pipewire.org/page_module_echo_cancel.html) · [API WebRTC AEC3](https://webrtc.googlesource.com/src/+/f0edfc399074da2c0b6a3fe866462fa464addf5c/modules/audio_processing/aec3/echo_canceller3.h) · [Contraintes de capture W3C](https://www.w3.org/TR/mediacapture-streams/#dom-mediatrackconstraintset-echocancellation)
+
+Le rejeu synthétique à 48 kHz utilise des trames de 10 ms et une voix sèche connue. Les bibliothèques prises en charge localement sont WebRTC Audio Processing 1.3 et SpeexDSP 1.2.1. Les mesures de voix portent sur des signaux synthétiques et sont calculées après compensation du retard observé de l’algorithme.
+
+| Scène synthétique | Écho retiré par AEC3 | Écho retiré par Speex | Gain de la voix faible AEC3 / Speex | Gain du chant AEC3 / Speex |
+| --- | ---: | ---: | ---: | ---: |
+| Retard fixe | 23,85 dB | 21,29 dB | −7,81 / −1,13 dB | −3,42 / −1,04 dB |
+| Dérive de 180 ppm | 23,16 dB | 6,26 dB | −11,49 / −1,00 dB | −3,85 / −1,05 dB |
+| Chemin à retard variable, réglé à 360 ms | 54,22 dB | 0,81 dB | −66,49 / −0,88 dB | −1,89 / −1,04 dB |
+| Mix stéréo | 25,05 dB | 15,10 dB | −18,25 / −1,23 dB | −4,79 / −1,05 dB |
+
+Le p95 du calcul de trame à retard fixe vaut 0,257 ms avec AEC3 et 0,259 ms avec Speex. Le délai de l’impulsion mesurée est de 8,96 ms et 0 ms respectivement. Ces valeurs excluent les tampons du périphérique et du graphe. Le retour de la propre voix en boucle baisse de 52,41 dB avec AEC3, accompagné d’une perte de 9,58 dB sur le chant. Speex réduit le retour de 15,23 dB avec une perte de 1,83 dB sur le chant. Aucun scénario ne valide à la fois l’atténuation et le seuil de préservation de 15 dB de SI-SDR. Les résultats n’isolent pas la voix du disque de l’accompagnement dans une vraie pièce. Le chemin temps réel et EasyEffects conservent leur configuration.
+
+Le score compare des mots décodés sans le texte attendu, après des contrôles sur le signal et la fuite de la piste connue. La tolérance de score de 1 s sépare cette décision de l’objectif de repères à 500 ms. Les témoins de silence, accompagnement, voix originale, guide, parole différente, refrain hors repère et capture interrompue conservent l’absence de crédit lorsque leur signal ne permet pas d’attribuer le chant au joueur. Les essais sur capture enregistrée rejouent aussi les décisions historiques sans attribuer un nouveau score à un participant.
+
+Le contrôle en lecture seule retrouve 12 captures BlackBox closes et intègres. Les 34 décisions de notation sont reproduites. Dans les quatre captures qui contiennent le moniteur et le témoin, aucun cycle identifié par la même horloge de graphe ne se recouvre. Le comparatif AEC sur matériel ne dispose donc d’aucune fenêtre commune. Le p95 synthétique ne décrit pas la latence du retour microphone en situation réelle.
+
+## Suggestions lexicales après reconnaissance
+
+[Le banc de consensus](../../tests/qualify-parole-lexical-consensus.py) relit le mix, les voix Demucs et les mêmes voix filtrées des 50 extraits. Une graphie du mix à faible confiance doit bénéficier d’un accord des deux parcours vocaux à 220 ms près, dans la langue détectée en commun. Un voisin lexicographique est utile uniquement si une expression de deux mots figure dans le corpus excluant les titres évalués. Les deux parcours vocaux partagent une séparation. Leur accord reste un indice pour l’éditeur.
+
+L’égalité de la clé phonétique grossière a produit zéro proposition. Avec une distance d’édition d’au plus un entre clés d’au moins quatre lettres, deux propositions apparaissent. Une seule reçoit l’appui d’un bigramme, en rap américain. Le nombre d’erreurs reste à 620 sur 1 317 mots, et le WER à 47,08 %. Les accents, contractions, mots courts, argot et alternances de langues demandent des témoins phonétiques mieux adaptés. Le banc n’a posé aucune suggestion en production.
+
+## Répétitions vocales
+
+[Le banc local](../../tests/qualify-parole-repetitions.py) compare l’évolution spectrale de passages de 3 s espacés d’au moins 8 s. Sur la voix séparée, il exige que l’activité dépasse −38 dBFS pendant au moins 60 % des deux fenêtres. Il retient jusqu’à vingt couples par entrée et par titre, sans ouvrir le texte pour choisir ces couples. Les annotations indépendantes servent ensuite à qualifier l’égalité des phrases d’au moins trois mots. Les quatre titres sont des chansons entières déjà munies de stems et de résultats Turbo Q5.
+
+| Signal | Couples proposés | Phrases identiques | Phrases différentes | Moins de trois mots annotés dans une fenêtre |
+| --- | ---: | ---: | ---: | ---: |
+| Mix | 80 | 36 | 23 | 21 |
+| Voix séparée | 80 | 51 | 29 | 0 |
+
+Parmi les 51 répétitions retrouvées sur la voix, les deux lectures Turbo n’ont pas le même nombre d’erreurs dans 31 couples. Le nombre d’omissions diffère dans 20, celui des substitutions dans 23 et celui des insertions dans 11. Ces décomptes se recoupent. Le signal vocal augmente le nombre de répétitions retrouvées dans ce lot, mais 29 phrases différentes restent proposées. Les variations et les ad-libs peuvent aussi faire diverger la référence. Ce résultat permet de chiffrer des occasions de comparaison dans l’éditeur. Aucun mot n’a été recopié ni publié. L’essai ne mesure donc aucun gain de WER après correction.
