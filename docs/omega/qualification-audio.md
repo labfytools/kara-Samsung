@@ -44,6 +44,8 @@ Sur une chanson entière de 193,68 s, les réglages CPU ont conservé deux fils 
 
 La variante diminue le PSI et le temps sur cet essai. Son PSS plus élevé et le franchissement de 1 % écartent une conclusion de gain mémoire reproductible. Demucs 4.0.1 expose directement la consommation séquentielle avec `-j 0`. Le réglage nocturne de production conserve son exécution qualifiée précédemment. [Découpage Demucs](https://github.com/facebookresearch/demucs/blob/main/demucs/apply.py) · [Exécuteur séquentiel Demucs](https://github.com/facebookresearch/demucs/blob/main/demucs/utils.py)
 
+Le relevé par étape place le pic du worker pendant la séparation proprement dite. Dans l’essai sériel, le maximum RSS cumulé du worker atteint environ 493 Mio après le chargement des poids et 557 Mio après le décodage. La séparation porte ce maximum à 1 800 Mio. À l’encodage FLAC, le PSS courant maximal échantillonné tombe à environ 1 099 Mio dans le groupe. Le pic de séparation combine les poids et les allocations de calcul et de restitution. Ces mesures permettent de localiser le pic sans attribuer chaque page au modèle ou à un tampon particulier.
+
 ### Pilote lexical et audio
 
 Les trois premiers extraits du manifeste, en rock et dans les deux groupes de rap, ont fourni 52 mots de référence. Le mix a rendu 25 erreurs, la voix brute et la voix normalisée 30 chacune et la segmentation adaptative 31. La relecture ciblée et la relecture phonétique ont laissé toutes les graphies du stem en place. L’écart entre le mix et le stem est concentré sur le rap américain du pilote. Ce résultat décrit ces trois cas et motive une qualification par genre.
@@ -68,6 +70,8 @@ Aucune variante n’a produit de mots dans les intervalles de plus de deux secon
 | Fin de ligne | 74,51 % / 877 ms / 68,63 % | 84,31 % / 741 ms / 72,55 % | 86,27 % / 517 ms / 80,39 % |
 
 Le p95 porte sur les repères retrouvés. La dernière valeur de chaque cellule conserve toutes les annotations au dénominateur. Le découpage a perdu 26 débuts de mots face au stem continu malgré un p95 calculé sur les repères restants plus bas. Le pire écart de début de mot sur le stem continu atteint 1 761 ms. Ces mesures font du stem continu un candidat à comparer sur d’autres genres et laissent l’objectif de 500 ms ouvert.
+
+Parmi les 56 débuts annotés à moins de 500 ms des 23 frontières adaptatives, 6 sont absents dans le découpage et 3 dans le stem continu. Sur les 402 autres, il en manque 42 et 19 respectivement. L’essentiel de l’écart vient donc de l’intérieur des fenêtres sur ce morceau. Du côté des fins de mots dans le stem continu, les 384 bornes fournies par le jeton suivant ont un p95 de 477 ms. Les 41 bornes estimées par la fin du segment ont un p95 de 846 ms. Une seule règle de correction pour les deux origines est mal étayée par cet essai.
 
 #### Décalage et dérive sur blocs tenus à part
 
