@@ -86,6 +86,24 @@ Le premier passage avec les variantes a effectué 72 requêtes en 55,68 s sur le
 
 Pour une recherche classique sans résultat ou ambiguë, Parole peut interroger Unison par ISRC. Il faut une correspondance exacte de l’identifiant, du titre et des crédits. Parole conserve un lien vers le résultat et le crédit du contributeur dans les détails du morceau, avec le quota habituel par fournisseur. Le texte et ses repères restent consultables à la source. Les conditions Jamendo encadrent la conservation hors ligne du contenu. [API Unison](https://docs.betterlyrics.org/unison) · [Licence Unison](https://github.com/better-lyrics/unison/blob/master/LICENSE-DATA.md) · [Conditions Jamendo](https://devportal.jamendo.com/api_terms_of_use)
 
+### Premières mesures après activation
+
+Le 26 novembre, `kara.service` a redémarré à 11 h 10 après les contrôles physiques du capot. La sauvegarde SQLite a passé `quick_check`. Parole a rouvert avec 13 201 pistes et l’inhibiteur de capot armé. La durée maximale effective est de 480 min. Le [relevé capot fermé](parole-capot-ferme.md) décrit la veille manuelle et la restauration après le débranchement.
+
+Entre la sauvegarde avant redémarrage et le relevé de 11 h 23, Parole a publié des paroles LRCLIB et un LRC LyricDown. Le lot représente environ 13 min de production. Les durées et taux ci-dessous portent sur les tentatives de chaque fournisseur et le compteur de publication comptabilise séparément les fichiers ou tags écrits dans la bibliothèque.
+
+| Fournisseur | Tentatives | Réponses exploitables | Erreurs consignées | Durée moyenne |
+| --- | ---: | ---: | ---: | ---: |
+| LRCLIB | 64 | 5 | 1 | 2,77 s |
+| lyrics.ovh | 62 | 0 | 0 | 2,67 s |
+| NetEase | 106 | 0 | 1 | 1,93 s |
+| QQ Music | 122 | 0 | 0 | 1,18 s |
+| Genius | 61 | 0 | 0 | 1,20 s |
+| LyricDown | 24 | 1 | 1 | 1,57 s |
+| Unison | 0 | 0 | 0 | — |
+
+Les 20 entrées du registre étaient actives, y compris les sources réservées aux pochettes, au catalogue ou aux imports. Unison a répondu sur l’ISRC public de qualification hors production. Les recherches de la première fenêtre de production n’ont déclenché aucune consultation Unison. Le débit sur une heure entière demande une fenêtre de mesure complète en production.
+
 ## Qualification
 
 Les fixtures vérifient aussi que la reprise d’activité ou une demande Kara interrompt un sous-processus déjà démarré. Elles vérifient la réserve sur chaque partition, indépendamment de la place totale. Les commandes suivantes exécutent les tests.

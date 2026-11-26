@@ -70,3 +70,9 @@ En mode nocturne, un échec de recherche sans correspondance peut créer une tâ
 Demucs utilise le cache de Kara. Turbo décode une première fois le mix sans contexte lexical et conserve ses observations dans le cache privé, liées à l’audio, au modèle et aux paramètres. Il propose des lignes de texte et de LRC lorsque les mots de la fenêtre les soutiennent. Les lignes écartées ne sont pas complétées. L’état du brouillon reste à vérifier. La préparation Kara peut réutiliser les observations lorsque la nouvelle référence a le même audio, le même décodeur et le même mode linguistique.
 
 Dans les détails du morceau, **Charger le brouillon Turbo** remplit l’éditeur pour le format manquant sélectionné. Écouter et corriger les paroles ou le minutage avant **Enregistrer**. L’enregistrement conserve la validation manuelle et protège une référence ajoutée entre-temps. Le brouillon ne change aucun fichier musical ni aucun LRC de la bibliothèque.
+
+### Essai du brouillon Vulkan sur un extrait réel
+
+Parole a préparé un brouillon sur une copie WAV de 21,59 s dépourvue de tags de paroles et de fichiers associés. Le moteur Turbo seul a retenu deux lignes, écarté trois segments textuels incertains et conservé 62 observations de mots dans le cache privé en 21,82 s. Les deux lignes ont exactement les mêmes mots normalisés que le LRC de référence. Leurs débuts s’en écartent de 320 et 460 ms. Kara a relu la première passe sous les mêmes signatures audio, modèle et paramètres. Le fichier WAV a conservé la même empreinte et la bibliothèque d’essai est restée sans TXT ni LRC publiés.
+
+Les deux essais de la tâche complète avec Demucs ont été suspendus sur dépassement d’un seuil de ressources. Les valeurs de 320 et 460 ms comparent deux lignes au LRC existant. Une mesure générale du seuil de 500 ms exige toujours des annotations indépendantes et des chansons entières.
