@@ -17,6 +17,26 @@ from _parole_resources import GIB, Resources, contents, thermal_admission, memor
 
 
 class ResourceTests(unittest.TestCase):
+    def test_demucs_thread_policy(self):
+        from _kara_stems import demucs_threads
+        from _parole_night import Desktop
+        self.assertEqual(demucs_threads({}), "6")
+        for value in ("2", "6", "12"):
+            self.assertEqual(demucs_threads({"KARA_DEMUCS_THREADS": value}), value)
+        for value in ("0", "1000", "invalid"):
+            self.assertEqual(demucs_threads({"KARA_DEMUCS_THREADS": value}), "6")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = Maintenance(root, None, state=root / "state")
+            self.addCleanup(runner.close)
+            runner.night_running = True
+            for closed, expected in ((True, "12"), (False, "2")):
+                runner.night.desktop = Desktop(True, True, closed, closed, False)
+                with patch("_parole_maintenance.run") as invoke:
+                    runner.output([sys.executable, "-V"])
+                self.assertEqual(invoke.call_args.kwargs["env"]["KARA_DEMUCS_THREADS"], expected)
+                self.assertEqual(demucs_threads(invoke.call_args.kwargs["env"]), expected)
+
     def test_configurable_closed_lid_thermal_ceiling(self):
         self.assertFalse(thermal_admission(DEFAULTS, [70], [60], nocturnal=True, closed=True))
         self.assertTrue(thermal_admission(DEFAULTS, [69], [60], nocturnal=True, closed=True))

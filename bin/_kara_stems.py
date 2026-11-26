@@ -29,6 +29,13 @@ PARAMETERS = {"engine": "demucs", "model": MODEL, "stem": "vocals", "shifts": 0,
               "overlap": 0.1, "segment": 7, "format": "flac"}
 
 
+def demucs_threads(env):
+    # Keep a bounded number of compute threads; the foreground and quieter
+    # nighttime policies retain their previous defaults.
+    value = env.get("KARA_DEMUCS_THREADS")
+    return value if value in {"2", "6", "12"} else "6"
+
+
 def model_signature():
     info = CHECKPOINT.stat()
     return {"settings": PARAMETERS, "checkpoint": [info.st_size, info.st_mtime_ns]}
@@ -195,7 +202,7 @@ def separate_locked(song):
         env = os.environ.copy()
         # Background preparation uses the same model with a smaller CPU
         # footprint. Parameters affecting the generated signal stay fixed.
-        threads = "2" if env.get("KARA_DEMUCS_THREADS") == "2" else "6"
+        threads = demucs_threads(env)
         env.update({"OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads, "OPENBLAS_NUM_THREADS": "1"})
         emit("progress", percent=2, status="Chargement du modèle de séparation")
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
