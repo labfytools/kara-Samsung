@@ -347,6 +347,32 @@ class NightTests(unittest.TestCase):
         self.assertEqual(self.owner.night_reference(song, path), result)
         self.owner.output.assert_called_once()
 
+    def test_quota_unavailable_uses_local_text_and_revisits_timing_when_ready(self):
+        path = self.owner.index.root / "song.opus"
+        song = {"id": "fixture", "token": "audio", "side": "side", "title": "Chanson",
+                "info": document({"plain": "Paroles présentes"}), "lrc": "absent", "audio": ""}
+        self.owner.output = Mock(return_value=(0, b'{"state":"found","lyrics":"[00:01.000]Paroles presentes"}'))
+        with patch("_parole_maintenance.ready_categories", return_value=set()):
+            result = self.owner.night_reference(song, path)
+            self.assertEqual((result["mode"], result["lyrics"]), ("plain", "Paroles présentes"))
+            self.assertEqual(self.owner.night_reference(song, path), result)
+            self.assertEqual(self.owner.night_reference({**song, "info": document({"plain": ""})}, path),
+                             {"state": "unavailable"})
+            self.owner.output.assert_not_called()
+        with patch("_parole_maintenance.ready_categories", return_value={"lrc"}):
+            self.assertEqual(self.owner.night_reference(song, path)["mode"], "timed")
+            self.owner.output.assert_called_once()
+            self.assertEqual(self.owner.output.call_args.args[0][-2:], ["prepare_lrc", "fixture"])
+
+    def test_no_provider_slot_can_still_read_a_pcm_reference(self):
+        song = {"id": "fixture", "token": "audio", "side": "side", "title": "Chanson",
+                "info": document({"plain": ""}), "lrc": "absent", "audio": "a" * 64}
+        self.owner.output = Mock(return_value=(0, b'{"state":"found","lyrics":"[00:01.000]Reference"}'))
+        with patch("_parole_maintenance.ready_categories", return_value=set()):
+            self.assertEqual(self.owner.night_reference(song, self.owner.index.root / "song.opus")["mode"], "timed")
+        self.owner.output.assert_called_once()
+        self.assertEqual(self.owner.output.call_args.args[0][-1], "--local-reference-only")
+
     def test_missing_references_enqueue_a_resumable_review_without_publication(self):
         path = self.owner.index.root / "song.opus"
         path.write_bytes(b"fixture")

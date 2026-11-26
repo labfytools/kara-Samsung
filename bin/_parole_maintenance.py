@@ -795,6 +795,7 @@ class Maintenance:
         # Retain a verified provider response across Demucs/Turbo cancellation.
         # Audio/sidecar edits and changed enabled sources invalidate that reply.
         local_text = sidecar(path, ".txt")[1] or json.loads(song["info"]).get("plain", "")
+        available = ready_categories(self.index, time()) & {"lyrics", "lrc"}
         with self.index.db() as db:
             sources = [tuple(row) for row in db.execute(
                 "SELECT id,config FROM sources WHERE state='active' ORDER BY id")]
@@ -804,21 +805,32 @@ class Maintenance:
                                  (song["id"],)).fetchone()
         if receipt and time() - receipt["checked"] < DAY:
             saved = json.loads(receipt["value"])
-            if saved.pop("revision", None) == revision:
+            lrc_deferred = saved.pop("lrc_deferred", False)
+            if saved.pop("revision", None) == revision and not (lrc_deferred and "lrc" in available):
                 return saved
 
-        def lookup(kind):
+        def lookup(kind, *, local_only=False):
+            command = [sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]]
+            if local_only:
+                command.append("--local-reference-only")
             try:
-                _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]],
-                                      settings["network_timeout"], maximum=6 * MAX_LRC_BYTES + 1024)
+                _, data = self.output(command, settings["network_timeout"], maximum=6 * MAX_LRC_BYTES + 1024)
             except TimeoutError:
                 return {"state": "unavailable"}
-            return json.loads(data)
+            result = json.loads(data)
+            return {"state": "unavailable"} if result["state"] == "local_miss" else result
 
         result = {"state": "not_found"}
         if settings["lrc"]:
-            self.journal.emit("LRC", f"Dernière recherche de minutage · {song['title']}")
-            result = lookup("prepare_lrc")
+            if "lrc" in available:
+                self.journal.emit("LRC", f"Dernière recherche de minutage · {song['title']}")
+                result = lookup("prepare_lrc")
+            elif song["lrc"] == "intégré" or song["audio"]:
+                result = lookup("prepare_lrc", local_only=True)
+            else:
+                # An unavailable provider cannot establish that lyrics are
+                # absent. Keep unknown songs eligible for a later search.
+                result = {"state": "unavailable"}
             if result["state"] == "found":
                 result["mode"] = "timed"
         if result["state"] not in ("found", "instrumental", "rescan") and settings["generate"]:
@@ -828,12 +840,19 @@ class Maintenance:
             if local_text.strip() and len(local_text.encode()) <= MAX_LRC_BYTES:
                 result = {"state": "found", "lyrics": local_text, "source": "bibliothèque"}
             elif settings["lyrics"]:
-                result = lookup("prepare_plain")
+                if "lyrics" in available or song["audio"]:
+                    result = lookup("prepare_plain", local_only="lyrics" not in available)
+                else:
+                    result = {"state": "unavailable"}
             if result["state"] == "found":
                 result["mode"] = "plain"
         if (result["state"] in ("found", "not_found", "ambiguous", "invalid", "instrumental")
                 and result.get("source") != LOCAL_SOURCE):
-            self.index.review("prepare_reference", song["id"], result["state"], dict(result, revision=revision))
+            # A plain fallback is reusable while timed providers wait. Once
+            # they reopen, give timing another chance before generating it.
+            deferred = result.get("mode") == "plain" and settings["lrc"] and "lrc" not in available
+            self.index.review("prepare_reference", song["id"], result["state"],
+                              dict(result, revision=revision, lrc_deferred=deferred))
         return result
 
     def prepare(self, task, *, nocturnal=False):

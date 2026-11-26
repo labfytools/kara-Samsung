@@ -311,7 +311,8 @@ def main():
     elif kind in ("prepare_plain", "prepare_lrc"):
         # A nocturnal lookup can supply a candidate to Turbo. It never
         # retags audio or publishes any provider text to the library.
-        result = lookup_song(index, subject, kind == "prepare_lrc", read_only=True)
+        result = lookup_song(index, subject, kind == "prepare_lrc", read_only=True,
+                             local_reference_only=sys.argv[3:] == ["--local-reference-only"])
     elif kind == "cover":
         result = {"state": cover(index, subject)}
     elif kind == "source_probe":
