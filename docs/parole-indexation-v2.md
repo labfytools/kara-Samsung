@@ -81,3 +81,26 @@ TagLib C 2.3.2 lit les cinq formats testés dans le banc Opus, FLAC, MP3, Ogg Vo
 Une empreinte acoustique utilisée pour qualifier un fournisseur ou une édition reste à la charge de la vérification d’import existante. L’indexation n’ajoute aucun calcul d’empreinte et une preuve de copie des flux peut préserver l’identité PCM au retagage. Les résultats du banc portent sur l’inventaire et la livraison. Ils ne mesurent ni le débit d’un fournisseur distant, ni la latence de l’application Strawberry, ni une partie Kara physique.
 
 Sous Sway headless et D-Bus isolés, une publication sur fixture est devenue visible dans la liste GTK **0,441 s** après admission. La mise à jour des modèles GTK a pris **0,82 ms** pour ce passage. Le test a également vérifié la conservation de l’objet de ligne lors d’une mise à jour de provenance, la sélection, le regroupement d’artistes et les parcours d’import et de synchronisation USB simulée.
+
+### Transferts en parallèle
+
+Le mode `overlap` du banc écrit et synchronise quatre réceptions HTTP locales de 4 Mio chacune, avec et sans l’indexation de 60 publications. Dans la référence, le débit régulé de ce serveur local est de 19,95 Mio/s seul et 20,35 Mio/s avec indexation. En V2, il est de 20,22 et 20,34 Mio/s. Le témoin ne montre pas de baisse mesurable. La fin des transferts et de l’indexation passe de 3,95 à 0,79 s, avec 60 appels FFprobe évités. Un passage par condition et un débit régulé en boucle locale ne permettent pas de conclure sur le rendement d’un fournisseur réseau.
+
+## Déploiement et vérification
+
+Le 26 novembre 2026, un premier redémarrage a réutilisé le raccourci pointant vers l’instantané isolé BlackBox. La mise en service V2 a conservé cet instantané, puis pointé le raccourci vers un checkout détaché. Les fichiers de BlackBox du premier instantané sont identiques à ceux de la version livrée. Un rejeu intermédiaire a révélé que la lecture Strawberry ciblée omettait le `rowid` inclus dans la signature de réconciliation. Le contrôle de non-régression exige maintenant un rejeu sans écriture après une réconciliation.
+
+Le service a redémarré sur `d42b60f`, PID **2348303**, à 18 h 01 CET. Le fil `parole-index` est actif et D-Bus appartient à ce PID. Parole a été rouverte et ramenée au premier plan sous Sway. Le service est resté actif sans redémarrage automatique ni erreur de niveau `err` au contrôle. La salle était en attente, la capture BlackBox et l’USB étaient inactifs et Strawberry était en pause. La file d’import a été suspendue coopérativement avant le redémarrage et remise à son état initial `running`.
+
+Les sauvegardes SQLite privées de maintenance, d’imports et de Strawberry sont dans `.runtime/parole-index-v2/deployment-final/avant-deploiement/`. Les trois copies ont passé `quick_check`. Le rapprochement avant-après conserve les 13 880 pistes présentes, les 13 201 chemins historiques, les 81 associations manuelles, les 30 lots, les sept manifestes de préparation, les douze manifestes de stems, les deux éléments de reprise et les réglages de nuit.
+
+Le service a consommé un rejeu de 26 chemins issus d’un reçu d’import réel en **0,319 s**. Les 26 étaient inchangés. L’intégrité et la cohérence complète des agrégats ont été vérifiées après le rejeu, et la file d’événements était vide. Les 26 chemins existaient aussi dans la collection Strawberry, configurée avec `monitor=true`. Ce contrôle vérifie la reprise et la concordance de deux catalogues établis. Aucun lot actif ou prêt à partir n’était disponible pour mesurer la publication distante ou l’arrivée d’un nouveau titre dans Strawberry.
+
+## Tests exécutés
+
+- Onze cas de livraison, interruption du processus en écriture, rejeu, fichier corrompu, mutation concurrente, déplacement, statistiques et inotify.
+- 36 cas Parole V3 sous Sway headless et D-Bus isolés, dont publication jusqu’à la liste GTK et conservation de la sélection.
+- 51 cas d’import couverts par le passage normal et le passage des quatre cas GTK. Huit cas de reprise et treize cas de téléchargement sur serveur local.
+- Deux cas de regroupement d’artistes, 21 cas nocturnes et cinq cas de ressources.
+- 37 cas de préparation, 15 Kara V1, six d’audition, neuf BlackBox V3 et une synchronisation USB simulée.
+- `git diff --check`, intégrité SQLite en fixture et en production, propriétaire D-Bus, activation du fil d’indexation, reprise de la file et présence de la fenêtre.

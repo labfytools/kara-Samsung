@@ -7,6 +7,7 @@ import os
 import re
 from contextlib import contextmanager
 from hashlib import sha256
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import resource
@@ -16,12 +17,13 @@ import sys
 from statistics import median, quantiles
 from threading import Thread
 from time import perf_counter, sleep, time
+from urllib.request import urlopen
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("workspace", type=Path)
 parser.add_argument("--code", type=Path, default=Path(__file__).resolve().parents[1] / "bin")
 parser.add_argument("--scale", type=int, default=2500)
-parser.add_argument("--mode", choices=("scale", "imports", "batch", "metadata", "tags", "latency"), default="scale")
+parser.add_argument("--mode", choices=("scale", "imports", "batch", "metadata", "tags", "latency", "overlap"), default="scale")
 parser.add_argument("--reference", action="store_true")
 parser.add_argument("--batch", type=int, choices=(1, 16, 32, 64, 128), default=64)
 options = parser.parse_args()
@@ -82,7 +84,7 @@ def place(first, amount, *, catalogue=True, folder="initial"):
     return paths
 
 
-if options.mode in ("scale", "imports", "batch"):
+if options.mode in ("scale", "imports", "batch", "overlap"):
     with sqlite3.connect(collection) as db:
         db.executescript("""
             CREATE TABLE songs(url TEXT,title TEXT,artist TEXT,album TEXT,albumartist TEXT,
@@ -200,6 +202,55 @@ elif options.mode == "imports":
 elif options.mode == "batch":
     new = place(0, options.scale, catalogue=False)
     emit(f"lots de {options.batch}", lambda: deliver(new))
+elif options.mode == "overlap":
+    place(0, options.scale)
+    inventory()
+    paths = place(0, 60, folder="publication-simultanée", catalogue=False)
+    block = bytes(64 * 1024)
+    blocks_per_transfer = 64
+
+    class Transfer(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(block) * blocks_per_transfer))
+            self.end_headers()
+            for _ in range(blocks_per_transfer):
+                self.wfile.write(block)
+                sleep(.012)
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Transfer) as server:
+        thread = Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            def download(number):
+                with urlopen(f"http://127.0.0.1:{server.server_port}/fixture", timeout=10) as incoming, (
+                        workspace / f"received-{number}").open("wb") as output:
+                    while data := incoming.read(len(block)):
+                        output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    return output.tell()
+
+            def flow(concurrent_index):
+                with ThreadPoolExecutor(max_workers=5) as pool:
+                    began = perf_counter()
+                    downloads = [pool.submit(download, i) for i in range(4)]
+                    indexing = pool.submit(publication, paths) if concurrent_index else None
+                    amount = sum(task.result() for task in downloads)
+                    transfer_seconds = perf_counter() - began
+                    outcome = indexing.result() if indexing else {}
+                return {"transferred_bytes": amount, "download_seconds": transfer_seconds,
+                        "download_mib_per_second": amount / transfer_seconds / 1024**2,
+                        "index_subprocesses": outcome.get("subprocesses", 0)}
+
+            emit("4 transferts HTTP locaux seuls", lambda: flow(False))
+            emit("4 transferts HTTP locaux et 60 publications", lambda: flow(True))
+        finally:
+            server.shutdown()
+            thread.join()
 elif options.mode == "latency":
     paths = place(0, 24, catalogue=False)
     for interval in (.25, .5, 1., 2.):
