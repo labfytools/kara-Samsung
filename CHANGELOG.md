@@ -3,6 +3,7 @@
 ## En développement
 
 - Armer l’inhibiteur de capot avant la fermeture sur secteur, confirmer le verrouillage Sway avant l’extinction et porter la durée nocturne par défaut à huit heures.
+- Alterner la préparation Kara avec les recherches et vérifications capot fermé, même sans fenêtre Parole, et conserver un bilan par catégorie.
 
 - Mettre en pause les nouvelles requêtes YouTube dès une limitation explicite ou une série de réponses ambiguës, conserver la temporisation après redémarrage et regrouper les diagnostics des demandes à vérifier. Les autres sources restent éligibles.
 

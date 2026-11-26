@@ -223,9 +223,45 @@ class Index:
         return None
 
     def preparation_due(self, now):
+        return self.work_due(("prepare",), now)
+
+    def work_due(self, kinds, now):
+        if not kinds:
+            return False
+        placeholders = ",".join("?" for _ in kinds)
         with self.db(wait=.15) as db:
-            return db.execute("""SELECT 1 FROM tasks WHERE kind='prepare' AND due<=?
-                                 AND state IN ('queued','suspended','temporary') LIMIT 1""", (now,)).fetchone() is not None
+            return db.execute(f"""SELECT 1 FROM tasks WHERE kind IN ({placeholders}) AND due<=?
+                                  AND state IN ('queued','suspended','temporary') LIMIT 1""",
+                              (*kinds, now)).fetchone() is not None
+
+    @staticmethod
+    def read_closed_report(db):
+        row = db.execute("SELECT value FROM settings WHERE key='night_lid_report'").fetchone()
+        return json.loads(row[0]) if row else None
+
+    @staticmethod
+    def write_closed_report(db, report):
+        db.execute("INSERT OR REPLACE INTO settings VALUES('night_lid_report',?)", (document(report),))
+
+    def closed_progress(self):
+        with self.db(wait=.15) as db:
+            return self.read_closed_report(db)
+
+    def start_closed_report(self):
+        since = time()
+        with self.db(wait=.15) as db:
+            self.write_closed_report(db, dict(started=since, ended=None, reason="", completed={}, deferred=0, interrupted=0))
+        return since
+
+    def end_closed_report(self, since, reason):
+        with self.db(wait=.15) as db:
+            db.execute("BEGIN IMMEDIATE")
+            report = self.read_closed_report(db)
+            if report and report["started"] == since and report["ended"] is None:
+                report.update(ended=time(), reason=reason)
+                self.write_closed_report(db, report)
+                return sum(report["completed"].values())
+        return None
 
     @staticmethod
     def read_night_report(db):
@@ -282,6 +318,10 @@ class Index:
                 report["interrupted"] += 1
                 report["pending"] = None
                 self.write_night_report(db, report)
+            closed = self.read_closed_report(db)
+            if closed and closed["ended"] is None:
+                closed.update(ended=time(), reason="redémarrage de la maintenance")
+                self.write_closed_report(db, closed)
             db.execute("UPDATE tasks SET state='suspended' WHERE state='running'")
             return interrupted
 
@@ -349,7 +389,7 @@ class Index:
                 self.write_night_report(db, report)
             return task
 
-    def finish(self, task, state, detail="", delay=0, *, night=None, refund_attempt=False):
+    def finish(self, task, state, detail="", delay=0, *, night=None, closed=None, refund_attempt=False):
         now = time()
         with self.db() as db:
             changed = db.execute("""UPDATE tasks SET state=?, detail=?, updated=?, due=?, attempts=attempts-?
@@ -377,6 +417,19 @@ class Index:
                     else:
                         report["interrupted"] += 1
                     self.write_night_report(db, report)
+            if changed and closed is not None:
+                since, outcome = closed
+                report = self.read_closed_report(db)
+                # Count only a settled claim from this closure, in the same
+                # transaction as the queue transition. An interruption can
+                # settle after the owner has released the lid inhibitor.
+                if report and report["started"] == since:
+                    if outcome == "completed" and report["ended"] is None:
+                        kind = task["kind"]
+                        report["completed"][kind] = report["completed"].get(kind, 0) + 1
+                    elif outcome != "completed":
+                        report[outcome] += 1
+                    self.write_closed_report(db, report)
 
     def exclude(self, kind, subject):
         with self.db() as db:

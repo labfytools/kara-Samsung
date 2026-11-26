@@ -190,6 +190,45 @@ class NightTests(unittest.TestCase):
         self.assertEqual(report["cache_bytes"], 100)
         self.assertIsNone(report["pending"])
 
+    def test_closed_background_alternates_work_and_persists_completed_tasks(self):
+        self.owner.foreground.clear()
+        self.owner.index.configure(night_lid=True, night_lid_qualified=True, network_interval=0)
+        self.settings = self.owner.index.settings()
+        self.night.refresh(self.settings)
+        self.assertTrue(self.observe(lid=True))
+        results = iter((TimeoutError(), (0, b'{"state":"found"}'), (0, b'{"state":"found"}')))
+
+        def output(*_args, **_kwargs):
+            result = next(results)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        order = []
+
+        def prepare(*_args, **_kwargs):
+            order.append("prepare")
+            return "done", "prêt", 0
+
+        self.owner.output = Mock(side_effect=output)
+        self.owner.prepare = prepare
+        for kind, subject in (("lrc", "slow"), ("cover", "cover"), ("cover", "cover2"), ("prepare", "song")):
+            self.owner.index.enqueue(kind, subject, "fixture", now=1)
+        for _ in range(4):
+            self.owner.tick()
+        report = self.owner.index.closed_progress()
+        self.assertEqual(order, ["prepare"])
+        self.assertEqual(report["completed"], {"cover": 2, "prepare": 1})
+        self.assertEqual(report["deferred"], 1)
+        self.assertIsNone(report["ended"])
+        self.assertEqual(self.owner.index.night_progress()[3]["ready"], 1)
+        self.ac = False
+        self.owner.tick()
+        report = self.owner.index.closed_progress()
+        self.assertIsNotNone(report["ended"])
+        self.assertEqual(report["reason"], "secteur requis")
+        self.assertIsNone(self.night.lid_fd)
+
     def test_report_retains_validated_work_and_counts_a_crashed_claim_once(self):
         index = self.owner.index
         at = time()

@@ -601,6 +601,29 @@ class ParoleView:
         ready, references, remaining, report = self.index.night_progress()
         lines = [f"Bibliothèque · {ready} préparations complètes · {references} références temporelles validées · "
                  f"{remaining} restantes dans la file"]
+        night = self.maintenance.night
+        state = night.desktop
+        power = {True: "Secteur", False: "Batterie"}.get(night.power, "Alimentation inconnue")
+        lid = "Capot inconnu" if state is None else ("Capot fermé" if state.lid else "Capot ouvert")
+        screens = "Écrans inconnus" if state is None else ("Écrans éteints" if state.screen_off else "Écrans allumés")
+        lock = ("État du verrou inconnu" if state is None else
+                ("Session verrouillée" if state.locked else "Session déverrouillée"))
+        inhibitor = "Inhibiteur de capot actif" if night.lid_fd is not None else "Inhibiteur de capot absent"
+        lines.extend((f"{lid} · {power} · {screens} · {lock}", inhibitor))
+        if night.reason:
+            lines.append(night.reason)
+        if closed := self.index.closed_progress():
+            stamp = datetime.fromtimestamp(closed["started"]).strftime("%d/%m à %H:%M")
+            completed = closed["completed"]
+            labels = {"prepare": "préparations", "lyrics": "paroles", "lrc": "LRC", "cover": "pochettes",
+                      "metadata": "métadonnées", "album": "albums", "discography": "discographies"}
+            counts = [f"{completed[kind]} {label}" for kind, label in labels.items() if kind in completed]
+            lines.append(f"Capot fermé le {stamp} · {sum(completed.values())} tâches réalisées · "
+                         f"{closed['interrupted']} interruptions · {closed['deferred']} reports")
+            if counts:
+                lines.append(" · ".join(counts))
+            if closed["reason"]:
+                lines.append(f"Fin du bilan · {closed['reason']}")
         storage = self.maintenance.resources.storage
         if "shared_bytes" in storage:
             lines.append(f"Espace mutualisé par liens · {display_size(storage['shared_bytes'])}")

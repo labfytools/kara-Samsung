@@ -37,7 +37,12 @@ from _paroles_lrc import MAX_LRC_BYTES
 CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
               "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "SYNC", "IDLE", "CACHE",
               "SUCCESS", "WARNING", "ERROR")
-NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata", "codex", "source", "source_probe")
+NIGHT_NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata")
+NETWORK = (*NIGHT_NETWORK, "codex", "source", "source_probe")
+NETWORK_FLAGS = {"album": "albums", "source": None, "source_probe": None}
+NETWORK_TURN = ("lrc", "lyrics", "album", "lrc", "discography", "lyrics", "cover", "metadata", "codex", "source", "source_probe")
+CHECKED_RESULTS = {"complete", "incomplete", "checked", "partial", "identified", "found", "not_found",
+                   "invalid", "ambiguous", "instrumental", "present"}
 HOUR = 3600
 DAY = 24 * HOUR
 PHASES = {"cache": "Vérification du cache", "lyrics": "Paroles de référence",
@@ -51,7 +56,7 @@ PHASES = {"cache": "Vérification du cache", "lyrics": "Paroles de référence",
 NIGHT_RESTART_SETTINGS = (
     "night_enabled", "night_lid", "night_lid_qualified", "night_screen_off", "night_idle",
     "night_minutes", "night_cpu_temperature", "night_gpu_temperature", "night_closed_temperature",
-    "cache_gib", "reserve_gib", "generate", "lyrics", "lrc", "paused",
+    "cache_gib", "reserve_gib", "generate", "lyrics", "lrc", "albums", "discography", "cover", "metadata", "paused",
 )
 
 
@@ -133,9 +138,9 @@ class Maintenance:
         self.journal = Journal(self.index.folder)
         self.night = Night(self.index, self.journal)
         self.night_running = False
+        self.night_network_next = True
         self.night_settings_at = 0.
         self.next_night_watch = 0.
-        self.night_handover = 0.
         self.night_policy = None
         self.night_lrc = (False, False)
         self.night_measures = {}
@@ -263,7 +268,7 @@ class Maintenance:
                 if self.import_queue.pending():
                     self.night.report("Préparation nocturne suspendue · imports prioritaires")
                     return True
-            return not self.night_allowed(self.current_settings, running=True)
+            return not self.night_allowed(self.current_settings, running=True, light=self.active[0] != "prepare")
         settings = getattr(self, "current_settings", None)
         if settings and settings["night_enabled"] and monotonic() >= self.next_night_watch:
             # Network workers and inventory may span many ticks. Keep power
@@ -284,7 +289,7 @@ class Maintenance:
                                             busy=self.priority or monotonic() < self.priority_until, running=True)
         return False
 
-    def night_allowed(self, settings, *, running):
+    def night_allowed(self, settings, *, running, light=False):
         now = monotonic()
         if running and now >= self.night_settings_at:
             self.night_settings_at = now + .5
@@ -308,9 +313,10 @@ class Maintenance:
             return False
         if not (idle or self.night.desktop.lid):
             return self.night.report("Préparation nocturne en attente d’inactivité")
-        if not self.resources.check(settings, running=running, nocturnal=True, lid=self.night.desktop.lid):
+        if not self.resources.check(settings, running=running, nocturnal=True, lid=self.night.desktop.lid, light=light):
             return self.night.report(self.resources.reason)
-        self.night.reason = ""
+        if running:
+            self.night.report("Mode nocturne actif · traitement en cours")
         return True
 
     def scan(self, settings, *, limit=None):
@@ -885,13 +891,15 @@ class Maintenance:
         category = {"discography": "DISCOGRAPHIE", "prepare": "KARA", "source_probe": "SOURCE",
                     "cleanup": "CACHE", IMPORT_LYRICS: "LYRICS", IMPORT_COVER: "COVER"}.get(kind, kind.upper())
         import_suspended = False
+        window = self.night.window if nocturnal else None
         with self.lock:
             self.interrupt.clear()
             if ((kind == "prepare" and (self.priority or monotonic() < self.priority_until))
                     or kind in IMPORT_ENRICHMENT and self.priority):
                 stats = (dict(seconds=0., outcome="interrupted", cache_bytes=None, corrected=0, generated=0)
-                         if nocturnal else None)
-                self.index.finish(task, "suspended", "ressources prioritaires", 15, night=stats)
+                         if nocturnal and kind == "prepare" else None)
+                self.index.finish(task, "suspended", "ressources prioritaires", 15, night=stats,
+                                  closed=(window, "interrupted") if window is not None else None)
                 return
             self.active = (kind, subject)
         self.night_running = nocturnal
@@ -909,13 +917,10 @@ class Maintenance:
                                         "cover": "Recherche de pochette", "metadata": "Vérification de l’identification", "cleanup": "Nettoyage des brouillons"}[kind]
                               + (f" · {song['title']}" if song is not None else ""))
         try:
+            if nocturnal and self.stopped():
+                raise Interrupted
             if kind == "prepare":
-                if nocturnal:
-                    if self.stopped():
-                        raise Interrupted
-                    result = self.prepare(task, nocturnal=True)
-                else:
-                    result = self.prepare(task)
+                result = self.prepare(task, nocturnal=True) if nocturnal else self.prepare(task)
             elif kind == "codex":
                 result = self.do_codex(task)
             elif kind in IMPORT_ENRICHMENT:
@@ -958,7 +963,8 @@ class Maintenance:
                     self.night.close(reason=self.night.reason)
                 else:
                     self.night.stop_work()
-                self.recover_night_drafts()
+                if kind == "prepare":
+                    self.recover_night_drafts()
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
             result = (("review", "enrichissement partiel · maintenance complémentaire", 0)
@@ -973,8 +979,8 @@ class Maintenance:
             self.progress = None
             self.night_running = False
         stats = None
-        if nocturnal:
-            state, detail, _ = result
+        state, detail, _ = result
+        if nocturnal and kind == "prepare":
             outcome = {"done": "ready", "review": "failed", "suspended": "interrupted"}.get(state, "deferred")
             if detail in ("séparation indisponible", "analyse Turbo indisponible", "opération indisponible"):
                 outcome = "failed"
@@ -988,7 +994,12 @@ class Maintenance:
                 pass
             stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
                          corrected=corrected, generated=generated, measurements=self.night_measures)
-        self.index.finish(task, *result, night=stats, refund_attempt=import_suspended)
+        closed = None
+        if window is not None:
+            outcome = ("interrupted" if state == "suspended" else "completed"
+                       if state in ("done", "review", "excluded") or detail in CHECKED_RESULTS else "deferred")
+            closed = window, outcome
+        self.index.finish(task, *result, night=stats, closed=closed, refund_attempt=import_suspended)
         if import_suspended:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
@@ -1124,7 +1135,7 @@ class Maintenance:
             self.night.stop_work()
             self.night.next_desktop = 0.
         self.night_policy = policy
-        self.night.refresh(settings)
+        desktop_ready = self.night.refresh(settings)
         if settings["night_enabled"]:
             self.resources.session_idle(settings["night_idle"])
             if self.resources.resumed:
@@ -1133,10 +1144,10 @@ class Maintenance:
         imports_pending = self.import_queue and self.import_queue.pending()
         if imports_pending or self.priority:
             self.night.stop_work()
+            if desktop_ready:
+                self.night.report("Préparation nocturne suspendue · Kara ou imports prioritaires")
         if (not self.foreground.is_set() and not settings["night_enabled"] and not imports_pending
                 and not enrichment_pending(self.index, now)):
-            return
-        if settings["night_enabled"] and not imports_pending and self.night.fd is not None and self.tick_night(settings, now):
             return
         if self.scan_now.is_set() or settings["startup"] and now >= self.next_scan:
             self.scan_now.clear()
@@ -1149,8 +1160,13 @@ class Maintenance:
             self.import_diagnostics.tick(settings, now)
         if self.tick_import_enrichment(settings, now):
             return
-        if settings["night_enabled"] and not imports_pending and self.tick_night(settings, now):
-            return
+        if settings["night_enabled"]:
+            if desktop_ready and not imports_pending and self.tick_night(settings, now):
+                return
+            if settings["night_lid"] and self.night.desktop and self.night.desktop.lid:
+                # The classical foreground path must not bypass a closed
+                # lid suspension or the nocturnal resource checks.
+                return
         if not self.foreground.is_set():
             return
         if not settings["night_enabled"]:
@@ -1174,26 +1190,32 @@ class Maintenance:
                 self.execute(task)
                 return
 
-        if now < self.next_network or not self.resources.allowed_storage(settings):
+        if not self.resources.allowed_storage(settings):
             return
-        flags = {"album": "albums", "source": None, "source_probe": None}
-        kinds = [kind for kind in NETWORK if flags.get(kind, kind) is None or settings[flags.get(kind, kind)]]
-        if (not settings["codex"] or now < settings.get("codex_suspended_until", 0)) and "codex" in kinds:
-            kinds.remove("codex")
+        self.tick_network(settings, now, self.network_kinds(settings, now))
+
+    @staticmethod
+    def network_kinds(settings, now, *, nocturnal=False):
+        return tuple(kind for kind in (NIGHT_NETWORK if nocturnal else NETWORK)
+                     if (NETWORK_FLAGS.get(kind, kind) is None or settings[NETWORK_FLAGS.get(kind, kind)])
+                     and (kind != "codex" or now >= settings.get("codex_suspended_until", 0)))
+
+    def tick_network(self, settings, now, kinds, *, nocturnal=False):
+        if now < self.next_network:
+            return False
         manual = self.index.claim(("codex",), now, high=True, codex_auto=settings["codex_auto"]) if "codex" in kinds else None
         if manual is None:
             manual = self.index.claim(tuple(kind for kind in kinds if kind != "codex"), now, bucket="network",
                                       limit=settings["network_daily"], high=True, gap=settings["network_interval"])
         if manual is not None:
             self.next_network = now + settings["network_interval"]
-            self.execute(manual)
-            return
+            self.execute(manual, nocturnal=nocturnal)
+            return True
         # Stagger task classes so a large burst of missing LRC never starves
         # album checks or source validation for the entire library.
-        turn = ("lrc", "lyrics", "album", "lrc", "discography", "lyrics", "cover", "metadata", "codex", "source", "source_probe")
-        for _ in turn:
-            kind = turn[self.network_cursor]
-            self.network_cursor = (self.network_cursor + 1) % len(turn)
+        for _ in NETWORK_TURN:
+            kind = NETWORK_TURN[self.network_cursor]
+            self.network_cursor = (self.network_cursor + 1) % len(NETWORK_TURN)
             if kind not in kinds:
                 continue
             task = self.index.claim((kind,), now, bucket="network" if kind != "codex" else None,
@@ -1201,29 +1223,38 @@ class Maintenance:
                                     gap=settings["network_interval"])
             if task is not None:
                 self.next_network = now + settings["network_interval"]
-                self.execute(task)
-                return
+                self.execute(task, nocturnal=nocturnal)
+                return True
+        return False
 
     def tick_night(self, settings, now):
-        if not self.index.preparation_due(now):
-            self.night.stop_work()
-            return False
-        if not self.night_allowed(settings, running=False):
-            if (self.night.fd is not None and monotonic() < self.night_handover
-                    and self.night.reason in {"CPU occupé", "Disque occupé", "GPU occupé ou non mesurable"}):
-                return True
-            self.night.stop_work()
-            return False
-        if not self.night.open(settings):
-            self.night.stop_work()
-            return False
-        task = self.index.claim(("prepare",), now,
-                                night=(self.night.budget, self.resources.storage.get("bytes", 0)))
-        if task is None:
-            self.night.stop_work()
-            return False
-        self.execute(task, nocturnal=True)
-        self.night_handover = monotonic() + 4.
-        if not self.index.preparation_due(time()):
-            self.night.stop_work()
-        return True
+        closed = self.night.window is not None and self.night.desktop.lid and self.night.lid_fd is not None
+        kinds = self.network_kinds(settings, now, nocturnal=True) if closed else ()
+        network_due = now >= self.next_network and self.index.work_due(kinds, now)
+        prepare_due = self.index.preparation_due(now)
+        # One owner, one engine at a time. Offer the other class the next
+        # turn so a continuous backlog of either class cannot starve it.
+        order = (True, False) if self.night_network_next else (False, True)
+        for light in order:
+            if not (network_due if light else prepare_due):
+                continue
+            if not self.night_allowed(settings, running=False, light=light) or not self.night.open(settings):
+                continue
+            if light:
+                if not self.tick_network(settings, now, kinds, nocturnal=True):
+                    self.night.report("Recherches nocturnes en attente · quota ou intervalle de maintenance")
+                    continue
+            else:
+                task = self.index.claim(("prepare",), now,
+                                        night=(self.night.budget, self.resources.storage.get("bytes", 0)))
+                if task is None:
+                    continue
+                self.execute(task, nocturnal=True)
+            self.night_network_next = not light
+            if self.night.window is not None or not self.index.preparation_due(time()):
+                self.night.stop_work()
+            return True
+        self.night.stop_work()
+        if not (network_due or prepare_due):
+            self.night.report("Mode nocturne en attente · file prête au prochain travail")
+        return False

@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import re
+import sqlite3
 import subprocess
 from time import CLOCK_BOOTTIME, clock_gettime, monotonic
 
@@ -217,6 +218,7 @@ class Night:
         self.reopened = self.restore_display = False
         self.release_after_work = False
         self.budget = None
+        self.window = None
         self.reason = ""
 
     def report(self, reason):
@@ -256,6 +258,18 @@ class Night:
             if process.poll() is None:
                 process.kill()
             process.wait()
+        self.end_window(reason)
+
+    def end_window(self, reason):
+        if self.window is not None:
+            try:
+                count = self.index.end_closed_report(self.window, reason)
+            except (OSError, ValueError, sqlite3.Error):
+                self.journal.emit("IDLE", "Bilan capot fermé indisponible", "WARNING")
+                return
+            self.window = None
+            if count is not None:
+                self.journal.emit("IDLE", f"Bilan capot fermé · {count} tâches réalisées · {reason}")
 
     def activity(self):
         # A Wayland activity event while closed can come from an external
@@ -299,6 +313,7 @@ class Night:
             self.reopened = bool(previous and previous.lid and not state.lid)
             if self.reopened:
                 self.restore_display = self.lid_fd is not None
+                self.end_window("réouverture du capot")
                 if self.restore_display:
                     self.activity()
         if not state.locked:
@@ -381,6 +396,8 @@ class Night:
                 # Keep logind's idle action inhibited across tasks, including
                 # when the queue is empty. Manual sleep has only a delay FD.
                 self.hold_idle()
+                if self.window is None:
+                    self.window = self.index.start_closed_report()
                 if not self.secure_closed(now):
                     return False
             if self.restore_display and not state.lid:
@@ -416,7 +433,7 @@ class Night:
         return True
 
     def errors(self):
-        failures = (OSError, ValueError, ImportError, TypeError, KeyError, subprocess.SubprocessError)
+        failures = (OSError, ValueError, ImportError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError)
         return failures + (self.login.glib.Error,) if self.login is not None else failures
 
     def hold_idle(self):

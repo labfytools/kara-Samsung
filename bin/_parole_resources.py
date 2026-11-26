@@ -81,7 +81,7 @@ class Resources:
         self.storage = {}
         self.sample = 0
         self.sample_closed = False
-        self.can_start = self.can_continue = False
+        self.can_start = self.can_start_light = self.can_continue = False
         self.reason = "Mesure des ressources"
 
     def close(self):
@@ -160,16 +160,16 @@ class Resources:
         return (self.storage["bytes"] + working < settings["cache_gib"] * GIB
                 and min(self.storage["free"].values()) > settings["reserve_gib"] * GIB + working)
 
-    def check(self, settings, *, busy=False, running=False, nocturnal=False, lid=False):
+    def check(self, settings, *, busy=False, running=False, nocturnal=False, lid=False, light=False):
         now = monotonic()
         if busy:
-            self.can_start = self.can_continue = False
+            self.can_start = self.can_start_light = self.can_continue = False
             self.reason = "Kara, lecture ou imports prioritaires"
             return False
         closed = nocturnal and lid
         if closed == self.sample_closed and now < self.sample + 1.5:
-            return self.can_continue if running else self.can_start
-        self.can_start = self.can_continue = False
+            return self.can_continue if running else (self.can_start_light if light else self.can_start)
+        self.can_start = self.can_start_light = self.can_continue = False
         try:
             self.collect_storage(now)
             if running:
@@ -238,6 +238,9 @@ class Resources:
                 self.reason = "Flux multimédia actif"
                 return False
             self.can_continue = True
+            # Network maintenance needs the same safety measurements and
+            # launch memory floor, but does not need a free compute slot.
+            self.can_start_light = available >= settings["memory_mib"]
             for ok, reason in (
                 (load is not None and load < settings["cpu"], "CPU occupé"),
                 (disk is not None and disk < settings["disk_busy"], "Disque occupé"),
@@ -245,10 +248,10 @@ class Resources:
             ):
                 if not ok:
                     self.reason = reason
-                    return running
+                    return running or (light and self.can_start_light)
             self.reason = "Ordinateur disponible"
-            self.can_start = True
-            return True
+            self.can_start = self.can_start_light
+            return running or self.can_start
         except (OSError, ValueError, StopIteration, IndexError, subprocess.SubprocessError):
             self.reason = "Mesures de ressources indisponibles"
             return False
