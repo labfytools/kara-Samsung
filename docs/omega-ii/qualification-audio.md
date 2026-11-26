@@ -64,6 +64,20 @@ Le même code compile avec Vulkan dans un répertoire privé. Le processus voit 
 
 Le CER vaut 29,69 % pour Turbo et 31,03 % pour Qwen. Turbo totalise 13 substitutions, 14 omissions et 12 insertions. Qwen totalise 12 substitutions, 17 omissions et 10 insertions. Le taux global identique masque six erreurs supplémentaires dans le rap américain. Les cinq exécutions terminent chacune en 4,09 à 4,65 s après admission, avec 188 à 317 Mio de PSS de groupe. Le GTT de l’hôte culmine à 6,83 Gio pendant le pilote, sans attribution exclusive au moteur. Le PSI observé à 1,54 % déclenche l’attente avant l’admission du reggae. Les cinq pistes sont des extraits historiques appariés, distincts de la population complète de 50. Le WER égal à 41,94 % sur ce sous-lot ne constitue pas un gain général face à 47,08 %.
 
+L’élargissement porte sur les deux premiers extraits de chaque genre dans le même manifeste historique. Il réutilise les cinq reçus précédents et termine onze paires sur douze. Deux reports PSI ont été relevés sur les deux passages, dont le premier cas de chanson française repris avec succès.
+
+| Genre | Paires | Mots | WER Turbo F16 | WER Qwen Vulkan |
+| --- | ---: | ---: | ---: | ---: |
+| Rock | 1/2 | 17 | 5,88 % | 0 % |
+| Rap américain | 2/2 | 52 | 36,54 % | 51,92 % |
+| Rap français | 2/2 | 38 | 84,21 % | 528,95 % |
+| Chanson française | 2/2 | 36 | 8,33 % | 19,44 % |
+| Reggae | 2/2 | 32 | 25,00 % | 15,63 % |
+| Soul | 2/2 | 49 | 32,65 % | 24,49 % |
+| **Total apparié** | **11/12** | **224** | **35,27 %** | **112,50 %** |
+
+Sur un extrait de rap français de 26 mots de référence, Qwen compte 26 substitutions et 163 insertions. Le calcul global garde cet extrait. Sur les onze paires, le CER atteint 94,80 % pour Qwen contre 28,61 % pour Turbo. Le maximum de PSS échantillonné est de 317 Mio, le GTT maximal de l’hôte 6,85 Gio. Les durées après admission vont de 3,86 à 6,69 s. Ce pilote confirme l’exécution sur Radeon et écarte ce réglage Qwen comme remplacement général de Turbo. Les deux titres reggae et les deux titres soul fournissent des pistes à vérifier avec un corpus indépendant.
+
 ## Sélection prudente mix ou voix
 
 Sur les reçus historiques, une grille de seuils utilise le nombre de mots au-dessus de 0,62 de confiance et la confiance médiane pendant les cinq premières secondes. Chaque séparation coûte un point d’erreur dans la fonction d’ajustement pour écarter les gains trop faibles. La grille a préféré **zéro séparation**. Les résultats ajustés sur ces 50 mêmes extraits sont descriptifs. Le choix reggae par genre aurait donné 46,01 % avec quatre séparations. Les références de ces quatre extraits avaient déjà motivé la règle. L’ensemble d’évaluation tenu à part fige 20 nouveaux enregistrements, 8 en rap américain, 8 en rap français et 4 en reggae, avec un texte total de 638 mots. Le filtre exclut les identifiants, les couples artiste-titre, les versions audio exactes et les paroles normalisées déjà rencontrées. Il partage des artistes avec le corpus historique, faute de titres admissibles en nombre suffisant avec exclusion de tous les artistes. Le regroupement de genre reprend la table utilisée pour échantillonner OMEGA I. Il ne devient pas un classificateur de production.
@@ -86,6 +100,23 @@ La mesure acoustique utilise la part de l’énergie entre 50 et 350 Hz sur les 
 | Reggae | 9 → 11 | 26 → 12 | 6 → 4 |
 
 Les omissions expliquent l’essentiel de la différence historique sur le rap américain et le reggae. Les métriques ne déterminent pas si Demucs a écarté des consonnes, des chœurs ou des ad-libs, ni si Turbo réagit aux changements de timbre. Le reggae reste représenté par quatre extraits historiques. Le rap français doit garder ses résultats séparés. Une amélioration moyenne ne doit pas compenser une perte dans un groupe.
+
+Dans le groupe historique de rap français, Turbo annonce `en` sur deux mixes et trois stems. Le changement d’entrée fait basculer un extrait de `fr` à `en`. Ce sont des sorties du détecteur, sans annotation mot à mot des alternances de langue. Le lexique d’argot fixe du banc ne rencontre aucun mot de sa liste dans ces 20 références. Il ne mesure donc pas l’argot dans ce lot. Les contractions et le verlan peuvent rester présents sous d’autres graphies ou formes en dehors de cette liste.
+
+### Nouveaux enregistrements
+
+Le mix F16 a terminé 14 extraits sur 20, puis la reprise signée en a complété quatre. Deux extraits de rap américain restent reportés après deux passages sur température. Les cases manquantes restent dans les dénominateurs de couverture du lot. Les 18 extraits mesurés totalisent 557 mots sur les 638 prévus.
+
+| Groupe tenu à part | Extraits terminés | Mots | Substitutions | Omissions | Insertions | WER mix | CER mix |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rap américain | 6/8 | 204 | 13 | 59 | 12 | 41,18 % | 37,35 % |
+| Rap français | 8/8 | 255 | 64 | 29 | 7 | 39,22 % | 25,00 % |
+| Reggae | 4/4 | 98 | 20 | 10 | 5 | 35,71 % | 21,92 % |
+| **Total** | **18/20** | **557** | **97** | **98** | **24** | **39,32 %** | **29,05 %** |
+
+Cette mesure décrit une nouvelle population. La comparaison de méthode se fait sur les paires où le mix et le stem du même extrait sont achevés. Au premier passage, les six tentatives appariées Demucs ont été interrompues sur température. Au premier nouvel essai de rap américain, la reprise réutilise le stem validé et réduit les erreurs de 8 à 4 sur 12 mots avec Demucs. L’option Open-Unmix ajoute quatre erreurs sur la même référence. Les résultats par morceau justifient de vérifier le signal avant de choisir une séparation.
+
+Le dernier règlement réutilise les deux observations déjà écrites du second extrait préfixé de rap français. Il porte le total à deux paires achevées sur six. Le rap français passe de 17 à 15 erreurs sur 31 mots. Sur les deux paires, la voix systématique passe de 25 à 19 erreurs sur 43 mots. La règle des basses et de la confiance sélectionne seulement la voix sur le rap français et totalise 23 erreurs. Les autres règles conservent le mix et ses 25 erreurs. Les reprises du premier rap français et du premier reggae ont été interrompues pour température et PSI respectivement. Le reggae indépendant est représenté par quatre mixes et aucune paire achevée. Aucun de ces résultats ne confirme une règle par genre.
 
 ## Première validation distincte sur le hip-hop anglais
 
@@ -116,6 +147,8 @@ Le témoin remplace aussi huit mots courants par chanson, par exemple `you` par 
 
 *Embers* a terminé en 200,40 s après reprise sous le plafond CPU local de 22 %. Le PSS de groupe culmine à 759 Mio et le PSI à 0,22 %. Le second passage intégral de *Feel* avec le filtre géométrique prend 209,71 s sous le même plafond, avec 760 Mio de PSS et 0,18 % de PSI. Les deux passages achevés utilisent le modèle ONNX et le vocabulaire signés. Les fenêtres du passage interrompu de *Embers* comptent dans le travail initial et sont relues par sa reprise.
 
+Les deux témoins Turbo F16 sur le mix entier de *CROWD PLEASER* et d’*Embers* ont rencontré chacun deux reports thermiques. Aucun de ces quatre passages ne fournit un témoin F16 équivalent. Le comparatif sur *Feel* utilise le témoin Turbo Q5 déjà conservé par OMEGA I.
+
 Dans un environnement local contenant NumPy 2.2.6 et ONNX Runtime 1.24.4, le banc CTC utilise un manifeste de chanson entière avec les empreintes audio et des trois fichiers d’annotation indépendants. Le banc de contre-épreuves reprend le reçu et ses fenêtres acoustiques. Le fait de changer l’audio, les poids, le vocabulaire ou la version du banc invalide la reprise. Les résultats anglais emploient la normalisation de Kara. Le modèle acoustique reçoit uniquement des échantillons PCM. [Banc CTC](../../tests/qualify-parole-ctc.py) · [Contre-épreuves](../../tests/qualify-parole-ctc-evidence.py)
 
 ### CTC français sur chanson entière
@@ -123,6 +156,8 @@ Dans un environnement local contenant NumPy 2.2.6 et ONNX Runtime 1.24.4, le ban
 L’export Parseh `aligner-fr` est dérivé de wav2vec2 XLSR-53 français entraîné sur Common Voice. Les 356 311 445 octets d’ONNX int8 sont épinglés sur `c8781e16f7ddf98b43972401061bfc8fb9aee7be`, avec licence annoncée Apache-2.0. Il tourne dans le même environnement ONNX et préserve les graphèmes accentués, apostrophes et traits d’union. Une contraction garde la seule unité temporelle annotée. Les repères qui correspondent à un seul mot normalisé sont aussi mesurés à part pour comparer les dénominateurs de Turbo. La carte du modèle indique une validation de conversion sur voix parlée de synthèse. Les gains sur la musique sont évalués ici dans la limite de l’échantillon. [Export Parseh](https://huggingface.co/parseh/aligner-fr/tree/c8781e16f7ddf98b43972401061bfc8fb9aee7be) · [Poids source](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-french)
 
 Sur *Séculaire feat. Nÿme* de Wasaru, 158,92 s, le treillis brut place 327 débuts sur 345 à ±500 ms et 94,20 % des fins dans la tolérance. Le p95 des débuts vaut 518 ms et le pire écart atteint 6,42 s. Le filtre de moyenne géométrique à 0,20 conserve 197 repères, dont 196 à ±500 ms, soit 56,81 % de tous les débuts annotés. Son p95 est de 77 ms sur les repères conservés et 17 lignes sur 40 ont un début dans la tolérance. Le treillis place huit mots inventés sur huit dans la contre-épreuve. Le filtre écarte les huit. Le passage complet prend 212,37 s sous quota local de 25 %, avec un PSS de groupe de 1 277 Mio au plus, 75,25 °C au CPU, 56 °C au GPU et 0,55 % de PSI mémoire. [Enregistrement publié](https://www.jamendo.com/track/1350717/seculaire-feat-nyme/lyrics) · [Annotations épinglées](https://huggingface.co/datasets/jamendolyrics/jamendolyrics/tree/de188c963fd4539bc769b3feb83582e5a9595e36)
+
+Sur *Abandon*, le treillis place 337 des 341 débuts originaux à ±500 ms. Son p95 vaut 144 ms et son écart maximal 916 ms. Le filtre à 0,20 conserve 204 débuts, tous dans la tolérance, et 19 débuts de ligne sur 43. Le treillis positionne huit mots absents et le filtre les écarte. Sur les 315 débuts comparables au témoin historique Turbo Q5, le CTC filtré en trouve 196 à ±500 ms (62,22 %) contre 83 (26,35 %) pour Turbo. Le passage complété reprend une fenêtre et prend 265,40 s sous quota de 25 %, avec 1 271 Mio de PSS de groupe et un PSI de 0,38 %. Ces résultats soutiennent la faisabilité sur deux chansons françaises entières avec un texte déjà disponible. Une validation de publication et un test avec des références de versions live ou incomplètes restent ouverts.
 
 ## Kara, écho et préservation de la voix
 
@@ -178,4 +213,12 @@ Parmi les 51 répétitions retrouvées sur la voix, les deux lectures Turbo n’
 
 Les quatre séparations terminées prennent de 2,17 à 2,95 s de la création du modèle à l’écriture PCM. Le PSS de groupe échantillonné se situe entre 271 et 362 Mio. Les deux reçus Demucs avec PSS directement exploitable sur le reggae et la soul indiquent respectivement 1 318 et 1 386 Mio, pour 36,43 et 36,88 s. Les réglages locaux de charge et les dates de ces passages diffèrent. Le PSI maximal du pilote terminé vaut 0,41 %. Deux cas ont également attendu en admission. Les échantillons thermiques à 82,5 °C avant le départ du stem reggae font partie de cette attente. L’exécution n’a repris qu’après admission par le gardien commun. Les mesures de 1 781 Mio (sept secondes) et de 1 606 Mio (cinq secondes) sur une chanson entière appartiennent à la campagne Demucs OMEGA I.
 
+Le profil Demucs d’OMEGA I situe le maximum RSS cumulé du worker autour de 493 Mio après chargement, 557 Mio après décodage et 1 800 Mio après la séparation. À l’écriture FLAC, le PSS courant de groupe est d’environ 1 099 Mio. La fenêtre de cinq secondes réduit le pic de PSS d’environ 10 % avec un temps supérieur d’environ 32 %. Les rapports historiques attribuent 10 reports sur 11 au PSI, le dernier à la mémoire disponible. Le pilote UMX change de modèle, de framework et de reconstruction, avec un seul séparateur actif. Les mesures de groupe ne dissocient pas toutes les pages des poids, du framework, des activations et des buffers. [Profil Demucs OMEGA I](../omega/qualification-audio.md)
+
 Sur ce pilote, un moteur plus léger apporte une réduction de mémoire mesurée et un WER descriptif à vérifier. Il ne qualifie ni le rendu instrumental de Kara, ni le rap américain, ni le coût sur chanson entière. L’export conserve la phase du mix, ce qui peut laisser de l’accompagnement dans une voix estimée. La précision des consonnes et l’impact sur les chœurs n’ont pas d’annotation indépendante dans ce lot.
+
+La reprise complète les deux extraits initialement reportés. Sur chacun des six cas préfixés, Open-Unmix totalise **41 erreurs sur 111 mots (36,94 %)** contre 42 (37,84 %) avec Demucs et 39 (35,14 %) sur le mix. Les CER respectifs sont de 24,72 %, 25,84 % et 24,91 %. Le rap américain fournit 18 erreurs sur 23 mots avec UMX, 17 avec Demucs et 12 sur le mix. La chanson française s’achève à zéro erreur pour les trois voies. Le comparatif sur les six extraits annule l’avantage observé quand seuls les quatre premiers résultats disponibles étaient comptés.
+
+Sur les nouveaux enregistrements, le premier passage Open-Unmix produit un résultat apparié sur chacun des deux raps. Le rap américain passe de 8 à 12 erreurs sur 12 mots, le rap français de 12 à 14 sur 37 mots. Le premier reggae indépendant est reporté pour température. Le WER apparié passe de 40,82 % sur le mix à 53,06 % sur ces deux pistes vocales. Ce lot reste trop limité pour trancher un effet de genre. Le coût mémoire plus faible ne suffit pas pour choisir le stem par défaut.
+
+Les capteurs matériels du banc sont conservés dans les reçus privés avec le PSI, les températures, la mémoire disponible et les compteurs GPU. La sonde AMD `power1_average` indique 18,18 à 26,85 W dans le passage CTC hip-hop anglais et 17,93 à 26,70 W dans le passage rock anglais. La sonde reflète l’hôte dans son ensemble de mesure et ne fournit pas le coût énergétique propre du modèle.
