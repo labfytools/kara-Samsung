@@ -68,9 +68,9 @@ def multimedia_active():
     return b"Corked: no" in query.stdout
 
 
-# PSI is a stall-time indicator, not a fraction of RAM in use. Allow
-# modest contention only for an already admitted closed-lid heavy task.
-# Other admission policies and the absolute memory reserve stay unchanged.
+# PSI is a stall-time indicator, not a fraction of RAM in use. For
+# unattended heavy work with the lid closed, record stalls without treating
+# PSI alone as memory exhaustion. The absolute reserve remains mandatory.
 MEMORY_RETRY_SECONDS = 30.
 
 
@@ -92,7 +92,7 @@ def memory_psi(text):
 
 
 def memory_limits(*, closed=False, running=False, light=False):
-    return (5., 3.) if closed and running and not light else (1., 1.)
+    return (None, None) if closed and not light else (1., 1.)
 
 
 def thermal_admission(settings, cpu_t, gpu_t, *, nocturnal=False, closed=False):
@@ -126,6 +126,7 @@ class Resources:
         self.reason = "Mesure des ressources"
         self.memory_detail = None
         self.memory_retry_at = 0.
+        self.memory_observation = None
 
     def close(self):
         proc, self.listener = self.listener, None
@@ -211,7 +212,7 @@ class Resources:
             self.memory_detail = None
             return False
         closed = nocturnal and lid
-        policy = (nocturnal, closed, running, light) if running else (nocturnal, closed, running)
+        policy = (nocturnal, closed, running, light)
         if policy == self.sample_policy and now < self.sample + 1.5:
             return self.can_continue if running else (self.can_start_light if light else self.can_start)
         self.can_start = self.can_start_light = self.can_continue = False
@@ -265,7 +266,10 @@ class Resources:
             # still revoke admission and trigger process-group cleanup.
             minimum = min(settings["memory_mib"], settings["running_memory_mib"]) if running else settings["memory_mib"]
             some_limit, full_limit = memory_limits(closed=closed, running=running, light=light)
-            pressure_ok = pressure < some_limit and full_pressure < full_limit
+            pressure_ok = some_limit is None or (pressure < some_limit and full_pressure < full_limit)
+            self.memory_observation = {"available_mib": available, "minimum_mib": minimum,
+                                       "some_avg10": pressure, "full_avg10": full_pressure,
+                                       "psi_advisory": some_limit is None}
             memory_ok = available >= minimum and pressure_ok
             if closed and running and not light and not memory_ok:
                 self.memory_retry_at = now + MEMORY_RETRY_SECONDS
@@ -282,9 +286,11 @@ class Resources:
                         # memory. Record both observations from this decision.
                         cause = ("réserve et PSI" if available < minimum and not pressure_ok
                                  else "réserve" if available < minimum else "PSI")
+                        thresholds = ("informatif, capot fermé" if some_limit is None else
+                                      f"seuils some {some_limit:g} %, full {full_limit:g} %")
                         self.memory_detail = (f"{cause} · {available:.0f} Mio disponibles (minimum {minimum})"
-                                              f" · PSI mémoire some avg10 {pressure:.2f} % (seuil {some_limit:g} %),"
-                                              f" full avg10 {full_pressure:.2f} % (seuil {full_limit:g} %)")
+                                              f" · PSI mémoire some avg10 {pressure:.2f} %,"
+                                              f" full avg10 {full_pressure:.2f} % ({thresholds})")
                     return False
             if multimedia_active():
                 self.reason = "Flux multimédia actif"
