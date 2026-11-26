@@ -1007,10 +1007,10 @@ class ParoleView:
             ("night_gpu_temperature", "Limite GPU (°C)", 45, 85),
             ("night_closed_temperature", "Limite capot fermé (°C)", 45, 70),
             ("cache_gib", "Plafond du cache Kara (Gio)", 1, 1000),
-            ("night_minutes", "Maintien éveillé maximal par période d’inactivité (minutes)", 5, 360),
+            ("night_minutes", "Maintien éveillé maximal par période d’inactivité (minutes)", 5, 720),
         ):
             number(night, *spec)
-        night.append(Gtk.Label(label="Secteur obligatoire. Le verrouillage et l’extinction restent gérés par Sway.",
+        night.append(Gtk.Label(label="Secteur obligatoire. Attendez l’inhibiteur de capot actif avant de fermer.",
                                xalign=0, wrap=True, css_classes=["muted"]))
         stack.add_titled(scroller(night), "night", "Préparation nocturne")
         codex = new()

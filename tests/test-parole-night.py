@@ -17,7 +17,7 @@ from _kara_prepare import PreparedCache, file_token
 from _kara_refine import VERSION as REFINEMENT_VERSION
 from _parole_index import document, sidecar
 from _parole_maintenance import Maintenance
-from _parole_night import Desktop, Login, mains_online
+from _parole_night import Desktop, Login, Night, mains_online
 
 
 class PowerTests(unittest.TestCase):
@@ -71,6 +71,7 @@ class NightTests(unittest.TestCase):
         self.login = self.night.login = SimpleNamespace(
             inhibit=Mock(side_effect=lambda *_: os.open("/dev/null", os.O_RDONLY)),
             observe=lambda: self.state, sleeping=lambda: self.state.sleeping,
+            request_lock=Mock(return_value=Mock(poll=Mock(return_value=0))), display=Mock(),
             hold_economy=Mock(return_value=object()), release_economy=Mock(), get=Mock(return_value="power-saver"),
             glib=SimpleNamespace(Error=RuntimeError))
         self.owner.index.configure(night_enabled=True, startup=False)
@@ -85,38 +86,86 @@ class NightTests(unittest.TestCase):
         self.assertTrue(self.night.open(self.settings))
         return self.night.fd, self.night.delay
 
-    def test_lid_requires_qualification_and_reopening_interrupts(self):
-        self.settings["night_lid"] = True
+    def observe(self, **changes):
+        self.state = replace(self.state, **changes)
+        self.night.next_desktop = 0
+        return self.night.check(self.settings)
+
+    def test_lid_arms_with_no_work_before_lock_idle_or_closure(self):
+        self.owner.index.configure(night_lid=True, night_lid_qualified=False)
+        self.owner.foreground.clear()
+        self.state = replace(self.state, locked=False, screen_off=False)
+        self.owner.resources.session_idle.return_value = False
+        self.owner.tick()
+        self.login.inhibit.assert_not_called()
+        self.owner.index.configure(night_lid_qualified=True)
+        self.owner.tick()
+        self.settings = self.owner.current_settings
+        self.login.inhibit.assert_called_once_with("handle-lid-switch", "block")
+        fd = self.night.lid_fd
+        self.assertFalse(self.observe(lid=True))
+        self.login.request_lock.assert_called_once()
+        self.login.display.assert_not_called()
+        self.assertFalse(self.observe(locked=True))
+        self.login.display.assert_called_once_with(False)
+        self.assertTrue(self.observe(screen_off=True))
+        self.assertTrue(self.owner.night_allowed(self.settings, running=False))
+        self.assertEqual(self.night.lid_fd, fd)
+        self.ac = False
+        self.assertFalse(self.night.refresh(self.settings))
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+        self.assertIsNone(self.night.fd)
+        self.ac = True
+        self.assertFalse(self.night.check(self.settings))
+        self.assertIsNone(self.night.lid_fd)
+
+    def test_ambiguous_opening_does_not_light_displays_or_reset_budget(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
         self.open()
-        self.login.inhibit.assert_any_call("idle", "block")
-        self.state = replace(self.state, lid=True)
+        self.assertTrue(self.observe(lid=True))
+        budget, fd = self.night.budget, self.night.lid_fd
+        self.state = replace(self.state, lid=False, sleeping=True)
+        # Observe the reported edge separately from manual-sleep cleanup.
+        self.night.observe(100.)
+        self.assertTrue(self.night.desktop.lid)
         self.night.next_desktop = 0
-        self.assertFalse(self.night.check(self.settings))
-        self.night.close()
-        self.settings["night_lid_qualified"] = True
-        self.night.next_desktop = 0
-        self.assertFalse(self.night.check(self.settings))
-        self.state = replace(self.state, lid=False)
-        self.night.next_desktop = 0
-        fds = self.open()
-        self.login.inhibit.assert_any_call("idle:handle-lid-switch", "block")
-        self.state = replace(self.state, lid=True)
-        self.night.next_desktop = 0
+        self.state = replace(self.state, lid=True, sleeping=False)
         self.assertTrue(self.night.check(self.settings))
-        self.state = replace(self.state, lid=False)
-        self.night.next_desktop = 0
-        self.assertFalse(self.night.check(self.settings))
-        self.night.close()
-        for fd in fds:
-            with self.assertRaises(OSError):
-                os.fstat(fd)
-        self.login.release_economy.assert_called_with(self.login.hold_economy.return_value)
+        self.assertTrue(self.observe(lid=False))
+        self.night.open_since -= 3
+        with patch("_parole_night.acpi_lid_closed", return_value=True):
+            self.assertTrue(self.observe(lid=False))
+        self.login.display.assert_not_called()
+        self.assertEqual(self.night.budget, budget)
+        self.assertEqual(self.night.lid_fd, fd)
         self.assertNotIn(("sleep", "block"), [call.args for call in self.login.inhibit.call_args_list])
+        self.night.next_display = 0
+        with patch("_parole_night.acpi_lid_closed", return_value=False):
+            self.assertFalse(self.observe(lid=False))
+        self.login.display.assert_called_once_with(True)
+        self.assertFalse(self.observe(screen_off=False))
+        self.assertTrue(self.night.reopened)
+
+    def test_expiry_releases_lid_even_when_no_work_is_due(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.assertTrue(self.night.refresh(self.settings))
+        fd = self.night.lid_fd
+        self.assertTrue(self.observe(lid=True))
+        self.night.budget = 1.
+        self.assertFalse(self.night.refresh(self.settings))
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+        self.assertIsNone(self.night.fd)
 
     def test_budget_survives_restart_and_real_resume_resets_it(self):
         self.open()
         self.night.close()
         self.owner.index.night_budget(1.)
+        self.night = self.owner.night = Night(self.owner.index, self.owner.journal)
+        self.night.login = self.login
+        self.addCleanup(self.night.close)
+        self.assertFalse(self.night.check(self.settings))
         self.assertFalse(self.night.open(self.settings))
         self.owner.resources.resumed = True
         self.assertTrue(self.owner.night_allowed(self.settings, running=False))

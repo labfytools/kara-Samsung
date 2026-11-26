@@ -80,6 +80,7 @@ class Resources:
         self.cpu = None
         self.storage = {}
         self.sample = 0
+        self.sample_closed = False
         self.can_start = self.can_continue = False
         self.reason = "Mesure des ressources"
 
@@ -165,7 +166,8 @@ class Resources:
             self.can_start = self.can_continue = False
             self.reason = "Kara, lecture ou imports prioritaires"
             return False
-        if now < self.sample + 1.5:
+        closed = nocturnal and lid
+        if closed == self.sample_closed and now < self.sample + 1.5:
             return self.can_continue if running else self.can_start
         self.can_start = self.can_continue = False
         try:
@@ -175,7 +177,10 @@ class Resources:
                 self.storage = {**self.storage, "free": {
                     name: disk_usage(nearest(path)).free for name, path in (
                         ("bibliothèque", self.root), ("références", CACHE_ROOT), ("pistes IA", STEM_ROOT))}}
-            idle = self.session_idle(settings["night_idle" if nocturnal else "idle"])
+            # The owner has already confirmed the closed lid, compositor
+            # lock and DPMS. Re-sample under the stricter thermal limits at
+            # that transition without waiting for a Wayland idle timeout.
+            idle = closed or self.session_idle(settings["night_idle" if nocturnal else "idle"])
             # Night.check reads the physical source at process-supervision
             # cadence. This legacy policy remains available for daytime work.
             power = True
@@ -206,15 +211,16 @@ class Resources:
             gpu_t = [value for name in ("amdgpu", "nouveau", "nvidia", "i915", "xe") for value in sensors.get(name, ())]
             cpu_limit = settings["night_cpu_temperature" if nocturnal else "temperature"]
             gpu_limit = settings["night_gpu_temperature" if nocturnal else "temperature"]
-            if nocturnal and lid:
-                closed = min(70, settings["night_closed_temperature"])
-                cpu_limit, gpu_limit = min(cpu_limit, closed), min(gpu_limit, closed)
+            if closed:
+                closed_limit = min(70, settings["night_closed_temperature"])
+                cpu_limit, gpu_limit = min(cpu_limit, closed_limit), min(gpu_limit, closed_limit)
             temperatures = ((cpu_t or gpu_t) and all(0 < value < cpu_limit for value in cpu_t)
                             and all(0 < value < gpu_limit for value in gpu_t))
             if nocturnal:
                 temperatures = cpu_t and gpu_t and temperatures
             disk = self.disk_load(now)
             self.sample = now
+            self.sample_closed = closed
             # During the task its own CPU/GPU/disk load is expected. User
             # activity, power, pressure, temperature and remaining space
             # still revoke admission and trigger process-group cleanup.

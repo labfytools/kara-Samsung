@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Armer l’inhibiteur de capot avant la fermeture sur secteur, confirmer le verrouillage Sway avant l’extinction et porter la durée nocturne par défaut à huit heures.
+
 - Mettre en pause les nouvelles requêtes YouTube dès une limitation explicite ou une série de réponses ambiguës, conserver la temporisation après redémarrage et regrouper les diagnostics des demandes à vérifier. Les autres sources restent éligibles.
 
 - Déclencher la fin de mesure yt-dlp uniquement à la fin du corps audio ou à l’entrée en conversion, y compris lorsque yt-dlp exécute des postprocesseurs avant le téléchargement.

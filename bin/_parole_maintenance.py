@@ -134,6 +134,7 @@ class Maintenance:
         self.night = Night(self.index, self.journal)
         self.night_running = False
         self.night_settings_at = 0.
+        self.next_night_watch = 0.
         self.night_handover = 0.
         self.night_policy = None
         self.night_lrc = (False, False)
@@ -256,6 +257,22 @@ class Maintenance:
             return True
         if self.import_owner is not None and self.import_queue.pause_requested():
             return True
+        if self.night_running:
+            if self.import_queue and monotonic() >= self.next_import_probe:
+                self.next_import_probe = monotonic() + 1.
+                if self.import_queue.pending():
+                    self.night.report("Préparation nocturne suspendue · imports prioritaires")
+                    return True
+            return not self.night_allowed(self.current_settings, running=True)
+        settings = getattr(self, "current_settings", None)
+        if settings and settings["night_enabled"] and monotonic() >= self.next_night_watch:
+            # Network workers and inventory may span many ticks. Keep power
+            # supervision live without starting a second maintenance owner.
+            self.next_night_watch = monotonic() + .5
+            try:
+                self.night.refresh(self.index.settings(wait=.15), fast=True)
+            except (OSError, ValueError, sqlite3.Error):
+                self.night.close(reason="réglages indisponibles")
         if self.active and self.active[0] == "prepare":
             now = monotonic()
             if self.import_queue and now >= self.next_import_probe:
@@ -263,8 +280,6 @@ class Maintenance:
                 if self.import_queue.pending():
                     self.interrupt.set()
                     return True
-            if self.night_running:
-                return not self.night_allowed(self.current_settings, running=True)
             return not self.resources.check(self.current_settings,
                                             busy=self.priority or monotonic() < self.priority_until, running=True)
         return False
@@ -276,21 +291,23 @@ class Maintenance:
             try:
                 fresh = self.index.settings(wait=.15)
             except (OSError, sqlite3.Error, ValueError):
-                return self.night.report("Préparation nocturne suspendue · réglages indisponibles")
+                return self.night.suspend("réglages indisponibles", running=True)
+            if not fresh["night_enabled"] or fresh["paused"]:
+                return self.night.refresh(fresh, running=True)
+            if self.night.lid_fd is not None and not (fresh["night_lid"] and fresh["night_lid_qualified"]):
+                return self.night.suspend("option capot fermé ou qualification thermique désactivée", running=True)
             if any(settings[name] != fresh[name] for name in NIGHT_RESTART_SETTINGS):
                 return self.night.report("Préparation nocturne suspendue · réglages modifiés")
         idle = self.resources.session_idle(settings["night_idle"])
         if self.resources.resumed:
             self.resources.resumed = False
             self.night.activity()
-            if running:
+            if running and self.night.desktop and not self.night.desktop.lid:
                 return self.night.report("Reprise d’activité · préparation nocturne suspendue")
-        if not self.night.check(settings, busy=self.priority or now < self.priority_until, fast=running):
+        if not self.night.check(settings, busy=self.priority or now < self.priority_until, running=running):
             return False
-        if not idle:
+        if not (idle or self.night.desktop.lid):
             return self.night.report("Préparation nocturne en attente d’inactivité")
-        if self.night.expired(settings):
-            return False
         if not self.resources.check(settings, running=running, nocturnal=True, lid=self.night.desktop.lid):
             return self.night.report(self.resources.reason)
         self.night.reason = ""
@@ -937,9 +954,10 @@ class Maintenance:
             if not import_suspended:
                 self.journal.emit(category, "Traitement interrompu · reprise différée")
             if nocturnal:
-                self.night.close()
-                if self.night.reason.startswith("Réouverture"):
-                    self.resources.close()
+                if self.night.release_after_work:
+                    self.night.close(reason=self.night.reason)
+                else:
+                    self.night.stop_work()
                 self.recover_night_drafts()
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
@@ -1097,19 +1115,24 @@ class Maintenance:
         settings = self.current_settings = self.index.settings()
         now = time()
         if settings["paused"]:
-            self.night.close()
+            self.night.refresh(settings)
             self.resources.close()
             return
         policy = tuple(settings[name] for name in NIGHT_RESTART_SETTINGS)
-        if policy != self.night_policy or not settings["night_enabled"] or self.priority:
-            self.night.close()
         if policy != self.night_policy:
             self.resources.sample = 0.
+            self.night.stop_work()
+            self.night.next_desktop = 0.
         self.night_policy = policy
+        self.night.refresh(settings)
+        if settings["night_enabled"]:
+            self.resources.session_idle(settings["night_idle"])
+            if self.resources.resumed:
+                self.resources.resumed = False
+                self.night.activity()
         imports_pending = self.import_queue and self.import_queue.pending()
-        if imports_pending and self.night.fd is not None:
-            self.night.close()
-            self.resources.close()
+        if imports_pending or self.priority:
+            self.night.stop_work()
         if (not self.foreground.is_set() and not settings["night_enabled"] and not imports_pending
                 and not enrichment_pending(self.index, now)):
             return
@@ -1183,30 +1206,24 @@ class Maintenance:
 
     def tick_night(self, settings, now):
         if not self.index.preparation_due(now):
-            self.night.close()
-            # Keep observing actual resume even after the last song or the
-            # awake budget spent. A later idle interval has its own budget.
-            self.resources.session_idle(settings["night_idle"])
-            if self.resources.resumed:
-                self.resources.resumed = False
-                self.night.activity()
+            self.night.stop_work()
             return False
         if not self.night_allowed(settings, running=False):
             if (self.night.fd is not None and monotonic() < self.night_handover
                     and self.night.reason in {"CPU occupé", "Disque occupé", "GPU occupé ou non mesurable"}):
                 return True
-            self.night.close()
+            self.night.stop_work()
             return False
         if not self.night.open(settings):
-            self.night.close()
+            self.night.stop_work()
             return False
         task = self.index.claim(("prepare",), now,
                                 night=(self.night.budget, self.resources.storage.get("bytes", 0)))
         if task is None:
-            self.night.close()
+            self.night.stop_work()
             return False
         self.execute(task, nocturnal=True)
         self.night_handover = monotonic() + 4.
         if not self.index.preparation_due(time()):
-            self.night.close()
+            self.night.stop_work()
         return True
