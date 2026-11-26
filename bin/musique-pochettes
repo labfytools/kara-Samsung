@@ -2,6 +2,7 @@
 """Récupère les pochettes de ~/Music/Artiste/Album en conservant l'existant."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 import json
@@ -22,7 +23,7 @@ from uuid import UUID
 
 from PIL import Image, ImageOps
 from _kara_paths import catalogue_command
-from _kara_import_resources import defer_service, wait_service
+from _kara_import_resources import PROCESSING, defer_service, resource_slot, wait_service
 from _kara_import_result import ImportIssue
 from _musique_oz import (INBOX, SHARED_LIBRARY, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file,
                          probe, share_file, shared_mutation, title_pair)
@@ -343,10 +344,18 @@ def fetch_cover(album, catalog, shared_root=None):
         return "pochette déjà présente"
     version = album.stat() if shared_root is not None else None
 
+    def processing():
+        # Local media work shares the import slots. Supplier requests keep
+        # their own cadence and run after the processing slot is returned.
+        if shared_root is not None and os.environ.get("KARA_PAROLE_COVER") == "1":
+            return resource_slot(shared_root / INBOX / ".kara-traitements", PROCESSING, timeout=12)
+        return nullcontext()
+
     def persist(payload):
         # Decode and resize outside the shared lock. The directory identity
         # and competing cover are checked immediately before publication.
-        prepared = prepare_cover(payload)
+        with processing():
+            prepared = prepare_cover(payload)
         with shared_mutation(shared_root):
             if version is not None:
                 current = album.stat()
@@ -363,15 +372,22 @@ def fetch_cover(album, catalog, shared_root=None):
     names, releases, groups, sources = set(), set(), set(), []
     for track in tracks:
         try:
-            tags, pictures = probe(track)
+            with processing():
+                tags, pictures = probe(track)
+        except ImportIssue:
+            raise
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"Lecture de {track.name} impossible : {error}", file=sys.stderr)
             continue
         for picture in pictures:
             try:
-                if persist(embedded_cover(track, picture)):
+                with processing():
+                    payload = embedded_cover(track, picture)
+                if persist(payload):
                     return "pochette intégrée extraite → cover.jpg"
                 return "pochette déjà présente"
+            except ImportIssue:
+                raise
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"Pochette de {track.name} illisible : {error}", file=sys.stderr)
         url = tags.get("purl")
