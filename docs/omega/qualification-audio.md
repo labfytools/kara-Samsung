@@ -154,6 +154,20 @@ Le folk espagnol *Esencia* de NandoMalo porte le marqueur `Polyphonic`. Demucs a
 
 Le chemin exact du brouillon de production F16 a également été exécuté sur une copie du titre country français. Il a atteint la transcription du mix et a été arrêté à 1,09 % de PSI, avec 4,21 Gio disponibles, après environ 10 s. Le relevé ne contient aucune phase Demucs et aucun brouillon n’a été publié pendant cette tentative.
 
+### Comparaison appariée de Turbo Q5 et reprise d’un brouillon
+
+Le sous-lot a été fixé avant les essais, avec deux extraits de chacun des six genres. Après trois résultats au premier passage, la reprise a attendu six relevés consécutifs à 0,25 % de PSI ou moins et au moins 4,5 Gio disponibles avant chaque admission. Le seuil d’arrêt de 1 % est resté actif. Neuf paires F16 et Q5 sur douze sont complètes, avec 180 mots de référence et les six genres représentés. Trois extraits restent reportés pour pression mémoire. Les chiffres ci-dessous portent uniquement sur les paires complètes et restent sensibles aux extraits reportés.
+
+| Entrée | WER F16 | WER Q5 | Décodage médian F16 | Décodage médian Q5 |
+| --- | ---: | ---: | ---: | ---: |
+| Mix | 31,11 % | 28,89 % | 9,50 s | 8,07 s |
+| Voix isolée | 31,11 % | 33,33 % | 9,38 s | 8,09 s |
+| Voix filtrée | 33,33 % | 32,78 % | 9,36 s | 8,24 s |
+
+Le GTT résident maximal du client GPU passe de 2 089 à 954 Mio et le chargement médian de 2,88 à 1,03 s. La mémoire graphique reste partagée avec l’hôte. La quantification réduit ce coût de chargement, avec des résultats de reconnaissance variables selon l’entrée.
+
+Le chemin réel de brouillon, exécuté dans un dossier de test avec Q5, a terminé le mix du morceau country français de 209,70 s. Les phases observées sont le chargement du modèle et la transcription. L’ensemble avec la vérification de reprise a pris 105,18 s, à 0,54 % de PSI au plus et 5,16 Gio disponibles au minimum. Le filtre de brouillon n’a gardé qu’une ligne et a écarté 36 segments. Un nouveau processus a relu le reçu en 0,66 s, sans changer son contenu ni sa date. Aucun fichier de paroles n’a été publié. Cette mesure valide la reprise de ce chemin et le résultat conserve le statut de brouillon à examiner.
+
 ### Alternance de langue, témoin construit
 
 Un montage de trois segments de neuf secondes issus des titres espagnol, anglais et français a fourni 39 mots entièrement inclus dans les intervalles annotés. La lecture Q5 en une seule fenêtre a estimé le français et commis neuf erreurs, soit 23,08 % de WER en 8,87 s. Avec les frontières du montage connues et la langue estimée séparément sur chaque segment, les trois langues sont correctes et le WER passe à 20,51 % en 24,51 s. Fixer les trois langues de référence donne les mêmes huit erreurs en 12,69 s. Le montage mesure la sensibilité de la détection à une frontière connue entre enregistrements. Il reste à qualifier les changements de langue au sein d’un même chant.
