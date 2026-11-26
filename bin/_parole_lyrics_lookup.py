@@ -150,6 +150,8 @@ class KeepAlive:
 def cache_identity(provider, signature, synced, local_text, strict, configuration):
     # Keep the exact version/credits in the key. LyricDown aligns an existing
     # text, and its timing is only reusable with the same reference text.
+    if provider == "LRCLIB":
+        signature = ("lrclib-2", *signature)
     return encoded_key(provider, signature, synced, encoded_key(local_text) if synced else "", strict, configuration)
 
 

@@ -80,6 +80,10 @@ Le statut Local, Externe ou Généré du LRC apparaît dans le tableau. Les dét
 
 Le 26 novembre 2026, un essai réel a pris 16 copies de titres sans LRC dans la file, dont 8 également sans texte. LRCLIB était le seul fournisseur activé. Les 24 recherches ont pris 35,83 s en 7 lots, pour 48 requêtes HTTP. La vérification a rejeté 3 correspondances ambiguës et 21 recherches se sont terminées sans résultat. Aucune parole ni aucun LRC n’a été publié sur cet échantillon. Les mesures couvrent ce lot court. Le débit par heure de production s’observe dans le compteur après déploiement.
 
+Une nouvelle interrogation de ces 16 titres a obtenu des candidats par recherche pour 14 pistes. Sur les candidats de la recherche, 88 ont été écartés à cause de l’édition, 21 du titre, 8 des crédits ou de la version et 3 de la durée. Dix candidats avaient une identité compatible, dont six avec un LRC utilisable. Plusieurs candidats peuvent correspondre à une seule piste, y compris des textes divergents. Les recherches essaient désormais le crédit original et une variante typographique du titre si nécessaire. L’acceptation conserve la vérification de l’édition et du minutage. Un LRC valide d’un enregistrement correspondant peut aussi fournir ses paroles brutes.
+
+Jamendo expose les paroles par API. Ses conditions encadrent la conservation hors ligne du contenu. Unison expose des paroles synchronisées avec attribution du fournisseur et du contributeur et demande la prise en compte des retraits, selon sa licence de données. Ces exigences restent à intégrer au parcours de publication avant d’utiliser ces sources automatiquement. [Conditions Jamendo](https://devportal.jamendo.com/api_terms_of_use) · [Licence Unison](https://github.com/better-lyrics/unison/blob/master/LICENSE-DATA.md)
+
 ## Qualification
 
 Les fixtures vérifient aussi que la reprise d’activité ou une demande Kara interrompt un sous-processus déjà démarré. Elles vérifient la réserve sur chaque partition, indépendamment de la place totale. Les commandes suivantes exécutent les tests.

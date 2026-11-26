@@ -287,6 +287,16 @@ class CatalogueTests(unittest.TestCase):
 
 
 class SourceTests(Fixture):
+    def test_lrclib_widens_discovery_without_widening_recording_match(self):
+        engine = lyrics_engine()
+        client = engine.LrcLib()
+        client.strict = True
+        record = dict(trackName="Titre", artistName="Artiste, Invité", albumName="Album",
+                      duration=10, syncedLyrics="[00:01.000]Paroles entendues")
+        client.get = Mock(side_effect=(None, [dict(record, albumName="Compilation")], [record]))
+        self.assertEqual(client.find("Titre", "Artiste, Invité", "Album", 10, "Artiste"), "Paroles entendues")
+        self.assertEqual(client.get.call_args.kwargs["artist_name"], "Artiste, Invité")
+
     def test_unavailable_catalogue_leaves_lyrics_eligible(self):
         from _parole_import_metrics import limited
         from _parole_sources import ready_categories, seed

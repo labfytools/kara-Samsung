@@ -180,7 +180,7 @@ class LrcLib:
     def fetch(self, url):
         request = Request(url, headers={
             "Accept": "application/json",
-            "User-Agent": "ParolesMusique/1.0 (client local pour Strawberry)",
+            "User-Agent": "ParolesMusique/1.0 (https://github.com/labfytools/kara-Samsung)",
         })
         for delay in ((None,) if self.gate.provider else (2, 5, None)):
             last_attempt = delay is None
@@ -222,17 +222,20 @@ class LrcLib:
             return result
 
         base_title, _ = split_feature(clean_title(title))
+        # Query variants widen discovery only. Keep edition, version,
+        # duration and credits in the original acceptance decision.
         search_artist = album_artist or artist
-        records = self.get("search", track_name=base_title, artist_name=search_artist)
-        result = best_transcript(records, title, artist, album, duration, album_artist,
-                                     synced=synced, strict=getattr(self, "strict", False))
-        if result is not None:
-            return result
-        alternative = normalized(base_title)
-        if "-" in alternative:
-            records = self.get("search", track_name=alternative.replace("-", " "), artist_name=search_artist)
-            return best_transcript(records, title, artist, album, duration, album_artist,
-                                     synced=synced, strict=getattr(self, "strict", False))
+        variants = dict.fromkeys(((base_title, search_artist), (base_title, artist),
+                                  (folded(base_title), search_artist)))
+        for label, credit in variants:
+            if not label or not credit:
+                continue
+            records = self.get("search", track_name=label, artist_name=credit)
+            text = best_transcript(records[:20] if isinstance(records, list) else (),
+                                   title, artist, album, duration, album_artist,
+                                   synced=synced, strict=getattr(self, "strict", False))
+            if text is not None:
+                return text
         return None
 
 
@@ -884,6 +887,10 @@ def transcript(record, duration, synced):
         return ""
     text = usable_text(record.get("syncedLyrics" if synced else "plainLyrics"),
                        MAX_LRC_BYTES if synced else 32_000)
+    if not synced and text is None:
+        timed = transcript(record, duration, True)
+        if timed:
+            return usable_text("\n".join(line for _, line in parse_lrc(timed) if line), 32_000)
     if synced and text:
         timed = [stamp for stamp, line in parse_lrc(text) if line]
         if not timed or timed[-1] > duration + 3:
