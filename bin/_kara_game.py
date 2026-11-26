@@ -4,11 +4,13 @@ import json
 import os
 from math import isfinite
 from pathlib import Path
+import socket
 import sys
 import time
 
 from gi.repository import Gio, GLib
 
+from _kara_blackbox_turbo import CHUNK, receive
 from _kara_scoring import (AudioWindow, MAX_PREPARED_WINDOW, SCORE_TOLERANCE,
                            prepared_window, score_breakdown, score_reference_line)
 from _kara_words import LyricVocabulary, words
@@ -37,6 +39,8 @@ class GameScore:
         self.changed = changed
         self.diagnostics = diagnostics
         self.diagnostic_turn = {}
+        self.capture_window = None
+        self.turbo_channel = None
         self.network_socket = None
         self.process = None
         self.requested = False
@@ -81,6 +85,7 @@ class GameScore:
         self.cursor = None
         self.previous = None
         self.pending = {}
+        self.pending_capture = {}
         self.epoch = 0.
         self.source_since = None
         self.seeked = False
@@ -107,6 +112,7 @@ class GameScore:
             return
         self.requested = True
         self.message = "Préparation du modèle local…"
+        diagnostic_channel = None
         try:
             flags = Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
             args = [sys.executable, "-B", str(SESSION), str(WORKER_PYTHON), "-B", str(BIN / "_kara_voice.py"),
@@ -119,12 +125,25 @@ class GameScore:
                 launcher = Gio.SubprocessLauncher.new(flags)
                 launcher.take_fd(os.dup(self.network_socket.fileno()), 3)
                 launcher.setenv("KARA_NETWORK_MIC_FD", "3", True)
+                if self.reference and self.capture_window:
+                    try:
+                        diagnostic_channel, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                        diagnostic_channel.setblocking(False)
+                        launcher.take_fd(sender.detach(), 4)
+                        launcher.setenv("KARA_TURBO_TRACE_FD", "4", True)
+                    except OSError:
+                        if diagnostic_channel:
+                            diagnostic_channel.close()
+                            diagnostic_channel = None
                 process = launcher.spawnv(args)
         except (GLib.Error, OSError):
+            if diagnostic_channel:
+                diagnostic_channel.close()
             self.requested = False
             self.message = "Le moteur Whisper local est indisponible."
             self.changed()
             return
+        self.turbo_channel = diagnostic_channel
         self.process = process
         self.changed()
         stream = Gio.DataInputStream.new(process.get_stdout_pipe())
@@ -162,6 +181,9 @@ class GameScore:
         self.changed()
 
     def close_input(self, process):
+        if self.turbo_channel is not None:
+            self.turbo_channel.close()
+            self.turbo_channel = None
         try:
             process.get_stdin_pipe().close(None)
         except GLib.Error:
@@ -193,6 +215,8 @@ class GameScore:
             self.ready = True
             self.echo = bool(event.get("echo"))
             self.model = event.get("model", "")
+            if self.diagnostics and event.get("decoder"):
+                self.diagnostics.emit("turbo", "decoder-ready", **self.diagnostic_turn, decoder=event["decoder"])
             self.message = ""
         if event.get("event") == "recording":
             self.recording = bool(event.get("active"))
@@ -200,6 +224,9 @@ class GameScore:
             self.recording = False
             self.message = event.get("message", "Erreur de l’enregistrement local.")
         if event.get("event") in {"score", "skipped"}:
+            if self.turbo_channel is not None:
+                receive(self.turbo_channel, self.record_decode)
+            self.pending_capture.pop(event.get("id"), None)
             batch = self.pending.pop(event.get("id"), None)
             if batch is not None and self.reference:
                 self.match_reference(batch, event)
@@ -232,6 +259,20 @@ class GameScore:
             return False
         return True
 
+    def record_decode(self, header, fd, size):
+        window, call, offset = header
+        admitted = self.pending_capture.get(window)
+        if admitted is None:
+            return
+        session, context, begin, finish = admitted
+        if not self.capture_window(context["turn"], begin, finish):
+            return
+        for cursor in range(0, size, CHUNK):
+            block = os.pread(fd, min(CHUNK, size - cursor), cursor)
+            self.diagnostics.pcm("turbo", 16000, 1, block, **context, recording_session=session,
+                                 decode={"window": window, "call": call, "window_offset": offset,
+                                         "first_frame": cursor // 2, "total_frames": size // 2})
+
     def send_job(self, window, begin, finish, source=None):
         self.sequence += 1
         self.pending[self.sequence] = window
@@ -248,6 +289,13 @@ class GameScore:
                     for start, stop in source[3]) else ""
             if self.diagnostics and self.diagnostics.active():
                 job["trace"] = True
+                turn = self.diagnostic_turn.get("turn")
+                if self.turbo_channel is not None and turn and self.capture_window(turn, begin):
+                    session = self.diagnostics.voice_window("turbo", begin)
+                    if session:
+                        job["capture_decoder"] = True
+                        self.pending_capture[self.sequence] = session, dict(self.diagnostic_turn), begin, finish
+                job["queued_ns"] = time.monotonic_ns()
         else:
             # Only the comparison step receives the expected text. The legacy
             # decoder gets an empty prompt, just like the prepared decoder.
@@ -263,7 +311,8 @@ class GameScore:
             self.diagnostics.emit("turbo", "window", **self.diagnostic_turn, window=self.sequence,
                                   position=window.start, line=window.line, capture_begin=begin,
                                   capture_end=finish, language=job["language"], rate=window.rate,
-                                  track_end=window.stop, instrumental=bool(source), guide=bool(job.get("guide")))
+                                  track_end=window.stop, instrumental=bool(source), guide=bool(job.get("guide")),
+                                  capture_decoder=bool(job.get("capture_decoder")))
         return True
 
     def match_reference(self, window, event):
@@ -298,7 +347,8 @@ class GameScore:
                                   raw_observed=event.get("heard", []), observed=recognized, source=source,
                                   tolerance=self.tolerance, reference=lines[index], decisions=self.line_results[index],
                                   comparison=audit,
-                                  decoder=event.get("diagnostics"), inference_seconds=event.get("inference_seconds"))
+                                  decoder=event.get("diagnostics"), inference_seconds=event.get("inference_seconds"),
+                                  queue_wait_ns=event.get("queue_wait_ns"))
         if source == "backing":
             self.feedback = "Accompagnement dominant · ligne non évaluée"
         elif source == "unverified":

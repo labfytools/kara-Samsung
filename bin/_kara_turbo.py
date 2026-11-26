@@ -1,6 +1,6 @@
 """Whisper Turbo hors ligne, sans dépendance au lecteur ni au micro."""
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import file_digest, sha256
 import os
 from pathlib import Path
@@ -67,6 +67,7 @@ class Segment:
     end: float
     no_speech: float
     words: tuple
+    tokens: tuple = ()
 
 
 def decode_segment(start, end, no_speech, tokens, origin, duration):
@@ -107,8 +108,15 @@ class TurboDecoder:
                                         stderr=None if logs else subprocess.DEVNULL)
         self.buffer = bytearray()
         try:
-            if self.read_line(monotonic() + 60) != b"ready":
+            ready = self.read_line(monotonic() + 60).split()
+            if not ready or ready[0] != b"ready" or len(ready) not in (1, 4):
                 raise ValueError("Le modèle Whisper large-v3-turbo n’a pas démarré.")
+            info = model.stat()
+            self.identity = {"build": binary.name, "model": model.name, "bytes": info.st_size,
+                             "modified_ns": info.st_mtime_ns, "backend_requested": backend, "threads": threads,
+                             "version": ready[1].decode() if len(ready) == 4 else None,
+                             "model_ftype": int(ready[2]) if len(ready) == 4 else None,
+                             "backend_observed": ready[3].decode() if len(ready) == 4 else None}
         except BaseException:
             self.close()
             raise
@@ -145,7 +153,7 @@ class TurboDecoder:
         except (OSError, StopIteration, ValueError, IndexError):
             return None
 
-    def decode(self, pcm, language, origin=0, *, beam=False, prompt=""):
+    def decode(self, pcm, language, origin=0, *, beam=False, prompt="", trace_tokens=False):
         code = (language or "auto").encode("ascii")
         if len(pcm) % 2 or not 0 < len(pcm) <= 29 * RATE * 2 or not 0 < len(code) <= 15:
             raise ValueError("Fenêtre PCM invalide.")
@@ -161,7 +169,7 @@ class TurboDecoder:
         pipe.flush()
         limit = monotonic() + 180
         length = len(pcm) / (2 * RATE)
-        segments, tokens = [], []
+        segments, tokens, evidence = [], [], []
         boundary = None
         detected = language
         for _ in range(8192):
@@ -169,8 +177,8 @@ class TurboDecoder:
             if kind in (b"segment", b"done") and boundary is not None:
                 segment = decode_segment(*boundary, tokens, origin, length)
                 if segment is not None:
-                    segments.append(segment)
-                tokens = []
+                    segments.append(replace(segment, tokens=tuple(evidence)) if trace_tokens else segment)
+                tokens, evidence = [], []
             if kind == b"done":
                 return detected, segments
             if kind == b"language":
@@ -178,7 +186,10 @@ class TurboDecoder:
             elif kind == b"segment":
                 boundary = int(fields[0]) / 100, int(fields[1]) / 100, float(fields[2])
             elif kind == b"token":
-                tokens.append((int(fields[0]) / 100, float(fields[1]), bytes.fromhex(fields[2].decode())))
+                stamp, probability, piece = int(fields[0]) / 100, float(fields[1]), bytes.fromhex(fields[2].decode())
+                tokens.append((stamp, probability, piece))
+                if trace_tokens:
+                    evidence.append((int(fields[3]) if len(fields) > 3 else None, stamp, probability, fields[2].decode()))
             elif kind == b"error":
                 if self.read_line(limit) != b"done":
                     raise ValueError("Fin de trame Turbo invalide.")

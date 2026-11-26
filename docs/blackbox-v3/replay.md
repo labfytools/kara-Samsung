@@ -38,3 +38,12 @@ Le bloc PCM est extrait de son segment par index et contrôles de format. `extra
 BlackBox V3 recherche, pour chaque cycle, les runs contigus du microphone et de chaque sortie. Le recouvrement logiciel utilise deux ancres du même renderer comprises dans le run du microphone et intersecte leur plage avec un run de sortie sans interruption. Une fenêtre d’au moins quatre secondes prend l’état `software_overlap`. Les événements d’extrémité et les deux ancres restent accessibles par leurs identifiants. Deux pistes présentes dans un même cycle peuvent avoir un recouvrement nul. La dérive est exprimée par un intervalle issu de deux mesures d’horloge et comprend leurs incertitudes.
 
 Un recouvrement logiciel ne qualifie pas un délai physique. La chaîne ADC, les tampons du navigateur, la présentation DAC, la latence Bluetooth, le retour micro et le trajet dans la pièce exigent les mesures du [protocole physique](protocole-physique.md). Le banc strict `tests/qualify-kara-aec-blackbox.py` demeure utilisable sur un monitor et un témoin qui partagent réellement leur grille PipeWire. Le banc synthétique `tests/test-kara-aec-blackbox.py` contrôle le comportement sur une paire commune et sur deux pilotes distincts.
+
+## Relancer un appel du décodeur
+
+```sh
+bin/kara-blackbox extract-turbo latest --id FENETRE --call 0 --output blackbox/reports/turbo.wav
+bin/kara-blackbox replay-turbo latest --id FENETRE --call 0 --device cpu --beam
+```
+
+Ces commandes requièrent une entrée Turbo V3 complète. Elles vérifient la taille et le SHA-256 relevé au point d’appel du décodeur. Le rejeu relance le décodeur sur ces octets et compare sa trace aux métadonnées historiques, avec choix du dispositif, de la langue et du décodage beam. Le terminal affiche les segments et les tokens. Une différence de moteur, de modèle, de backend ou de réglage doit être prise en compte dans l’interprétation des divergences.

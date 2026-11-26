@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Exercise the production recorder with isolated, synthetic PCM only."""
 import json
+from hashlib import sha256
+import os
 from pathlib import Path
+import socket
 import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_blackbox import BlackBox, atomic_json, cycle_id, digest, events, validate_recording
 from _kara_blackbox_clock import browser_anchor
+from _kara_blackbox_turbo import receive, submit
 
 
 class RecordingTests(unittest.TestCase):
@@ -136,6 +141,41 @@ class RecordingTests(unittest.TestCase):
         first = json.loads(subprocess.check_output(
             [*cli, "replay-timeline", session, "--cycle", cycle_id(session, "b" * 16), "--limit", "1"], text=True))
         self.assertEqual(first["event"], "turn-start")
+
+    def test_exact_turbo_input_is_bound_to_decode_call(self):
+        self.box.start(consent=True, voice=True, tracks=["turbo"])
+        session = self.box.voice_session()
+        block = struct.pack("<h", 756) * 19200
+        self.box.emit("party", "turn-start", **self.turn)
+        self.box.emit("turbo", "window", **self.turn, window=7)
+        rx, tx = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with rx, tx:
+            rx.setblocking(False)
+            self.assertTrue(submit(tx, 7, 1, 5, block))
+
+            def process(header, fd, size):
+                window, call, offset = header
+                self.box.pcm("turbo", 16000, 1, os.pread(fd, size, 0), **self.turn, recording_session=session,
+                             decode={"window": window, "call": call, "window_offset": offset,
+                                     "first_frame": 0, "total_frames": size // 2})
+
+            receive(rx, process)
+        self.box.emit("scoring", "line-decision", **self.turn, window=7,
+                      decoder={"decodes": [{"call": 1, "input_frames": len(block) // 2,
+                                            "input_sha256": sha256(block).hexdigest()}]})
+        self.box.emit("party", "turn-end", **self.turn)
+        self.box.stop(wait=True)
+        folder = self.box.root / session
+        window_id = next(row["id"] for row in events(folder / "events.jsonl") if row["event"] == "window")
+        result = self.box.root.parent / "bout.wav"
+        cli = [sys.executable, "-B", str(Path(__file__).resolve().parents[1] / "bin/kara-blackbox"),
+               "--root", str(self.box.root), "extract-turbo", session,
+               "--id", str(window_id), "--call", "1", "--output", str(result)]
+        report = json.loads(subprocess.check_output(cli, text=True))
+        self.assertEqual(report["sha256"], sha256(block).hexdigest())
+        with wave.open(str(result)) as wav:
+            self.assertEqual(wav.readframes(wav.getnframes()), block)
+        self.assertEqual(result.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

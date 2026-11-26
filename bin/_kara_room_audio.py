@@ -54,6 +54,7 @@ class Route:
     frame_end: int | None = None
     seq: int | None = None
     scoring: bool = True
+    authorized_start: float | None = None
 
     @property
     def context(self):
@@ -95,6 +96,7 @@ class RoomAudio:
         self.preferences = {}
         self.default_preferences = {}
         self.preference_device = None
+        self.last_authorized = None
 
     def status(self):
         return {"available": bool(self.runner and not self.silent), "profile": self.profile, "output": self.output,
@@ -221,6 +223,7 @@ class RoomAudio:
             volume = self.preferences.get((owner, device),
                                           self.default_preferences.get(owner, min(100, settings["volume_percent"])))
             self.route = Route(owner, player, turn, song, sink, device, settings, volume, sender, scoring=scoring)
+            self.last_authorized = None
             self.route.return_enabled = not require_consent
         self.diagnostics.emit("audio", "route", player=player, turn=turn, song=song, output=sink,
                               profile=settings["profile"], guard=True, requested_percent=volume, scoring=scoring,
@@ -251,6 +254,14 @@ class RoomAudio:
         with self.lock:
             if self.route:
                 self.route.recording_on = playing
+                if not playing:
+                    self.route.authorized_start = None
+
+    def capture_window(self, turn, begin, end=None):
+        with self.lock:
+            allowed = self.last_authorized
+            return bool(allowed and allowed[0] == turn and allowed[1] <= begin <= allowed[2]
+                        and (end is None or begin < end <= allowed[2]))
 
     def selected_sink(self):
         with self.lock:
@@ -288,6 +299,7 @@ class RoomAudio:
                 return False
             route.claimed = ws
             route.connection = token_hex(16)
+            route.authorized_start = None
             route.receiving = False
             route.gain = 0.
             route.seq = None
@@ -512,5 +524,10 @@ class RoomAudio:
             route.sent += 1
             timing = {"frame_end": frame_end, "send_ms": send_clock, "received_s": received}
             if route.recording_on and route.recording_consent and route.scoring:
+                # The preceding block can contain warm-up samples. Use the
+                # end of the first admitted block as the conservative bound.
+                if route.authorized_start is None:
+                    route.authorized_start = end
+                self.last_authorized = (route.turn, route.authorized_start, end)
                 self.diagnostics.pcm("whisper", 16000, 1, pcm, capture_end=end, sequence=sequence,
                                      packet_timing=timing, connection=route.connection, **route.context)

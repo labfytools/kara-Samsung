@@ -1,5 +1,6 @@
 """Run the production voice recognition path on a captured window, offline."""
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 import wave
@@ -20,16 +21,25 @@ def main():
     parser.add_argument("--backing", type=Path)
     parser.add_argument("--original", type=Path)
     parser.add_argument("--guide", type=Path)
+    parser.add_argument("--exact", action="store_true")
+    parser.add_argument("--beam", action="store_true")
+    parser.add_argument("--threads", type=int)
     args = parser.parse_args()
     with wave.open(str(args.wav), "rb") as source:
         if ((source.getframerate(), source.getnchannels(), source.getsampwidth()) != (RATE, 1, 2)
                 or not 0 < source.getnframes() <= RATE * 32):
             parser.error("Format de la fenêtre WAV incompatible.")
-        audio = np.frombuffer(source.readframes(source.getnframes()), dtype="<i2").astype(np.float32) / 32768
-    prepared = Preparer(PreparedCache(), device=args.device)
+        pcm = source.readframes(source.getnframes())
+    prepared = Preparer(PreparedCache(), device=args.device, threads=args.threads)
     try:
         prepared.settings()  # Resolves the native build used by the production cache.
         decoder = prepared.load_decoder()
+        if args.exact:
+            language, spans = decoder.decode(pcm, args.language, args.start, beam=args.beam, trace_tokens=True)
+            print(json.dumps({"language": language, "segments": [asdict(span) for span in spans],
+                              "decoder": decoder.identity}, ensure_ascii=False))
+            return
+        audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
         evidence = {}
         if args.backing and args.original:
             heard, classification = transcribe_prepared_job(decoder, audio, {

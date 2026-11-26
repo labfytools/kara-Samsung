@@ -742,8 +742,8 @@
   $("micro-cut").onclick = () => run($("micro-cut"), () => command("audio-cut"));
 
 
-  for (const [value, title] of [["wifi", "Audio reçu des téléphones"], ["whisper", "Signal analysé par Whisper"],
-    ["return", "Retour vocal numérique"], ["playback", "Mix Kara à l’entrée de la sortie"],
+  for (const [value, title] of [["wifi", "Audio reçu des téléphones"], ["whisper", "Signal envoyé au moteur de score"],
+    ["turbo", "Fenêtres exactes envoyées à Turbo"], ["return", "Retour vocal numérique"], ["playback", "Mix Kara à l’entrée de la sortie"],
     ["monitor", "Monitor PipeWire"], ["witness", "Micro témoin du Vivobook"]]) {
     const label = element("label");
     const input = element("input");

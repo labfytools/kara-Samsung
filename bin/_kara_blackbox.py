@@ -36,12 +36,12 @@ AUDIO_SEGMENT_BYTES = 16 * 1024 * 1024
 GRAPH_TRACKS = ("monitor", "witness")
 GRAPH_CLOCK_FIELDS = ("driver", "frame", "monotonic_ns", "xrun", "quantum", "present",
                       "spa_headers", "route", "epoch")
-TRACK_NAME = re.compile(r"[a-f0-9]{16}-(?:wifi|whisper|return|monitor|witness|playback)-[0-9]{4}\.wav")
-TRACKS = ("wifi", "whisper", "return", "playback", *GRAPH_TRACKS)
+TRACK_NAME = re.compile(r"[a-f0-9]{16}-(?:wifi|whisper|return|monitor|witness|playback|turbo)-[0-9]{4}\.wav")
+TRACKS = ("wifi", "whisper", "return", "playback", "turbo", *GRAPH_TRACKS)
 DEFAULT_TRACKS = tuple(track for track in TRACKS if track != "witness")
 STREAM_ROLES = {"wifi": "MIC_RECEIVED", "whisper": "MIC_PROCESSED", "return": "PLAYER_MONITOR",
                 "monitor": "OUTPUT_MONITOR", "witness": "ACOUSTIC_WITNESS",
-                "playback": "PLAYBACK_REFERENCE"}
+                "playback": "PLAYBACK_REFERENCE", "turbo": "TURBO_INPUT"}
 FLOAT_WAV = struct.Struct("<4sI4s4sIHHIIHH4sII4sI")
 INCIDENTS = {"error", "disconnect", "interrupted", "capture-gap", "overflow",
              "partial", "xrun", "write-error", "marker", "tv-timeout", "clipping"}
@@ -159,6 +159,7 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
                 if item["event"] == "turn-start":
                     cycle["start_ns"] = item["monotonic_ns"]
                     cycle["identity"] = data.get("identity", {})
+                    cycle["scored"] = data.get("scored")
                 elif item["event"] == "turn-end":
                     cycle["end_ns"] = item["monotonic_ns"]
                 elif item["component"] == "audio" and item["event"] == "reference":
@@ -242,16 +243,22 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
                     "id": f"{cycle_id(manifest['session'], cycle['turn'])}/{track}",
                     "state": "absent" if track in capture["tracks"] else "disabled", "frames": 0})
                 graph = acoustic.get(cycle["turn"], {}).get(track, {})
-                if stream["frames"] and (not complete or not cycle["start_ns"] or not cycle["end_ns"]
+                if not stream["frames"] and track in ("whisper", "turbo") and cycle.get("scored") is False:
+                    stream["state"] = "not_applicable"
+                elif stream["frames"] and (not complete or not cycle["start_ns"] or not cycle["end_ns"]
                                          or graph.get("coverage") == "partial"):
                     stream["state"] = "incomplete"
                 elif not stream["frames"] and "unavailable" in graph.get("states", ()):
                     stream["state"] = "unusable"
-            for role in ("MIC_RAW", "MIC_AEC", "TURBO_INPUT"):
+            for role in ("MIC_RAW", "MIC_AEC"):
                 cycle["streams"].setdefault(role, {"state": "not_applicable"})
             for role, name in (("MUSIC_REFERENCE", "instrumental"), ("ORIGINAL_VOCAL", "original_voice")):
                 reference = cycle.get("references", {}).get(name)
                 cycle["streams"][role] = {"state": "available", "reference": reference} if reference else {"state": "absent"}
+        for identity, cycle in cycles.items():
+            completeness = analysis["cycles"].get(identity, {}).get("turbo_capture", {})
+            if (completeness.get("missing_calls") or completeness.get("unconfirmed_calls")) and cycle["streams"]["TURBO_INPUT"]["frames"]:
+                cycle["streams"]["TURBO_INPUT"]["state"] = "incomplete"
         manifest["cycles"] = cycles
         manifest["total_bytes"] = sum(file["bytes"] for file in manifest["files"].values())
         capture["state"] = ("incomplete" if not complete or any(
@@ -396,6 +403,13 @@ class BlackBox:
                     and (track is None or track in record.tracks)):
                 return record.identity
 
+    def voice_window(self, track, begin):
+        with self.lock:
+            record = self.session
+            if (record and not record.stop.is_set() and track in record.tracks
+                    and begin * 1_000_000_000 >= record.manifest["monotonic_ns"]):
+                return record.identity
+
     def disk_available(self):
         path = self.root
         while not path.exists() and path.parent != path:
@@ -502,7 +516,7 @@ class BlackBox:
 
     def pcm(self, track, rate, channels, block, *, turn, player, song, sequence=None, capture_end=None,
             clock=None, recording_session=None, packet_timing=None, connection=None,
-            sample_format=None, playback_timing=None):
+            sample_format=None, playback_timing=None, decode=None):
         # Explicit voice consent is independent of metadata collection. This
         # admission check lives before the copy and never performs file I/O.
         if track not in TRACKS or not isinstance(turn, str) or not TURN.fullmatch(turn):
@@ -511,10 +525,14 @@ class BlackBox:
         floating = graph or track == "playback" and sample_format == "f32le"
         width = 4 if floating else 2
         if (rate not in (16000, 44100, 48000) or channels not in (1, 2)
-                or not 0 < len(block) <= (65536 if graph or track == "playback" else 4096)
+                or not 0 < len(block) <= (65536 if graph or track in ("playback", "turbo") else 4096)
                 or len(block) % (channels * width)):
             return
         if track == "playback" and (sample_format not in ("f32le", "s16le") or not playback_timing):
+            return
+        if track == "turbo" and (rate != 16000 or channels != 1 or not recording_session or decode is None
+                                  or any(type(decode.get(key)) is not int or decode[key] < 0
+                                         for key in ("window", "call", "window_offset", "first_frame", "total_frames"))):
             return
         if graph and (not clock or not recording_session or rate != 48000
                       or channels != (2 if track == "monitor" else 1)
@@ -553,6 +571,8 @@ class BlackBox:
                 }
             if isinstance(connection, str) and re.fullmatch(r"[a-f0-9]{32}", connection):
                 item["data"]["connection"] = connection
+            if track == "turbo":
+                item["data"]["decode"] = decode
             try:
                 record.pending.put_nowait((item, bytes(block)))
             except Full:
@@ -744,6 +764,10 @@ def validate_recording(folder, manifest):
                         or manifest["status"] == "complete" and data["sample"] != tail):
                     raise ValueError("Identité du flux ou continuité de l’index PCM invalide.")
                 tails[data["file"]] = data["sample"] + data["frames"]
+                if data["track"] == "turbo":
+                    call = data["decode"]
+                    if not 0 <= call["first_frame"] < call["first_frame"] + data["frames"] <= call["total_frames"] <= 29 * 16000:
+                        raise ValueError("Plage du décodeur Turbo invalide.")
             if graph:
                 clock = data["clock"]
                 expected_planes = 6 if data["track"] == "monitor" else 1

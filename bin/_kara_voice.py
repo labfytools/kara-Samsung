@@ -2,6 +2,7 @@
 """Capture et transcription locale déclenchées par le mode jeu."""
 from collections import deque
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ import struct
 from pywhispercpp.model import Model
 
 from _kara_capture import TurnCapture
+from _kara_blackbox_turbo import submit as submit_turbo_input
 from _kara_dtw_words import read_timing
 from _kara_scoring import AudioWindow, SCORE_TOLERANCE, add_evidence, same_word
 from _kara_words import IGNORED_HINTS, words
@@ -366,7 +368,7 @@ class PlayerDecoding:
 PLAYER_DECODING = PlayerDecoding()
 
 
-def transcribe_player(decoder, audio, language, *, decoding=None, diagnostics=None):
+def transcribe_player(decoder, audio, language, *, decoding=None, diagnostics=None, observe=None):
     """Decode without lyric context and keep sample-relative token timestamps."""
     decoding = decoding or PLAYER_DECODING
     frames = len(audio) // 800
@@ -382,19 +384,38 @@ def transcribe_player(decoder, audio, language, *, decoding=None, diagnostics=No
     pcm = np.clip(audio * gain * 32768, -32768, 32767).astype("<i2")
     heard = []
     stride, pad = round(decoding.stride * RATE), round(decoding.padding * RATE)
-    for low in range(0, len(pcm), stride):
+    for call, low in enumerate(range(0, len(pcm), stride)):
         high = min(len(pcm), low + stride)
         begin, end = max(0, low - pad), min(len(pcm), high + pad)
         clip = pcm[begin:end]
         if len(clip) < RATE * 1.2:
             clip = np.pad(clip, (0, int(RATE * 1.2) - len(clip)))
-        _, segments = decoder.decode(clip.tobytes(), language, begin / RATE, beam=decoding.beam)
+        payload = clip.tobytes()
+        delivered = observe(call, begin, payload) if observe else None
+        started = time.monotonic_ns()
+        options = {"trace_tokens": True} if diagnostics is not None and isinstance(decoder, TurboDecoder) else {}
+        detected, segments = decoder.decode(payload, language, begin / RATE, beam=decoding.beam, **options)
         if diagnostics is not None:
-            diagnostics.setdefault("decodes", []).append({
+            elapsed = time.monotonic_ns() - started
+            call_trace = {
+                "call": call, "input_frames": len(clip), "input_submitted": delivered,
+                "input_sha256": sha256(payload).hexdigest() if observe else None,
                 "begin": begin / RATE, "end": end / RATE, "owner": [low / RATE, high / RATE],
+                "language_requested": language or "auto", "language_detected": detected, "inference_ns": elapsed,
+                "started_ns": started, "beam_size": 3 if decoding.beam else None,
+                "stride_s": decoding.stride, "padding_s": decoding.padding, "gain": gain, "prompted": False,
                 "segments": [{"text": span.text, "start": span.start, "end": span.end,
-                              "no_speech": span.no_speech} for span in segments],
-            })
+                              "no_speech": span.no_speech} for span in segments[:32]],
+            }
+            tokens = [
+                [i, token, token_time, probability, piece[:96]]
+                for i, span in enumerate(segments)
+                for token, token_time, probability, piece in getattr(span, "tokens", ())
+            ]
+            # Bound one JSON line even on pathological repeated output.
+            call_trace["tokens"] = tokens[:96]
+            call_trace["omitted_tokens"] = max(0, len(tokens) - 96)
+            diagnostics.setdefault("decodes", []).append(call_trace)
         for segment in segments:
             if segment.no_speech > .65:
                 continue
@@ -472,7 +493,7 @@ def filtered_replay_fraction(received, expected):
     return max(0., 1. - float(residual @ residual) / power)
 
 
-def transcribe_prepared_job(decoder, audio, job, *, decoding=None, diagnostics=None):
+def transcribe_prepared_job(decoder, audio, job, *, decoding=None, diagnostics=None, observe=None):
     if not job.get("instrumental"):
         return [], "unverified"
     if float(np.max(np.abs(audio), initial=0.)) < QUIET_VOICE_FLOOR:
@@ -522,7 +543,7 @@ def transcribe_prepared_job(decoder, audio, job, *, decoding=None, diagnostics=N
             diagnostics.setdefault("filtered_replay_fraction", {})[name] = explained
         if explained >= .94:
             return [], "backing"
-    return transcribe_player(decoder, audio, job["language"], decoding=decoding, diagnostics=diagnostics)
+    return transcribe_player(decoder, audio, job["language"], decoding=decoding, diagnostics=diagnostics, observe=observe)
 
 
 def record_prepared_diagnosis(stats, job, source, heard=(), diagnostic=None):
@@ -539,10 +560,11 @@ def record_prepared_diagnosis(stats, job, source, heard=(), diagnostic=None):
     })
 
 
-def process_jobs(mic, jobs, model, turbo, stats=None):
+def process_jobs(mic, jobs, model, turbo, stats=None, trace_channel=None):
     while True:
         job = jobs.get()
-        began = time.monotonic()
+        began_ns = time.monotonic_ns()
+        began = began_ns / 1_000_000_000
         try:
             minimum_coverage = .90 if job.get("prepared") else .50
             audio = mic.samples(job["begin"], job["end"], minimum_coverage=minimum_coverage)
@@ -555,13 +577,19 @@ def process_jobs(mic, jobs, model, turbo, stats=None):
                 continue
             if job.get("prepared"):
                 diagnostic = {} if job.get("trace") or stats is not None and "lignes" in stats else None
-                heard, source = transcribe_prepared_job(model, audio, job, diagnostics=diagnostic)
+                def observe(call, offset, block):
+                    return submit_turbo_input(trace_channel, job["id"], call, offset, block)
+
+                capture = trace_channel is not None and job.get("capture_decoder")
+                heard, source = transcribe_prepared_job(model, audio, job, diagnostics=diagnostic,
+                                                        observe=observe if capture else None)
                 if stats is not None:
                     stats["lignes_analysees"] += 1
                     stats["lignes_signal_faible"] += source == "silence"
                     stats["mots_transcrits"] = stats.get("mots_transcrits", 0) + len(heard)
                     record_prepared_diagnosis(stats, job, source, heard, diagnostic)
-                extra = ({"diagnostics": diagnostic, "inference_seconds": time.monotonic() - began}
+                extra = ({"diagnostics": diagnostic, "inference_seconds": time.monotonic() - began,
+                          "queue_wait_ns": max(0, began_ns - job.get("queued_ns", began_ns))}
                          if job.get("trace") else {})
                 emit("score", id=job["id"], heard=heard, source=source, **extra)
                 continue
@@ -648,6 +676,7 @@ def load_model(mode):
 
 def main(mode="base", language=""):
     echo = recorder = native = prepared_decoder = mic = None
+    trace_channel = None
     stats = {"lignes_demandees": 0, "lignes_analysees": 0, "lignes_signal_faible": 0,
              "captures_incompletes": 0, "echecs_decodeur": 0, "file_pleine": 0,
              "mots_attendus": 0, "mots_reconnus_a_temps": 0,
@@ -657,6 +686,8 @@ def main(mode="base", language=""):
         stats["comparaison"] = "reference_turbo_gtk"
     try:
         wireless = os.environ.get("KARA_NETWORK_MIC_FD") == "3"
+        if wireless and os.environ.get("KARA_TURBO_TRACE_FD") == "4":
+            trace_channel = socket.socket(fileno=4)
         if not wireless:
             microphone = pulse("get-default-source")
             if not microphone or microphone.endswith(".monitor"):
@@ -690,8 +721,8 @@ def main(mode="base", language=""):
             Thread(target=mic.read, daemon=True).start()
             if not mic.started.wait(timeout=2.0):
                 raise ValueError("Aucun flux audio reçu du micro sélectionné.")
-        Thread(target=process_jobs, args=(mic, jobs, model, label == "Turbo", stats), daemon=True).start()
-        emit("ready", echo=echo is not None, model=label)
+        Thread(target=process_jobs, args=(mic, jobs, model, label == "Turbo", stats, trace_channel), daemon=True).start()
+        emit("ready", echo=echo is not None, model=label, decoder=prepared_decoder.identity if prepared_decoder else None)
         for line in sys.stdin:
             job = json.loads(line)
             command = job.get("command")
@@ -731,6 +762,8 @@ def main(mode="base", language=""):
         emit("error", message=str(error))
         return 1
     finally:
+        if trace_channel is not None:
+            trace_channel.close()
         if mic is not None:
             mic.stop_recording()
         save_diagnostics(stats)

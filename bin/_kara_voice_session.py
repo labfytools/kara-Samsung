@@ -125,7 +125,8 @@ def main(command):
                     return 0
                 # The private datagram route, when supplied by Parole, is
                 # inherited only by the score worker, never by system tools.
-                passed = (3,) if os.environ.get("KARA_NETWORK_MIC_FD") == "3" else ()
+                passed = tuple(fd for fd, key in ((3, "KARA_NETWORK_MIC_FD"), (4, "KARA_TURBO_TRACE_FD"))
+                               if os.environ.get(key) == str(fd))
                 worker = subprocess.Popen(command, pass_fds=passed)
                 return wait_for_worker(worker, input_poll)
     except (OSError, KeyError, RuntimeError, subprocess.SubprocessError) as error:

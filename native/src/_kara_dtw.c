@@ -212,7 +212,7 @@ static void print_prepared(struct whisper_context *context)
             printf("token %" PRId64 " %.5f ", token.t_dtw, token.p);
             for (; *part; part++)
                 printf("%02x", *part);
-            putchar('\n');
+            printf(" %d\n", token.id);
         }
     }
 }
@@ -223,10 +223,10 @@ static int prepare_stream(const char *model, bool gpu, int threads, bool require
     static struct vulkan_probe probe;
     /* Whisper may fall back to CPU after a GPU request. Its pinned backend
      * reports device selection and initialization failure before it is ready. */
-    if (require_vulkan)
+    if (gpu)
         whisper_log_set(probe_vulkan, &probe);
     struct whisper_context *context = open_model(model, gpu);
-    if (require_vulkan)
+    if (gpu)
         whisper_log_set(NULL, NULL);
     if (context && require_vulkan && (!atomic_load(&probe.selected) || atomic_load(&probe.failed))) {
         whisper_free(context);
@@ -240,7 +240,10 @@ static int prepare_stream(const char *model, bool gpu, int threads, bool require
         free(samples);
         return 4;
     }
-    puts("ready");
+    /* Return the loaded model type and distinguish observed Vulkan from
+     * a GPU request whose actual backend was not proven by the probe. */
+    printf("ready %s %d %s\n", whisper_version(), whisper_model_ftype(context),
+           !gpu ? "cpu" : atomic_load(&probe.selected) && !atomic_load(&probe.failed) ? "vulkan" : "unverified");
     fflush(stdout);
     int status = 0;
     unsigned char header[5];

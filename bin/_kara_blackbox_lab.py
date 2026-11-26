@@ -61,6 +61,9 @@ class Cycle:
     scored: int = 0
     score: dict | None = None
     turbo_windows: int = 0
+    turbo_frames: dict = field(default_factory=dict)
+    missing_turbo: int = 0
+    recorded_turbo: int = 0
 
     def add_anchor(self, row):
         data = row["data"]
@@ -76,6 +79,10 @@ class Cycle:
     def add_pcm(self, row):
         data = row["data"]
         name, frames, rate = data["track"], data["frames"], data["rate"]
+        if name == "turbo":
+            call = data["decode"]
+            key = call["window"], call["call"]
+            self.turbo_frames[key] = self.turbo_frames.get(key, 0) + frames
         if name in self.tracks:
             self.tracks[name].frames += frames
         if name == "monitor":
@@ -98,6 +105,17 @@ class Cycle:
                 group = (name, timing["pipeline_base_ns"], rate, data["channels"], data["sample_format"])
                 self.tracks[name].submit(group, first, first + duration, t0 + timing["host_after_ns"],
                                          t0 + duration + timing["host_before_ns"], row["id"], tolerance=1)
+
+    def score_decision(self, data):
+        self.scored += 1
+        for call in (data.get("decoder") or {}).get("decodes", ()):
+            if not call.get("input_sha256"):
+                continue
+            present = self.turbo_frames.pop((data.get("window"), call["call"]), 0)
+            if present == call["input_frames"]:
+                self.recorded_turbo += 1
+            else:
+                self.missing_turbo += 1
 
     def describe(self):
         pairs = {}
@@ -133,6 +151,8 @@ class Cycle:
                     else "insufficient_overlap" if pairs else "missing_timing_or_tracks"),
                 "physical_alignment_bound_ns": None, "renderer_drift_ppm_intervals": drift,
                 "rx_gaps_reported": self.gaps, "turbo_windows": self.turbo_windows,
+                "turbo_capture": {"calls_with_all_frames": self.recorded_turbo,
+                                  "missing_calls": self.missing_turbo, "unconfirmed_calls": len(self.turbo_frames)},
                 "score_decisions": self.scored, "score": self.score}
 
 
@@ -156,7 +176,7 @@ def analyze(folder):
         elif cycle and event == "window" and row["component"] == "turbo":
             cycle.turbo_windows += 1
         elif cycle and event == "line-decision" and row["component"] == "scoring":
-            cycle.scored += 1
+            cycle.score_decision(data)
         elif cycle and event == "turn-end" and row["component"] == "party":
             cycle.score = data.get("summary")
         if event == "transport-end" and row["component"] == "audio":

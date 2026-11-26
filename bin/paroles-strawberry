@@ -170,6 +170,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.next_capture_clock = 0.
         self.mobile_imports = MobileImports(self)
         self.game_score = GameScore(self.refresh_game, diagnostics=self.blackbox)
+        self.game_score.capture_window = self.room_audio.capture_window
         self.seek_signal = self.bus.signal_subscribe(PLAYER, INTERFACE, "Seeked", OBJECT, None,
                                                       Gio.DBusSignalFlags.NONE, self.player_seeked)
         self.vocal_effect = StemPlayback()
@@ -1320,7 +1321,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.blackbox.emit("party", "turn-start", **self.game_score.diagnostic_turn, scored=scored, training=player.training,
                            identity={"room": self.bb_room, "party": self.remote_party.identity},
                            reference={**{key: reference.get(key) for key in ("song_id", "prepared_at", "lrc_sha256",
-                                       "language", "duration", "settings")},
+                                       "language", "duration", "settings", "model")},
                                       "audio_sha256": reference["audio"]["sha256"]} if reference else None)
         self.turn_scored = scored
         self.game_toggle.set_sensitive(scored)
