@@ -624,6 +624,19 @@ class ParoleView:
                 formatted = f"{data:,}".replace(",", " ")
             value.set_text(formatted)
 
+    @staticmethod
+    def activity_lines(label, counts):
+        network_lyrics, network_lrc = counts.get("network_lyrics", 0), counts.get("network_lrc", 0)
+        local_lyrics, local_lrc = counts.get("local_lyrics", 0), counts.get("local_lrc", 0)
+        return (
+            f"{label} · Réseau {network_lyrics} textes / {network_lrc} LRC · Bibliothèque {local_lyrics} textes / {local_lrc} LRC",
+            f"{counts.get('draft', 0)} brouillons Turbo · {counts.get('validated_lyrics', 0)} textes et "
+            f"{counts.get('validated_lrc', 0)} minutages de brouillon validés",
+            f"{counts.get('generated', 0)} LRC générés · {counts.get('corrected', 0)} LRC recalés · "
+            f"{counts.get('ready', 0)} chansons prêtes · {counts.get('memory', 0)} reports mémoire · "
+            f"{counts.get('quota', 0)} reports quota",
+        )
+
     def refresh_night_summary(self):
         ready, references, remaining, report = self.index.night_progress()
         lines = [f"Bibliothèque · {ready} préparations complètes · {references} références temporelles validées · "
@@ -639,9 +652,10 @@ class ParoleView:
         lines.extend((f"{lid} · {power} · {screens} · {lock}", inhibitor))
         if night.reason:
             lines.append(night.reason)
-        yield_hour = self.index.network_yield()
-        lines.append(f"Dernière heure révolue · {yield_hour.get('lyrics', 0)} paroles · "
-                     f"{yield_hour.get('lrc', 0)} LRC récupérés")
+        hour, day, drafts = self.index.activity_progress()
+        lines.extend((f"Brouillons à vérifier · {drafts}",
+                      *self.activity_lines("Dernière heure révolue", hour),
+                      *self.activity_lines("Dernières 24 h révolues", day)))
         if closed := self.index.closed_progress():
             stamp = datetime.fromtimestamp(closed["started"]).strftime("%d/%m à %H:%M")
             completed = closed["completed"]
@@ -653,6 +667,8 @@ class ParoleView:
                          f"{closed['interrupted']} interruptions · {closed['deferred']} reports")
             if counts:
                 lines.append(" · ".join(counts))
+            if "activity" in closed:
+                lines.extend(self.activity_lines("Résultats de la fermeture", closed["activity"]))
             if closed["reason"]:
                 lines.append(f"Fin du bilan · {closed['reason']}")
         storage = self.maintenance.resources.storage

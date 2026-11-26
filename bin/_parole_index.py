@@ -437,14 +437,15 @@ class Index:
             return task
 
     def finish(self, task, state, detail="", delay=0, *, night=None, closed=None, refund_attempt=False,
-               network_found=False):
+               network_found=False, activity=()):
         now = time()
         with self.db() as db:
             changed = db.execute("""UPDATE tasks SET state=?, detail=?, updated=?, due=?, attempts=attempts-?
                           WHERE kind=? AND subject=? AND state='running' AND revision=?""",
                                  (state, detail[:300], now, now + delay, refund_attempt,
                                   task["kind"], task["subject"], task["revision"])).rowcount
-            if changed and state == "done" and network_found and task["kind"] in ("lyrics", "lrc"):
+            published = state == "done" and network_found and task["kind"] in ("lyrics", "lrc")
+            if changed and published:
                 # Count an actual external publication once at queue
                 # settlement. Provider hits and cached attempts are separate.
                 minute = int(now) // 60 * 60
@@ -452,6 +453,8 @@ class Index:
                               ON CONFLICT(kind,subject) DO UPDATE SET value=CAST(value AS INTEGER)+1""",
                            (f"{minute}:{task['kind']}", task["kind"], minute))
                 db.execute("DELETE FROM reviews WHERE kind='network_yield' AND checked<?", (minute - 48 * 3600,))
+            if changed and activity:
+                self.record_activity(db, now, activity)
             if night is not None:
                 report = self.read_night_report(db)
                 if report and report["pending"] == [task["subject"], task["revision"]]:
@@ -480,6 +483,11 @@ class Index:
                 # transaction as the queue transition. An interruption can
                 # settle after the owner has released the lid inhibitor.
                 if report and report["started"] == since:
+                    recorded = (*activity, f"network_{task['kind']}") if published else activity
+                    if recorded:
+                        counts = report.setdefault("activity", {})
+                        for name in recorded:
+                            counts[name] = counts.get(name, 0) + 1
                     if outcome == "completed" and report["ended"] is None:
                         kind = task["kind"]
                         report["completed"][kind] = report["completed"].get(kind, 0) + 1
@@ -493,6 +501,54 @@ class Index:
             return dict(db.execute("""SELECT state,sum(CAST(value AS INTEGER)) FROM reviews
                                       WHERE kind='network_yield' AND checked>=? AND checked<?
                                       GROUP BY state""", (end - 3600, end)))
+
+    @staticmethod
+    def record_activity(db, now, activity):
+        # Minute buckets are ordered by the existing reviews primary key.
+        # The caller owns the same transaction as the queue or validation receipt.
+        minute = int(now) // 60 * 60
+        db.executemany("""INSERT INTO reviews VALUES('activity_yield',?,?,?,'1')
+                          ON CONFLICT(kind,subject) DO UPDATE SET value=CAST(value AS INTEGER)+1""",
+                       ((f"{minute:012d}:{name}", name, minute) for name in activity))
+        db.execute("DELETE FROM reviews WHERE kind='activity_yield' AND subject<?",
+                   (f"{minute - 48 * 3600:012d}:",))
+
+    def activity_progress(self, *, now=None):
+        end = int(time() if now is None else now) // 60 * 60
+        since_hour, since_day = end - 3600, end - 24 * 3600
+        with self.db(wait=.15) as db:
+            rows = db.execute("""SELECT state,
+                                     sum(CASE WHEN checked>=? THEN CAST(value AS INTEGER) ELSE 0 END),
+                                     sum(CAST(value AS INTEGER))
+                                 FROM reviews WHERE kind='activity_yield' AND subject>=? AND subject<?
+                                 GROUP BY state""", (since_hour, f"{since_day:012d}:", f"{end:012d}:"))
+            hour, day = {}, {}
+            for label, last_hour, last_day in rows:
+                hour[label], day[label] = last_hour, last_day
+            # Read the historical external publications without backfilling or
+            # counting the same event in both histories.
+            rows = db.execute("""SELECT state,
+                                     sum(CASE WHEN checked>=? THEN CAST(value AS INTEGER) ELSE 0 END),
+                                     sum(CAST(value AS INTEGER))
+                                 FROM reviews WHERE kind='network_yield' AND checked>=? AND checked<?
+                                 GROUP BY state""", (since_hour, since_day, end))
+            for label, last_hour, last_day in rows:
+                hour[f"network_{label}"], day[f"network_{label}"] = last_hour, last_day
+            drafts = db.execute("""SELECT count(*) FROM tasks AS t JOIN songs AS s ON s.id=t.subject
+                                  WHERE t.kind='transcription' AND t.state='review' AND t.detail='brouillon à vérifier'
+                                  AND (s.lyrics='absent' OR s.lrc='absent')""").fetchone()[0]
+        return hour, day, drafts
+
+    def record_validation(self, identity, suffix, audio, sidecar, *, draft):
+        now = time()
+        value = document({"audio": audio, "sidecar": sidecar,
+                          "source": "Turbo, validé manuellement" if draft else "Correction manuelle"})
+        with self.db() as db:
+            changed = db.execute("""INSERT INTO reviews VALUES('transcription_validation',?,'validated',?,?)
+                         ON CONFLICT(kind,subject) DO UPDATE SET checked=excluded.checked,value=excluded.value
+                         WHERE value<>excluded.value""", (identity + suffix, now, value)).rowcount
+            if changed and draft:
+                self.record_activity(db, now, ("validated_lrc" if suffix == ".lrc" else "validated_lyrics",))
 
     def exclude(self, kind, subject):
         with self.db() as db:

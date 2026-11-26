@@ -309,6 +309,7 @@ class Maintenance:
             # cleanup changes memory usage. The queue keeps its retry state.
             phase = self.progress[0] if self.progress else "Maintenance"
             self.journal.emit("RESSOURCES", f"{phase} suspendu · {self.resources.memory_detail}", "WARNING")
+            self.memory_interruption = True
 
     def night_allowed(self, settings, *, running, light=False):
         now = monotonic()
@@ -641,16 +642,19 @@ class Maintenance:
 
     def finish_network(self, task, future, window):
         publication = False
+        activity = ()
         try:
             value = future.result()
             result = self.network_result(task, value)
             publication = value["state"] == "found" and value.get("source") not in (None, "Strawberry", LOCAL_SOURCE)
+            activity = self.reference_activity(task, value, result)
         except Interrupted:
             result = "suspended", "ressources libérées", 45
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(task["kind"].upper(), "Moteur indisponible ou réponse invalide", "WARNING")
             result = "temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8))
-        self.index.finish(task, *result, closed=self.closed_outcome(window, result), network_found=publication)
+        self.index.finish(task, *result, closed=self.closed_outcome(window, result), network_found=publication,
+                          activity=activity)
         self.revision += 1
         return self.network_completed(result)
 
@@ -658,6 +662,16 @@ class Maintenance:
     def network_completed(result):
         state, detail, _ = result
         return state != "suspended" and (state != "temporary" or detail in CHECKED_RESULTS)
+
+    @staticmethod
+    def reference_activity(task, value, result):
+        kind = task["kind"]
+        if kind in ("lyrics", "lrc"):
+            if value["state"] == "found" and result[0] == "done" and value.get("source") in ("Strawberry", LOCAL_SOURCE):
+                return (f"local_{kind}",)
+            if value["state"] == "limited" and result[0] == "temporary":
+                return ("quota",)
+        return ()
 
     @staticmethod
     def closed_outcome(window, result):
@@ -1068,6 +1082,7 @@ class Maintenance:
                     "cleanup": "CACHE", IMPORT_LYRICS: "LYRICS", IMPORT_COVER: "COVER"}.get(kind, kind.upper())
         import_suspended = False
         network_found = False
+        activity = ()
         window = self.night.window if nocturnal else None
         with self.lock:
             self.interrupt.clear()
@@ -1082,6 +1097,7 @@ class Maintenance:
         self.night_running = nocturnal
         self.night_settings_at = 0.
         self.night_lrc = (False, False)
+        self.memory_interruption = False
         self.night_measures = {}
         song = self.index.song(subject) if kind in ("lyrics", "lrc", *HEAVY) else None
         self.progress = (category, song["title"] if song is not None else "En cours", None)
@@ -1115,6 +1131,7 @@ class Maintenance:
                 value = self.network_output(task, self.current_settings, local_reference_only=local_reference_only)
                 result = self.network_result(task, value)
                 network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry", LOCAL_SOURCE)
+                activity = self.reference_activity(task, value, result)
         except Interrupted:
             import_suspended = self.import_owner is not None and self.import_queue.pause_requested()
             result = ("suspended", "ressources libérées", 0 if import_suspended else 45)
@@ -1142,6 +1159,14 @@ class Maintenance:
             self.night_running = False
         stats = None
         state, detail, _ = result
+        if kind == "transcription" and detail == "brouillon à vérifier":
+            activity = ("draft",)
+        if state == "suspended" and self.memory_interruption:
+            activity = ("memory",)
+        if kind == "prepare" and state == "done" and detail == "prêt":
+            corrected, generated = self.night_lrc
+            activity = tuple(label for label, observed in (("ready", True), ("corrected", corrected and not generated),
+                                                           ("generated", generated)) if observed)
         if nocturnal and kind == "prepare":
             outcome = {"done": "ready", "review": "failed", "suspended": "interrupted"}.get(state, "deferred")
             if detail in ("séparation indisponible", "analyse Turbo indisponible", "opération indisponible"):
@@ -1157,7 +1182,8 @@ class Maintenance:
             stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
                          corrected=corrected, generated=generated, measurements=self.night_measures)
         self.index.finish(task, *result, night=stats, closed=self.closed_outcome(window, result),
-                          refund_attempt=import_suspended or detail == LOCAL_REFERENCE_MISS, network_found=network_found)
+                          refund_attempt=import_suspended or detail == LOCAL_REFERENCE_MISS, network_found=network_found,
+                          activity=activity)
         if import_suspended:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)

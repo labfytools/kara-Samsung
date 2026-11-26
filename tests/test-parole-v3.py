@@ -192,6 +192,31 @@ class QueueTests(Fixture):
         self.assertEqual(index.network_yield(now=120), {"lyrics": 1})
         self.assertEqual(index.network_yield(now=3660), {})
 
+    def test_activity_intervals_and_night_count_only_settled_results(self):
+        start = 1_800_000_000
+        with patch("_parole_index.time", return_value=start):
+            night = self.index.start_closed_report()
+        for kind, source, stamp, state, activity in (
+            ("lyrics", "external", start + 5, "done", ()),
+            ("lrc", "local", start + 6, "done", ("local_lrc",)),
+            ("lrc", "quota", start + 61, "temporary", ("quota",)),
+        ):
+            self.index.enqueue(kind, source, "revision", now=stamp)
+            task = self.index.claim((kind,), stamp)
+            with patch("_parole_index.time", return_value=stamp):
+                for _ in range(2):
+                    self.index.finish(task, state, delay=300, closed=(night, "completed"),
+                                      network_found=source == "external", activity=activity)
+        with patch("_parole_index.time", return_value=start + 62):
+            for _ in range(2):
+                self.index.record_validation("draft", ".txt", "audio", "same sidecar", draft=True)
+        hour, day, drafts = self.index.activity_progress(now=start + 3660)
+        self.assertEqual((hour["network_lyrics"], hour["local_lrc"], hour["quota"], hour["validated_lyrics"], drafts),
+                         (0, 0, 1, 1, 0))
+        self.assertEqual(day, {"network_lyrics": 1, "local_lrc": 1, "quota": 1, "validated_lyrics": 1})
+        self.assertEqual(self.index.closed_progress()["activity"], {"network_lyrics": 1, "local_lrc": 1, "quota": 1})
+        self.assertEqual(self.index.activity_progress(now=start + 25 * 3600), ({}, {}, 0))
+
     def test_network_batch_settles_fast_track_while_another_waits(self):
         owner = Maintenance(self.root, None, state=self.base / "state")
         self.addCleanup(owner.close)
@@ -456,6 +481,8 @@ class SourceTests(Fixture):
                 self.assertEqual(self.index.song(song["id"])["lrc"], "local")
                 self.assertFalse(self.index.work_due(("lrc",), time(), local_reference=True))
                 self.assertFalse(self.index.network_yield())
+        _, day, _ = self.index.activity_progress(now=time() + 60)
+        self.assertEqual(day, {"local_lrc": 2})
 
     def test_unison_exact_isrc_keeps_attribution_and_discards_lyrics(self):
         from _parole_unison import discover
@@ -810,6 +837,8 @@ class GtkTests(Fixture):
         summary = view.night_summary.get_label()
         self.assertIn("0 préparations complètes", summary)
         self.assertIn("0 références temporelles validées", summary)
+        self.assertIn("Dernières 24 h révolues · Réseau 0 textes / 0 LRC · Bibliothèque 0 textes / 0 LRC", summary)
+        self.assertIn("0 reports mémoire · 0 reports quota", summary)
         self.assertNotIn("Moyennes", summary)
 
         from time import sleep
