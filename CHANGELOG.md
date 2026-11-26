@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Actualiser seulement les lignes modifiées dans la liste Parole et préserver la sélection.
 - Réutiliser les paroles vérifiées entre éditions lorsque le PCM est identique, avec des fichiers associés et leur provenance.
 - Limiter l’extraction des fenêtres BlackBox aux pistes WAV de leur dossier de capture.
 - Journaliser la mesure PSI et la mémoire disponible ayant suspendu un calcul de maintenance.

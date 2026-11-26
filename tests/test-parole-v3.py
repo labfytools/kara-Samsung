@@ -552,6 +552,21 @@ class GtkTests(Fixture):
         self.assertEqual(view.songs.get_n_items(), 0)
         view.all()
         self.assertIsNone(window.legacy_controls.get_root())
+        visible = view.songs.get_item(0)
+        view.song_selection.set_selected(0)
+        modifications = []
+        view.songs.connect("items-changed", lambda *_: modifications.append(True))
+        window.maintenance.index.update(visible.data["id"], checked=42.)
+        window.maintenance.revision += 1
+        view.refresh_state()
+        self.assertEqual(modifications, [])
+        self.assertIs(view.song_selection.get_selected_item(), visible)
+        self.assertEqual(visible.data["checked"], 42.)
+        window.maintenance.index.update(visible.data["id"], lyrics="Strawberry")
+        window.maintenance.revision += 1
+        view.refresh_state()
+        self.assertEqual(modifications, [True])
+        self.assertEqual(view.song_selection.get_selected_item().data["id"], visible.data["id"])
         view.details(view.songs.get_item(0).data)
         window.open_import()
         self.assertTrue(window.album_import.get_reveal_child())

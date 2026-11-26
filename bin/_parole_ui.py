@@ -514,14 +514,39 @@ class ParoleView:
             self.page = min(self.page, max(0, (count-1) // PAGE))
             rows = db.execute("SELECT * FROM songs" + where + " ORDER BY owner,album,disc,track,title,id LIMIT ? OFFSET ?",
                               (*args, PAGE, self.page * PAGE)).fetchall()
-        self.songs.splice(0, self.songs.get_n_items(), [Row(row) for row in rows])
-        self.song_selection.set_selected(next((i for i, r in enumerate(rows) if r["id"] == old_id),
-                                              Gtk.INVALID_LIST_POSITION))
+        if self.update_song_rows(rows):
+            self.song_selection.set_selected(next((i for i, r in enumerate(rows) if r["id"] == old_id),
+                                                  Gtk.INVALID_LIST_POSITION))
         self.select_song()
         self.row_count.set_text(f"{count:,} chansons".replace(",", " ") +
                                 (f" · page {self.page+1}/{(count+PAGE-1)//PAGE}" if count > PAGE else ""))
         self.previous.set_sensitive(self.page > 0)
         self.following.set_sensitive((self.page + 1) * PAGE < count)
+
+    def update_song_rows(self, rows):
+        current = [self.songs.get_item(i) for i in range(self.songs.get_n_items())]
+        rendered = ("id", "title", "artist", "album", "duration", "lyrics", "lrc", "kara")
+
+        def retained(item, row):
+            if any(item.data[key] != row[key] for key in rendered):
+                return False
+            # Details still need the latest provenance and file version. A
+            # metadata-only revision leaves the visible Gtk row and selection intact.
+            item.data = row
+            return True
+
+        first, tail = 0, 0
+        common = min(len(current), len(rows))
+        while first < common and retained(current[first], rows[first]):
+            first += 1
+        while first + tail < common and retained(current[-tail - 1], rows[-tail - 1]):
+            tail += 1
+        removed = len(current) - first - tail
+        added = rows[first:len(rows) - tail]
+        if removed or added:
+            self.songs.splice(first, removed, [Row(row) for row in added])
+            return True
+        return False
 
     @staticmethod
     def render_cell(widget, row, field):
