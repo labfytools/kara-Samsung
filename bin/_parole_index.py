@@ -25,6 +25,7 @@ MEDIA, SIDECAR, PREPARATION, REMOVE, ARTWORK = (1 << i for i in range(5))
 EVENT_BATCH = 64
 EVENT_DELAY = .25
 EVENT_MAX_DELAY = 1.5
+REMOVAL_DELAY = .75
 COVER_NAMES = {"cover", "folder", "album", "albumart", "front"}
 COVER_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
 
@@ -306,18 +307,21 @@ class Index:
                 serial=excluded.serial,
                 due=min(excluded.due, index_events.first + ?), attempts=0,
                 combined=index_events.combined+1, proof=coalesce(excluded.proof,index_events.proof)
-        """, ((path, mask, serial, proofs.get(path, {}).get("published", now), now + EVENT_DELAY,
+        """, ((path, mask, serial, proofs.get(path, {}).get("published", now),
+               now + (REMOVAL_DELAY if mask & REMOVE else EVENT_DELAY),
                document(proofs[path]) if path in proofs else None, EVENT_MAX_DELAY) for path in paths))
 
-    def events(self, now, *, size=EVENT_BATCH):
+    def events(self, now, *, size=EVENT_BATCH, light=False):
         with self.db(wait=.15) as db:
             backlog = db.execute("SELECT count(*) FROM index_events").fetchone()[0]
             # Select the ready window in index order, then postpone removals
             # within it so that a destination can first inherit a moved ID.
             rows = db.execute("""
-                SELECT * FROM index_events WHERE due<=? OR (? AND attempts=0)
+                SELECT * FROM index_events WHERE
+                  (due<=? OR (? AND attempts=0 AND mask & ?=0))
+                  AND (NOT ? OR proof IS NOT NULL OR mask & ?=0)
                 ORDER BY due,path LIMIT ?
-            """, (now, backlog >= size, size)).fetchall()
+            """, (now, backlog >= size, REMOVE, light, MEDIA, size)).fetchall()
         return backlog, sorted(rows, key=lambda row: bool(row["mask"] & REMOVE))
 
     def night_budget(self, since=...):
@@ -834,6 +838,10 @@ def probe_track(path):
 def index_path(root, path):
     if not path.is_relative_to(root) or path.suffix.lower() not in AUDIO:
         return False
+    try:
+        str(path).encode("utf-8")
+    except UnicodeError:
+        return False
     parts = path.relative_to(root).parts
     return bool(parts and parts[0] not in SKIP_TOP and not any(p.startswith(".") for p in parts))
 
@@ -867,12 +875,12 @@ def affected_tracks(index, folder):
     # update independent of the total size of the library.
     prefix = str(folder) + "/"
     with index.db(wait=.15) as db:
-        return [row[0] for row in db.execute("SELECT path FROM songs WHERE path>=? AND path<?",
-                                             (prefix, prefix[:-1] + "0")) if Path(row[0]).parent == folder]
+        return [path for row in db.execute("SELECT path FROM songs WHERE path>=? AND path<?",
+                                          (prefix, prefix[:-1] + "0")) if (path := Path(row[0])).parent == folder]
 
 
 def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, paths=None,
-              events=None, reader=probe_track, plan_events=None):
+              events=None, reader=probe_track, plan_events=None, allow_probe=True):
     root = index.root
     counts = dict(scanned=0, changed=0, missing=0, errors=0, unchanged=0, probes=0,
                   reused=0, strawberry=0, transactions=0, receipts=0, delivered=0, combined=0, lag=0.)
@@ -1087,6 +1095,9 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                 info.pop("file_tags", None)
                                 info.pop("probe_error", None)
                             else:
+                                if not allow_probe:
+                                    retry.add(pathname)
+                                    continue
                                 try:
                                     with measure("ffprobe"):
                                         counts["probes"] += 1

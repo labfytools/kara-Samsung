@@ -413,7 +413,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 *self.maintenance.import_activity,
                 int(bool(self.maintenance.active and self.maintenance.active[0] in ("import_lyrics", "import_cover"))))
             self.album_import.refresh_providers()
-            self.maintenance.set_priority(self.maintenance_busy())
+            self.maintenance.set_priority(self.maintenance_busy(), kara=self.kara_busy())
             self.maintenance.start()
         elif not background:
             self.maintenance.show()
@@ -444,9 +444,11 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def maintenance_busy(self):
         # The maintenance owner already yields heavy preparation to pending
         # imports. Import activity itself must not block their enrichment.
+        return self.kara_busy() or self.playback_state == "Playing"
+
+    def kara_busy(self):
         return bool(self.validating or self.party.active is not None or self.game_score.requested
-                    or self.remote_party.phase in ("preparing", "running")
-                    or self.playback_state == "Playing")
+                    or self.remote_party.phase in ("preparing", "running"))
 
     def toggle_vocal_effect(self, button):
         if self.effect_changing:
@@ -625,7 +627,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                                    or "Enregistrer les diagnostics de la partie")
         self.album_import.launch_next()
         if self.maintenance:
-            self.maintenance.set_priority(self.maintenance_busy())
+            self.maintenance.set_priority(self.maintenance_busy(), kara=self.kara_busy())
         return GLib.SOURCE_CONTINUE
 
     def set_remote_music_volume(self, percent):

@@ -5,12 +5,14 @@ import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from time import monotonic
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_index import ARTWORK, MEDIA, PREPARATION, REMOVE, SIDECAR, Index, inventory, revision
+from _parole_index_watch import EVENT, OVERFLOW, Watch
 
 
 class Delivery(unittest.TestCase):
@@ -137,6 +139,35 @@ class Delivery(unittest.TestCase):
                 self.assertEqual(self.take(cache=lambda *_: ("nouveau", "prêt", {}))["changed"], 1)
         row, = self.rows()
         self.assertEqual((row["kara"], row["lrc"]), ("prêt", "local"))
+
+    def test_inotify_delivers_external_files_and_directory_rename(self):
+        self.notify(proof=True)
+        self.take()
+        watch = Watch(self.index, limit=32)
+        self.addCleanup(watch.close)
+        self.assertEqual(watch.poll(), ({}, False))
+        self.assertIsNotNone(watch.fd)
+        self.path.with_suffix(".lrc").write_text("[00:12.00]Nouvelle ligne\n")
+        new = self.path.parent.with_name("Renommé")
+        self.path.parent.rename(new)
+        changed, gap = watch.poll()
+        self.assertFalse(gap)
+        self.assertEqual(changed[self.path] & (SIDECAR | REMOVE), SIDECAR | REMOVE)
+        self.assertEqual(changed[new / self.path.name], MEDIA)
+        (new / "02.flac").write_bytes(b"nouveau fichier")
+        self.assertTrue(watch.poll()[0][new / "02.flac"] & MEDIA)
+
+    def test_inotify_overflow_and_watch_limit_report_gap(self):
+        watch = Watch(self.index, limit=32)
+        self.addCleanup(watch.close)
+        watch.start()
+        with patch("_parole_index_watch.os.read", return_value=EVENT.pack(-1, OVERFLOW, 0, 0)):
+            self.assertEqual(watch.poll(), ({}, True))
+        self.assertIsNone(watch.fd)
+        self.assertGreater(watch.next_start, monotonic())
+        limited = Watch(self.index, limit=1)
+        self.assertEqual(limited.poll(), ({}, True))
+        self.assertIsNone(limited.fd)
 
 
 if __name__ == "__main__":

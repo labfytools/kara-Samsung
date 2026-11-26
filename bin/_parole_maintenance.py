@@ -27,6 +27,7 @@ from _parole_codex import KINDS, research
 from _parole_artist_groups import recover as recover_artist_groups
 from _parole_index import (ARTWORK, LOCAL_REFERENCE_MISS, REFERENCE_REUSE_SECONDS, Index, affected_tracks,
                            document, encoded_key, inventory, path_rows, sidecar)
+from _parole_index_watch import Watch
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
 from _parole_import_enrichment import paths_for as enrichment_paths, pending as enrichment_pending
@@ -165,13 +166,14 @@ class Maintenance:
         self.index_lock = Lock()
         self.index_progress = None
         self.priority = False
+        self.index_priority = False
         self.thread = None
         self.active = None
         self.progress = None
         self.block = ""
         self.cancelled = None
         self.priority_until = 0.
-        self.next_scan = 0
+        self.next_scan = time() + 3
         self.plan_policy = None
         self.network_cursor = 0
         self.network_width = 2
@@ -199,9 +201,10 @@ class Maintenance:
         if self.thread is None:
             self.journal.close()
 
-    def set_priority(self, busy):
+    def set_priority(self, busy, *, kara=None):
         with self.lock:
             self.priority = busy
+            self.index_priority = busy if kara is None else kara
             if busy and self.active and self.active[0] in (*HEAVY, *IMPORT_ENRICHMENT):
                 self.interrupt.set()
         if busy and self.active:
@@ -357,7 +360,7 @@ class Maintenance:
         return True
 
     def index_stopped(self):
-        return self.shutdown.is_set() or self.priority or monotonic() < self.priority_until
+        return self.shutdown.is_set() or self.index_priority or monotonic() < self.priority_until
 
     def scan(self, settings, *, limit=None, replan=False):
         started = monotonic()
@@ -366,7 +369,7 @@ class Maintenance:
         try:
             args = () if self.state_root is None else (self.state_root,)
             associations = self.index.associations(*args)
-            result = inventory(self.index, self.collection, self.inspect_cache, self.index_stopped,
+            result = inventory(self.index, self.collection, self.inspect_cache, lambda: self.index_stopped() or self.priority,
                                lambda scanned: setattr(self, "index_progress", scanned), limit=limit)
             elapsed = monotonic() - started
             self.metrics.update(result, scan_seconds=elapsed, associations=associations)
@@ -391,30 +394,54 @@ class Maintenance:
         # One consumer in the existing maintenance lease owns both the
         # event queue and the periodic reconciliation. Provider work never
         # holds up its delivery, and GTK only signals its wake event.
-        delay = .25
-        while not self.shutdown.is_set():
-            self.index_wake.clear()
-            try:
-                delay = self.index_turn()
-            except (OSError, sqlite3.Error, ValueError) as error:
-                self.journal.emit("INDEX", f"Indexation différée · {type(error).__name__}", "WARNING")
-                delay = 5
-            self.index_wake.wait(delay)
+        # On Linux a thread can lower its own scheduling priority. This also
+        # applies to the one FFprobe it can launch at a time.
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, max(5, os.getpriority(os.PRIO_PROCESS, 0)))
+        except OSError:
+            pass
+        watch = Watch(self.index)
+        try:
+            while not self.shutdown.is_set():
+                self.index_wake.clear()
+                try:
+                    delay = self.index_turn(watch)
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    self.journal.emit("INDEX", f"Indexation différée · {type(error).__name__}", "WARNING")
+                    delay = 5
+                self.index_wake.wait(delay)
+        finally:
+            watch.close()
 
-    def index_turn(self):
+    def index_turn(self, watch=None):
         if self.index_stopped():
             return .5
         settings = self.index.settings(wait=.15)
         if settings["paused"]:
             return .5
         now = time()
-        backlog, events = self.index.events(now)
+        if watch is not None:
+            changes, gap = watch.poll()
+            if gap:
+                self.scan_now.set()
+                self.journal.emit("INDEX", watch.reason or "Surveillance des dossiers rétablie")
+            if changes:
+                try:
+                    with self.index.db(wait=.15) as db:
+                        for mask in sorted(set(changes.values())):
+                            self.index.notify((path for path, value in changes.items() if value == mask), mask, db=db)
+                except sqlite3.Error:
+                    # The kernel batch was consumed. Recover it with the same
+                    # reconciliation used for an overflow.
+                    self.scan_now.set()
+                    raise
+        backlog, events = self.index.events(now, light=self.priority)
         self.metrics["index_pending"] = backlog
         if events:
             started = monotonic()
             with self.index_lock:
                 result = inventory(self.index, self.collection, self.inspect_cache, self.index_stopped,
-                                   lambda *_: None, events=events,
+                                   lambda *_: None, events=events, allow_probe=not self.priority,
                                    plan_events=lambda db, paths: self.plan_events(db, settings, paths))
             duration = monotonic() - started
             self.metrics.update(index_last=result, index_seconds=duration)
@@ -429,8 +456,8 @@ class Maintenance:
                                   f"SQLite {result['phase_seconds'].get('sqlite_lock',0)*1000:.1f} ms")
                 self.wake.set()
             return 0. if backlog > len(events) and delivered else .25
-        if self.scan_now.is_set() or (not backlog and settings["startup"] and now >= self.next_scan and
-                                     (self.foreground.is_set() or settings["night_enabled"])):
+        if not self.priority and (self.scan_now.is_set() or settings["startup"] and now >= self.next_scan and
+                                  (not backlog or now >= self.next_scan + 30)):
             replan = self.scan_now.is_set()
             self.scan_now.clear()
             self.next_scan = now + max(1, settings["scan_minutes"]) * 60
