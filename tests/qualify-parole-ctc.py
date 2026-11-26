@@ -19,10 +19,8 @@ from _kara_turbo import RATE, digest, pcm_file
 from _kara_words import words
 from _parole_process import Interrupted, run
 
-HOP = 320
-KERNEL = 400
-CORE = RATE * 16
-PAD = RATE * 2
+from _kara_ctc import CORE, HOP, KERNEL, cpu_session, emissions, predict, window_grid
+
 GATES = (0, .20, .40, .60, .80)
 FRENCH_WORDS = re.compile(r"[^\W_]+(?:['-][^\W_]+)*")
 FRENCH_PUNCTUATION = str.maketrans({"’": "'", "‘": "'", "‐": "-", "‑": "-"})
@@ -30,18 +28,13 @@ FRENCH_PUNCTUATION = str.maketrans({"’": "'", "‘": "'", "‐": "-", "‑": "
 
 def infer(model, source, checkpoint, symbols):
     import numpy as np
-    import onnxruntime as ort
-
-    session, input_name = None, None
+    runtime = None
     chunks, reused = [], 0
     with pcm_file(source) as (size, fetch):
         if not 1 <= size <= RATE * 3600:
             raise ValueError("Durée PCM hors limites")
         for left in range(0, size, CORE):
-            right = min(left + CORE, size)
-            start, end = max(0, left - PAD), min(size, right + PAD)
-            centers = start + np.arange((end - start - KERNEL) // HOP + 1) * HOP + KERNEL // 2
-            mask = (centers >= left) & (centers < right)
+            start, end, mask = window_grid(size, left)
             receipt = checkpoint / f"{left:09d}.npy"
             if receipt.exists():
                 data = np.load(receipt, allow_pickle=False)
@@ -50,21 +43,9 @@ def infer(model, source, checkpoint, symbols):
                 chunks.append(data)
                 reused += 1
                 continue
-            if session is None:
-                policy = ort.SessionOptions()
-                policy.intra_op_num_threads = policy.inter_op_num_threads = 1
-                session = ort.InferenceSession(str(model), policy, providers=["CPUExecutionProvider"])
-                (input_node,) = session.get_inputs()
-                input_name = input_node.name
-            signal = np.frombuffer(fetch(start, end), dtype="<i2").astype(np.float32) / 32768
-            signal = (signal - signal.mean()) / np.sqrt(signal.var() + 1e-7)
-            (logits,) = session.run(None, {input_name: signal[None, :]})
-            logits = logits[0]
-            if logits.shape != (len(mask), symbols) or not np.isfinite(logits).all():
-                raise ValueError("Horloge ou alphabet du modèle CTC inattendu")
-            usable = logits[mask]
-            logp = usable - usable.max(axis=1, keepdims=True)
-            logp -= np.log(np.exp(logp).sum(axis=1, keepdims=True))
+            if runtime is None:
+                runtime = cpu_session(model)
+            logp = emissions(runtime, fetch(start, end), mask, symbols)
             # A completed window stands alone. An interruption may leave a
             # temporary file but cannot make it visible as a complete window.
             with NamedTemporaryFile(dir=checkpoint, prefix=".ctc-", delete=False) as pending:
@@ -78,68 +59,6 @@ def infer(model, source, checkpoint, symbols):
                     draft.unlink(missing_ok=True)
             chunks.append(logp)
     return np.concatenate(chunks), reused
-
-
-def viterbi(logp, tokens, blank):
-    import numpy as np
-
-    if not tokens or len(tokens) > len(logp):
-        raise ValueError("Référence CTC hors limites")
-    labels = np.full(2 * len(tokens) + 1, blank)
-    labels[1::2] = tokens
-    skip = (labels[2:] != blank) & (labels[2:] != labels[:-2])
-    # One byte per predecessor bounds this prototype at 200 million cells.
-    # A forced path proposes alignments, including for words never sung.
-    if len(labels) * len(logp) > 200_000_000:
-        raise ValueError("Trellis CTC trop volumineux")
-    causes = np.empty((len(logp), len(labels)), dtype=np.uint8)
-    score = np.full(len(labels), -np.inf, dtype=np.float32)
-    score[0] = 0
-    for frame, likelihood in enumerate(logp):
-        best = score.copy()
-        cause = causes[frame]
-        cause.fill(0)
-        improve = score[:-1] > best[1:]
-        best[1:][improve] = score[:-1][improve]
-        cause[1:][improve] = 1
-        improve = skip & (score[:-2] > best[2:])
-        best[2:][improve] = score[:-2][improve]
-        cause[2:][improve] = 2
-        score = best + likelihood[labels]
-    state = len(labels) - (2 if score[-2] > score[-1] else 1)
-    if not np.isfinite(score[state]):
-        raise ValueError("Aucun chemin CTC complet")
-    spans = [[] for _ in tokens]
-    for frame in range(len(logp) - 1, -1, -1):
-        if state % 2:
-            spans[state // 2].append(frame)
-        state -= int(causes[frame, state])
-    return spans
-
-
-def predict(logp, vocabulary, target, *, language="en"):
-    import numpy as np
-
-    blank = vocabulary["<pad>"]
-    text = "|".join(target)
-    if language == "en":
-        text = text.upper()
-    tokens = [vocabulary[character] for character in text]
-    spans = viterbi(logp, tokens, blank)
-    position = 0
-    output = []
-    for word in target:
-        indices = range(position, position + len(word))
-        # Retain the weakest character's best acoustic posterior. This is a
-        # rejection signal, not a calibrated probability for sung words.
-        character_scores = [float(logp[spans[i], tokens[i]].max()) for i in indices]
-        minimum = float(np.exp(min(character_scores)))
-        mean = float(np.exp(sum(character_scores) / len(character_scores)))
-        start = (spans[position][-1] * HOP + KERNEL // 2 - HOP // 2) / RATE
-        end = (spans[position + len(word) - 1][0] * HOP + KERNEL // 2 + HOP // 2) / RATE
-        output.append((start, end, minimum, mean))
-        position += len(word) + 1
-    return output
 
 
 def reference_units(labels, rows, target, parse, language):

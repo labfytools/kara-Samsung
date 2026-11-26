@@ -1,6 +1,7 @@
 """Run the production voice recognition path on a captured window, offline."""
 import argparse
 from dataclasses import asdict
+from hashlib import sha256
 import json
 from pathlib import Path
 import wave
@@ -36,7 +37,8 @@ def main():
         decoder = prepared.load_decoder()
         if args.exact:
             language, spans = decoder.decode(pcm, args.language, args.start, beam=args.beam, trace_tokens=True)
-            print(json.dumps({"language": language, "segments": [asdict(span) for span in spans],
+            print(json.dumps({"input_sha256": sha256(pcm).hexdigest(),
+                              "language": language, "segments": [asdict(span) for span in spans],
                               "decoder": decoder.identity}, ensure_ascii=False))
             return
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768

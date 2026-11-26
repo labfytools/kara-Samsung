@@ -216,40 +216,91 @@ def exact_input(folder, window, call):
     return pcm, metadata, decoder
 
 
-def exact_turbo(args, folder, window):
+def decoder_wave(path, pcm):
+    with open(path, "xb", opener=private_file) as stream, wave.open(stream, "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(pcm)
+
+
+def turbo_clip(args, clip, metadata, decoder, *, local_cpu=False):
     from _kara_paths import BIN, DATA
 
+    python = DATA / "hyprwhspr/venv/bin/python"
+    historic = decoder or {}
+    device = args.device or ("cpu" if local_cpu or historic.get("backend_requested") == "cpu" else "gpu")
+    command = [str(python) if python.is_file() else sys.executable, "-B",
+               str(BIN / "_kara_blackbox_replay.py"), str(clip), args.language or metadata["language_requested"],
+               str(metadata["begin"]), str(metadata["end"]), "--device", device, "--exact"]
+    if local_cpu:
+        command.extend(("--threads", "2"))
+    elif historic.get("threads") and args.device is None:
+        command.extend(("--threads", str(historic["threads"])))
+    use_beam = args.beam if args.beam is not None else bool(metadata["beam_size"])
+    if use_beam:
+        command.append("--beam")
+    result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=240)
+    decoded = json.loads(result.stdout)
+    if decoded["input_sha256"] != metadata["input_sha256"]:
+        raise ValueError("Le moteur Turbo a lu un autre PCM.")
+    return decoded
+
+
+def exact_turbo(args, folder, window):
     pcm, metadata, decoder = exact_input(folder, window, args.call)
-
-    def write(path):
-        with open(path, "xb", opener=private_file) as stream, wave.open(stream, "wb") as wav:
-            wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
-            wav.writeframes(pcm)
-
     if args.action == "extract-turbo":
         if args.output is None:
             raise ValueError("Fournis le chemin de sortie WAV avec --output.")
-        write(args.output)
+        decoder_wave(args.output, pcm)
         output({"frames": metadata["input_frames"], "sha256": metadata["input_sha256"], "call": args.call})
         return
-    python = DATA / "hyprwhspr/venv/bin/python"
-    historic = decoder or {}
-    device = args.device or ("cpu" if historic.get("backend_requested") == "cpu" else "gpu")
     with TemporaryDirectory(prefix="kara-turbo-replay-") as draft:
         clip = Path(draft) / "decoder.wav"
-        write(clip)
-        command = [str(python) if python.is_file() else sys.executable, "-B",
-                   str(BIN / "_kara_blackbox_replay.py"), str(clip), args.language or metadata["language_requested"],
-                   str(metadata["begin"]), str(metadata["end"]), "--device", device, "--exact"]
-        if historic.get("threads") and args.device is None:
-            command.extend(("--threads", str(historic["threads"])))
-        use_beam = args.beam if args.beam is not None else bool(metadata["beam_size"])
-        if use_beam:
-            command.append("--beam")
-        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=240)
+        decoder_wave(clip, pcm)
+        result = turbo_clip(args, clip, metadata, decoder)
     output({"input_sha256": metadata["input_sha256"], "call": args.call, "historical": metadata,
             "historical_decoder": decoder,
-            "replayed": json.loads(result.stdout)})
+            "replayed": result})
+
+
+def compare_recognition(args, folder, window):
+    from _kara_paths import BIN
+    from _kara_recognition_compare import paired_results
+
+    if args.recognizers != "turbo" and not (args.ctc_model and args.ctc_vocab):
+        raise ValueError("Le moteur CTC exige --ctc-model et --ctc-vocab, deux fichiers locaux.")
+    truth = truth_sha256 = None
+    if args.truth:
+        with open(args.truth, "rb", opener=private_file) as stream:
+            raw = stream.read(8193)
+        if len(raw) > 8192:
+            raise ValueError("Transcription humaine trop longue pour un appel du décodeur.")
+        truth, truth_sha256 = raw.decode("utf-8"), sha256(raw).hexdigest()
+    pcm, metadata, decoder = exact_input(folder, window, args.call)
+    results = {}
+    with TemporaryDirectory(prefix="kara-recognition-") as draft:
+        clip = Path(draft) / "shared.wav"
+        decoder_wave(clip, pcm)
+        if args.recognizers != "ctc":
+            turbo = turbo_clip(args, clip, metadata, decoder, local_cpu=True)
+            turbo["words"] = [{**word, "word": word["text"]} for span in turbo["segments"]
+                              if span["no_speech"] <= .65 for word in span["words"]]
+            results["turbo"] = turbo
+        if args.recognizers != "turbo":
+            command = [str(args.ctc_python or sys.executable), "-B", str(BIN / "_kara_ctc.py"), str(clip),
+                       str(args.ctc_model.resolve(strict=True)), str(args.ctc_vocab.resolve(strict=True))]
+            worker = subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+            ctc = json.loads(worker.stdout)
+            # Both reports use the origin of the captured Turbo job.
+            for word in ctc["words"]:
+                word["start"] += metadata["begin"]
+                word["end"] += metadata["begin"]
+            results["ctc"] = ctc
+    language = args.language or metadata.get("language_requested")
+    if not language or language == "auto":
+        language = results.get("turbo", {}).get("language") or metadata.get("language_detected")
+    result = paired_results(metadata["input_sha256"], results, language, truth)
+    output({**result, "cycle": window["cycle"], "window": window["data"]["window"], "call": args.call,
+            "reference_transcript_sha256": truth_sha256})
 
 
 def replay_round(args, folder):
@@ -306,7 +357,7 @@ def main():
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
                                           "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
-                                          "extract-turbo", "replay-turbo",
+                                          "extract-turbo", "replay-turbo", "compare-recognition",
                                           "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
                                           "annotate", "simulate", "delete", "prune"))
     parser.add_argument("session", nargs="?", default="latest")
@@ -337,6 +388,11 @@ def main():
     parser.add_argument("--language")
     parser.add_argument("--call", type=int, default=0)
     parser.add_argument("--beam", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--recognizers", choices=("turbo", "ctc", "both"), default="both")
+    parser.add_argument("--ctc-model", type=Path)
+    parser.add_argument("--ctc-vocab", type=Path)
+    parser.add_argument("--ctc-python", type=Path)
+    parser.add_argument("--truth", type=Path, help="transcription humaine indépendante de l’appel sélectionné")
     parser.add_argument("--backing", type=Path)
     parser.add_argument("--original", type=Path)
     args = parser.parse_args()
@@ -477,7 +533,7 @@ def main():
             if item is None:
                 raise ValueError("Événement PCM introuvable.")
             output(extract_pcm(folder, item, args.output, args.frames))
-        elif args.action in ("extract", "replay-whisper", "extract-turbo", "replay-turbo"):
+        elif args.action in ("extract", "replay-whisper", "extract-turbo", "replay-turbo", "compare-recognition"):
             if args.id is None:
                 raise ValueError("Fournis l’identifiant d’événement de fenêtre avec --id.")
             if args.action == "extract" and args.output is None:
@@ -485,9 +541,12 @@ def main():
             window = next((item for item in matching(args, folder) if item["event"] == "window"), None)
             if window is None:
                 raise ValueError("Fenêtre vocale introuvable.")
-            if args.action in ("extract-turbo", "replay-turbo"):
+            if args.action in ("extract-turbo", "replay-turbo", "compare-recognition"):
                 validate_recording(folder, read(folder / "manifest.json"))
-                exact_turbo(args, folder, window)
+                if args.action == "compare-recognition":
+                    compare_recognition(args, folder, window)
+                else:
+                    exact_turbo(args, folder, window)
             elif args.action == "extract":
                 output(extract_window(folder, window, args.output, reconstruct_gaps=args.reconstruct_gaps))
             else:

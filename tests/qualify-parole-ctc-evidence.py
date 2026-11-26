@@ -13,34 +13,11 @@ import numpy as np
 HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1] / "bin"))
 from _kara_turbo import digest
+from _kara_ctc import greedy
 from _kara_words import words
 
 SUBSTITUTIONS = {"a": "the", "and": "but", "i": "he", "in": "on", "is": "was",
                  "it": "this", "my": "your", "to": "for", "you": "we"}
-
-
-def greedy(logp, vocabulary, offset, hop):
-    alphabet = {value: key for key, value in vocabulary.items()}
-    blank, separator = vocabulary["<pad>"], vocabulary["|"]
-    symbols, start, end, previous = [], None, None, blank
-    for frame, symbol in enumerate(logp.argmax(axis=1)):
-        if symbol == separator and symbols:
-            normalized = words("".join(symbols))
-            if len(normalized) == 1:
-                yield normalized[0], offset + start * hop, offset + (end + 1) * hop
-            symbols, start, end = [], None, None
-        character = alphabet[symbol]
-        if len(character) == 1 and character != "|":
-            if symbol != previous:
-                symbols.append(character)
-            if start is None:
-                start = frame
-            end = frame
-        previous = symbol
-    if symbols:
-        normalized = words("".join(symbols))
-        if len(normalized) == 1:
-            yield normalized[0], offset + start * hop, offset + (end + 1) * hop
 
 
 def corroborate(known, forced, independent, tolerance=.5, *, require_overlap=True):

@@ -65,6 +65,19 @@ bin/kara-blackbox replay-turbo latest --id FENETRE --call 0 --device cpu --beam
 
 Ces commandes requièrent une entrée Turbo V3 complète. Elles vérifient la taille et le SHA-256 relevé au point d’appel du décodeur. Le rejeu relance le décodeur sur ces octets et compare sa trace aux métadonnées historiques, avec choix du dispositif, de la langue et du décodage beam. Le terminal affiche les segments et les tokens. Une différence de moteur, de modèle, de backend ou de réglage doit être prise en compte dans l’interprétation des divergences.
 
+### Comparer Turbo et CTC
+
+```sh
+bin/kara-blackbox compare-recognition latest --id FENETRE --call 0 \
+  --ctc-python .runtime/omega-ii/ctc/venv/bin/python \
+  --ctc-model .runtime/omega-ii/ctc/fr/model.int8.onnx \
+  --ctc-vocab .runtime/omega-ii/ctc/fr/vocab.json
+```
+
+Les deux décodeurs lisent successivement le même PCM16 mono 16 kHz issu d’un appel exact de la capture. Le résultat exige que chaque moteur atteste l’empreinte des octets lus. Le CTC décode librement les émissions ONNX sur CPU, avec le fenêtrage et le moteur déjà employés dans OMEGA II. Ses repères et ceux de Turbo utilisent l’origine de la fenêtre du score. Choisir le modèle et le vocabulaire locaux de la langue. `--recognizers ctc` ou `--recognizers turbo` rejoue un seul étage. Par défaut la comparaison lance Turbo sur CPU avec deux threads.
+
+Les variantes phonétiques comparent les sorties lexicales en français ou en anglais. Elles utilisent la clé d’OMEGA II avec égalité ou distance d’édition d’au plus un. Ces variantes comprennent des faux positifs connus sur les mots voisins. Le WER strict n’est calculé que si `--truth` désigne une transcription humaine indépendante qui couvre exactement l’appel choisi. Le texte attendu par le jeu n’est pas utilisé dans le décodage ni comme vérité terrain. Les résultats de cette commande restent séparés du score en production.
+
 ## Annotations et simulation
 
 ```sh

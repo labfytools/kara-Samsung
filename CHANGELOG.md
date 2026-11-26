@@ -17,6 +17,7 @@
 - Signaler les fenêtres sans décision, les répétitions observées et les décisions de score incohérentes dans le rapport BlackBox.
 - Identifier les sorties et paramètres audio du cycle, puis vérifier leur compatibilité avec un reçu de calibration explicite.
 - Comparer le moteur SPA de PipeWire Echo Cancel hors ligne et vérifier les empreintes des trames communes aux candidats.
+- Comparer Turbo, CTC et les variantes phonétiques sur le même PCM BlackBox, avec WER sur transcription humaine fournie.
 
 - Réserver la préparation nocturne aux références locales ou déjà obtenues tant que les fournisseurs de références sont indisponibles.
 - Répéter un extrait de brouillon trois fois et le ralentir à 80 % en préservant la hauteur, avec arrêt sur reprise de Kara ou de Strawberry.

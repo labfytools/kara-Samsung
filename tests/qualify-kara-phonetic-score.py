@@ -10,9 +10,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 import _kara_scoring as scoring
 from _kara_blackbox import events, session_folders, validate_recording
+from _kara_recognition_compare import phonetic_match
 from _kara_words import detect_language
-from _parole_acoustic import sound
-from _parole_separation_metrics import edit_distance
 
 BASE_MATCH = scoring.same_word
 MODES = {"exact": None, "cle_phonetique": 0, "edition_phonetique": 1}
@@ -24,10 +23,7 @@ def evaluate(reference, heard, source, tolerance, language):
         def match(target, text):
             if BASE_MATCH(target, text):
                 return True
-            if edits is None or not language:
-                return False
-            a, b = sound(target, language), sound(text, language)
-            return min(len(a), len(b)) >= 4 and edit_distance(a, b) <= edits
+            return edits is not None and phonetic_match(target, text, language, edits)
 
         # Reuse the production source gate and the existing match clock.
         # Only this offline call changes lexical comparison.
