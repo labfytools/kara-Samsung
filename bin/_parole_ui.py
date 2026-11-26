@@ -1012,6 +1012,7 @@ class ParoleView:
             ("temperature", "Température maximale (°C)", 45, 95),
             ("gpu", "Charge GPU avant départ (%)", 0, 95), ("disk_busy", "Activité disque avant départ (%)", 1, 95),
             ("network_timeout", "Durée maximale par recherche classique (secondes)", 15, 300),
+            ("network_workers", "Maximum de recherches indépendantes en parallèle", 1, 20),
             ("heavy_daily", "Préparations anticipées par jour", 1, 100),
         ):
             number(resources, *spec)

@@ -95,6 +95,25 @@ def provider_policy(index, identity, *, validation=False):
     return daily, configured
 
 
+def ready_categories(index, now):
+    """Advisory admission only. Transport reserves the actual quota atomically."""
+    with index.db(wait=.15) as db:
+        rows = db.execute("""SELECT s.id,s.category,s.config,coalesce(u.used,0) AS used
+                             FROM sources s LEFT JOIN daily_usage u
+                               ON u.bucket='provider:'||s.id AND u.day=?
+                             WHERE s.state='active' AND NOT EXISTS
+                               (SELECT 1 FROM import_provider_limits l WHERE l.source=s.id AND l.until>?)""",
+                          (date.fromtimestamp(now).isoformat(), now)).fetchall()
+    ready = set()
+    for row in rows:
+        daily, _ = provider_limits(json.loads(row["config"]))
+        if row["used"] < daily:
+            ready.update(row["category"].split(","))
+            if row["id"] == "MusicBrainz":
+                ready.add("musicbrainz")
+    return ready
+
+
 def audio_policies(index, *, now=None):
     """Read the configured request budgets and observed provider signals."""
     now = time() if now is None else now

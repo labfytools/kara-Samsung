@@ -1,5 +1,6 @@
 """Ordonnanceur de maintenance rattaché au propriétaire GTK du service Kara."""
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from logging import Logger
 from logging.handlers import RotatingFileHandler
@@ -31,7 +32,7 @@ from _parole_import_enrichment import paths_for as enrichment_paths, pending as 
 from _parole_night import Night
 from _parole_process import Interrupted, run
 from _parole_resources import Resources
-from _parole_sources import discover, seed, controls
+from _parole_sources import discover, seed, controls, ready_categories
 from _paroles_lrc import MAX_LRC_BYTES
 
 CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
@@ -40,6 +41,8 @@ CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNL
 NIGHT_NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata")
 NETWORK = (*NIGHT_NETWORK, "codex", "source", "source_probe")
 NETWORK_FLAGS = {"album": "albums", "source": None, "source_probe": None}
+NETWORK_CATEGORY = {"lyrics": "lyrics", "lrc": "lrc", "album": "musicbrainz", "metadata": "musicbrainz",
+                    "discography": "musicbrainz", "cover": "cover"}
 NETWORK_TURN = ("lrc", "lyrics", "album", "lrc", "discography", "lyrics", "cover", "metadata", "codex", "source", "source_probe")
 CHECKED_RESULTS = {"complete", "incomplete", "checked", "partial", "identified", "found", "not_found",
                    "invalid", "ambiguous", "instrumental", "present"}
@@ -162,6 +165,8 @@ class Maintenance:
         self.priority_until = 0.
         self.next_scan = 0
         self.network_cursor = 0
+        self.network_width = 2
+        self.network_active = {}
         self.import_enrichment_turn = 0
         self.import_activity = (0, 0)
         self.import_lyrics_stats = None
@@ -219,6 +224,8 @@ class Maintenance:
     def cancel(self, kind, subject):
         self.index.cancel(kind, subject)
         with self.lock:
+            if event := self.network_active.get((kind, subject)):
+                event.set()
             if self.active == (kind, subject):
                 self.cancelled = self.active
                 self.interrupt.set()
@@ -562,7 +569,7 @@ class Maintenance:
         return ("temporary" if state not in ("excluded",) else "excluded",
                 state, self.current_settings["review_days"] * DAY)
 
-    def output(self, command, timeout=140, observer=None, maximum=262_144, *, extra_env=None):
+    def output(self, command, timeout=140, observer=None, maximum=262_144, *, extra_env=None, stop=None):
         env = dict(os.environ, KARA_MUSIC_LIBRARY=str(self.index.root))
         if extra_env:
             env.update(extra_env)
@@ -572,8 +579,115 @@ class Maintenance:
             env["KARA_DEMUCS_THREADS"] = "2"
         # All input paths are program arguments; no shell evaluates titles or paths.
         retain = tuple(fd for fd in (self.owner, self.import_owner) if fd is not None)
-        return run(command, stop=self.stopped, timeout=timeout, event=observer, env=env, maximum=maximum,
+        return run(command, stop=self.stopped if stop is None else stop, timeout=timeout, event=observer, env=env, maximum=maximum,
                    retain=retain)
+
+    def network_output(self, task, settings, *, stop=None):
+        kind, subject = task["kind"], task["subject"]
+        code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
+                                 timeout=220 if kind == "source" else settings["network_timeout"], stop=stop)
+        if code:
+            raise ValueError("Moteur réseau arrêté")
+        return json.loads(data)
+
+    def network_result(self, task, value):
+        kind = task["kind"]
+        outcome = value["state"]
+        if kind in ("lyrics", "lrc"):
+            return self.do_song(task, value)
+        if kind == "cover":
+            if outcome == "not_found":
+                self.queue_codex("cover", task["subject"], "aucune pochette vérifiée")
+            if outcome == "found":
+                self.journal.emit("COVER", "Pochette vérifiée et publiée")
+            return "temporary", outcome, DAY if outcome == "temporary" else 30 * DAY
+        if kind == "source_probe":
+            self.journal.emit("SOURCE", "Documentation accessible" if outcome == "available" else
+                              "Documentation ou conditions à vérifier")
+            return ("done" if outcome == "available" else "review"), outcome, 0
+        if kind == "source":
+            self.journal.emit("SOURCE", "Fournisseur validé et activé" if outcome == "complete" else
+                              "Vérification du fournisseur échouée", "INFO" if outcome == "complete" else "WARNING")
+            return ("done" if outcome == "complete" else "review"), outcome, 0
+        return self.do_review(task, value)
+
+    def finish_network(self, task, future, window):
+        publication = False
+        try:
+            value = future.result()
+            result = self.network_result(task, value)
+            publication = value["state"] == "found" and value.get("source") not in (None, "Strawberry")
+        except Interrupted:
+            result = "suspended", "ressources libérées", 45
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
+            self.journal.emit(task["kind"].upper(), "Moteur indisponible ou réponse invalide", "WARNING")
+            result = "temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8))
+        self.index.finish(task, *result, closed=self.closed_outcome(window, result), network_found=publication)
+        self.revision += 1
+        return self.network_completed(result)
+
+    @staticmethod
+    def network_completed(result):
+        state, detail, _ = result
+        return state != "suspended" and (state != "temporary" or detail in CHECKED_RESULTS)
+
+    @staticmethod
+    def closed_outcome(window, result):
+        if window is not None:
+            state, detail, _ = result
+            outcome = ("interrupted" if state == "suspended" else "completed"
+                       if state in ("done", "review", "excluded") or detail in CHECKED_RESULTS else "deferred")
+            return window, outcome
+        return None
+
+    def network_batch(self, tasks, settings, *, nocturnal):
+        stop = Event()
+        window = self.night.window if nocturnal else None
+        successful = 0
+        with self.lock:
+            self.active = ("network", "")
+            self.interrupt.clear()
+            self.network_active = {(task["kind"], task["subject"]): Event() for task in tasks}
+        self.night_running = nocturnal
+        self.night_settings_at = 0.
+        self.journal.emit("SYSTEM", f"Recherches classiques en parallèle · {len(tasks)} tâches")
+        try:
+            if self.stopped():
+                stop.set()
+            with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="parole-recherche") as pool:
+                # Only the maintenance owner changes queue state and
+                # supervises the shared resource governor. Each thread
+                # merely runs one bounded engine with its own stop event.
+                pending = {}
+                for task in tasks:
+                    event = self.network_active[task["kind"], task["subject"]]
+                    job = pool.submit(self.network_output, task, settings,
+                                      stop=lambda event=event: stop.is_set() or event.is_set())
+                    pending[job] = task
+                try:
+                    while pending:
+                        if not stop.is_set() and self.stopped():
+                            stop.set()
+                        completed, _ = wait(pending, timeout=.15, return_when=FIRST_COMPLETED)
+                        for job in sorted(completed, key=lambda item: (pending[item]["kind"], pending[item]["subject"])):
+                            task = pending.pop(job)
+                            successful += self.finish_network(task, job, window)
+                finally:
+                    stop.set()
+        finally:
+            with self.lock:
+                self.network_active.clear()
+                self.active = None
+                self.interrupt.clear()
+            self.night_running = False
+            if nocturnal and self.night.release_after_work:
+                self.night.close(reason=self.night.reason)
+        # Keep a finite production bound, then grow after healthy batches.
+        # A restricted or failing batch reduces contention at the transport.
+        if successful * 2 < len(tasks):
+            self.network_width = max(1, self.network_width // 2)
+        elif successful == len(tasks):
+            self.network_width = min(20, self.network_width + 1)
 
     def enrich_import(self, task):
         kind, subject = task["kind"], task["subject"]
@@ -926,30 +1040,9 @@ class Maintenance:
                 self.journal.emit("CACHE", f"{removed} dossiers intermédiaires retirés")
                 result = ("done", "nettoyé", 0)
             else:
-                _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
-                                      timeout=220 if kind == "source" else self.current_settings["network_timeout"])
-                value = json.loads(data)
-                if kind in ("lyrics", "lrc"):
-                    result = self.do_song(task, value)
-                    network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry")
-                elif kind == "source_probe":
-                    self.journal.emit("SOURCE", "Documentation accessible" if value["state"] == "available" else
-                                      "Documentation ou conditions à vérifier")
-                    result = ("done" if value["state"] == "available" else "review", value["state"], 0)
-                elif kind == "cover":
-                    outcome = value["state"]
-                    if outcome == "not_found":
-                        self.queue_codex("cover", subject, "aucune pochette vérifiée")
-                    if outcome == "found":
-                        self.journal.emit("COVER", "Pochette vérifiée et publiée")
-                    result = ("temporary", outcome, DAY if outcome == "temporary" else 30 * DAY)
-                elif kind == "source":
-                    activated = value["state"] == "complete"
-                    self.journal.emit("SOURCE", "Fournisseur validé et activé" if activated else "Vérification du fournisseur échouée",
-                                      "INFO" if activated else "WARNING")
-                    result = ("done" if activated else "review", value["state"], 0)
-                else:
-                    result = self.do_review(task, value)
+                value = self.network_output(task, self.current_settings)
+                result = self.network_result(task, value)
+                network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry")
         except Interrupted:
             import_suspended = self.import_owner is not None and self.import_queue.pause_requested()
             result = ("suspended", "ressources libérées", 0 if import_suspended else 45)
@@ -991,17 +1084,13 @@ class Maintenance:
                 pass
             stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
                          corrected=corrected, generated=generated, measurements=self.night_measures)
-        closed = None
-        if window is not None:
-            outcome = ("interrupted" if state == "suspended" else "completed"
-                       if state in ("done", "review", "excluded") or detail in CHECKED_RESULTS else "deferred")
-            closed = window, outcome
-        self.index.finish(task, *result, night=stats, closed=closed, refund_attempt=import_suspended,
-                          network_found=network_found)
+        self.index.finish(task, *result, night=stats, closed=self.closed_outcome(window, result),
+                          refund_attempt=import_suspended, network_found=network_found)
         if import_suspended:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
         self.revision += 1
+        return result
 
     def authorized_imports(self, settings):
         if (self.import_queue is None or self.import_queue.pause_requested()
@@ -1192,39 +1281,59 @@ class Maintenance:
             return
         self.tick_network(settings, now, self.network_kinds(settings, now))
 
-    @staticmethod
-    def network_kinds(settings, now, *, nocturnal=False):
+    def network_kinds(self, settings, now, *, nocturnal=False):
+        ready = ready_categories(self.index, now)
         return tuple(kind for kind in (NIGHT_NETWORK if nocturnal else NETWORK)
                      if (NETWORK_FLAGS.get(kind, kind) is None or settings[NETWORK_FLAGS.get(kind, kind)])
+                     and (kind not in NETWORK_CATEGORY or NETWORK_CATEGORY[kind] in ready)
                      and (kind != "codex" or now >= settings.get("codex_suspended_until", 0)))
 
     def tick_network(self, settings, now, kinds, *, nocturnal=False):
         manual = self.index.claim(("codex",), now, high=True, codex_auto=settings["codex_auto"]) if "codex" in kinds else None
-        if manual is None:
-            manual = self.index.claim(tuple(kind for kind in kinds if kind != "codex"), now, high=True)
         if manual is not None:
             self.execute(manual, nocturnal=nocturnal)
             return True
-        # Stagger task classes so a large burst of missing LRC never starves
-        # album checks or source validation for the entire library.
+        kinds_without_codex = tuple(kind for kind in kinds if kind != "codex")
+        first = self.index.claim(kinds_without_codex, now, high=True) or self.claim_network(settings, now, kinds)
+        if first is None:
+            return False
+        tasks = [first]
+        maximum = max(1, min(20, settings["network_workers"], self.network_width))
+        if first["kind"] in NIGHT_NETWORK and maximum > 1:
+            batch_kinds = tuple(kind for kind in kinds if kind in NIGHT_NETWORK)
+            subjects = [first["subject"]]
+            while len(tasks) < maximum:
+                task = self.claim_network(settings, now, batch_kinds, avoid=subjects)
+                if task is None:
+                    break
+                tasks.append(task)
+                subjects.append(task["subject"])
+        if len(tasks) == 1:
+            result = self.execute(first, nocturnal=nocturnal)
+            if self.network_width == 1 and result and self.network_completed(result):
+                self.network_width = 2
+        else:
+            self.network_batch(tasks, settings, nocturnal=nocturnal)
+        return True
+
+    def claim_network(self, settings, now, kinds, *, avoid=()):
+        # Interleave job classes and avoid concurrent changes to the same
+        # track or edition, including text/LRC pairs on one recording.
         for _ in NETWORK_TURN:
             kind = NETWORK_TURN[self.network_cursor]
             self.network_cursor = (self.network_cursor + 1) % len(NETWORK_TURN)
-            if kind not in kinds:
-                continue
-            task = self.index.claim((kind,), now, codex_auto=settings["codex_auto"])
-            if task is not None:
-                self.execute(task, nocturnal=nocturnal)
-                return True
-        return False
+            if kind in kinds:
+                task = self.index.claim((kind,), now, codex_auto=settings["codex_auto"], avoid=avoid)
+                if task is not None:
+                    return task
+        return None
 
     def tick_night(self, settings, now):
-        closed = self.night.window is not None and self.night.desktop.lid and self.night.lid_fd is not None
-        kinds = self.network_kinds(settings, now, nocturnal=True) if closed else ()
+        kinds = self.network_kinds(settings, now, nocturnal=True)
         network_due = self.index.work_due(kinds, now)
         prepare_due = self.index.preparation_due(now)
-        # One owner, one engine at a time. Offer the other class the next
-        # turn so a continuous backlog of either class cannot starve it.
+        # Offer the other class the next turn. A bounded network batch
+        # alternates with one song, so neither class can starve the other.
         order = (True, False) if self.night_network_next else (False, True)
         for light in order:
             if not (network_due if light else prepare_due):

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 from time import time
+from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
@@ -143,6 +144,34 @@ class QueueTests(Fixture):
         self.assertEqual(index.network_yield(now=120), {"lyrics": 1})
         self.assertEqual(index.network_yield(now=3660), {})
 
+    def test_network_batch_settles_fast_track_while_another_waits(self):
+        owner = Maintenance(self.root, None, state=self.base / "state")
+        self.addCleanup(owner.close)
+        index = owner.index
+        owner.current_settings = index.settings()
+        for kind, subject in (("lrc", "same"), ("lyrics", "same"), ("lyrics", "fast")):
+            index.enqueue(kind, subject, "fixture", now=5)
+        fast_settled = Event()
+
+        def output(task, settings, *, stop):
+            if task["subject"] == "same" and not fast_settled.wait(2):
+                raise TimeoutError("La sortie rapide n’a pas pu être traitée")
+            return {"state": "found", "source": "LRCLIB"}
+
+        def result(task, _value):
+            if task["subject"] == "fast":
+                fast_settled.set()
+            return "done", "found", 0
+
+        owner.network_output = output
+        owner.network_result = result
+        self.assertTrue(owner.tick_network(owner.current_settings, 6, ("lrc", "lyrics")))
+        with index.db() as db:
+            states = {(r["kind"], r["subject"]): r["state"] for r in db.execute("SELECT * FROM tasks")}
+        self.assertEqual(states, {("lrc", "same"): "done", ("lyrics", "same"): "queued", ("lyrics", "fast"): "done"})
+        self.assertEqual(owner.network_width, 3)
+        self.assertFalse(owner.network_active)
+
     def test_automatic_codex_is_opt_in_and_manual_claims_remain_available(self):
         self.assertFalse(self.index.settings()["codex_auto"])
         self.index.enqueue("codex", "automatic", "rev", priority=10, now=5)
@@ -239,6 +268,19 @@ class CatalogueTests(unittest.TestCase):
 
 
 class SourceTests(Fixture):
+    def test_unavailable_catalogue_leaves_lyrics_eligible(self):
+        from _parole_import_metrics import limited
+        from _parole_sources import ready_categories, seed
+
+        seed(self.index)
+        now = time()
+        self.assertIn("musicbrainz", ready_categories(self.index, now))
+        limited(self.index, "MusicBrainz", 30, 503, now=now)
+        ready = ready_categories(self.index, now)
+        self.assertNotIn("musicbrainz", ready)
+        self.assertIn("lyrics", ready)
+        self.assertIn("musicbrainz", ready_categories(self.index, now + 30))
+
     def test_maintenance_queries_use_track_review_and_fall_back_to_tags(self):
         self.audio()
         self.scan()

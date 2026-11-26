@@ -28,7 +28,7 @@ DEFAULTS = {
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
     "import_strategy": "speed", "import_preferred": "",
     "import_lyrics_workers": 4,
-    "gpu": 15, "disk_busy": 25, "network_timeout": 145, "heavy_daily": 3,
+    "gpu": 15, "disk_busy": 25, "network_timeout": 145, "network_workers": 4, "heavy_daily": 3,
     "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
     "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,
     "night_idle": 420, "night_cpu_temperature": 78, "night_gpu_temperature": 75,
@@ -356,10 +356,12 @@ class Index:
             self.reserve(db, bucket, day, now, gap)
             return True
 
-    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None):
+    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None,
+              avoid=()):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
+        excluded = ",".join("?" for _ in avoid)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             day = date.fromtimestamp(now).isoformat()
@@ -368,12 +370,13 @@ class Index:
             task = db.execute(f"""
                 UPDATE tasks SET state='running', updated=?, attempts=attempts+1
                 WHERE rowid=(SELECT rowid FROM tasks WHERE kind IN ({placeholders})
+                    AND subject NOT IN ({excluded})
                     AND state IN ('queued','suspended','temporary') AND due<=? AND (NOT ? OR priority<=15)
                     AND (? OR kind!='codex' OR json_extract(payload,'$.manual')=1
                          OR json_extract(payload,'$.kind') IN ('adapter','import_patch'))
                     ORDER BY max(10,priority-cast((?-due)/86400 AS INTEGER)),due,subject LIMIT 1)
                 RETURNING *
-            """, (now, *kinds, now, high, codex_auto, now)).fetchone()
+            """, (now, *kinds, *avoid, now, high, codex_auto, now)).fetchone()
             if bucket and task is not None:
                 self.reserve(db, bucket, day, now, gap)
             if night is not None and task is not None:
