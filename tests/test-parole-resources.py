@@ -13,10 +13,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_index import DEFAULTS
 from _parole_maintenance import Journal, Maintenance
-from _parole_resources import GIB, Resources, contents
+from _parole_resources import GIB, Resources, contents, thermal_admission
 
 
 class ResourceTests(unittest.TestCase):
+    def test_configurable_closed_lid_thermal_ceiling(self):
+        self.assertFalse(thermal_admission(DEFAULTS, [70], [60], nocturnal=True, closed=True))
+        self.assertTrue(thermal_admission(DEFAULTS, [69], [60], nocturnal=True, closed=True))
+        settings = dict(DEFAULTS, night_cpu_temperature=90, night_gpu_temperature=90,
+                        night_closed_temperature=90)
+        self.assertTrue(thermal_admission(settings, [89.9], [89.9], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [90], [70], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [70], [90], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [], [60], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [60], [], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [0], [60], nocturnal=True, closed=True))
+        settings.update(night_cpu_temperature=100, night_gpu_temperature=100, night_closed_temperature=100)
+        self.assertFalse(thermal_admission(settings, [90], [60], nocturnal=True, closed=True))
+        settings.update(night_gpu_temperature=75)
+        self.assertFalse(thermal_admission(settings, [80], [75], nocturnal=True, closed=True))
+
     def test_stem_shared_blocks_do_not_count_twice_against_the_cap(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

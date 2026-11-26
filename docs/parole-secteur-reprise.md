@@ -13,3 +13,7 @@ Retour logiciel : redéployer la révision précédente au repos, sans restaurer
 ## Durée illimitée sur secteur
 
 Le réglage `night_minutes=0` désactive uniquement l’expiration temporelle. Les durées finies restent disponibles dans les paramètres. Le test simule 49 heures de maintien puis une perte secteur et confirme que l’inhibiteur est libéré après le délai de confirmation. Les protections thermiques, mémoire, disque, verrouillage et veille manuelle restent inchangées. Une endurance physique de 48 heures n’a pas été mesurée.
+
+## Plafond thermique configurable à 90 °C
+
+Sur demande explicite de l’utilisateur, les trois réglages nocturnes peuvent atteindre 90 °C, y compris capot fermé. Les valeurs par défaut restent conservatrices (78/75/70 °C). Le calcul est interrompu dès que l’un des capteurs atteint la limite effective ou si un capteur nécessaire est absent. La protection matérielle, le gouverneur mémoire et la réserve disque restent inchangés. Le plafond ne constitue pas une température cible ni une qualification d’endurance capot fermé.

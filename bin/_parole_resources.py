@@ -68,6 +68,19 @@ def multimedia_active():
     return b"Corked: no" in query.stdout
 
 
+def thermal_admission(settings, cpu_t, gpu_t, *, nocturnal=False, closed=False):
+    cpu_limit = settings["night_cpu_temperature" if nocturnal else "temperature"]
+    gpu_limit = settings["night_gpu_temperature" if nocturnal else "temperature"]
+    if closed:
+        # Explicitly configurable, with a hard application ceiling of 90°C.
+        # Keep the conservative defaults and all sensor validation.
+        closed_limit = min(90, settings["night_closed_temperature"])
+        cpu_limit, gpu_limit = min(cpu_limit, closed_limit), min(gpu_limit, closed_limit)
+    temperatures = ((cpu_t or gpu_t) and all(0 < value < cpu_limit for value in cpu_t)
+                    and all(0 < value < gpu_limit for value in gpu_t))
+    return bool(temperatures and (not nocturnal or (cpu_t and gpu_t)))
+
+
 class Resources:
     def __init__(self, root):
         self.root = root
@@ -213,15 +226,7 @@ class Resources:
                     sensors.setdefault(name, []).extend(int(p.read_text()) / 1000 for p in device.glob("temp*_input"))
             cpu_t = [value for name in ("k10temp", "coretemp", "zenpower") for value in sensors.get(name, ())]
             gpu_t = [value for name in ("amdgpu", "nouveau", "nvidia", "i915", "xe") for value in sensors.get(name, ())]
-            cpu_limit = settings["night_cpu_temperature" if nocturnal else "temperature"]
-            gpu_limit = settings["night_gpu_temperature" if nocturnal else "temperature"]
-            if closed:
-                closed_limit = min(70, settings["night_closed_temperature"])
-                cpu_limit, gpu_limit = min(cpu_limit, closed_limit), min(gpu_limit, closed_limit)
-            temperatures = ((cpu_t or gpu_t) and all(0 < value < cpu_limit for value in cpu_t)
-                            and all(0 < value < gpu_limit for value in gpu_t))
-            if nocturnal:
-                temperatures = cpu_t and gpu_t and temperatures
+            temperatures = thermal_admission(settings, cpu_t, gpu_t, nocturnal=nocturnal, closed=closed)
             disk = self.disk_load(now)
             self.index_pressure = (now, load, available, pressure, disk)
             self.sample = now
