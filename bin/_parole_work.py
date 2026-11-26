@@ -38,7 +38,7 @@ def lyrics_engine():
     return module
 
 
-def lookup_song(index, identity, synced, *, read_only=False):
+def lookup_song(index, identity, synced, *, read_only=False, local_reference_only=False):
     os.environ["KARA_IMPORT_PROCESSING"] = "1"
     engine = lyrics_engine()
     song = index.song(identity)
@@ -85,6 +85,10 @@ def lookup_song(index, identity, synced, *, read_only=False):
                 if not engine.save_lrc(path.with_suffix(extension), local.text.strip()):
                     return {"state": "present"}
             return {"state": "found", "source": LOCAL_SOURCE, "audio": song["audio"]}
+        if local_reference_only:
+            # A discovery hint need not yield a trusted reference. Leave the
+            # ordinary task available when a network provider can serve it.
+            return {"state": "local_miss"}
         try:
             lyrics, provider = engine.LyricsSources().find(
                 title, artist, tags.get("album"), duration, tags.get("albumartist"),
@@ -292,7 +296,8 @@ def main():
     kind, subject = sys.argv[1:3]
     index = Index(music_library())
     if kind in ("lyrics", "lrc"):
-        result = lookup_song(index, subject, kind == "lrc")
+        result = lookup_song(index, subject, kind == "lrc",
+                             local_reference_only=sys.argv[3:] == ["--local-reference-only"])
     elif kind in KINDS:
         # Library-lock progress and tool diagnostics must not contaminate the
         # machine-readable result expected by the maintenance supervisor.

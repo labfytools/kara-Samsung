@@ -355,7 +355,7 @@ class SourceTests(Fixture):
 
     def test_exact_pcm_reference_crosses_editions_without_network_or_retag(self):
         from _parole_local_reference import SOURCE, local_reference
-        from _parole_index import sidecar
+        from _parole_index import LOCAL_REFERENCE_MISS, sidecar
         from _parole_work import lookup_song
 
         original = self.audio("album.flac")
@@ -375,8 +375,28 @@ class SourceTests(Fixture):
             self.index.update(song["id"], audio=pcm_digest(Path(song["path"])))
         before = target.read_bytes()
         self.assertIsNone(local_reference(self.index, self.index.song(second["id"]), synced=True))
+        owner = Maintenance(self.root, None, state=self.base / "state")
+        self.addCleanup(owner.close)
+        owner.output = Mock(wraps=owner.output)
+        with self.index.db() as db:
+            db.execute("""INSERT INTO daily_usage(bucket,day,used)
+                          SELECT 'provider:'||id,date('now','localtime'),200 FROM sources""")
+        settings = owner.current_settings = self.index.settings()
+        self.index.enqueue("lrc", second["id"], "fixture")
+        kinds = owner.network_kinds(settings, time())
+        self.assertNotIn("lrc", kinds)
+        self.assertTrue(owner.tick_network(settings, time(), kinds))
+        self.assertEqual(owner.output.call_args.args[0][-1], "--local-reference-only")
+        with self.index.db() as db:
+            self.assertEqual(tuple(db.execute("SELECT state,detail,attempts FROM tasks").fetchone()),
+                             ("temporary", LOCAL_REFERENCE_MISS, 0))
+        self.assertFalse(self.index.work_due(("lrc",), time(), local_reference=True))
+        self.assertTrue(self.index.work_due(("lrc",), time()))
+        self.assertFalse(target.with_suffix(".lrc").exists())
+
         self.index.review("transcription_validation", first["id"] + ".lrc", "validated",
                           {"audio": first["token"], "sidecar": sidecar(original, ".lrc")[0]})
+        self.index.update(first["id"], checked=time())
         engine = lyrics_engine()
         with patch("_parole_work.lyrics_engine", return_value=engine), patch.object(
                 engine.LyricsSources, "find", side_effect=AssertionError("requête superflue")):
@@ -385,7 +405,12 @@ class SourceTests(Fixture):
             self.assertFalse(target.with_suffix(".lrc").exists())
             # Reuse plain text and exact timestamps in separate publications.
             self.assertEqual(lookup_song(self.index, second["id"], False)["source"], SOURCE)
-            self.assertEqual(lookup_song(self.index, second["id"], True)["source"], SOURCE)
+        self.assertTrue(owner.tick_network(settings, time(), kinds))
+        self.assertEqual(owner.output.call_args.args[0][-1], "--local-reference-only")
+        with self.index.db() as db:
+            self.assertEqual(tuple(db.execute("SELECT state,detail FROM tasks").fetchone()),
+                             ("done", "référence PCM locale"))
+        self.assertFalse(self.index.network_yield())
         self.assertEqual(target.with_suffix(".txt").read_text(), "Chant contrôlé\n")
         self.assertEqual(target.with_suffix(".lrc").read_bytes(), source.read_bytes())
         self.assertEqual(target.read_bytes(), before)

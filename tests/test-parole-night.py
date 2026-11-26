@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_prepare import PreparedCache, file_token
 from _kara_refine import VERSION as REFINEMENT_VERSION
 from _kara_turbo import ObservedWord
-from _parole_index import document, sidecar
+from _parole_index import document, inventory, sidecar
 from _parole_maintenance import Maintenance
 from _parole_night import Desktop, Login, Night, mains_online
 from _parole_transcribe import proposals, review_ranges
@@ -252,6 +252,33 @@ class NightTests(unittest.TestCase):
         self.assertIsNotNone(report["ended"])
         self.assertEqual(report["reason"], "secteur requis")
         self.assertIsNone(self.night.lid_fd)
+
+    def test_closed_night_admits_a_local_prematch_without_provider_availability(self):
+        self.owner.foreground.clear()
+        index = self.owner.index
+        index.configure(night_lid=True, night_lid_qualified=True)
+        self.settings = self.owner.current_settings = index.settings()
+        self.night.refresh(self.settings)
+        self.assertTrue(self.observe(lid=True))
+        donor, target = (index.root / name for name in ("album.opus", "anthologie.opus"))
+        donor.write_bytes(b"fixture")
+        target.write_bytes(b"fixture")
+        donor.with_suffix(".lrc").write_text("[00:01.000]Texte local\n")
+        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
+                  paths=[donor, target], reader=lambda _: ({"title": "Titre", "artist": "Artiste",
+                                                          "duration_seconds": 5}, {}))
+        with index.db() as db:
+            db.execute("UPDATE songs SET audio=?", ("a" * 64,))
+            identity = db.execute("SELECT id FROM songs WHERE path=?", (str(target),)).fetchone()[0]
+        index.enqueue("lrc", identity, "fixture")
+        self.owner.output = Mock(return_value=(0, b'{"state":"local_miss"}'))
+        with patch("_parole_maintenance.ready_categories", return_value=set()):
+            self.assertTrue(self.owner.tick_night(self.settings, time()))
+            self.assertFalse(self.owner.tick_night(self.settings, time()))
+        self.owner.output.assert_called_once()
+        self.assertEqual(self.owner.output.call_args.args[0][-1], "--local-reference-only")
+        self.assertEqual(index.closed_progress()["deferred"], 1)
+        self.assertIsNotNone(self.night.lid_fd)
 
     def test_report_retains_validated_work_and_counts_a_crashed_claim_once(self):
         index = self.owner.index

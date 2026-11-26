@@ -38,6 +38,32 @@ DEFAULTS = {
 }
 LYRIC_KEYS = ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
 SKIP_TOP = {INBOX, "YouTube"}
+LOCAL_REFERENCE_MISS = "aucune preuve locale"
+
+# Start with indexed PCM identities, avoiding a scan of every waiting
+# network task when provider quotas are exhausted. Eligibility is a hint.
+# The worker still verifies the waveform identity receipt and current files.
+LOCAL_REFERENCE_SCOPE = """
+    FROM songs AS target INDEXED BY songs_audio
+    CROSS JOIN (SELECT 'lyrics' AS kind UNION ALL SELECT 'lrc') AS category
+    CROSS JOIN tasks AS candidate
+    WHERE target.audio>'' AND length(target.audio)=64
+      AND candidate.kind=category.kind AND candidate.subject=target.id
+      AND ((candidate.kind='lyrics' AND target.lyrics='absent')
+           OR (candidate.kind='lrc' AND target.lrc='absent'))
+      AND EXISTS (
+          SELECT 1 FROM songs AS donor WHERE donor.audio=target.audio AND donor.id<>target.id
+            AND (donor.lrc IN ('local','externe','généré')
+                 OR (candidate.kind='lyrics' AND donor.lyrics NOT IN ('absent','instrumental')))
+            AND (candidate.detail<>? OR donor.checked>candidate.updated OR target.checked>candidate.updated)
+          )
+      AND
+"""
+
+
+def task_scope(local_reference):
+    return ((LOCAL_REFERENCE_SCOPE, (LOCAL_REFERENCE_MISS,)) if local_reference
+            else ("FROM tasks AS candidate WHERE", ()))
 
 
 def key(text):
@@ -229,14 +255,15 @@ class Index:
     def preparation_due(self, now):
         return self.work_due(("prepare",), now)
 
-    def work_due(self, kinds, now):
+    def work_due(self, kinds, now, *, local_reference=False):
         if not kinds:
             return False
         placeholders = ",".join("?" for _ in kinds)
+        scope, arguments = task_scope(local_reference)
         with self.db(wait=.15) as db:
-            return db.execute(f"""SELECT 1 FROM tasks WHERE kind IN ({placeholders}) AND due<=?
-                                  AND state IN ('queued','suspended','temporary') LIMIT 1""",
-                              (*kinds, now)).fetchone() is not None
+            return db.execute(f"""SELECT 1 {scope} candidate.kind IN ({placeholders}) AND candidate.due<=?
+                                  AND candidate.state IN ('queued','suspended','temporary') LIMIT 1""",
+                              (*arguments, *kinds, now)).fetchone() is not None
 
     @staticmethod
     def read_closed_report(db):
@@ -361,11 +388,12 @@ class Index:
             return True
 
     def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None,
-              avoid=()):
+              avoid=(), local_reference=False):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
         excluded = ",".join("?" for _ in avoid)
+        scope, arguments = task_scope(local_reference)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             day = date.fromtimestamp(now).isoformat()
@@ -373,14 +401,16 @@ class Index:
                 return None
             task = db.execute(f"""
                 UPDATE tasks SET state='running', updated=?, attempts=attempts+1
-                WHERE rowid=(SELECT rowid FROM tasks WHERE kind IN ({placeholders})
-                    AND subject NOT IN ({excluded})
-                    AND state IN ('queued','suspended','temporary') AND due<=? AND (NOT ? OR priority<=15)
-                    AND (? OR kind!='codex' OR json_extract(payload,'$.manual')=1
-                         OR json_extract(payload,'$.kind') IN ('adapter','import_patch'))
-                    ORDER BY max(10,priority-cast((?-due)/86400 AS INTEGER)),due,subject LIMIT 1)
+                WHERE rowid=(SELECT candidate.rowid {scope} candidate.kind IN ({placeholders})
+                    AND candidate.subject NOT IN ({excluded})
+                    AND candidate.state IN ('queued','suspended','temporary') AND candidate.due<=?
+                    AND (NOT ? OR candidate.priority<=15)
+                    AND (? OR candidate.kind!='codex' OR json_extract(candidate.payload,'$.manual')=1
+                         OR json_extract(candidate.payload,'$.kind') IN ('adapter','import_patch'))
+                    ORDER BY max(10,candidate.priority-cast((?-candidate.due)/86400 AS INTEGER)),
+                             candidate.due,candidate.subject LIMIT 1)
                 RETURNING *
-            """, (now, *kinds, *avoid, now, high, codex_auto, now)).fetchone()
+            """, (now, *arguments, *kinds, *avoid, now, high, codex_auto, now)).fetchone()
             if bucket and task is not None:
                 self.reserve(db, bucket, day, now, gap)
             if night is not None and task is not None:

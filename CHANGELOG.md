@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Traiter les correspondances PCM locales même quand les quotas des fournisseurs sont épuisés.
 - Écouter les passages incertains d’un brouillon sur le mix ou la voix déjà séparée.
 - Enregistrer les refus d’accès HTTP des fournisseurs de paroles et appliquer leur temporisation avant de réessayer.
 - Mesurer le décalage et la dérive des repères Turbo en réservant des blocs d’annotations pour leur évaluation.

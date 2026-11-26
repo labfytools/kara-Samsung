@@ -25,7 +25,7 @@ from _kara_refine import VERSION as REFINEMENT_VERSION
 from _kara_stems import ROOT as STEM_ROOT, FILES, cached_stems, stem_directory
 from _parole_codex import KINDS, research
 from _parole_artist_groups import recover as recover_artist_groups
-from _parole_index import Index, document, encoded_key, inventory, sidecar
+from _parole_index import LOCAL_REFERENCE_MISS, Index, document, encoded_key, inventory, sidecar
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
 from _parole_import_enrichment import paths_for as enrichment_paths, pending as enrichment_pending
@@ -170,6 +170,7 @@ class Maintenance:
         self.next_scan = 0
         self.network_cursor = 0
         self.network_width = 2
+        self.local_reference_next = True
         self.network_active = {}
         self.import_enrichment_turn = 0
         self.import_activity = (0, 0)
@@ -549,6 +550,8 @@ class Maintenance:
             self.revision += 1
         elif outcome == "present":
             self.refresh_song(song)
+        elif outcome == "local_miss":
+            return "temporary", LOCAL_REFERENCE_MISS, 0
         elif outcome in ("temporary", "network", "unavailable", "limited"):
             msg = {"temporary": "Publication ou moteur temporairement indisponible",
                    "network": "Erreur réseau", "unavailable": "Fournisseur indisponible",
@@ -602,9 +605,12 @@ class Maintenance:
         return run(command, stop=self.stopped if stop is None else stop, timeout=timeout, event=observer, env=env, maximum=maximum,
                    retain=retain)
 
-    def network_output(self, task, settings, *, stop=None):
+    def network_output(self, task, settings, *, stop=None, local_reference_only=False):
         kind, subject = task["kind"], task["subject"]
-        code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
+        command = [sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject]
+        if local_reference_only:
+            command.append("--local-reference-only")
+        code, data = self.output(command,
                                  timeout=220 if kind == "source" else settings["network_timeout"], stop=stop)
         if code:
             raise ValueError("Moteur réseau arrêté")
@@ -1053,7 +1059,7 @@ class Maintenance:
         self.journal.emit("TRANSCRIPTION", f"{receipt['lines']} lignes proposées · {receipt['omitted']} écartées")
         return "review", detail, 0
 
-    def execute(self, task, *, nocturnal=False):
+    def execute(self, task, *, nocturnal=False, local_reference_only=False):
         started = monotonic()
         kind, subject = task["kind"], task["subject"]
         category = {"discography": "DISCOGRAPHIE", "prepare": "KARA", "source_probe": "SOURCE",
@@ -1077,7 +1083,9 @@ class Maintenance:
         self.night_measures = {}
         song = self.index.song(subject) if kind in ("lyrics", "lrc", *HEAVY) else None
         self.progress = (category, song["title"] if song is not None else "En cours", None)
-        if kind not in ("prepare", "codex"):
+        if local_reference_only:
+            self.journal.emit(category, "Vérification d’une référence PCM locale")
+        elif kind not in ("prepare", "codex"):
             self.journal.emit(category, {"lyrics": "Recherche de paroles", "lrc": "Recherche d’un LRC",
                                         "transcription": "Transcription locale pour vérification",
                                         "album": "Vérification d’une édition", "discography": f"Vérification · {subject}",
@@ -1102,7 +1110,7 @@ class Maintenance:
                 self.journal.emit("CACHE", f"{removed} dossiers intermédiaires retirés")
                 result = ("done", "nettoyé", 0)
             else:
-                value = self.network_output(task, self.current_settings)
+                value = self.network_output(task, self.current_settings, local_reference_only=local_reference_only)
                 result = self.network_result(task, value)
                 network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry", LOCAL_SOURCE)
         except Interrupted:
@@ -1147,7 +1155,7 @@ class Maintenance:
             stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
                          corrected=corrected, generated=generated, measurements=self.night_measures)
         self.index.finish(task, *result, night=stats, closed=self.closed_outcome(window, result),
-                          refund_attempt=import_suspended, network_found=network_found)
+                          refund_attempt=import_suspended or detail == LOCAL_REFERENCE_MISS, network_found=network_found)
         if import_suspended:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
@@ -1350,15 +1358,34 @@ class Maintenance:
                      and (kind not in NETWORK_CATEGORY or NETWORK_CATEGORY[kind] in ready)
                      and (kind != "codex" or now >= settings.get("codex_suspended_until", 0)))
 
+    @staticmethod
+    def local_reference_kinds(settings, network_kinds):
+        return tuple(kind for kind in ("lrc", "lyrics") if settings[kind] and kind not in network_kinds)
+
+    def tick_local_reference(self, kinds, now, *, nocturnal):
+        task = self.index.claim(kinds, now, local_reference=True)
+        if task is None:
+            return False
+        # The same durable task and governor own the operation. Only this
+        # turn skips provider admission because it cannot access the network.
+        self.execute(task, nocturnal=nocturnal, local_reference_only=True)
+        self.local_reference_next = False
+        return True
+
     def tick_network(self, settings, now, kinds, *, nocturnal=False):
         manual = self.index.claim(("codex",), now, high=True, codex_auto=settings["codex_auto"]) if "codex" in kinds else None
         if manual is not None:
             self.execute(manual, nocturnal=nocturnal)
             return True
+        local_kinds = self.local_reference_kinds(settings, kinds)
+        try_local_first = self.local_reference_next
+        if try_local_first and self.tick_local_reference(local_kinds, now, nocturnal=nocturnal):
+            return True
         kinds_without_codex = tuple(kind for kind in kinds if kind != "codex")
         first = self.index.claim(kinds_without_codex, now, high=True) or self.claim_network(settings, now, kinds)
         if first is None:
-            return False
+            return not try_local_first and self.tick_local_reference(local_kinds, now, nocturnal=nocturnal)
+        self.local_reference_next = True
         tasks = [first]
         maximum = max(1, min(20, settings["network_workers"], self.network_width))
         if first["kind"] in NIGHT_NETWORK and maximum > 1:
@@ -1392,7 +1419,8 @@ class Maintenance:
 
     def tick_night(self, settings, now):
         kinds = self.network_kinds(settings, now, nocturnal=True)
-        network_due = self.index.work_due(kinds, now)
+        network_due = (self.index.work_due(kinds, now) or
+                       self.index.work_due(self.local_reference_kinds(settings, kinds), now, local_reference=True))
         transcription_due = settings["night_transcribe"] and self.index.work_due(("transcription",), now)
         prepare_due = self.index.preparation_due(now)
         # Offer the other class the next turn. A bounded network batch
