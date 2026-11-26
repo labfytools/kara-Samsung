@@ -37,3 +37,13 @@ Le véritable importeur géré a publié une copie de sept pistes audio d’un a
 | la collection Strawberry | 0,528 s | 2,750 s | 4,732 s |
 
 Ce résultat mesure un import local et le véritable scanner Strawberry sur ce profil. Il ne comprend aucun débit fournisseur et ne mesure pas l’arrivée des titres sur un téléphone.
+
+## Non-régression et mise en service
+
+Sur deux passages appariés avec des copies de l’index réel, les 13 880 pistes inchangées ont été ignorées sans écritures ni processus de lecture des tags. Les temps V2 étaient de 2,34 s et 2,17 s, contre 2,16 s et 2,13 s pour V2.1.
+
+Les validations comprennent 12 cas de livraison et de reprise, trois cas de regroupement et de réparation, 36 cas Parole V3, 52 cas d’import dont les parcours GTK, et une synchronisation USB simulée. S’y ajoutent 21 cas de maintenance nocturne, huit cas de reprise d’import, cinq cas de ressources, 37 cas de préparation et neuf cas BlackBox V3. L’essai du véritable Strawberry a été réalisé dans un profil isolé et l’USB reste une validation simulée.
+
+Kara a redémarré le 26 novembre 2026 à 18 h 26 CET sur `9360d37`, avec le lecteur TagLib compilé dans les données de l’utilisateur. Le PID **2458881** possède le nom D-Bus. Le fil d’indexation est actif, la fenêtre Parole a été remise au premier plan et aucun redémarrage automatique ni erreur de niveau `err` n’a été observé. La salle, la capture et la synchronisation USB étaient inactives. La file d’import a retrouvé son état initial. Les trois sauvegardes privées passent `quick_check`, et le rapprochement avant-après conserve les 13 880 pistes, les 81 associations, les 30 lots, les sept manifestes de préparation, les douze manifestes de pistes séparées et les éléments de reprise.
+
+Un rejeu de production a consommé 26 chemins déjà présents dans les deux catalogues en **0,416 s**, sans modifier une ligne de piste. La file d’événements était vide après le rejeu et les agrégats étaient exacts. L’instantané V2 précédent reste disponible comme retour arrière. Les sauvegardes se trouvent sous `.runtime/parole-index-v21/deployment/avant-deploiement/`.
