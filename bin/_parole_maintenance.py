@@ -294,9 +294,19 @@ class Maintenance:
                 if self.import_queue.pending():
                     self.interrupt.set()
                     return True
-            return not self.resources.check(self.current_settings,
-                                            busy=self.priority or monotonic() < self.priority_until, running=True)
+            allowed = self.resources.check(self.current_settings,
+                                           busy=self.priority or monotonic() < self.priority_until, running=True)
+            if not allowed:
+                self.log_memory_stop()
+            return not allowed
         return False
+
+    def log_memory_stop(self):
+        if self.resources.memory_detail:
+            # Journal the sample that revoked admission before process
+            # cleanup changes memory usage. The queue keeps its retry state.
+            phase = self.progress[0] if self.progress else "Maintenance"
+            self.journal.emit("RESSOURCES", f"{phase} suspendu · {self.resources.memory_detail}", "WARNING")
 
     def night_allowed(self, settings, *, running, light=False):
         now = monotonic()
@@ -323,6 +333,8 @@ class Maintenance:
         if not (idle or self.night.desktop.lid):
             return self.night.report("Préparation nocturne en attente d’inactivité")
         if not self.resources.check(settings, running=running, nocturnal=True, lid=self.night.desktop.lid, light=light):
+            if running and not light:
+                self.log_memory_stop()
             return self.night.report(self.resources.reason)
         if running:
             self.night.report("Mode nocturne actif · traitement en cours")

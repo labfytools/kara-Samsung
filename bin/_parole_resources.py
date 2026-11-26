@@ -83,6 +83,7 @@ class Resources:
         self.sample_closed = False
         self.can_start = self.can_start_light = self.can_continue = False
         self.reason = "Mesure des ressources"
+        self.memory_detail = None
 
     def close(self):
         proc, self.listener = self.listener, None
@@ -165,11 +166,13 @@ class Resources:
         if busy:
             self.can_start = self.can_start_light = self.can_continue = False
             self.reason = "Kara, lecture ou imports prioritaires"
+            self.memory_detail = None
             return False
         closed = nocturnal and lid
         if closed == self.sample_closed and now < self.sample + 1.5:
             return self.can_continue if running else (self.can_start_light if light else self.can_start)
         self.can_start = self.can_start_light = self.can_continue = False
+        self.memory_detail = None
         try:
             self.collect_storage(now)
             if running:
@@ -225,14 +228,22 @@ class Resources:
             # activity, power, pressure, temperature and remaining space
             # still revoke admission and trigger process-group cleanup.
             minimum = min(settings["memory_mib"], settings["running_memory_mib"]) if running else settings["memory_mib"]
+            memory_ok = available >= minimum and pressure < 1
             for ok, reason in (
                 (idle, "Session active"), (power, "Alimentation secteur requise"),
-                (available >= minimum and pressure < 1, "Mémoire ou pression mémoire"),
+                (memory_ok, "Mémoire ou pression mémoire"),
                 (temperatures, "Température CPU/GPU indisponible ou trop élevée"),
                 (self.allowed_storage(settings), "Réserve disque ou plafond du cache"),
             ):
                 if not ok:
                     self.reason = reason
+                    if reason == "Mémoire ou pression mémoire":
+                        # PSI is system-wide and can trigger with ample freeable
+                        # memory. Record both observations from this decision.
+                        cause = ("réserve et PSI" if available < minimum and pressure >= 1
+                                 else "réserve" if available < minimum else "PSI")
+                        self.memory_detail = (f"{cause} · {available:.0f} Mio disponibles (minimum {minimum})"
+                                              f" · PSI mémoire some avg10 {pressure:.2f} % (seuil 1 %)")
                     return False
             if multimedia_active():
                 self.reason = "Flux multimédia actif"

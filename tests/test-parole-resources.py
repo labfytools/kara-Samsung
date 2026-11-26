@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 from time import monotonic, time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
@@ -36,6 +36,28 @@ class ResourceTests(unittest.TestCase):
         self.assertTrue(resources.allowed_storage(DEFAULTS, duration=200))
         resources.storage["bytes"] = 50 * GIB - 10
         self.assertFalse(resources.allowed_storage(DEFAULTS, duration=200))
+
+    def test_memory_observation_distinguishes_pressure_from_reserve(self):
+        resources = Resources(Path("/fixture"))
+        resources.collect_storage = Mock()
+        resources.disk_load = Mock(return_value=0)
+        resources.allowed_storage = Mock(return_value=True)
+        resources.session_idle = Mock(return_value=True)
+        readings = {"/proc/stat": "cpu 1 0 1 50 0 0 0 0",
+                    "/proc/meminfo": "MemAvailable: 5570560 kB",
+                    "/proc/pressure/memory": "some avg10=1.12 avg60=0.10 avg300=0.10 total=4"}
+        with (patch.object(Path, "read_text", lambda path: readings[str(path)]),
+              patch.object(Path, "glob", return_value=[])):
+            self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True))
+            self.assertIn("PSI · 5440 Mio", resources.memory_detail)
+            self.assertIn("1.12 %", resources.memory_detail)
+            resources.sample = 0
+            readings.update({"/proc/meminfo": "MemAvailable: 1310720 kB",
+                             "/proc/pressure/memory": "some avg10=0.29 avg60=0.10 avg300=0.10 total=4"})
+            self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True))
+            self.assertIn("réserve · 1280 Mio", resources.memory_detail)
+            resources.check(DEFAULTS, busy=True, nocturnal=True)
+            self.assertIsNone(resources.memory_detail)
 
     def test_kara_selection_and_return_of_activity_release_supervised_work(self):
         with TemporaryDirectory() as tmp:
