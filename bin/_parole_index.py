@@ -19,6 +19,7 @@ from _kara_paths import STATE
 from _kara_prepare import file_token
 from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, grouped_artist, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
+from _parole_taglib import helper as taglib_helper, read as taglib_read
 
 REFERENCE_REUSE_SECONDS = 86_400
 MEDIA, SIDECAR, PREPARATION, REMOVE, ARTWORK = (1 << i for i in range(5))
@@ -853,7 +854,7 @@ def sidecar_token(path):
         return "invalid"
 
 
-def local_state(path, embedded, duration, old, info, stable, measure):
+def local_state(path, embedded, duration, old, info, stable, measure, *, exact_duration=None):
     # Versions are kept separately for the two sidecars. A new LRC can reuse
     # the existing TXT result, and a duration change can reuse parsed timing.
     with measure("sidecar_stat"):
@@ -878,14 +879,24 @@ def local_state(path, embedded, duration, old, info, stable, measure):
                 evidence.append(bool(raw.strip()))
     info["side_state"] = evidence
     end, plain = evidence
-    if end >= 0 and (not duration or 0 < end <= duration + 3):
+    embedded_end = -1
+    if not tokens[0] and embedded:
+        with measure("lrc"):
+            rows = parse_lrc(embedded)
+        if rows:
+            embedded_end = rows[-1][0]
+    # Near the acceptance boundary, encoder padding and presentation timing
+    # can change the verdict. Keep FFprobe as the reference for that decision.
+    candidate_end = end if tokens[0] else embedded_end
+    if exact_duration and duration and abs(candidate_end - duration - 3) <= .15:
+        duration = exact_duration()
+    if end >= 0 and duration is not None and (not duration or 0 < end <= duration + 3):
         lrc = "local"
     elif tokens[0]:
         lrc = "à vérifier"
     else:
-        with measure("lrc"):
-            rows = parse_lrc(embedded) if embedded else []
-        lrc = "intégré" if rows and (not duration or 0 < rows[-1][0] <= duration + 3) else "absent"
+        lrc = ("à vérifier" if duration is None else "intégré"
+               if embedded_end >= 0 and (not duration or 0 < embedded_end <= duration + 3) else "absent")
     lyrics = "fichier texte" if plain else "Strawberry" if embedded.strip() else "LRC" if lrc == "local" else "absent"
     # Reference provenance belongs to its exact file and audio versions.
     if old and stable:
@@ -954,10 +965,12 @@ def affected_tracks(index, folder):
 
 
 def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, paths=None,
-              events=None, reader=probe_track, plan_events=None, allow_probe=True):
+              events=None, reader=None, plan_events=None, allow_probe=True):
     root = index.root
     counts = dict(scanned=0, changed=0, missing=0, errors=0, unchanged=0, probes=0,
-                  reused=0, strawberry=0, transactions=0, receipts=0, delivered=0, combined=0, lag=0.)
+                  taglib=0, reused=0, strawberry=0, transactions=0, receipts=0, delivered=0, combined=0, lag=0.)
+    fast_reader = taglib_helper() if reader is None else None
+    reader = reader or probe_track
     events = {row["path"]: row for row in events} if events is not None else {}
     if events:
         paths = tuple(map(Path, events))
@@ -1144,7 +1157,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     same_path = old is not None and old["path"] == str(path)
                     same_catalogue = catalogue_revision == info.get("catalogue")
                     reuse = same_audio and not info.get("probe_error") and (
-                        same_catalogue or not fresh or info.get("file_tags"))
+                        same_catalogue or not fresh or info.get("file_tags") or info.get("tag_reader") == "taglib")
                     with measure("metadata"):
                         if reuse:
                             tags = info["tags"]
@@ -1159,6 +1172,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                 tags = proof_tags
                                 counts["receipts"] += 1
                                 info["file_tags"] = True
+                                info.pop("tag_reader", None)
                                 info.pop("probe_error", None)
                             elif fresh and (old is None or same_audio or not same_coarse_stamp):
                                 tags = dict(strawberry)
@@ -1167,15 +1181,30 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                     tags[dest] = strawberry[f"musicbrainz_{source}_id"]
                                 counts["strawberry"] += 1
                                 info.pop("file_tags", None)
+                                info.pop("tag_reader", None)
                                 info.pop("probe_error", None)
                             else:
                                 if not allow_probe:
                                     retry.add(pathname)
                                     continue
+                                attempt = None
+                                if fast_reader is not None:
+                                    with measure("taglib"):
+                                        attempt = taglib_read(path, fast_reader)
                                 try:
-                                    with measure("ffprobe"):
-                                        counts["probes"] += 1
-                                        tags, _ = reader(path)
+                                    if attempt is not None:
+                                        tags = attempt.tags
+                                        counts["taglib"] += 1
+                                        info["tag_reader"] = "taglib"
+                                        # The enrichment writer needs the exact FFprobe
+                                        # spelling of all tags before comparing a rewrite.
+                                        info.pop("file_tags", None)
+                                    else:
+                                        with measure("ffprobe"):
+                                            counts["probes"] += 1
+                                            tags, _ = reader(path)
+                                        info["file_tags"] = True
+                                        info.pop("tag_reader", None)
                                 except (OSError, ValueError, subprocess.SubprocessError):
                                     tags = info.get("tags", {}) if old else {}
                                     info["probe_error"] = True
@@ -1183,7 +1212,6 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                     if event:
                                         retry.add(pathname)
                                 else:
-                                    info["file_tags"] = True
                                     info.pop("probe_error", None)
                             duration = tags.get("duration_seconds") or (
                                 strawberry["length"] / 1e9 if fresh and (strawberry["length"] or 0) > 0 else 0)
@@ -1192,10 +1220,28 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                             if len(embedded.encode()) > MAX_LRC_BYTES:
                                 embedded = ""
                     stable = same_audio and embedded == info.get("plain", "") and duration == old["duration"]
+                    timing_pending = bool(info.get("timing_pending"))
                     if stable and event and not mask & (MEDIA | SIDECAR):
                         side, lyrics, lrc = old["side"], old["lyrics"], old["lrc"]
                     else:
-                        side, lyrics, lrc = local_state(path, embedded, duration, old, info, stable, measure)
+                        def exact_duration():
+                            if allow_probe:
+                                try:
+                                    with measure("ffprobe"):
+                                        counts["probes"] += 1
+                                        if exact := reader(path)[0].get("duration_seconds"):
+                                            return exact
+                                except (OSError, ValueError, subprocess.SubprocessError):
+                                    counts["errors"] += 1
+                            if event:
+                                retry.add(pathname)
+                            info["timing_pending"] = True
+                            return None
+
+                        verify = exact_duration if info.get("tag_reader") == "taglib" else None
+                        side, lyrics, lrc = local_state(path, embedded, duration, old, info,
+                                                       stable and not info.pop("timing_pending", False), measure,
+                                                       exact_duration=verify)
                     if stable and event and side == old["side"] and not mask & PREPARATION:
                         cache, kara, report = old["cache"], old["kara"], info.get("report", {})
                     else:
@@ -1211,7 +1257,8 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     plays = integer(strawberry["playcount"]) if strawberry else old["plays"] if old else 0
                     if (same_path and stable and same_catalogue and side == old["side"] and cache == old["cache"]
                             and kara == old["kara"] and lyrics == old["lyrics"] and lrc == old["lrc"]
-                            and plays == old["plays"] and not artwork_changed and not info.get("probe_error")):
+                                and plays == old["plays"] and not artwork_changed and not info.get("probe_error")
+                                and timing_pending == bool(info.get("timing_pending"))):
                         counts["unchanged"] += 1
                         if event:
                             settled.add(pathname)

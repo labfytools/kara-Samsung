@@ -384,7 +384,7 @@ class Maintenance:
             self.metrics.update(result, scan_seconds=elapsed, associations=associations)
             self.journal.emit("INDEX", f"{result['scanned']} vérifiées · {result['unchanged']} inchangées · "
                               f"{result['changed']} mises à jour · {result['missing']} disparues · "
-                              f"{result['errors']} erreurs · {elapsed:.2f} s · {result['probes']} FFprobe")
+                              f"{result['errors']} erreurs · {elapsed:.2f} s · {result['taglib']} TagLib · {result['probes']} FFprobe")
             changed = result["changed"] or result["missing"]
             if changed:
                 self.changed()
@@ -476,6 +476,7 @@ class Maintenance:
                 self.journal.emit("INDEX", f"{result['changed']} intégrées · {result['changed']/max(duration,.001):.1f} pistes/s · "
                                   f"{result['unchanged']} inchangées · {result['combined']} regroupées · "
                                   f"{result['receipts']+result['reused']} métadonnées réutilisées · "
+                                  f"{result['taglib']} TagLib · {result['probes']} FFprobe · "
                                   f"retard {result['lag']/delivered:.2f} s · {backlog} en file à l’admission · "
                                   f"SQLite {result['phase_seconds'].get('sqlite_lock',0)*1000:.1f} ms")
                 self.wake.set()

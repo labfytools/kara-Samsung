@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_index import ARTWORK, MEDIA, PREPARATION, REMOVE, SIDECAR, Index, inventory, revision
 from _parole_index_watch import EVENT, OVERFLOW, Watch
+from _parole_taglib import Reading
 
 
 class Delivery(unittest.TestCase):
@@ -124,6 +125,19 @@ class Delivery(unittest.TestCase):
         self.notify(proof=True)
         self.assertEqual(self.take()["delivered"], 1)
         self.assertEqual(len(self.rows()), 1)
+
+    def test_taglib_rechecks_a_timestamp_near_duration_cutoff(self):
+        self.notify()
+        self.path.with_suffix(".lrc").write_text("[00:43.10]Repère limite\n")
+        _, events = self.index.events(3)
+        with (patch("_parole_index.taglib_helper", return_value=Path("/fixture/parole-tags")),
+              patch("_parole_index.taglib_read", return_value=Reading({**self.tags, "duration_seconds": 40.12}, False)),
+              patch("_parole_index.probe_track", return_value=(self.tags, [])) as ffprobe):
+            result = inventory(self.index, None, lambda *_: ("", "absent", {}), lambda: False,
+                               lambda *_: None, events=events)
+        self.assertEqual((result["taglib"], result["probes"], result["delivered"]), (1, 1, 1))
+        ffprobe.assert_called_once_with(self.path)
+        self.assertEqual(self.rows()[0]["lrc"], "à vérifier")
 
     def test_move_keeps_previous_path_and_authorized_delete(self):
         self.notify(proof=True)
