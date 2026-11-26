@@ -225,11 +225,13 @@ class LrcLib:
         # Query variants widen discovery only. Keep edition, version,
         # duration and credits in the original acceptance decision.
         search_artist = album_artist or artist
-        variants = dict.fromkeys(((base_title, search_artist), (base_title, artist),
-                                  (folded(base_title), search_artist)))
+        variants = ((base_title, search_artist), (base_title, artist), (folded(base_title), search_artist))
+        queried = set()
         for label, credit in variants:
-            if not label or not credit:
+            query = normalized(label), normalized(credit)
+            if not all(query) or query in queried:
                 continue
+            queried.add(query)
             records = self.get("search", track_name=label, artist_name=credit)
             text = best_transcript(records[:20] if isinstance(records, list) else (),
                                    title, artist, album, duration, album_artist,
