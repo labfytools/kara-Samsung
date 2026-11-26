@@ -84,6 +84,8 @@ Les 47 nouvelles séparations ont duré 32,45 s en médiane, avec des pics PSS d
 
 Sur la chanson entière de 193,68 s, le premier essai Demucs avec fenêtres de cinq secondes s’est arrêté après environ treize secondes pendant la séparation. Le PSI valait 1,24 % pour 5,40 Gio disponibles et 54,5 °C côté CPU. Le réglage de cinq secondes n’est ainsi pas qualifié au seuil de production.
 
+La reprise manuelle avec réserve de 4 Gio termine les fenêtres de cinq secondes en 276,23 s. Le pic PSS de groupe passe de 1 781 Mio pour les fenêtres sérielles de sept secondes à 1 606 Mio. Le PSI monte à 1,72 %. Les sorties ne sont plus identiques. Sur le PCM mono à 16 kHz, les deux stems vocaux ont le même nombre d’échantillons et une corrélation de 0,9955. L’énergie du résidu est à −20,39 dB face au stem de sept secondes après ajustement du gain. Cette mesure compare les sorties des séparateurs et laisse ouverte l’exactitude par rapport à une voix propre de référence.
+
 ### Turbo Q5 sur une chanson entière
 
 Turbo Q5_0 a terminé les trois variantes sur le titre espagnol de 193,68 s, avec la séparation validée réutilisée et le seuil de PSI de 1 %. Le poids officiel occupe environ 548 Mio et porte le SHA-256 `394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2`. Les écarts entre variantes comparent la préparation du signal avec le même poids sur le même titre. La tentative F16 avait été interrompue et les conditions de l’hôte avaient changé. [Poids Turbo Q5_0 officiel](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-large-v3-turbo-q5_0.bin)
@@ -151,6 +153,10 @@ La pop française *Pas que t’es pas* d’AZUL possède le marqueur `LyricOverl
 Le folk espagnol *Esencia* de NandoMalo porte le marqueur `Polyphonic`. Demucs a été arrêté après 89 s de séparation à 3,99 Gio disponibles au seuil manuel de 4 Gio, avec un PSI de 0 %. Le stem n’a donc pas été évalué. Les entrées d’AZUL et de NandoMalo ont été utilisées pour le calcul local sous CC BY-NC-SA et CC BY-SA respectivement. Les pistes, annotations et stems restent dans l’espace privé d’essai. [CC BY-NC-SA](https://creativecommons.org/licenses/by-nc-sa/4.0/) · [CC BY-SA](https://creativecommons.org/licenses/by-sa/4.0/)
 
 Le chemin exact du brouillon de production F16 a également été exécuté sur une copie du titre country français. Il a atteint la transcription du mix et a été arrêté à 1,09 % de PSI, avec 4,21 Gio disponibles, après environ 10 s. Le relevé ne contient aucune phase Demucs et aucun brouillon n’a été publié pendant cette tentative.
+
+### Alternance de langue, témoin construit
+
+Un montage de trois segments de neuf secondes issus des titres espagnol, anglais et français a fourni 39 mots entièrement inclus dans les intervalles annotés. La lecture Q5 en une seule fenêtre a estimé le français et commis neuf erreurs, soit 23,08 % de WER en 8,87 s. Avec les frontières du montage connues et la langue estimée séparément sur chaque segment, les trois langues sont correctes et le WER passe à 20,51 % en 24,51 s. Fixer les trois langues de référence donne les mêmes huit erreurs en 12,69 s. Le montage mesure la sensibilité de la détection à une frontière connue entre enregistrements. Il reste à qualifier les changements de langue au sein d’un même chant.
 
 ### Détection d’activité sur un titre entier
 
