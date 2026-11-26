@@ -433,6 +433,8 @@ def main():
             validate_recording(folder, read(folder / "manifest.json"))
             if args.cycle is None:
                 raise ValueError("Le comparatif AEC exige la sélection explicite d’un --cycle SESSION/TOUR.")
+            if args.output and args.output.resolve().is_relative_to(args.root.resolve()):
+                raise ValueError("L’écoute comparée doit être exportée en dehors des captures originales.")
             report = analyze(folder)
             if args.cycle not in report["cycles"]:
                 raise ValueError("Cycle V3 absent.")
@@ -448,7 +450,7 @@ def main():
                 mic = simulate_pcm(mic, render, overlay, 48000)
                 config["simulated"] = overlay
             output({"experiment": sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
-                    "inputs": config, "comparison": compare(render, mic, args.aec_delay_ms)})
+                    "inputs": config, "comparison": compare(render, mic, args.aec_delay_ms, output=args.output)})
         elif args.action == "extract-pcm":
             if args.id is None or args.output is None:
                 raise ValueError("Indique un événement PCM (--id) et un fichier de sortie (--output).")

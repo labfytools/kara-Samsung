@@ -7,7 +7,7 @@ import numpy as np
 from scipy.signal import correlate
 
 from _kara_aec_prototype import FRAME, RATE, Speex, WebRtc, build_webrtc, find_delay, process, with_engine
-from _kara_blackbox import events, private_file, wave_layout
+from _kara_blackbox import atomic_json, events, float_header, private_file, wave_layout
 from _kara_blackbox_lab import MIN_AEC_NS, SECOND
 
 MAX_SECONDS = 12
@@ -117,7 +117,7 @@ def rms(signal):
     return float(np.sqrt(np.mean(signal.astype(np.float64) ** 2)))
 
 
-def compare(render, mic, candidate_delay=None):
+def compare(render, mic, candidate_delay=None, *, output=None):
     ref = render.mean(axis=1, dtype=np.float64)
     if rms(ref) < .0001 or rms(mic) < .0001:
         raise ValueError("Niveau insuffisant pour comparer le couplage acoustique.")
@@ -135,6 +135,7 @@ def compare(render, mic, candidate_delay=None):
         return {"rms": rms(signal), "reference_correlation": float(np.dot(value, base) / scale) if scale else None}
 
     variants = {"unchanged": stats(mic)}
+    exports = {"reference": render, "unchanged": mic} if output else {}
     with TemporaryDirectory(prefix="kara-blackbox-aec-") as draft:
         library = Path(draft) / "webrtc.so"
         build_webrtc(library)
@@ -144,6 +145,20 @@ def compare(render, mic, candidate_delay=None):
             variants[name] = {**stats(signal[algorithm_delay:]),
                               "algorithm_delay_ms": algorithm_delay * 1000 / RATE,
                               "frame_p95_us": float(np.percentile(times, 95))}
-    return {"frames": len(mic), "rate": RATE, "delay_candidate_ms": delay,
-            "variants": variants, "physical_alignment_bound_ns": None,
-            "ground_truth_available": False, "method": "software_clock_linear_alignment"}
+            if output:
+                exports[name] = signal
+    result = {"frames": len(mic), "rate": RATE, "delay_candidate_ms": delay,
+              "variants": variants, "physical_alignment_bound_ns": None,
+              "ground_truth_available": False, "method": "software_clock_linear_alignment"}
+    if output:
+        # Audition is an explicit, private offline export. Preserve the
+        # algorithm's uncompensated output and its recorded delay.
+        output.mkdir(mode=0o700)
+        for name, signal in exports.items():
+            channels = signal.shape[1] if signal.ndim == 2 else 1
+            pcm = signal.astype("<f4").tobytes()
+            with open(output / f"{name}.wav", "xb", opener=private_file) as stream:
+                stream.write(float_header(RATE, channels, len(pcm)))
+                stream.write(pcm)
+        atomic_json(output / "comparison.json", result)
+    return result

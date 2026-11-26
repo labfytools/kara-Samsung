@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
-from _kara_blackbox import BlackBox
+from _kara_blackbox import BlackBox, wave_layout
 from _kara_blackbox_aec import compare, input_pair
 from _kara_blackbox_lab import analyze
 
@@ -85,11 +85,14 @@ class ReplayTests(unittest.TestCase):
             report = analyze(folder)
             render, mic = input_pair(folder, report, f"{session}/{turn['turn']}", "monitor")
             self.assertEqual(len(mic), 5 * rate)
-            metrics = compare(render, mic)
+            export = Path(directory) / "compare"
+            metrics = compare(render, mic, output=export)
             self.assertEqual(metrics["delay_candidate_ms"], 40)
             self.assertIsNone(metrics["physical_alignment_bound_ns"])
             self.assertFalse(metrics["ground_truth_available"])
             self.assertGreater(metrics["variants"]["unchanged"]["reference_correlation"], .99)
+            self.assertEqual(wave_layout(export / "reference.wav")[:3], (rate, 2, len(mic)))
+            self.assertEqual((export / "aec3.wav").stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

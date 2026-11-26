@@ -227,7 +227,10 @@ class RoomAudio:
             self.route.return_enabled = not require_consent
         self.diagnostics.emit("audio", "route", player=player, turn=turn, song=song, output=sink,
                               profile=settings["profile"], guard=True, requested_percent=volume, scoring=scoring,
-                              trial=self.mix_trial_name)
+                              trial=self.mix_trial_name,
+                              capture_settings={key: settings[key] for key in
+                                                ("mic_gain_percent", "chrome_echo", "chrome_noise", "pulse_buffer")
+                                                if key in settings})
         return reader
 
     def close_turn(self):

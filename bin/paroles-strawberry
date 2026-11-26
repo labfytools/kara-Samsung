@@ -636,7 +636,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 self.apply_player_mix(self.party.active)
         else:
             self.write_music_volume(percent / 100)
-        self.blackbox.emit("audio", "music-volume", percent=percent)
+        self.blackbox.emit("audio", "music-volume", **self.game_score.diagnostic_turn, percent=percent)
 
     def write_music_volume(self, level, callback=None, *, stage=False):
         if not stage:
