@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from _kara_paths import STATE
 from _musique_oz import AUDIO, INBOX, component, shared_mutation
-from _parole_index import document, key
+from _parole_index import MEDIA, PREPARATION, document, key
 
 KIND = "artist_group"
 
@@ -151,6 +151,7 @@ def persist_paths(index, plan, identity, undo, queue):
                 db.execute("UPDATE songs SET path=?,owner=?,previous=?,search=? WHERE id=?",
                            (path, owner, song["path"], key(" ".join((song["title"], song["artist"], owner, song["album"]))),
                             song["id"]))
+            index.notify((target / name for name in row["file_names"]), MEDIA | PREPARATION, db=db)
             db.execute("UPDATE canonical_references SET path=?||substr(path,?) WHERE substr(path,1,?)=?",
                        (replacement, len(prefix) + 1, len(prefix), prefix))
             if not undo:

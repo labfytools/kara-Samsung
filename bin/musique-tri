@@ -12,12 +12,14 @@ import shutil
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+from time import time
 
 from _kara_import_local import stamp
 from _kara_import_resources import ImportPause, ImportSuspended, checkpoint, run_checked
 from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, audio_file, audio_files,
                          canonical_album_artist, component, mutation_report, probe, share_file, shared_mutation,
                          SHARED_LIBRARY, source_video, title_pair)
+from _parole_index import revision
 
 TAG_WRITABLE = {".opus", ".ogg", ".oga", ".flac", ".m4a", ".mp3"}
 
@@ -154,8 +156,9 @@ def write_tags(source, target, tags, updates, recover=False):
             capture_output=True, check=True, timeout=60,
         )
         expected = tags | updates
-        new_tags, _ = probe(draft)
-        if any(new_tags.get(key) != value for key, value in expected.items() if key != "encoder"):
+        new_tags, _ = probe(draft, include_duration=True, include_codec=True)
+        if any(new_tags.get(key) != value for key, value in expected.items()
+               if key not in ("encoder", "duration_seconds", "codec")):
             raise ValueError("vérification des tags après copie sans réencodage échouée")
         shutil.copymode(source, draft)
         share_file(draft, target)
@@ -164,6 +167,7 @@ def write_tags(source, target, tags, updates, recover=False):
         else:
             (publish_import if recover else os.link)(draft, target)
             source.unlink()
+        return new_tags
 
 
 def target_parts(source, tags, artist, album):
@@ -235,7 +239,7 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
             remember(existing)
             source.unlink()
             mutation_report(f"Déjà dans la bibliothèque : {existing.relative_to(root)}")
-            return existing, False
+            return existing, False, None
     for attempt in range(1, 10_000):
         suffix = "" if attempt == 1 else f" [{attempt}]"
         target = folder / (name + suffix + extension)
@@ -244,25 +248,27 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
                 if not preview:
                     write_tags(source, target, tags, updates)
                 mutation_report(f"{source.name} · tags de l’album : {album_artist} / {album_title}")
-            return target, False
+            return target, False, None
         if target in reserved or target.exists() or target.is_symlink():
             if importing and not preview and (same_content(source, target)
                     or not preserve_tags and same_import_track(source, target, tags)):
                 remember(target)
                 source.unlink()
                 mutation_report(f"Déjà dans la bibliothèque : {target.relative_to(root)}")
-                return target, False
+                return target, False, None
             if same_content(source, reserved.get(target, target)):
                 mutation_report(f"Identique, conservé à la source : {source.name}")
-                return (target if target.is_file() else None), False
+                return (target if target.is_file() else None), False, None
             continue
+        published_tags = None
         if not preview:
             try:
                 remember(target)
                 if updates:
-                    write_tags(source, target, tags, updates, receipt is not None)
+                    published_tags = write_tags(source, target, tags, updates, receipt is not None)
                 else:
                     move_track(source, target, receipt is not None)
+                    published_tags = tags
             except FileExistsError:
                 continue
         if preview:
@@ -270,7 +276,7 @@ def classify(source, tags, album_artist, album_title, root, preview, reserved, i
         elif video:
             known_sources[folder][identity] = target
         mutation_report(f"{source.name} → {target.relative_to(root)}")
-        return target, not preview
+        return target, not preview, published_tags
     raise ValueError("aucun nom de fichier libre")
 
 
@@ -337,7 +343,7 @@ def main():
         checkpoint()
         try:
             token = stamp(track.lstat())
-            tags, _ = probe(track)
+            tags, _ = probe(track, include_duration=True, include_codec=True)
             prepared.append((track, tags, token))
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             failures += 1
@@ -356,6 +362,7 @@ def main():
         reserved = {}
         known_sources = {}
         destinations = set()
+        verified = {}
         added = 0
         for track, tags in items:
             # One receipt and its atomic publication form a safe unit. A
@@ -368,20 +375,25 @@ def main():
                              and track.parent.name.startswith(".kara-"))
                 if importing and args.artiste_album:
                     artist = canonical_album_artist(artist, album, artist_id=tags.get("musicbrainzalbumartistid"))
-                target, moved = classify(track, tags, artist, album, root, args.apercu, reserved, importing,
+                target, moved, published_tags = classify(track, tags, artist, album, root, args.apercu, reserved, importing,
                                          known_sources, args.reprise_interne if importing else None,
                                          preserve_tags=args.garder_tags_import,
                                          folder_hint=args.dossier_import if importing else None,
                                          filing_artist=args.classement_artiste if importing else None)
                 if target is not None:
                     destinations.add(str(target))
+                    if args.rapport_detaille and published_tags is not None:
+                        # Only the exact version created here can reuse these
+                        # tags. A reused duplicate has its own original credit.
+                        verified[str(target)] = {"token": revision(target.lstat()), "tags": published_tags,
+                                                 "published": time()}
                 added += moved
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 failures += 1
                 mutation_report(f"Erreur pour {track.name} : {error}", file=sys.stderr)
         if args.rapport:
             tracks = sorted(destinations)
-            report = {"tracks": tracks, "added": added} if args.rapport_detaille else tracks
+            report = {"tracks": tracks, "added": added, "verified": verified} if args.rapport_detaille else tracks
             args.rapport.write_text(json.dumps(report), encoding="utf-8")
         return int(failures != 0)
 

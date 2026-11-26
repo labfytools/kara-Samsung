@@ -1,7 +1,8 @@
 """Bibliothèque et tâches de Parole. La collection Strawberry reste en lecture seule."""
 from collections import defaultdict
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from hashlib import sha256
+from functools import lru_cache
 import json
 from itertools import islice
 import os
@@ -20,6 +21,12 @@ from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, grouped_arti
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 REFERENCE_REUSE_SECONDS = 86_400
+MEDIA, SIDECAR, PREPARATION, REMOVE, ARTWORK = (1 << i for i in range(5))
+EVENT_BATCH = 64
+EVENT_DELAY = .25
+EVENT_MAX_DELAY = 1.5
+COVER_NAMES = {"cover", "folder", "album", "albumart", "front"}
+COVER_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
 
 DEFAULTS = {
     "startup": True, "paused": False, "lyrics": True, "lrc": True, "generate": True,
@@ -235,6 +242,12 @@ class Index:
                 CREATE TABLE IF NOT EXISTS inventory_root (
                     id INTEGER PRIMARY KEY CHECK(id=1), dev INTEGER NOT NULL, inode INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS index_events (
+                    path TEXT PRIMARY KEY, mask INTEGER NOT NULL, serial TEXT NOT NULL,
+                    first REAL NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL,
+                    combined INTEGER NOT NULL, proof TEXT
+                );
+                CREATE INDEX IF NOT EXISTS index_events_due ON index_events(due,path);
                 INSERT OR IGNORE INTO library_stats VALUES(1,0,0,0,0,0);
                 CREATE TRIGGER IF NOT EXISTS song_added AFTER INSERT ON songs BEGIN
                     UPDATE library_stats SET total=total+1, bytes=bytes+new.bytes,
@@ -272,6 +285,40 @@ class Index:
             result.update((row["key"], json.loads(row["value"])) for row in db.execute("SELECT * FROM settings"))
             result["reserve_gib"] = max(DEFAULTS["reserve_gib"], result["reserve_gib"])
             return result
+
+    def notify(self, paths, mask=MEDIA, *, proofs=None, now=None, db=None):
+        # The producer supplies only final library paths. The consumer checks
+        # the exact disk version before using an optional publication receipt.
+        paths = [str(path) for value in dict.fromkeys(paths)
+                 if index_path(self.root, path := Path(value))]
+        if not paths:
+            return
+        if db is None:
+            with self.db(wait=.25) as opened:
+                self.notify(paths, mask, proofs=proofs, now=now, db=opened)
+            return
+        now = time() if now is None else now
+        serial = uuid4().hex
+        proofs = {} if proofs is None else proofs
+        db.executemany("""
+            INSERT INTO index_events VALUES(?,?,?,?,?,0,0,?)
+            ON CONFLICT(path) DO UPDATE SET mask=index_events.mask | excluded.mask,
+                serial=excluded.serial,
+                due=min(excluded.due, index_events.first + ?), attempts=0,
+                combined=index_events.combined+1, proof=coalesce(excluded.proof,index_events.proof)
+        """, ((path, mask, serial, proofs.get(path, {}).get("published", now), now + EVENT_DELAY,
+               document(proofs[path]) if path in proofs else None, EVENT_MAX_DELAY) for path in paths))
+
+    def events(self, now, *, size=EVENT_BATCH):
+        with self.db(wait=.15) as db:
+            backlog = db.execute("SELECT count(*) FROM index_events").fetchone()[0]
+            # Select the ready window in index order, then postpone removals
+            # within it so that a destination can first inherit a moved ID.
+            rows = db.execute("""
+                SELECT * FROM index_events WHERE due<=? OR (? AND attempts=0)
+                ORDER BY due,path LIMIT ?
+            """, (now, backlog >= size, size)).fetchall()
+        return backlog, sorted(rows, key=lambda row: bool(row["mask"] & REMOVE))
 
     def night_budget(self, since=...):
         # CLOCK_BOOTTIME values survive a service restart on this boot only.
@@ -811,12 +858,43 @@ def missing_on_device(path, device):
     return False
 
 
-def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, paths=None, reader=probe_track):
+def cover_path(path):
+    return path.stem.casefold() in COVER_NAMES and path.suffix.casefold() in COVER_TYPES
+
+
+def affected_tracks(index, folder):
+    # A lexical range on the unique path index keeps an album cover
+    # update independent of the total size of the library.
+    prefix = str(folder) + "/"
+    with index.db(wait=.15) as db:
+        return [row[0] for row in db.execute("SELECT path FROM songs WHERE path>=? AND path<?",
+                                             (prefix, prefix[:-1] + "0")) if Path(row[0]).parent == folder]
+
+
+def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, paths=None,
+              events=None, reader=probe_track, plan_events=None):
     root = index.root
     counts = dict(scanned=0, changed=0, missing=0, errors=0, unchanged=0, probes=0,
-                  reused=0, strawberry=0, transactions=0)
+                  reused=0, strawberry=0, transactions=0, receipts=0, delivered=0, combined=0, lag=0.)
+    events = {row["path"]: row for row in events} if events is not None else {}
+    if events:
+        paths = tuple(map(Path, events))
     phases = defaultdict(float)
     calls = defaultdict(int)
+
+    @lru_cache(maxsize=64)
+    def cover_revision(folder):
+        entries = []
+        for path in folder.iterdir():
+            if cover_path(path):
+                info = path.lstat()
+                if stat.S_ISREG(info.st_mode):
+                    entries.append([path.name, revision(info)])
+        return sorted(entries)
+
+    def lookup_media(path):
+        event = events.get(str(path))
+        return event is None or event["mask"] & MEDIA and not event["proof"]
 
     @contextmanager
     def measure(name):
@@ -847,6 +925,8 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
     generation = uuid4().hex
     group_rules = album_groups(index.path)
     pending = []
+    removed = []
+    settled, retry = set(), set()
     now = time()
     walk_failed = False
 
@@ -856,7 +936,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
         counts["errors"] += 1
 
     def flush():
-        if not pending:
+        if not (pending or removed or settled or retry):
             return
         if root_identity() != identity:
             raise OSError("Stockage de la bibliothèque changé pendant l’inventaire")
@@ -864,6 +944,7 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
             with measure("sqlite_lock"):
                 db.execute("BEGIN IMMEDIATE")
             counts["transactions"] += 1
+            planned = []
             for song in pending:
                 written = db.execute("""
                     INSERT INTO songs VALUES(
@@ -881,6 +962,10 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     WHERE songs.token=:old_token AND songs.checked=:old_checked
                 """, song).rowcount
                 counts["changed"] += written
+                if written:
+                    planned.append(song["path"])
+                elif song["path"] in events:
+                    retry.add(song["path"])
                 # Keep the canonical edition and recording IDs when a known
                 # inode moves. The path is changed in the song transaction.
                 if written and (song["old_token"] is None or song["canonical_previous"] is not None):
@@ -888,10 +973,38 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                         UPDATE canonical_references SET path=:path,song=:id
                         WHERE (path=:path AND song='') OR (path=:canonical_previous AND song IN ('',:id))
                     """, song)
+            for song in removed:
+                deleted = db.execute("DELETE FROM songs WHERE id=? AND path=? AND token=? AND checked=?",
+                                     (song["id"], song["path"], song["token"], song["checked"])).rowcount
+                counts["missing"] += deleted
+                if deleted:
+                    db.execute("UPDATE tasks SET state='excluded' WHERE subject=? AND state!='running'", (song["id"],))
+                elif db.execute("SELECT 1 FROM songs WHERE path=?", (song["path"],)).fetchone():
+                    retry.add(song["path"])
+            if planned and plan_events:
+                with measure("plan"):
+                    plan_events(db, planned)
+            # Acknowledgement and visible changes share one commit. An event
+            # merged during inspection has a different serial and survives.
+            for pathname in sorted(settled - retry):
+                event = events[pathname]
+                if db.execute("DELETE FROM index_events WHERE path=? AND serial=?",
+                              (pathname, event["serial"])).rowcount:
+                    counts["delivered"] += 1
+                    counts["combined"] += event["combined"]
+                    counts["lag"] += max(0., time() - event["first"])
+            db.executemany("UPDATE index_events SET attempts=attempts+1,due=? WHERE path=? AND serial=?",
+                           ((time() + min(1800, 2 ** min(10, events[name]["attempts"] + 2)), name,
+                             events[name]["serial"]) for name in sorted(retry)))
         pending.clear()
+        removed.clear()
+        settled.clear()
+        retry.clear()
 
+    reader_context = (collection_reader(collection, root, targeted=paths is not None)
+                      if not events or any(lookup_media(path) for path in paths) else nullcontext(lambda paths: {}))
     started = perf_counter()
-    with collection_reader(collection, root, targeted=paths is not None) as read_batch, index.db() as db:
+    with reader_context as read_batch, index.db() as db:
         phases["strawberry"] += perf_counter() - started
         candidates = iter(audio_paths(root, error) if paths is None else dict.fromkeys(paths))
         while not stop() and (limit is None or counts["scanned"] < limit):
@@ -903,15 +1016,19 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                 break
             if not batch:
                 continue
-            with measure("strawberry"):
-                catalogue = read_batch(batch)
             with measure("sqlite_read"):
                 previous = path_rows(db, batch)
+            lookup = {path for path in batch if lookup_media(path)}
+            with measure("strawberry"):
+                catalogue = read_batch(lookup) if lookup else {}
             for path in batch:
                 if stop():
                     break
-                missing.pop(str(path), None)
-                old = previous.get(str(path))
+                pathname = str(path)
+                missing.pop(pathname, None)
+                old = previous.get(pathname)
+                event = events.get(pathname)
+                mask = event["mask"] if event else 0
                 try:
                     with measure("file_stat"):
                         st = path.lstat()
@@ -929,7 +1046,9 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                     and not Path(known["path"]).exists()):
                                 old = known
                                 canonical_previous = old["path"]
-                    strawberry = catalogue.get(str(path))
+                    proof = json.loads(event["proof"]) if event and event["proof"] else {}
+                    proof_tags = proof.get("tags") if proof.get("token") == token else None
+                    strawberry = catalogue.get(pathname)
                     fresh = bool(strawberry and (st.st_size, int(st.st_mtime)) ==
                                  (strawberry["filesize"], strawberry["mtime"]))
                     values = tuple(strawberry) if strawberry else ()
@@ -937,10 +1056,13 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                         values = values[:-1]
                     catalogue_revision = encoded_key(values)
                     info = json.loads(old["info"]) if old else {}
+                    if event and path not in lookup and old:
+                        catalogue_revision = info.get("catalogue", catalogue_revision)
                     same_audio = old is not None and old["token"] == token
                     same_path = old is not None and old["path"] == str(path)
                     same_catalogue = catalogue_revision == info.get("catalogue")
-                    reuse = same_audio and not info.get("probe_error") and (same_catalogue or not fresh)
+                    reuse = same_audio and not info.get("probe_error") and (
+                        same_catalogue or not fresh or info.get("file_tags"))
                     with measure("metadata"):
                         if reuse:
                             tags = info["tags"]
@@ -951,12 +1073,18 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                             old_stamp = json.loads(old["token"]) if old is not None else None
                             same_coarse_stamp = old_stamp is not None and (old_stamp[2], old_stamp[3] // 10**9) == (
                                 st.st_size, st.st_mtime_ns // 10**9)
-                            if fresh and (old is None or same_audio or not same_coarse_stamp):
+                            if proof_tags is not None:
+                                tags = proof_tags
+                                counts["receipts"] += 1
+                                info["file_tags"] = True
+                                info.pop("probe_error", None)
+                            elif fresh and (old is None or same_audio or not same_coarse_stamp):
                                 tags = dict(strawberry)
                                 for dest, source in (("albumid", "album"), ("artistid", "album_artist"),
                                                      ("recordingid", "recording")):
                                     tags[dest] = strawberry[f"musicbrainz_{source}_id"]
                                 counts["strawberry"] += 1
+                                info.pop("file_tags", None)
                                 info.pop("probe_error", None)
                             else:
                                 try:
@@ -967,7 +1095,10 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                     tags = info.get("tags", {}) if old else {}
                                     info["probe_error"] = True
                                     counts["errors"] += 1
+                                    if event:
+                                        retry.add(pathname)
                                 else:
+                                    info["file_tags"] = True
                                     info.pop("probe_error", None)
                             duration = tags.get("duration_seconds") or (
                                 strawberry["length"] / 1e9 if fresh and (strawberry["length"] or 0) > 0 else 0)
@@ -976,18 +1107,34 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                             if len(embedded.encode()) > MAX_LRC_BYTES:
                                 embedded = ""
                     stable = same_audio and embedded == info.get("plain", "") and duration == old["duration"]
-                    side, lyrics, lrc = local_state(path, embedded, duration, old, info, stable, measure)
-                    with measure("cache"):
-                        cache, kara, report = inspect_cache(path, old, token, side)
+                    if stable and event and not mask & (MEDIA | SIDECAR):
+                        side, lyrics, lrc = old["side"], old["lyrics"], old["lrc"]
+                    else:
+                        side, lyrics, lrc = local_state(path, embedded, duration, old, info, stable, measure)
+                    if stable and event and side == old["side"] and not mask & PREPARATION:
+                        cache, kara, report = old["cache"], old["kara"], info.get("report", {})
+                    else:
+                        with measure("cache"):
+                            cache, kara, report = inspect_cache(path, old, token, side)
+                    artwork_changed = False
+                    if (event and mask & ARTWORK) or (not event and "artwork" in info):
+                        with measure("artwork"):
+                            artwork = cover_revision(path.parent)
+                        artwork_changed = artwork != info.get("artwork")
+                        info["artwork"] = artwork
                     counts["scanned"] += 1
                     plays = integer(strawberry["playcount"]) if strawberry else old["plays"] if old else 0
                     if (same_path and stable and same_catalogue and side == old["side"] and cache == old["cache"]
                             and kara == old["kara"] and lyrics == old["lyrics"] and lrc == old["lrc"]
-                            and plays == old["plays"] and not info.get("probe_error")):
+                            and plays == old["plays"] and not artwork_changed and not info.get("probe_error")):
                         counts["unchanged"] += 1
+                        if event:
+                            settled.add(pathname)
                         continue
                     if revision(path.lstat()) != token:
                         error("version audio modifiée pendant l’inventaire")
+                        if event:
+                            retry.add(pathname)
                         continue
                     if canonical_previous is not None:
                         missing.pop(canonical_previous, None)
@@ -1000,9 +1147,11 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                     release_id = tags.get("albumid") or tags.get("musicbrainzalbumid") or ""
                     year = integer(str(tags.get("year") or tags.get("date") or "")[:4])
                     edition = encoded_key(owner, album, release_id or year, str(path.parent))
-                    if not same_audio or embedded != info.get("plain", ""):
+                    same_streams = same_audio or (proof_tags is not None and old is not None and
+                                                 proof.get("same_streams_as") == old["token"])
+                    if not same_streams or embedded != info.get("plain", ""):
                         info.pop("lyrics_provider", None)
-                    if not same_audio or json.loads(side)[0] != json.loads(old["side"])[0]:
+                    if not same_streams or json.loads(side)[0] != json.loads(old["side"])[0]:
                         info.pop("lrc_provider", None)
                     info.update(tags={k: v for k, v in tags.items() if k not in LYRIC_KEYS},
                                 plain=embedded, catalogue=catalogue_revision, report=report)
@@ -1015,10 +1164,25 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
                                         artist_id=artist_id, release_id=release_id, plays=plays, lyrics=lyrics, lrc=lrc,
                                         kara=kara, search=key(" ".join((title, artist, owner, album))), seen=generation,
                                         added=old["added"] if old else now, checked=now, info=document(info),
-                                        audio=old["audio"] if same_audio else "", canonical_previous=canonical_previous,
+                                        audio=old["audio"] if same_streams else "", canonical_previous=canonical_previous,
                                         old_token=old["token"] if old else None, old_checked=old["checked"] if old else None))
+                    if event:
+                        settled.add(pathname)
+                except FileNotFoundError:
+                    if event and mask & REMOVE:
+                        if old and missing_on_device(path, old["dev"]):
+                            removed.append(old)
+                            settled.add(pathname)
+                        elif old is None:
+                            settled.add(pathname)
+                        else:
+                            retry.add(pathname)
+                    elif event:
+                        retry.add(pathname)
                 except (OSError, ValueError, UnicodeError) as exc:
                     error(exc)
+                    if event:
+                        retry.add(pathname)
             flush()
             progress(counts["scanned"])
 

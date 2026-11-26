@@ -998,7 +998,7 @@ def stream_hashes(path):
     )
 
 
-def save_lyrics(path, version, tags, lyrics, publication_root=None):
+def save_lyrics(path, version, tags, lyrics, publication_root=None, *, published=None):
     scope = "-metadata:s:a:0" if path.suffix.lower() in STREAM_TAGS else "-metadata"
     key = "lyrics-eng" if path.suffix.lower() == ".mp3" else "LYRICS"
     with TemporaryDirectory(dir=path.parent, prefix=".paroles-") as workspace:
@@ -1009,7 +1009,7 @@ def save_lyrics(path, version, tags, lyrics, publication_root=None):
             "écriture du tag LYRICS échouée",
         )
         try:
-            saved_tags, _ = probe(draft)
+            saved_tags, _ = probe(draft, include_duration=published is not None, include_codec=published is not None)
         except subprocess.CalledProcessError as error:
             raise ValueError("vérification des nouveaux tags impossible") from error
         if lyrics not in (saved_tags.get(key) for key in LYRICS_TAGS):
@@ -1025,7 +1025,10 @@ def save_lyrics(path, version, tags, lyrics, publication_root=None):
             shutil.copymode(path, draft)
             share_file(draft, path)
             os.replace(draft, path)
-            return track_version(path)
+            current = track_version(path)
+            if published is not None:
+                published(current, saved_tags, version)
+            return current
 
 
 def save_lrc(path, lyrics):
@@ -1126,11 +1129,18 @@ def process_track(path, client, preview, synced=False, publication_root=None):
     return f"paroles intégrées · {source}"
 
 
-def process_import_track(path, client, index, settings, excluded, locks, activity, strawberry):
-    from _parole_index import document, sidecar as read_sidecar
+def process_import_track(path, client, index, settings, excluded, locks, activity, strawberry, *, notify=None):
+    from _parole_index import MEDIA, SIDECAR, document, sidecar as read_sidecar
 
     version = track_version(path)
-    tags, _ = probe(path, include_duration=True)
+    with index.db() as db:
+        row = db.execute("SELECT info,duration FROM songs WHERE path=? AND token=?", (str(path), document(version))).fetchone()
+    known = json.loads(row["info"]) if row else {}
+    if known.get("file_tags") and not known.get("probe_error"):
+        tags = {**known["tags"], "duration_seconds": row["duration"]}
+        tags.pop("codec", None)
+    else:
+        tags, _ = probe(path, include_duration=True)
     duration = tags.pop("duration_seconds", 0.)
     title, artist, album, owner = (tags.get(key) for key in ("title", "artist", "album", "albumartist"))
     if (owner or artist) in excluded:
@@ -1142,11 +1152,7 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
     local_text = local_text or read_sidecar(path, ".txt")[1]
     if not local_text and strawberry and (version[2], version[3] // 10**9) == (strawberry["filesize"], strawberry["mtime"]):
         local_text = strawberry["lyrics"] or ""
-    if not local_text:
-        with index.db() as db:
-            row = db.execute("SELECT info FROM songs WHERE path=? AND token=?", (str(path), document(version))).fetchone()
-        if row:
-            local_text = json.loads(row["info"]).get("plain", "")
+    local_text = local_text or known.get("plain", "")
     lrc_path = path.with_suffix(".lrc")
     lrc_exists = lrc_path.exists() or lrc_path.is_symlink()
     lrc_text = read_sidecar(path, ".lrc")[1] if lrc_exists else ""
@@ -1186,9 +1192,13 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
         else:
             timed, lrc = lookup(True)
     if text:
+        def published(current, saved, previous):
+            notify(path, MEDIA, {"token": document(current), "tags": saved,
+                                 "same_streams_as": document(previous)})
+
         try:
             with resource_slot(index.root / INBOX / ".kara-traitements", PROCESSING, timeout=12):
-                version = save_lyrics(path, version, tags, text, index.root)
+                version = save_lyrics(path, version, tags, text, index.root, published=published if notify else None)
         except (OSError, ValueError, ImportIssue, subprocess.SubprocessError):
             plain = "temporary"
     if lrc:
@@ -1198,6 +1208,8 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
                     raise ValueError("fichier modifié pendant la recherche")
                 if not save_lrc(lrc_path, lrc):
                     timed = "present"
+                elif notify:
+                    notify(path, SIDECAR, None)
         except (OSError, ValueError):
             timed = "temporary"
     return plain, timed

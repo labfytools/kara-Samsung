@@ -20,6 +20,7 @@ def schedule(index, tracks):
     with index.db() as db:
         # Commit delivery before the import outcome. A crash in between can
         # replay the publication receipt and enqueue the same tasks safely.
+        index.notify(paths, db=db)
         for kind, values, size in ((LYRICS, paths, BATCH_SIZE), (COVER, albums, 1)):
             for offset in range(0, len(values), size):
                 batch = values[offset:offset + size]

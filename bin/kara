@@ -788,6 +788,15 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
         tracks = available_tracks(data["tracks"], SHARED_LIBRARY)
         if len(tracks) != len(data["tracks"]):
             progress.issue("Tri dans l’audiothèque", "path", "Une destination publiée est inaccessible.")
+        if progress.measure_index is not None and tracks:
+            try:
+                # The sorter already read these exact files. Store the
+                # versioned tags before the managed album outcome is emitted.
+                progress.measure_index.notify(tracks, proofs=data.get("verified", {}))
+            except (OSError, sqlite3.Error):
+                # The durable import receipts still describe the published
+                # subset. Album settlement can send the same paths again.
+                progress.log("Index", "Publication à rapprocher de l’index")
     return data["added"], tracks
 
 

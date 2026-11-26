@@ -24,3 +24,11 @@ La bibliothèque est celle de production, consultée en lecture seule. Les écri
 | Transactions d’inventaire | 56 | 1 |
 
 La première transaction V2 enregistre l’identité du stockage. Les passages suivants à inventaire égal et sans erreur n’ouvrent aucune transaction d’écriture. Une planification intégrale forcée a pris 0,57 s sur la référence et 0,54 s sur V2. V2 omet cette phase après une réconciliation stable si la politique de maintenance est déjà appliquée.
+
+## Livraison persistante
+
+Le résultat détaillé du tri fournit les tags déjà vérifiés sur la version publiée, avec son instant de publication. L’import enregistre les chemins et leurs preuves dans la base Parole. L’admission des enrichissements couvre aussi les chemins qui viennent d’un reçu de reprise et ceux qui n’ont pas ce détail. Un chemin est unique dans la file, et les notifications combinent les types de changements. La fenêtre démarre à 250 ms, s’étend au maximum jusqu’à 1,5 s lors d’une rafale et s’ouvre dès que 64 chemins attendent.
+
+L’indexeur vérifie le périphérique, l’inode, la taille et les temps à la nanoseconde avant de réutiliser les tags. Il publie les pistes, planifie leur maintenance et accuse réception dans la même transaction WAL. Un événement plus récent conserve son numéro de livraison. Une lecture échouée ou une mutation concurrente diffère la livraison. Le chemin de secours reste la réconciliation. Lorsqu’une écriture de paroles prouve que tous les flux sont inchangés, l’identité PCM existante reste valable pour la nouvelle version. Les références Kara conservent leurs propres vérifications.
+
+Le thread d’indexation appartient au bail de maintenance du service. Il traite des lots bornés pendant que les opérations réseau suivent leur propre cours. Le catalogue de la salle fusionne les chemins publiés. Un album importé ne demande plus d’inventaire global de Parole. Strawberry garde son mécanisme de surveillance et sa base en lecture seule.

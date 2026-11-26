@@ -3,6 +3,7 @@
 ## En développement
 
 - Réutiliser les versions des paroles et des métadonnées pendant la réconciliation de Parole et éviter les écritures SQLite pour les pistes inchangées.
+- Intégrer les publications et enrichissements d’import dans une file durable fusionnée par piste, avec réutilisation des tags vérifiés.
 - Identifier chaque cycle et flux BlackBox V3, pseudonymiser les joueurs, publier les blocs WAV atomiquement et réserver le micro témoin à une sélection explicite.
 - Capturer le PCM reçu avant le filtrage réseau et le mix Kara après les faders, borner la synchronisation réseau par échange d’horloges et exiger l’accord individuel pendant le tour.
 - Vérifier les recouvrements par cycle, afficher le prévol et produire un rapport BlackBox avec rejeu chronologique, comparaison de tolérances et export expurgé.
