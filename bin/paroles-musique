@@ -30,7 +30,7 @@ from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_art
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _kara_import_resources import PROCESSING, RATE_DIRECTORY, defer_service, resource_slot, wait_service
 from _kara_import_result import ImportIssue
-from _parole_lyrics_lookup import (KeepAlive, backoff, cache_identity, cached, contexts, provider_profiles,
+from _parole_lyrics_lookup import (KeepAlive, cache_identity, cached, contexts, provider_profiles,
                                    record_profile, remember)
 
 
@@ -101,7 +101,7 @@ class RequestGate:
                 return True
             except ProviderUnavailable as error:
                 raise ServiceUnavailable(str(error), "limited") from error
-        if os.environ.get("KARA_IMPORT_PROCESSING"):
+        if host == "lrclib.net" or os.environ.get("KARA_IMPORT_PROCESSING"):
             try:
                 wait_service(host, self.interval, max_wait=30)
                 return True
@@ -119,12 +119,11 @@ class RequestGate:
             time.sleep(delay)
 
     def defer(self, host, delay, status=429):
-        if self.provider is not None or os.environ.get("KARA_IMPORT_PROCESSING"):
+        if host == "lrclib.net" or self.provider is not None or os.environ.get("KARA_IMPORT_PROCESSING"):
             if self.provider:
-                from _parole_import_metrics import limited
+                from _parole_sources import provider_backoff
 
-                delay = backoff(*self.provider, delay)
-                limited(*self.provider, delay, status)
+                delay = provider_backoff(*self.provider, host, delay, status)
             defer_service(host, delay)
             return
         with self.lock:
@@ -136,15 +135,29 @@ class RequestGate:
     @contextmanager
     def open(self, opener, request, timeout):
         host = urlsplit(request.full_url).hostname
-        slot = (resource_slot(RATE_DIRECTORY / "lyrics" / sha256(self.provider[1].encode()).hexdigest(),
-                              2, timeout=self.remaining(8)) if self.provider else nullcontext())
+        if host == "lrclib.net":
+            from _parole_sources import request_slot
+
+            slot = request_slot(host, self.remaining(8))
+        else:
+            slot = (resource_slot(RATE_DIRECTORY / "lyrics" / sha256(self.provider[1].encode()).hexdigest(),
+                                  2, timeout=self.remaining(8)) if self.provider else nullcontext())
         try:
             with slot:
                 if not self.remaining(timeout) or not self.wait(host) or not (budget := self.remaining(timeout)):
                     raise ServiceUnavailable("Créneau fournisseur indisponible", "limited")
                 self.requests += 1
-                with opener.open(request, timeout=budget) as response:
-                    yield response
+                try:
+                    with opener.open(request, timeout=budget) as response:
+                        yield response
+                except HTTPError as error:
+                    if self.provider and (error.code == 429 or error.code >= 500):
+                        self.defer(host, retry_delay(error.headers.get("Retry-After"), 5), error.code)
+                    raise
+                except (URLError, TimeoutError):
+                    if self.provider:
+                        self.defer(host, 5, 503)
+                    raise
         except ImportIssue as error:
             raise ServiceUnavailable(str(error), "limited") from error
 
@@ -188,7 +201,8 @@ class LrcLib:
                 if error.code not in {429, 500, 502, 503, 504}:
                     raise ServiceUnavailable(f"LRCLIB a répondu HTTP {error.code}", "limited" if error.code == 429 else "unavailable") from error
                 delay = retry_delay(error.headers.get("Retry-After"), delay or 5)
-                self.gate.defer(urlsplit(request.full_url).hostname, delay, error.code)
+                if not self.gate.provider:
+                    self.gate.defer(urlsplit(request.full_url).hostname, delay, error.code)
                 if delay > 30:
                     raise ServiceUnavailable("LRCLIB demande d’attendre avant de réessayer", "limited") from error
                 if last_attempt:
@@ -244,7 +258,7 @@ class LyricsOvh:
         except HTTPError as error:
             if error.code == 429 or error.code >= 500:
                 self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
-            if error.code == 429 or error.code >= 500:
+            if not self.gate.provider and (error.code == 429 or error.code >= 500):
                 self.gate.defer(urlsplit(request.full_url).hostname,
                                 retry_delay(error.headers.get("Retry-After"), 5), error.code)
             return None
@@ -309,7 +323,7 @@ class PublicLyrics:
         except HTTPError as error:
             if error.code == 429 or error.code >= 500:
                 self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
-            if error.code == 429 or error.code >= 500:
+            if not self.gate.provider and (error.code == 429 or error.code >= 500):
                 self.gate.defer(urlsplit(request.full_url).hostname,
                                 retry_delay(error.headers.get("Retry-After"), 5), error.code)
             return None

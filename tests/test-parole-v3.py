@@ -13,7 +13,7 @@ import sys
 import tempfile
 from time import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
@@ -128,13 +128,20 @@ class InventoryTests(Fixture):
 
 
 class QueueTests(Fixture):
-    def test_final_lookup_and_classic_queue_share_persistent_budget_and_spacing(self):
-        self.index.enqueue("lyrics", "song", "fixture", now=10)
-        self.assertTrue(self.index.reserve_daily("network", 2, now=10, gap=20))
-        self.assertIsNone(self.index.claim(("lyrics",), 29, bucket="network", limit=2, gap=20))
-        self.assertIsNotNone(self.index.claim(("lyrics",), 30, bucket="network", limit=2, gap=20))
-        self.assertFalse(self.index.reserve_daily("network", 2, now=90, gap=20))
-        self.assertFalse(self.index.reserve_daily("network", 0, now=100_000, gap=20))
+    def test_classic_queue_ignores_legacy_global_quota_and_counts_external_publications(self):
+        owner = Maintenance(self.root, None, state=self.base / "state")
+        self.addCleanup(owner.close)
+        index = owner.index
+        index.enqueue("lyrics", "song", "fixture", now=10)
+        self.assertTrue(index.reserve_daily("network", 1, now=10, gap=20))
+        owner.execute = Mock()
+        self.assertTrue(owner.tick_network(index.settings(), 11, ("lyrics",)))
+        task = owner.execute.call_args.args[0]
+        with patch("_parole_index.time", return_value=12):
+            index.finish(task, "done", "found", network_found=True)
+            index.finish(task, "done", "found", network_found=True)
+        self.assertEqual(index.network_yield(now=120), {"lyrics": 1})
+        self.assertEqual(index.network_yield(now=3660), {})
 
     def test_automatic_codex_is_opt_in_and_manual_claims_remain_available(self):
         self.assertFalse(self.index.settings()["codex_auto"])

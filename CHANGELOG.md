@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Supprimer le plafond et l’intervalle globaux de la maintenance réseau, isoler les temporisations par fournisseur et compter les paroles et LRC publiés par heure.
 - Armer l’inhibiteur de capot avant la fermeture sur secteur, confirmer le verrouillage Sway avant l’extinction et porter la durée nocturne par défaut à huit heures.
 - Alterner la préparation Kara avec les recherches et vérifications capot fermé, même sans fenêtre Parole, et conserver un bilan par catégorie.
 

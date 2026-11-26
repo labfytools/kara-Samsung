@@ -28,7 +28,7 @@ DEFAULTS = {
     "idle": 300, "battery": False, "cpu": 25, "memory_mib": 4096, "running_memory_mib": 1536, "temperature": 78,
     "import_strategy": "speed", "import_preferred": "",
     "import_lyrics_workers": 4,
-    "gpu": 15, "disk_busy": 25, "network_interval": 20, "network_daily": 24, "network_timeout": 145, "heavy_daily": 3,
+    "gpu": 15, "disk_busy": 25, "network_timeout": 145, "heavy_daily": 3,
     "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
     "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,
     "night_idle": 420, "night_cpu_temperature": 78, "night_gpu_temperature": 75,
@@ -389,13 +389,22 @@ class Index:
                 self.write_night_report(db, report)
             return task
 
-    def finish(self, task, state, detail="", delay=0, *, night=None, closed=None, refund_attempt=False):
+    def finish(self, task, state, detail="", delay=0, *, night=None, closed=None, refund_attempt=False,
+               network_found=False):
         now = time()
         with self.db() as db:
             changed = db.execute("""UPDATE tasks SET state=?, detail=?, updated=?, due=?, attempts=attempts-?
                           WHERE kind=? AND subject=? AND state='running' AND revision=?""",
                                  (state, detail[:300], now, now + delay, refund_attempt,
                                   task["kind"], task["subject"], task["revision"])).rowcount
+            if changed and state == "done" and network_found and task["kind"] in ("lyrics", "lrc"):
+                # Count an actual external publication once at queue
+                # settlement. Provider hits and cached attempts are separate.
+                minute = int(now) // 60 * 60
+                db.execute("""INSERT INTO reviews VALUES('network_yield',?,?,?, '1')
+                              ON CONFLICT(kind,subject) DO UPDATE SET value=CAST(value AS INTEGER)+1""",
+                           (f"{minute}:{task['kind']}", task["kind"], minute))
+                db.execute("DELETE FROM reviews WHERE kind='network_yield' AND checked<?", (minute - 48 * 3600,))
             if night is not None:
                 report = self.read_night_report(db)
                 if report and report["pending"] == [task["subject"], task["revision"]]:
@@ -430,6 +439,13 @@ class Index:
                     elif outcome != "completed":
                         report[outcome] += 1
                     self.write_closed_report(db, report)
+
+    def network_yield(self, *, now=None):
+        end = int(time() if now is None else now) // 60 * 60
+        with self.db(wait=.15) as db:
+            return dict(db.execute("""SELECT state,sum(CAST(value AS INTEGER)) FROM reviews
+                                      WHERE kind='network_yield' AND checked>=? AND checked<?
+                                      GROUP BY state""", (end - 3600, end)))
 
     def exclude(self, kind, subject):
         with self.db() as db:

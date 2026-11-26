@@ -192,7 +192,7 @@ class NightTests(unittest.TestCase):
 
     def test_closed_background_alternates_work_and_persists_completed_tasks(self):
         self.owner.foreground.clear()
-        self.owner.index.configure(night_lid=True, night_lid_qualified=True, network_interval=0)
+        self.owner.index.configure(night_lid=True, night_lid_qualified=True)
         self.settings = self.owner.index.settings()
         self.night.refresh(self.settings)
         self.assertTrue(self.observe(lid=True))

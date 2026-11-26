@@ -13,11 +13,13 @@ import ssl
 from time import monotonic, time
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
-from _kara_import_resources import AUDIO_INTERVALS, checkpoint, current_pause, defer_service, download_event, wait_service
+from _kara_import_resources import (AUDIO_INTERVALS, RATE_DIRECTORY, checkpoint, current_pause, defer_service,
+                                    download_event, resource_slot, wait_service)
 from _kara_import_result import ImportIssue
 from _parole_index import document
 from _parole_import_providers import ARCHIVE, AUDIO_HOSTS, JAMENDO, MANUAL, YOUTUBE
 from _parole_import_metrics import Transfer, limited, observe
+from _parole_lyrics_lookup import backoff
 
 BUILTINS = {
     "LRCLIB": ("lrclib.net", "lyrics,lrc", "https://lrclib.net/docs"),
@@ -45,6 +47,20 @@ COVER_PROVIDERS = {host: identity for identity, (host, category, _) in BUILTINS.
 
 class ProviderUnavailable(OSError):
     pass
+
+
+@contextmanager
+def request_slot(host, timeout):
+    # LRCLIB requests must finish before another starts. Both discovery and
+    # the built-in lyrics client share the same interprocess slot.
+    if host == "lrclib.net":
+        with resource_slot(RATE_DIRECTORY / "lrclib-http", 1, timeout=timeout):
+            try:
+                yield
+            finally:
+                defer_service(host, .25)
+    else:
+        yield
 
 
 def provider_limits(config):
@@ -203,7 +219,15 @@ def https_connection(host, timeout):
 
 def fetch(url, *, interval=1.2, accept="application/json", registry=None, provider=None, validation=False):
     parts = public_url(url)
-    service = parts.hostname if registry is not None else "parole-" + parts.hostname
+    try:
+        with request_slot(parts.hostname, 5):
+            return fetch_response(parts, interval, accept, registry, provider, validation)
+    except ImportIssue as error:
+        raise ProviderUnavailable("Créneau fournisseur indisponible") from error
+
+
+def fetch_response(parts, interval, accept, registry, provider, validation):
+    service = parts.hostname if registry is not None or parts.hostname == "lrclib.net" else "parole-" + parts.hostname
     if registry is not None:
         wait_provider(registry, provider, service, interval, validation=validation)
     else:
@@ -216,16 +240,15 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
         try:
             checkpoint()
             path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
-            connection.request("GET", path, headers={"Accept": accept, "User-Agent": "Parole/3 (Kara music library)"})
+            connection.request("GET", path, headers={
+                "Accept": accept, "User-Agent": "Parole/3 (https://github.com/labfytools/kara-Samsung)"})
             response = connection.getresponse()
             if response.status == 404:
                 return None
             if response.status == 429 or response.status >= 500:
                 retry = response.getheader("Retry-After", "")
-                delay = retry_delay(retry)
+                delay = provider_backoff(registry, provider, service, retry_delay(retry), response.status)
                 defer_service(service, delay)
-                if provider in (ARCHIVE, JAMENDO):
-                    limited(registry, provider, delay, response.status)
                 raise ProviderUnavailable(f"Fournisseur HTTP {response.status}")
             if response.status != 200:
                 raise ValueError(f"Réponse HTTP {response.status} refusée")
@@ -245,7 +268,20 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
             raise
         except (OSError, http.client.HTTPException) as error:
             checkpoint()
+            defer_service(service, provider_backoff(registry, provider, service, 5, 503))
             raise ProviderUnavailable("Source indisponible") from error
+
+
+def provider_backoff(index, identity, host, minimum, status):
+    if host == "lrclib.net" and status == 429:
+        from random import uniform
+
+        minimum += uniform(0, min(minimum * .3, 3))
+    if index is None or not identity:
+        return minimum
+    delay = backoff(index, identity, minimum)
+    limited(index, identity, delay, status)
+    return delay
 
 
 class AudioDownload:

@@ -161,7 +161,6 @@ class Maintenance:
         self.cancelled = None
         self.priority_until = 0.
         self.next_scan = 0
-        self.next_network = 0
         self.network_cursor = 0
         self.import_enrichment_turn = 0
         self.import_activity = (0, 0)
@@ -652,10 +651,6 @@ class Maintenance:
             if saved.pop("revision", None) == revision:
                 return saved
 
-        if ((settings["lrc"] or settings["generate"] and settings["lyrics"] and not local_text.strip())
-                and not self.index.reserve_daily("network", settings["network_daily"], gap=settings["network_interval"])):
-            return {"state": "limited"}
-
         def lookup(kind):
             try:
                 _, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]],
@@ -891,6 +886,7 @@ class Maintenance:
         category = {"discography": "DISCOGRAPHIE", "prepare": "KARA", "source_probe": "SOURCE",
                     "cleanup": "CACHE", IMPORT_LYRICS: "LYRICS", IMPORT_COVER: "COVER"}.get(kind, kind.upper())
         import_suspended = False
+        network_found = False
         window = self.night.window if nocturnal else None
         with self.lock:
             self.interrupt.clear()
@@ -935,6 +931,7 @@ class Maintenance:
                 value = json.loads(data)
                 if kind in ("lyrics", "lrc"):
                     result = self.do_song(task, value)
+                    network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry")
                 elif kind == "source_probe":
                     self.journal.emit("SOURCE", "Documentation accessible" if value["state"] == "available" else
                                       "Documentation ou conditions à vérifier")
@@ -999,7 +996,8 @@ class Maintenance:
             outcome = ("interrupted" if state == "suspended" else "completed"
                        if state in ("done", "review", "excluded") or detail in CHECKED_RESULTS else "deferred")
             closed = window, outcome
-        self.index.finish(task, *result, night=stats, closed=closed, refund_attempt=import_suspended)
+        self.index.finish(task, *result, night=stats, closed=closed, refund_attempt=import_suspended,
+                          network_found=network_found)
         if import_suspended:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
@@ -1201,14 +1199,10 @@ class Maintenance:
                      and (kind != "codex" or now >= settings.get("codex_suspended_until", 0)))
 
     def tick_network(self, settings, now, kinds, *, nocturnal=False):
-        if now < self.next_network:
-            return False
         manual = self.index.claim(("codex",), now, high=True, codex_auto=settings["codex_auto"]) if "codex" in kinds else None
         if manual is None:
-            manual = self.index.claim(tuple(kind for kind in kinds if kind != "codex"), now, bucket="network",
-                                      limit=settings["network_daily"], high=True, gap=settings["network_interval"])
+            manual = self.index.claim(tuple(kind for kind in kinds if kind != "codex"), now, high=True)
         if manual is not None:
-            self.next_network = now + settings["network_interval"]
             self.execute(manual, nocturnal=nocturnal)
             return True
         # Stagger task classes so a large burst of missing LRC never starves
@@ -1218,11 +1212,8 @@ class Maintenance:
             self.network_cursor = (self.network_cursor + 1) % len(NETWORK_TURN)
             if kind not in kinds:
                 continue
-            task = self.index.claim((kind,), now, bucket="network" if kind != "codex" else None,
-                                    limit=settings["network_daily"], codex_auto=settings["codex_auto"],
-                                    gap=settings["network_interval"])
+            task = self.index.claim((kind,), now, codex_auto=settings["codex_auto"])
             if task is not None:
-                self.next_network = now + settings["network_interval"]
                 self.execute(task, nocturnal=nocturnal)
                 return True
         return False
@@ -1230,7 +1221,7 @@ class Maintenance:
     def tick_night(self, settings, now):
         closed = self.night.window is not None and self.night.desktop.lid and self.night.lid_fd is not None
         kinds = self.network_kinds(settings, now, nocturnal=True) if closed else ()
-        network_due = now >= self.next_network and self.index.work_due(kinds, now)
+        network_due = self.index.work_due(kinds, now)
         prepare_due = self.index.preparation_due(now)
         # One owner, one engine at a time. Offer the other class the next
         # turn so a continuous backlog of either class cannot starve it.
@@ -1242,7 +1233,7 @@ class Maintenance:
                 continue
             if light:
                 if not self.tick_network(settings, now, kinds, nocturnal=True):
-                    self.night.report("Recherches nocturnes en attente · quota ou intervalle de maintenance")
+                    self.night.report("Recherches nocturnes en attente · aucune tâche disponible")
                     continue
             else:
                 task = self.index.claim(("prepare",), now,

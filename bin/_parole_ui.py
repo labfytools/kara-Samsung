@@ -612,6 +612,9 @@ class ParoleView:
         lines.extend((f"{lid} · {power} · {screens} · {lock}", inhibitor))
         if night.reason:
             lines.append(night.reason)
+        yield_hour = self.index.network_yield()
+        lines.append(f"Dernière heure révolue · {yield_hour.get('lyrics', 0)} paroles · "
+                     f"{yield_hour.get('lrc', 0)} LRC récupérés")
         if closed := self.index.closed_progress():
             stamp = datetime.fromtimestamp(closed["started"]).strftime("%d/%m à %H:%M")
             completed = closed["completed"]
@@ -1008,8 +1011,6 @@ class ParoleView:
             ("running_memory_mib", "Réserve mémoire pendant un traitement (Mio)", 512, 16384, 128),
             ("temperature", "Température maximale (°C)", 45, 95),
             ("gpu", "Charge GPU avant départ (%)", 0, 95), ("disk_busy", "Activité disque avant départ (%)", 1, 95),
-            ("network_interval", "Intervalle entre opérations réseau (secondes)", 5, 900),
-            ("network_daily", "Recherches classiques par jour", 0, 500),
             ("network_timeout", "Durée maximale par recherche classique (secondes)", 15, 300),
             ("heavy_daily", "Préparations anticipées par jour", 1, 100),
         ):
