@@ -253,12 +253,11 @@ def import_enrichment(index, kind, subject, report):
     locks = tuple(Lock() for _ in range(31))
     activity_lock = Lock()
     active = [0, 0]
-    publications = {}
 
     def notify(path, mask, proof):
-        with activity_lock:
-            old_mask, old_proof = publications.get(str(path), (0, None))
-            publications[str(path)] = old_mask | mask, proof or old_proof
+        # The receiving index coalesces these notices. Each verified file
+        # becomes eligible even while another lookup in the batch is blocked.
+        index.notify([path], mask, proofs={str(path): proof} if proof else None)
 
     def activity(synced, delta):
         with activity_lock:
@@ -285,14 +284,6 @@ def import_enrichment(index, kind, subject, report):
     finally:
         for source in clients:
             source.close()
-        # File publication happened under its existing library lock. Deliver
-        # the affected paths together after the network workers have joined.
-        if publications:
-            proofs = {path: proof for path, (_, proof) in publications.items() if proof is not None}
-            with index.db() as db:
-                for mask in sorted({mask for mask, _ in publications.values()}):
-                    index.notify((path for path, (value, _) in publications.items() if value == mask),
-                                 mask, proofs=proofs, db=db)
     prune(index)
     plain = Counter(result[0] for result, _ in processed)
     timed = Counter(result[1] for result, _ in processed)

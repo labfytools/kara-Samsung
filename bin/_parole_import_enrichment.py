@@ -43,10 +43,3 @@ def paths_for(index, kind, subject):
             if (path := grouped_path(index.root, Path(value), database=index.path)).is_relative_to(index.root)
             and path != index.root and path.resolve() == path
             and (path.is_file() if kind == LYRICS else path.is_dir())]
-
-
-def pending(index, now):
-    with index.db(wait=.15) as db:
-        return bool(db.execute("""SELECT 1 FROM tasks WHERE kind IN (?,?)
-                               AND state IN ('queued','temporary','suspended') AND due<=? LIMIT 1""",
-                               (*KINDS, now)).fetchone())

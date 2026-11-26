@@ -3,6 +3,7 @@
 ## En développement
 
 - Publier les pistes vérifiées pendant les transferts suivants et livrer leur reçu à l’index V2 dès le tri.
+- Traiter les pochettes indépendamment des paroles et du minutage, et notifier chaque fichier associé dès sa publication.
 - Lire les tags ordinaires de l’index avec TagLib lorsque le lecteur est disponible, et conserver le repli FFprobe.
 - Appliquer le classement manuel au tag d’album des imports concernés et vérifier le PCM avant une correction sauvegardée.
 

@@ -13,7 +13,7 @@ import os
 
 from _kara_import_resources import ImportSuspended, MAX_MEDIA, PROCESSING, check_space, checkpoint, current_pause
 from _kara_import_result import ImportIssue
-from _musique_oz import AUDIO, share_file
+from _musique_oz import AUDIO, share_file, shared_mutation
 from _parole_import_providers import MANUAL
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
@@ -342,9 +342,10 @@ def resume_verified_entry(entry, destination, stop):
     return digest.hexdigest()
 
 
-def publish_sidecar(entry, target):
+def publish_sidecar(entry, target, *, audio, root):
     if target.exists() or target.is_symlink():
-        return
+        return False
+    version = stamp(audio.lstat())
     lyrics = target.suffix == ".lrc"
     limit = MAX_LRC_BYTES if lyrics else 8 * BLOCK
     if not 0 < entry.size <= limit:
@@ -368,12 +369,18 @@ def publish_sidecar(entry, target):
         draft.flush()
         os.fsync(draft.fileno())
         share_file(draft.name, target)
-        try:
-            os.link(draft.name, target)
-        except FileExistsError:
-            return
-        fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        # ZIP reads and image verification can be slow. The library lock
+        # covers only the final link to the still-current audio destination.
+        with shared_mutation(root, wait=True):
+            if audio.resolve() != audio or stamp(audio.lstat()) != version:
+                raise ValueError("Le morceau a changé pendant la copie du fichier associé.")
+            try:
+                os.link(draft.name, target)
+            except FileExistsError:
+                return False
+            fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return True

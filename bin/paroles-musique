@@ -1026,9 +1026,9 @@ def save_lyrics(path, version, tags, lyrics, publication_root=None, *, published
             share_file(draft, path)
             os.replace(draft, path)
             current = track_version(path)
-            if published is not None:
-                published(current, saved_tags, version)
-            return current
+        if published is not None:
+            published(current, saved_tags, version)
+        return current
 
 
 def save_lrc(path, lyrics):
@@ -1163,10 +1163,10 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
     # The owner may process copies of the same recording in one batch.
     # Only the lookup is shared. Each publication checks its own file version.
     lock = locks[int.from_bytes(sha256(document(signature).encode()).digest()[:4]) % len(locks)]
-    with lock:
-        client.new_track()
+    client.new_track()
 
-        def lookup(synced):
+    def lookup(synced):
+        with lock:
             activity(synced, 1)
             try:
                 value, _ = client.find(*signature, synced=synced, local_text=local_text,
@@ -1179,18 +1179,9 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
                 activity(synced, -1)
             return ("missing" if value is None else "found" if value else "instrumental"), value
 
-        plain, text = (("present", None) if plain_present else
-                       lookup(False) if settings["lyrics"] and path.suffix.lower() in STREAM_TAGS | FILE_TAGS
-                       else ("missing", None))
-        local_text = local_text or text or ""
-        if lrc_exists:
-            timed, lrc = ("present" if lrc_present else "review"), None
-        elif not settings["lrc"]:
-            timed, lrc = "missing", None
-        elif embedded := catalog_transcript(local_text, duration, synced=True):
-            timed, lrc = "found", embedded
-        else:
-            timed, lrc = lookup(True)
+    plain, text = (("present", None) if plain_present else
+                   lookup(False) if settings["lyrics"] and path.suffix.lower() in STREAM_TAGS | FILE_TAGS
+                   else ("missing", None))
     if text:
         def published(current, saved, previous):
             notify(path, MEDIA, {"token": document(current), "tags": saved,
@@ -1201,15 +1192,27 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
                 version = save_lyrics(path, version, tags, text, index.root, published=published if notify else None)
         except (OSError, ValueError, ImportIssue, subprocess.SubprocessError):
             plain = "temporary"
+    # Publish verified plain text before a possibly slower timing request.
+    # The same client keeps the validated text and its shared provider result.
+    local_text = local_text or text or ""
+    if lrc_exists:
+        timed, lrc = ("present" if lrc_present else "review"), None
+    elif not settings["lrc"]:
+        timed, lrc = "missing", None
+    elif embedded := catalog_transcript(local_text, duration, synced=True):
+        timed, lrc = "found", embedded
+    else:
+        timed, lrc = lookup(True)
     if lrc:
         try:
             with shared_mutation(index.root):
                 if track_version(path) != version or path.resolve() != path:
                     raise ValueError("fichier modifié pendant la recherche")
-                if not save_lrc(lrc_path, lrc):
-                    timed = "present"
-                elif notify:
-                    notify(path, SIDECAR, None)
+                saved = save_lrc(lrc_path, lrc)
+            if not saved:
+                timed = "present"
+            elif notify:
+                notify(path, SIDECAR, None)
         except (OSError, ValueError):
             timed = "temporary"
     return plain, timed

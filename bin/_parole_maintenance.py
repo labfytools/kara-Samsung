@@ -30,7 +30,7 @@ from _parole_index import (ARTWORK, LOCAL_REFERENCE_MISS, REFERENCE_REUSE_SECOND
 from _parole_index_watch import Watch
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
-from _parole_import_enrichment import paths_for as enrichment_paths, pending as enrichment_pending
+from _parole_import_enrichment import paths_for as enrichment_paths
 from _parole_local_reference import SOURCE as LOCAL_SOURCE
 from _parole_night import Night
 from _parole_process import Interrupted, run
@@ -154,7 +154,6 @@ class Maintenance:
         self.night_lrc = (False, False)
         self.night_measures = {}
         self.owner = None
-        self.import_owner = None
         self.foreground = Event()
         if not background:
             self.foreground.set()
@@ -181,7 +180,7 @@ class Maintenance:
         self.network_width = 2
         self.local_reference_next = True
         self.network_active = {}
-        self.import_enrichment_turn = 0
+        self.import_enrichment_active = {}
         self.import_activity = (0, 0)
         self.import_lyrics_stats = None
         self.next_import_probe = 0.
@@ -207,8 +206,11 @@ class Maintenance:
         with self.lock:
             self.priority = busy
             self.index_priority = busy if kara is None else kara
-            if busy and self.active and self.active[0] in (*HEAVY, *IMPORT_ENRICHMENT):
+            if busy and self.active and self.active[0] in HEAVY:
                 self.interrupt.set()
+            if busy:
+                for cancel in self.import_enrichment_active.values():
+                    cancel.set()
         if busy and self.active:
             self.wake.set()
 
@@ -230,6 +232,9 @@ class Maintenance:
         self.index.configure(paused=paused)
         if paused:
             self.interrupt.set()
+            with self.lock:
+                for cancel in self.import_enrichment_active.values():
+                    cancel.set()
         self.wake.set()
         self.index_wake.set()
         self.journal.emit("SYSTEM", "Maintenance suspendue" if paused else "Maintenance reprise")
@@ -242,7 +247,8 @@ class Maintenance:
     def cancel(self, kind, subject):
         self.index.cancel(kind, subject)
         with self.lock:
-            if event := self.network_active.get((kind, subject)):
+            event = self.network_active.get((kind, subject)) or self.import_enrichment_active.get((kind, subject))
+            if event:
                 event.set()
             if self.active == (kind, subject):
                 self.cancelled = self.active
@@ -289,12 +295,10 @@ class Maintenance:
     def stopped(self):
         if self.shutdown.is_set() or self.interrupt.is_set():
             return True
-        if self.import_owner is not None and self.import_queue.pause_requested():
-            return True
         if self.night_running:
             if self.import_queue and monotonic() >= self.next_import_probe:
                 self.next_import_probe = monotonic() + 1.
-                if self.import_queue.pending():
+                if self.import_queue.pending() or self.import_enrichment_count():
                     self.night.report("Préparation nocturne suspendue · imports prioritaires")
                     return True
             return not self.night_allowed(self.current_settings, running=True, light=self.active[0] not in HEAVY)
@@ -311,7 +315,7 @@ class Maintenance:
             now = monotonic()
             if self.import_queue and now >= self.next_import_probe:
                 self.next_import_probe = now + 1.
-                if self.import_queue.pending():
+                if self.import_queue.pending() or self.import_enrichment_count():
                     self.interrupt.set()
                     return True
             allowed = self.resources.check(self.current_settings,
@@ -793,16 +797,17 @@ class Maintenance:
         return ("temporary" if state not in ("excluded",) else "excluded",
                 state, self.current_settings["review_days"] * DAY)
 
-    def output(self, command, timeout=140, observer=None, maximum=262_144, *, extra_env=None, stop=None):
+    def output(self, command, timeout=140, observer=None, maximum=262_144, *, extra_env=None, stop=None,
+               import_owner=None):
         env = dict(os.environ, KARA_MUSIC_LIBRARY=str(self.index.root))
         if extra_env:
             env.update(extra_env)
         if self.state_root is not None:
             env["XDG_STATE_HOME"] = str(self.state_root)
-        if self.night_running:
+        if self.night_running and import_owner is None:
             env["KARA_DEMUCS_THREADS"] = "2"
         # All input paths are program arguments; no shell evaluates titles or paths.
-        retain = tuple(fd for fd in (self.owner, self.import_owner) if fd is not None)
+        retain = tuple(fd for fd in (self.owner, import_owner) if fd is not None)
         return run(command, stop=self.stopped if stop is None else stop, timeout=timeout, event=observer, env=env, maximum=maximum,
                    retain=retain)
 
@@ -929,7 +934,7 @@ class Maintenance:
         elif successful == len(tasks):
             self.network_width = min(20, self.network_width + 1)
 
-    def enrich_import(self, task):
+    def enrich_import(self, task, owner, stop):
         kind, subject = task["kind"], task["subject"]
         paths = enrichment_paths(self.index, kind, subject)
         def update(event):
@@ -937,9 +942,11 @@ class Maintenance:
                 self.import_activity = event["lyrics"], event["lrc"]
         try:
             code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
-                                     timeout=180, observer=update, extra_env={"KARA_ENRICHMENT_EVENTS": "1"})
+                                     timeout=180, observer=update if kind == IMPORT_LYRICS else None,
+                                     extra_env={"KARA_ENRICHMENT_EVENTS": "1"}, stop=stop, import_owner=owner)
         finally:
-            self.import_activity = (0, 0)
+            if kind == IMPORT_LYRICS:
+                self.import_activity = (0, 0)
         value = json.loads(data.splitlines()[-1]) if not code else {"state": "temporary"}
         if kind == IMPORT_LYRICS and paths:
             if "tracks_seconds" in value:
@@ -952,7 +959,7 @@ class Maintenance:
         if kind == IMPORT_COVER and value["state"] == "complete" and paths:
             self.index.notify(affected_tracks(self.index, paths[0]), ARTWORK)
             self.index_wake.set()
-        if self.stopped():
+        if stop():
             raise Interrupted
         if value["state"] == "complete":
             return "done", "enrichissement vérifié", 0
@@ -960,34 +967,87 @@ class Maintenance:
             return "temporary", "recherche différée", 300
         return "review", "enrichissement partiel · maintenance complémentaire", 0
 
-    def tick_import_enrichment(self, settings, now):
-        # Enrichment can run without a nocturnal resource sample. It needs
-        # the library's free-space reserve and consumes no preparation cache.
+    def import_enrichment_count(self):
+        with self.lock:
+            return len(self.import_enrichment_active)
+
+    def import_enrichment_loop(self, kind):
+        # Two bounded lanes under the same maintenance owner. Text and LRC
+        # share a provider lookup, while artwork has its own durable claims.
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, max(5, os.getpriority(os.PRIO_PROCESS, 0)))
+        except OSError:
+            pass
+        while not self.shutdown.is_set():
+            try:
+                if self.tick_import_enrichment(self.index.settings(wait=.15), time(), kind):
+                    continue
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
+                self.journal.emit("ERROR", "File d’enrichissement temporairement indisponible", "WARNING")
+                self.shutdown.wait(5)
+            self.shutdown.wait(.5)
+
+    def tick_import_enrichment(self, settings, now, kind=IMPORT_LYRICS):
+        enabled = (settings["lyrics"] or settings["lrc"]) if kind == IMPORT_LYRICS else settings["cover"]
+        if (not enabled or settings["paused"] or self.priority or self.shutdown.is_set()
+                or not self.index.work_due((kind,), now)):
+            return False
         if ((self.import_queue is not None and self.import_queue.pause_requested())
                 or disk_usage(self.index.root).free <= settings["reserve_gib"] * 1024**3):
             return False
-        # One owner alternates stages and keeps their claims separate from the
-        # classic maintenance budget. Audio imports own their existing slots.
         with (self.import_queue.activity() if self.import_queue is not None else nullcontext()) as owner:
             if owner is not None and self.import_queue.pause_requested():
                 return False
-            for _ in IMPORT_ENRICHMENT:
-                kind = IMPORT_ENRICHMENT[self.import_enrichment_turn]
-                self.import_enrichment_turn = (self.import_enrichment_turn + 1) % len(IMPORT_ENRICHMENT)
-                if not (settings["lyrics"] or settings["lrc"] if kind == IMPORT_LYRICS else settings["cover"]):
-                    continue
-                task = self.index.claim((kind,), now)
-                if task is not None:
-                    # Hold the same lease through claim settlement and child
-                    # reaping. The global pause can now confirm both occurred.
-                    self.import_owner = owner
-                    try:
-                        self.execute(task)
-                    finally:
-                        self.import_owner = None
-                    self.wake.set()
+            task = self.index.claim((kind,), now)
+            if task is None:
+                return False
+            identity = kind, task["subject"]
+            cancel = Event()
+            with self.lock:
+                self.import_enrichment_active[identity] = cancel
+            try:
+                self.run_import_enrichment(task, owner, cancel)
+            finally:
+                with self.lock:
+                    self.import_enrichment_active.pop(identity, None)
+        return True
+
+    def run_import_enrichment(self, task, owner, cancel):
+        kind = task["kind"]
+        category = "LYRICS" if kind == IMPORT_LYRICS else "COVER"
+        started = monotonic()
+        next_check = 0.
+
+        def stopped():
+            nonlocal next_check
+            if self.shutdown.is_set() or self.priority or cancel.is_set():
+                return True
+            now = monotonic()
+            if now >= next_check:
+                next_check = now + .25
+                if (owner is not None and self.import_queue.pause_requested()
+                        or self.index.settings(wait=.15)["paused"]):
                     return True
-        return False
+            return False
+
+        self.journal.emit(category, "Paroles et LRC des imports" if kind == IMPORT_LYRICS else "Pochette d’un import")
+        paused = False
+        try:
+            # Import pause drains the child and the claim before the activity
+            # lease is released. Other network work has separate cancellation.
+            result = self.enrich_import(task, owner, stopped)
+        except Interrupted:
+            paused = owner is not None and self.import_queue.pause_requested()
+            result = "suspended", "ressources libérées", 0 if paused else 45
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
+            self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
+            result = (("review", "enrichissement partiel · maintenance complémentaire", 0)
+                      if task["attempts"] >= 2 else ("temporary", "opération indisponible", 600))
+        self.index.finish(task, *result, refund_attempt=paused)
+        if paused:
+            self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
+        self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
+        self.changed()
 
     def night_reference(self, song, path):
         settings = self.current_settings
@@ -1297,15 +1357,13 @@ class Maintenance:
         started = monotonic()
         kind, subject = task["kind"], task["subject"]
         category = {"discography": "DISCOGRAPHIE", "prepare": "KARA", "source_probe": "SOURCE",
-                    "cleanup": "CACHE", IMPORT_LYRICS: "LYRICS", IMPORT_COVER: "COVER"}.get(kind, kind.upper())
-        import_suspended = False
+                    "cleanup": "CACHE"}.get(kind, kind.upper())
         network_found = False
         activity = ()
         window = self.night.window if nocturnal else None
         with self.lock:
             self.interrupt.clear()
-            if ((kind in HEAVY and (self.priority or monotonic() < self.priority_until))
-                    or kind in IMPORT_ENRICHMENT and self.priority):
+            if kind in HEAVY and (self.priority or monotonic() < self.priority_until):
                 stats = (dict(seconds=0., outcome="interrupted", cache_bytes=None, corrected=0, generated=0)
                          if nocturnal and kind == "prepare" else None)
                 self.index.finish(task, "suspended", "ressources prioritaires", 15, night=stats,
@@ -1325,7 +1383,6 @@ class Maintenance:
             self.journal.emit(category, {"lyrics": "Recherche de paroles", "lrc": "Recherche d’un LRC",
                                         "transcription": "Transcription locale pour vérification",
                                         "album": "Vérification d’une édition", "discography": f"Vérification · {subject}",
-                                        IMPORT_LYRICS: "Paroles et LRC des imports", IMPORT_COVER: "Pochette d’un import",
                                         "source": "Vérification des conditions et des correspondances",
                                         "source_probe": "Vérification de la documentation fournisseur",
                                         "cover": "Recherche de pochette", "metadata": "Vérification de l’identification", "cleanup": "Nettoyage des brouillons"}[kind]
@@ -1339,8 +1396,6 @@ class Maintenance:
                 result = self.transcribe_task(task)
             elif kind == "codex":
                 result = self.do_codex(task)
-            elif kind in IMPORT_ENRICHMENT:
-                result = self.enrich_import(task)
             elif kind == "cleanup":
                 removed = self.cleanup_interrupted()
                 self.journal.emit("CACHE", f"{removed} dossiers intermédiaires retirés")
@@ -1351,10 +1406,8 @@ class Maintenance:
                 network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry", LOCAL_SOURCE)
                 activity = self.reference_activity(task, value, result)
         except Interrupted:
-            import_suspended = self.import_owner is not None and self.import_queue.pause_requested()
-            result = ("suspended", "ressources libérées", 0 if import_suspended else 45)
-            if not import_suspended:
-                self.journal.emit(category, "Traitement interrompu · reprise différée")
+            result = ("suspended", "ressources libérées", 45)
+            self.journal.emit(category, "Traitement interrompu · reprise différée")
             if nocturnal:
                 if self.night.release_after_work:
                     self.night.close(reason=self.night.reason)
@@ -1364,9 +1417,7 @@ class Maintenance:
                     self.recover_night_drafts()
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
-            result = (("review", "enrichissement partiel · maintenance complémentaire", 0)
-                      if kind in IMPORT_ENRICHMENT and task["attempts"] >= 2 else
-                      ("temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8))))
+            result = "temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8))
         finally:
             with self.lock:
                 if self.cancelled == self.active:
@@ -1400,10 +1451,8 @@ class Maintenance:
             stats = dict(seconds=round(elapsed, 3), cache_bytes=storage, outcome=outcome,
                          corrected=corrected, generated=generated, measurements=self.night_measures)
         self.index.finish(task, *result, night=stats, closed=self.closed_outcome(window, result),
-                          refund_attempt=import_suspended or detail == LOCAL_REFERENCE_MISS, network_found=network_found,
+                          refund_attempt=detail == LOCAL_REFERENCE_MISS, network_found=network_found,
                           activity=activity)
-        if import_suspended:
-            self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
         self.changed()
         return result
@@ -1478,7 +1527,10 @@ class Maintenance:
                     self.recover_night_drafts()
                 self.journal.emit("SYSTEM", "Maintenance de Parole démarrée")
                 index_thread = Thread(target=self.index_loop, name="parole-index", daemon=False)
-                index_thread.start()
+                enrichment_threads = [Thread(target=self.import_enrichment_loop, args=(kind,),
+                                             name=f"parole-{kind[7:]}", daemon=False) for kind in IMPORT_ENRICHMENT]
+                for thread in (index_thread, *enrichment_threads):
+                    thread.start()
                 try:
                     while not self.shutdown.is_set():
                         try:
@@ -1493,7 +1545,8 @@ class Maintenance:
                 finally:
                     self.shutdown.set()
                     self.index_wake.set()
-                    index_thread.join()
+                    for thread in (index_thread, *enrichment_threads):
+                        thread.join()
         finally:
             self.owner = None
             self.night.close()
@@ -1551,20 +1604,17 @@ class Maintenance:
             if self.resources.resumed:
                 self.resources.resumed = False
                 self.night.activity()
-        imports_pending = self.import_queue and self.import_queue.pending()
+        imports_pending = self.import_enrichment_count() or self.import_queue and self.import_queue.pending()
         if imports_pending or self.priority:
             self.night.stop_work()
             if desktop_ready:
                 self.night.report("Préparation nocturne suspendue · Kara ou imports prioritaires")
-        if (not self.foreground.is_set() and not settings["night_enabled"] and not imports_pending
-                and not enrichment_pending(self.index, now)):
+        if not self.foreground.is_set() and not settings["night_enabled"] and not imports_pending:
             return
         if self.priority:
             return
         if self.import_diagnostics and not self.import_queue.pause_requested():
             self.import_diagnostics.tick(settings, now)
-        if self.tick_import_enrichment(settings, now):
-            return
         if settings["night_enabled"]:
             if desktop_ready and not imports_pending and self.tick_night(settings, now):
                 return

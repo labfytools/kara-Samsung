@@ -37,11 +37,11 @@ from _kara_import_resources import (AUDIO_PROVIDERS, CATALOGUE, MAX_DOWNLOADS, M
                                    memory_download_limit, observe_youtube, track_results, wait_service, watch_download)
 from _kara_paths import BIN, DATA, catalogue_command
 from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, album_groups, audio_file, audio_files, component,
-                         grouped_path, index_file, manual_album_artist, probe, shared_mutation, source_video)
+                         grouped_path, index_file, manual_album_artist, probe, source_video)
 from _parole_import_providers import ARCHIVE, AUDIO_HOSTS, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_import_enrichment import schedule as schedule_enrichment
-from _parole_index import Index
+from _parole_index import ARTWORK, SIDECAR, Index
 from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as compare_music, duration_ms,
                                     from_catalogue as music_facts, position, same_track)
 from _parole_music_registry import (acoustic_evidence, original_tags, possible_duplicates, registered_positions,
@@ -1000,26 +1000,25 @@ def local_destination(record, candidates, root):
     return None
 
 
-def local_sidecars(tracks, entries, root, progress):
+def local_sidecars(tracks, entries, root, progress, *, covers=True):
     albums = {}
     for name, track in tracks.items():
         albums.setdefault(Path(name).parent, set()).add(track.parent)
-    with shared_mutation(root, wait=True):
-        for name, track in tracks.items():
-            pause_checkpoint()
-            if not available_tracks([str(track)], root):
-                continue
-            source = Path(name)
-            assets = [(str(source.with_suffix(".lrc")), track.with_suffix(".lrc"))]
-            if albums[source.parent] == {track.parent}:
-                assets.append((str(source.parent / "cover.jpg"), track.parent / "cover.jpg"))
-            for member, destination in assets:
-                if member in entries:
-                    try:
-                        publish_sidecar(entries[member], destination)
-                    except (OSError, ValueError, BadZipFile, RuntimeError) as error:
-                        record_error(progress, f"Fichier local associé · {member}",
-                                     ImportIssue("path", str(error)))
+    for name, track in tracks.items():
+        pause_checkpoint()
+        if not available_tracks([str(track)], root):
+            continue
+        source = Path(name)
+        assets = [(str(source.with_suffix(".lrc")), track.with_suffix(".lrc"), SIDECAR)]
+        if covers and albums[source.parent] == {track.parent}:
+            assets.append((str(source.parent / "cover.jpg"), track.parent / "cover.jpg", ARTWORK))
+        for member, destination, mask in assets:
+            if member in entries:
+                try:
+                    if publish_sidecar(entries[member], destination, audio=track, root=root) and progress.measure_index:
+                        progress.measure_index.notify([track], mask)
+                except (OSError, ValueError, BadZipFile, RuntimeError, sqlite3.Error) as error:
+                    record_error(progress, f"Fichier local associé · {member}", ImportIssue("path", str(error)))
 
 
 def import_local(item, root, inbox, previous, stop, seen, selection):
@@ -1242,6 +1241,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                 def publish_ready(selected, staged_proof=None):
                     if not selected:
                         return
+                    names = tuple(selected.values())
                     # An exact original or a PCM-equivalent edition may be
                     # admitted by another album. Only matching identities
                     # share a lock, held through registration of the proof.
@@ -1259,6 +1259,8 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                             record_error(progress, "Registre canonique", error)
                         finally:
                             progress.guard = previous_guard
+                    local_sidecars({name: targets[name] for name in names if name in targets},
+                                   entries, root, progress, covers=False)
 
                 def pending_entries():
                     for number, name in enumerate(audio, 1):

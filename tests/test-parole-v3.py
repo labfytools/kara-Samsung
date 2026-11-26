@@ -13,6 +13,7 @@ import sys
 import tempfile
 from time import monotonic, sleep, time
 from threading import Event
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -63,6 +64,29 @@ class Fixture(unittest.TestCase):
 
 
 class InventoryTests(Fixture):
+    def test_import_text_is_published_before_timed_lookup(self):
+        from threading import Lock
+
+        path = self.audio()
+        engine = lyrics_engine()
+        plain = "Un refrain assez long pour la vérification"
+        published = []
+
+        def lookup(*_signature, synced, local_text, **_options):
+            if synced:
+                self.assertEqual(local_text, plain)
+                self.assertEqual(len(published), 1)
+                self.assertEqual(engine.probe(path)[0]["lyrics"], plain)
+                return "[00:01.00]Le refrain", "fixture"
+            return plain, "fixture"
+
+        client = SimpleNamespace(new_track=lambda: None, find=lookup)
+        result = engine.process_import_track(path, client, self.index, self.index.settings(), set(),
+                                             (Lock(),), lambda *_: None, None,
+                                             notify=lambda *event: published.append(event))
+        self.assertEqual(result, ("found", "found"))
+        self.assertEqual(len(published), 2)
+
     def test_manual_correction_in_lexicon_is_bound_to_sidecar_and_audio(self):
         from _parole_lexicon import records
 
@@ -276,6 +300,40 @@ class QueueTests(Fixture):
         self.assertEqual(states, {("lrc", "same"): "done", ("lyrics", "same"): "queued", ("lyrics", "fast"): "done"})
         self.assertEqual(owner.network_width, 3)
         self.assertFalse(owner.network_active)
+
+    def test_import_cover_settles_while_lyrics_worker_waits(self):
+        owner = Maintenance(self.root, None, state=self.base / "state", background=True)
+        owner.index.configure(startup=False, night_enabled=False)
+        for kind in ("import_lyrics", "import_cover"):
+            owner.index.enqueue(kind, "album", "fixture")
+        text_started, release = Event(), Event()
+
+        def enrich(task, _lease, stop):
+            if task["kind"] == "import_lyrics":
+                text_started.set()
+                if not release.wait(6) or stop():
+                    raise Interrupted
+            return "done", "fixture", 0
+
+        owner.enrich_import = enrich
+        with patch("_parole_maintenance.disk_usage", return_value=SimpleNamespace(free=50 * 1024**3)):
+            owner.start()
+            try:
+                self.assertTrue(text_started.wait(4))
+                deadline = monotonic() + 4
+                while True:
+                    with owner.index.db() as db:
+                        states = dict(db.execute("SELECT kind,state FROM tasks"))
+                    if states["import_cover"] == "done":
+                        break
+                    self.assertLess(monotonic(), deadline, "La pochette attend la recherche de paroles")
+                    sleep(.025)
+                self.assertEqual(states["import_lyrics"], "running")
+            finally:
+                release.set()
+                owner.close()
+                owner.thread.join(5)
+            self.assertFalse(owner.thread.is_alive())
 
     def test_automatic_codex_is_opt_in_and_manual_claims_remain_available(self):
         self.assertFalse(self.index.settings()["codex_auto"])
