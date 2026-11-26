@@ -453,6 +453,32 @@ class SourceTests(Fixture):
         source.write_text("[00:01.250]Correction plus récente\n")
         self.assertIsNone(local_reference(self.index, self.index.song(second["id"]), synced=True))
 
+    def test_replaced_tags_cannot_inherit_the_previous_pcm_donors_provenance(self):
+        from _parole_local_reference import local_reference
+
+        source = self.audio("donneur.flac", lyrics="Texte approuvé")
+        target = self.audio("destinataire.flac")
+        self.scan()
+        rows = {row["path"]: row for row in self.songs()}
+        donor, recipient = rows[str(source)], rows[str(target)]
+        pcm = pcm_digest(source)
+        self.assertEqual(pcm, pcm_digest(target))
+        previous = json.loads(donor["info"])
+        self.index.update(donor["id"], info=json.dumps(previous | {"lyrics_provider": "LRCLIB"}), audio=pcm)
+        self.index.update(recipient["id"], audio=pcm)
+        reference = local_reference(self.index, self.index.song(recipient["id"]), synced=False)
+        self.assertEqual(reference.text, "Texte approuvé")
+
+        replacement = self.audio("remplacement.flac", lyrics="Autre texte non vérifié")
+        replacement.replace(source)
+        self.scan()
+        self.assertEqual(pcm_digest(source), pcm)
+        self.index.update(donor["id"], audio=pcm)
+        fresh = json.loads(self.index.song(donor["id"])["info"])
+        self.assertEqual(fresh["plain"], "Autre texte non vérifié")
+        self.assertNotIn("lyrics_provider", fresh)
+        self.assertIsNone(local_reference(self.index, self.index.song(recipient["id"]), synced=False))
+
     def test_embedded_lrc_is_materialized_on_a_local_turn_with_or_without_provider_slots(self):
         embedded = "[00:01.000]Vers déjà présent"
         for available in (True, False):

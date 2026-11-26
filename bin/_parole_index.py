@@ -844,6 +844,13 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
             release_id = tags.get("albumid") or tags.get("musicbrainzalbumid") or ""
             year = integer(str(tags.get("year") or tags.get("date") or "")[:4])
             edition = encoded_key(owner, album, release_id or year, str(path.parent))
+            # The provider approved one version of the reference. A later
+            # inventory is evidence of presence only, even if the replacement
+            # audio eventually receives the same PCM identity.
+            if not same_audio or embedded != info.get("plain", ""):
+                info.pop("lyrics_provider", None)
+            if not same_audio or json.loads(side)[0] != json.loads(old["side"])[0]:
+                info.pop("lrc_provider", None)
             info.update(tags={k: v for k, v in tags.items() if k not in LYRIC_KEYS},
                         plain=embedded, catalogue=catalog_revision, report=report)
             pending.append(dict(id=old["id"] if old else uuid4().hex, path=str(path), token=token,
