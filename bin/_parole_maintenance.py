@@ -29,6 +29,7 @@ from _parole_index import Index, document, encoded_key, inventory, sidecar
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
 from _parole_import_enrichment import paths_for as enrichment_paths, pending as enrichment_pending
+from _parole_local_reference import SOURCE as LOCAL_SOURCE
 from _parole_night import Night
 from _parole_process import Interrupted, run
 from _parole_resources import Resources
@@ -532,7 +533,11 @@ class Maintenance:
             return "temporary", outcome, 10
         if outcome == "found":
             provider = result["source"]
-            if kind == "lrc":
+            if provider == LOCAL_SOURCE:
+                self.refresh_song(song, audio=result["audio"], provenance={f"{kind}_provider": provider})
+                self.journal.emit(kind.upper(), f"Référence PCM locale intégrée · {song['title']}")
+                return "done", "référence PCM locale", 0
+            elif kind == "lrc":
                 self.refresh_song(song, lrc="intégré" if provider == "Strawberry" else "externe",
                                   provenance={"lrc_provider": provider})
             else:
@@ -631,7 +636,7 @@ class Maintenance:
         try:
             value = future.result()
             result = self.network_result(task, value)
-            publication = value["state"] == "found" and value.get("source") not in (None, "Strawberry")
+            publication = value["state"] == "found" and value.get("source") not in (None, "Strawberry", LOCAL_SOURCE)
         except Interrupted:
             result = "suspended", "ressources libérées", 45
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
@@ -804,7 +809,8 @@ class Maintenance:
                 result = lookup("prepare_plain")
             if result["state"] == "found":
                 result["mode"] = "plain"
-        if result["state"] in ("found", "not_found", "ambiguous", "invalid", "instrumental"):
+        if (result["state"] in ("found", "not_found", "ambiguous", "invalid", "instrumental")
+                and result.get("source") != LOCAL_SOURCE):
             self.index.review("prepare_reference", song["id"], result["state"], dict(result, revision=revision))
         return result
 
@@ -1098,7 +1104,7 @@ class Maintenance:
             else:
                 value = self.network_output(task, self.current_settings)
                 result = self.network_result(task, value)
-                network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry")
+                network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry", LOCAL_SOURCE)
         except Interrupted:
             import_suspended = self.import_owner is not None and self.import_queue.pause_requested()
             result = ("suspended", "ressources libérées", 0 if import_suspended else 45)

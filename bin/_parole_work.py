@@ -22,6 +22,7 @@ from _parole_catalogue import check_album, check_discography, check_recording, r
 from _parole_index import Index, collection_reader, document, key, sidecar
 from _parole_import_enrichment import COVER, KINDS, LYRICS, paths_for
 from _parole_import_metrics import snapshot
+from _parole_local_reference import SOURCE as LOCAL_SOURCE, local_reference
 from _parole_lyrics_lookup import prune
 from _parole_sources import ProviderUnavailable, LyricsEndpoint, validate_endpoint, record, fetch
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
@@ -71,6 +72,19 @@ def lookup_song(index, identity, synced, *, read_only=False):
             and any(content for _, content in rows)):
         lyrics, provider = text, "Strawberry"
     else:
+        local = local_reference(index, song, synced=synced)
+        if local:
+            if read_only:
+                return {"state": "found", "source": LOCAL_SOURCE, "lyrics": local.text}
+            # The library mutation lease coordinates the target with imports
+            # and manual edits. Publish an absent sidecar without retagging.
+            with shared_mutation(index.root):
+                if file_token(path) != token or path.resolve() != path or not local.current():
+                    return {"state": "rescan"}
+                extension = ".lrc" if synced else ".txt"
+                if not engine.save_lrc(path.with_suffix(extension), local.text.strip()):
+                    return {"state": "present"}
+            return {"state": "found", "source": LOCAL_SOURCE, "audio": song["audio"]}
         try:
             lyrics, provider = engine.LyricsSources().find(
                 title, artist, tags.get("album"), duration, tags.get("albumartist"),

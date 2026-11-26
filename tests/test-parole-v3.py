@@ -287,6 +287,45 @@ class CatalogueTests(unittest.TestCase):
 
 
 class SourceTests(Fixture):
+    def test_exact_pcm_reference_crosses_editions_without_network_or_retag(self):
+        from _parole_local_reference import SOURCE, local_reference
+        from _parole_index import sidecar
+        from _parole_work import lookup_song
+
+        original = self.audio("album.flac")
+        target = self.audio("anthologie.flac")
+        # The two containers have independent editions and identical decoded PCM.
+        anthology = target.parent.parent / "Anthologie"
+        anthology.mkdir()
+        target = target.rename(anthology / target.name)
+        source = original.with_suffix(".lrc")
+        source.write_text("[00:01.000]Chant contrôlé\n")
+        self.scan()
+        by_path = {Path(song["path"]): song for song in self.songs()}
+        first, second = by_path[original], by_path[target]
+        self.assertNotEqual(first["edition"], second["edition"])
+        self.assertEqual(pcm_digest(original), pcm_digest(target))
+        for song in by_path.values():
+            self.index.update(song["id"], audio=pcm_digest(Path(song["path"])))
+        before = target.read_bytes()
+        self.assertIsNone(local_reference(self.index, self.index.song(second["id"]), synced=True))
+        self.index.review("transcription_validation", first["id"] + ".lrc", "validated",
+                          {"audio": first["token"], "sidecar": sidecar(original, ".lrc")[0]})
+        engine = lyrics_engine()
+        with patch("_parole_work.lyrics_engine", return_value=engine), patch.object(
+                engine.LyricsSources, "find", side_effect=AssertionError("requête superflue")):
+            preview = lookup_song(self.index, second["id"], True, read_only=True)
+            self.assertEqual((preview["source"], preview["lyrics"]), (SOURCE, source.read_text()))
+            self.assertFalse(target.with_suffix(".lrc").exists())
+            # Reuse plain text and exact timestamps in separate publications.
+            self.assertEqual(lookup_song(self.index, second["id"], False)["source"], SOURCE)
+            self.assertEqual(lookup_song(self.index, second["id"], True)["source"], SOURCE)
+        self.assertEqual(target.with_suffix(".txt").read_text(), "Chant contrôlé\n")
+        self.assertEqual(target.with_suffix(".lrc").read_bytes(), source.read_bytes())
+        self.assertEqual(target.read_bytes(), before)
+        source.write_text("[00:01.250]Correction plus récente\n")
+        self.assertIsNone(local_reference(self.index, self.index.song(second["id"]), synced=True))
+
     def test_unison_exact_isrc_keeps_attribution_and_discards_lyrics(self):
         from _parole_unison import discover
 
