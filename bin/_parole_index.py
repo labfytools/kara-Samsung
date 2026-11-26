@@ -31,6 +31,7 @@ DEFAULTS = {
     "gpu": 15, "disk_busy": 25, "network_timeout": 145, "network_workers": 4, "heavy_daily": 3,
     "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
     "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,
+    "night_transcribe": True,
     "night_idle": 420, "night_cpu_temperature": 78, "night_gpu_temperature": 75,
     "night_closed_temperature": 70, "night_minutes": 480,
     "releases": ["Album", "EP", "Mixtape/Street"],

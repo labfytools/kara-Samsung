@@ -15,9 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _kara_prepare import PreparedCache, file_token
 from _kara_refine import VERSION as REFINEMENT_VERSION
+from _kara_turbo import ObservedWord
 from _parole_index import document, sidecar
 from _parole_maintenance import Maintenance
 from _parole_night import Desktop, Login, Night, mains_online
+from _parole_transcribe import proposals
 
 
 class PowerTests(unittest.TestCase):
@@ -295,6 +297,37 @@ class NightTests(unittest.TestCase):
         self.assertEqual((result["mode"], result["lyrics"]), ("plain", "Paroles locales vérifiées"))
         self.assertEqual(self.owner.night_reference(song, path), result)
         self.owner.output.assert_called_once()
+
+    def test_missing_references_enqueue_a_resumable_review_without_publication(self):
+        path = self.owner.index.root / "song.opus"
+        path.write_bytes(b"fixture")
+        song = {"id": "fixture", "path": str(path), "token": document(file_token(path)), "title": "Chanson",
+                "side": document([sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]),
+                "lrc": "absent", "lyrics": "absent", "duration": 24, "plays": 5,
+                "info": document({"plain": ""})}
+        self.owner.index.song = Mock(return_value=song)
+        self.owner.cache.cached = Mock(return_value=None)
+        self.owner.night_reference = Mock(return_value={"state": "not_found"})
+        self.owner.resources.allowed_storage = Mock(return_value=True)
+        self.assertEqual(self.owner.prepare({"subject": "fixture"}, nocturnal=True)[0], "review")
+        self.assertIsNotNone(self.owner.index.claim(("transcription",), time()))
+        self.owner.index.recover()
+        self.owner.output = Mock(return_value=(0, b'{"event":"draft","lines":2,"omitted":1}'))
+        with patch("_parole_maintenance.cached_stems", return_value=(Path("a"), Path("b"))):
+            self.assertTrue(self.owner.tick_night(self.settings, time()))
+        self.owner.output.assert_called_once()
+        self.assertIn("_parole_transcribe.py", " ".join(self.owner.output.call_args.args[0]))
+        with self.owner.index.db() as db:
+            self.assertEqual(tuple(db.execute("SELECT state,detail FROM tasks").fetchone()),
+                             ("review", "brouillon à vérifier"))
+        self.assertFalse(path.with_suffix(".lrc").exists())
+        self.assertFalse(path.with_suffix(".txt").exists())
+
+    def test_draft_filters_segments_without_corresponding_observed_words(self):
+        heard = [ObservedWord("vrai", 1., 1.1, .9), ObservedWord("chant", 1.2, 1.4, .8)]
+        parts = [dict(start=.9, end=2., text="Vrai chant", no_speech=.1),
+                 dict(start=2.1, end=3.1, text="Paroles suggérées", no_speech=.1)]
+        self.assertEqual(proposals(4., heard, parts), ("Vrai chant", "[00:01.000]Vrai chant", 1))
 
     def test_local_lrc_rejected_acoustically_gets_one_alternate_lookup(self):
         path = self.owner.index.root / "song.opus"

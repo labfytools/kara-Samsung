@@ -37,7 +37,8 @@ from _paroles_lrc import MAX_LRC_BYTES
 
 CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
               "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "SYNC", "IDLE", "CACHE",
-              "SUCCESS", "WARNING", "ERROR")
+              "SUCCESS", "WARNING", "ERROR", "TRANSCRIPTION")
+HEAVY = ("prepare", "transcription")
 NIGHT_NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata")
 NETWORK = (*NIGHT_NETWORK, "codex", "source", "source_probe")
 NETWORK_FLAGS = {"album": "albums", "source": None, "source_probe": None}
@@ -60,6 +61,7 @@ NIGHT_RESTART_SETTINGS = (
     "night_enabled", "night_lid", "night_lid_qualified", "night_screen_off", "night_idle",
     "night_minutes", "night_cpu_temperature", "night_gpu_temperature", "night_closed_temperature",
     "cache_gib", "reserve_gib", "generate", "lyrics", "lrc", "albums", "discography", "cover", "metadata", "paused",
+    "night_transcribe",
 )
 
 
@@ -142,6 +144,7 @@ class Maintenance:
         self.night = Night(self.index, self.journal)
         self.night_running = False
         self.night_network_next = True
+        self.transcription_next = True
         self.night_settings_at = 0.
         self.next_night_watch = 0.
         self.night_policy = None
@@ -191,7 +194,7 @@ class Maintenance:
     def set_priority(self, busy):
         with self.lock:
             self.priority = busy
-            if busy and self.active and self.active[0] in ("prepare", *IMPORT_ENRICHMENT):
+            if busy and self.active and self.active[0] in (*HEAVY, *IMPORT_ENRICHMENT):
                 self.interrupt.set()
         if busy and self.active:
             self.wake.set()
@@ -201,7 +204,7 @@ class Maintenance:
         # exits. The GTK thread does not wait on a decoder or GPU driver.
         with self.lock:
             self.priority_until = monotonic() + 5
-            if self.active and self.active[0] == "prepare":
+            if self.active and self.active[0] in HEAVY:
                 self.interrupt.set()
                 return False
         return True
@@ -274,7 +277,7 @@ class Maintenance:
                 if self.import_queue.pending():
                     self.night.report("Préparation nocturne suspendue · imports prioritaires")
                     return True
-            return not self.night_allowed(self.current_settings, running=True, light=self.active[0] != "prepare")
+            return not self.night_allowed(self.current_settings, running=True, light=self.active[0] not in HEAVY)
         settings = getattr(self, "current_settings", None)
         if settings and settings["night_enabled"] and monotonic() >= self.next_night_watch:
             # Network workers and inventory may span many ticks. Keep power
@@ -399,7 +402,7 @@ class Maintenance:
                         continue
                     revision = encoded_key(row["revision"], row["tracks"], settings["releases"])
                     self.index.enqueue(kind, subject, revision, 42 if kind == "album" else 46 if kind == "cover" else 45, db=db)
-            db.execute("""UPDATE tasks SET state='excluded' WHERE kind IN ('lyrics','lrc','prepare','metadata')
+            db.execute("""UPDATE tasks SET state='excluded' WHERE kind IN ('lyrics','lrc','prepare','metadata','transcription')
                          AND NOT EXISTS(SELECT 1 FROM songs WHERE id=tasks.subject)""")
             db.execute("""UPDATE tasks SET state='excluded' WHERE kind IN ('album','cover')
                          AND NOT EXISTS(SELECT 1 FROM songs WHERE edition=tasks.subject)""")
@@ -833,6 +836,10 @@ class Maintenance:
             if result["state"] in ("temporary", "network", "unavailable", "limited", "rescan"):
                 return "temporary", "dernière recherche indisponible", 300
             if result["state"] != "found":
+                if (result["state"] == "not_found" and self.current_settings["night_transcribe"]
+                        and song["lrc"] == "absent" and song["lyrics"] == "absent"):
+                    self.index.enqueue("transcription", identity, encoded_key(song["token"], song["side"], "v1"),
+                                       priority=20 if song["plays"] else 35)
                 return "review", "référence fiable absente", 0
             reference_option = "--timed-reference" if result["mode"] == "timed" else "--plain-reference"
             plain, provider = result["lyrics"], result["source"]
@@ -994,6 +1001,46 @@ class Maintenance:
                                   "Fournisseur proposé · validation nécessaire")
         return ("done" if result["status"] == "found" else "review", result["status"], 0)
 
+    def transcribe_task(self, task):
+        song = self.index.song(task["subject"])
+        if not song or song["lyrics"] != "absent" or song["lrc"] != "absent":
+            return "excluded", "référence disponible ou piste disparue", 0
+        path = Path(song["path"])
+        if path.resolve(strict=True) != path or not path.is_relative_to(self.index.root):
+            return "excluded", "chemin hors bibliothèque", 0
+        if document(file_token(path)) != song["token"] or any(sidecar(path, ext)[0] for ext in (".txt", ".lrc")):
+            return "excluded", "morceau ou référence modifiée", 0
+        duration = song["duration"]
+        if not 1 <= duration <= 3600:
+            return "review", "durée hors limites du moteur Kara", 0
+        self.resources.collect_storage(monotonic(), force=True)
+        if not self.resources.allowed_storage(self.current_settings, duration):
+            return "suspended", "plafond du cache ou réserve disque", 1800
+
+        def progress(event):
+            percent = event.get("percent")
+            if event.get("event") == "progress" and type(percent) in (int, float):
+                self.progress = "TRANSCRIPTION", song["title"], max(0, min(100, percent)) / 100
+
+        if not cached_stems(path):
+            self.journal.emit("DEMUCS", f"Séparation réutilisable dans Kara · {song['title']}")
+            code, _ = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path)],
+                                  1800, progress)
+            if code:
+                return "temporary", "séparation indisponible", 6 * HOUR
+        if document(file_token(path)) != song["token"]:
+            return "excluded", "morceau modifié pendant la séparation", 0
+        code, data = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_parole_transcribe.py"),
+                                  str(self.cache.root), str(path)], 1800, progress)
+        if code:
+            return "temporary", "transcription indisponible", 6 * HOUR
+        receipt = json.loads(data.splitlines()[-1])
+        if receipt.get("event") != "draft":
+            return "temporary", "brouillon indisponible", 6 * HOUR
+        detail = "brouillon à vérifier" if receipt["lines"] else "transcription incertaine"
+        self.journal.emit("TRANSCRIPTION", f"{receipt['lines']} lignes proposées · {receipt['omitted']} écartées")
+        return "review", detail, 0
+
     def execute(self, task, *, nocturnal=False):
         started = monotonic()
         kind, subject = task["kind"], task["subject"]
@@ -1004,7 +1051,7 @@ class Maintenance:
         window = self.night.window if nocturnal else None
         with self.lock:
             self.interrupt.clear()
-            if ((kind == "prepare" and (self.priority or monotonic() < self.priority_until))
+            if ((kind in HEAVY and (self.priority or monotonic() < self.priority_until))
                     or kind in IMPORT_ENRICHMENT and self.priority):
                 stats = (dict(seconds=0., outcome="interrupted", cache_bytes=None, corrected=0, generated=0)
                          if nocturnal and kind == "prepare" else None)
@@ -1016,10 +1063,11 @@ class Maintenance:
         self.night_settings_at = 0.
         self.night_lrc = (False, False)
         self.night_measures = {}
-        song = self.index.song(subject) if kind in ("lyrics", "lrc", "prepare") else None
+        song = self.index.song(subject) if kind in ("lyrics", "lrc", *HEAVY) else None
         self.progress = (category, song["title"] if song is not None else "En cours", None)
         if kind not in ("prepare", "codex"):
             self.journal.emit(category, {"lyrics": "Recherche de paroles", "lrc": "Recherche d’un LRC",
+                                        "transcription": "Transcription locale pour vérification",
                                         "album": "Vérification d’une édition", "discography": f"Vérification · {subject}",
                                         IMPORT_LYRICS: "Paroles et LRC des imports", IMPORT_COVER: "Pochette d’un import",
                                         "source": "Vérification des conditions et des correspondances",
@@ -1031,6 +1079,8 @@ class Maintenance:
                 raise Interrupted
             if kind == "prepare":
                 result = self.prepare(task, nocturnal=True) if nocturnal else self.prepare(task)
+            elif kind == "transcription":
+                result = self.transcribe_task(task)
             elif kind == "codex":
                 result = self.do_codex(task)
             elif kind in IMPORT_ENRICHMENT:
@@ -1053,7 +1103,7 @@ class Maintenance:
                     self.night.close(reason=self.night.reason)
                 else:
                     self.night.stop_work()
-                if kind == "prepare":
+                if kind in HEAVY:
                     self.recover_night_drafts()
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
@@ -1331,12 +1381,13 @@ class Maintenance:
     def tick_night(self, settings, now):
         kinds = self.network_kinds(settings, now, nocturnal=True)
         network_due = self.index.work_due(kinds, now)
+        transcription_due = settings["night_transcribe"] and self.index.work_due(("transcription",), now)
         prepare_due = self.index.preparation_due(now)
         # Offer the other class the next turn. A bounded network batch
         # alternates with one song, so neither class can starve the other.
         order = (True, False) if self.night_network_next else (False, True)
         for light in order:
-            if not (network_due if light else prepare_due):
+            if not (network_due if light else (prepare_due or transcription_due)):
                 continue
             if not self.night_allowed(settings, running=False, light=light) or not self.night.open(settings):
                 continue
@@ -1345,16 +1396,21 @@ class Maintenance:
                     self.night.report("Recherches nocturnes en attente · aucune tâche disponible")
                     continue
             else:
-                task = self.index.claim(("prepare",), now,
-                                        night=(self.night.budget, self.resources.storage.get("bytes", 0)))
+                task = None
+                if transcription_due and (not prepare_due or self.transcription_next):
+                    task = self.index.claim(("transcription",), now)
+                if task is None and prepare_due:
+                    task = self.index.claim(("prepare",), now,
+                                            night=(self.night.budget, self.resources.storage.get("bytes", 0)))
                 if task is None:
                     continue
                 self.execute(task, nocturnal=True)
+                self.transcription_next = task["kind"] == "prepare"
             self.night_network_next = not light
             if self.night.window is not None or not self.index.preparation_due(time()):
                 self.night.stop_work()
             return True
         self.night.stop_work()
-        if not (network_due or prepare_due):
+        if not (network_due or prepare_due or transcription_due):
             self.night.report("Mode nocturne en attente · file prête au prochain travail")
         return False

@@ -618,6 +618,12 @@ class Preparer:
                 previous_attempt = None
                 if self.require_vulkan and not force and (plain is not None or timed is not None):
                     previous_attempt = self.cache.cached(song, settings=settings, insufficient=True, verify=False)
+                if previous_attempt is None and self.require_vulkan and not force:
+                    from _parole_transcribe import read_draft
+
+                    # A reviewed lyric can use the private mix observations,
+                    # subject to the same hash, model and language checks.
+                    previous_attempt = read_draft(self.cache, song)
                 item = self.first_pass(song, lrc, settings, progress, plain=plain, timed=timed,
                                        provider=provider, rejected=rejected, previous_attempt=previous_attempt)
             elif item["settings"] != settings:

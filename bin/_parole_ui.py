@@ -619,7 +619,8 @@ class ParoleView:
             stamp = datetime.fromtimestamp(closed["started"]).strftime("%d/%m à %H:%M")
             completed = closed["completed"]
             labels = {"prepare": "préparations", "lyrics": "paroles", "lrc": "LRC", "cover": "pochettes",
-                      "metadata": "métadonnées", "album": "albums", "discography": "discographies"}
+                      "metadata": "métadonnées", "album": "albums", "discography": "discographies",
+                      "transcription": "transcriptions à vérifier"}
             counts = [f"{completed[kind]} {label}" for kind, label in labels.items() if kind in completed]
             lines.append(f"Capot fermé le {stamp} · {sum(completed.values())} tâches réalisées · "
                          f"{closed['interrupted']} interruptions · {closed['deferred']} reports")
@@ -717,8 +718,15 @@ class ParoleView:
                 widget, "Identité et provenance", json.dumps(provenance, ensure_ascii=False, indent=2))))
         path = Path(row["path"])
         versions = {}
+        from _parole_transcribe import read_draft
+
+        draft = (read_draft(self.maintenance.cache, path)
+                 if any(item["kind"] == "transcription" for item in checks) else None)
+        draft_format = None
 
         def reload_text(*_):
+            nonlocal draft_format
+            draft_format = None
             suffix = ".lrc" if forms.get_selected() else ".txt"
             version, value = sidecar(path, suffix)
             versions[suffix] = json.loads(version) if version and version != "invalid" else None
@@ -746,6 +754,10 @@ class ParoleView:
             suffix = ".lrc" if forms.get_selected() else ".txt"
             try:
                 save_correction(self.index, identity, suffix, versions[suffix], text)
+                if draft_format == suffix:
+                    version, _ = sidecar(path, suffix)
+                    self.index.review("transcription_validation", identity + suffix, "validated",
+                                      {"audio": row["token"], "sidecar": version, "source": "Turbo, validé manuellement"})
             except (OSError, ValueError, sqlite3.Error, SystemExit) as error:
                 status.set_text(str(error))
                 return
@@ -756,6 +768,20 @@ class ParoleView:
         save = button("Enregistrer", commit)
         editbar.append(edit)
         editbar.append(save)
+        if draft and draft["plain"]:
+            def load_draft(_):
+                nonlocal draft_format
+                suffix = ".lrc" if forms.get_selected() else ".txt"
+                field = "lrc" if suffix == ".lrc" else "lyrics"
+                if row[field] != "absent" or sidecar(path, suffix)[0]:
+                    status.set_text("Une référence existe déjà pour ce format.")
+                    return
+                draft_format = suffix
+                buffer.set_text(draft["timed"] if suffix == ".lrc" else draft["plain"])
+                start_edit(None)
+                status.set_text("Brouillon Turbo. Écoutez et corrigez le texte avant d’enregistrer.")
+
+            editbar.append(button("Charger le brouillon Turbo", load_draft))
         if identification:
             found = json.loads(identification[0])
             if found.pop("token", None) == row["token"]:
@@ -1023,6 +1049,7 @@ class ParoleView:
         night.append(self.night_summary)
         self.refresh_night_summary()
         toggles(night, (("night_enabled", "Activer la préparation nocturne"),
+                        ("night_transcribe", "Proposer des transcriptions quand aucune source ne répond"),
                         ("night_screen_off", "Préparer lorsque l’écran est éteint"),
                         ("night_lid", "Préparer lorsque le capot est fermé"),
                         ("night_lid_qualified", "Refroidissement capot fermé vérifié sur cet ordinateur")))

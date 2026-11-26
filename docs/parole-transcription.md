@@ -28,4 +28,12 @@ Le 26 novembre 2026, 8 899 enregistrements ont fourni du vocabulaire. Trois extr
 
 Le reggae passe de 15 à 3 erreurs avec les deux contextes. Le couplet de rap français passe de 11 à 23 erreurs avec le contexte général. Avec le contexte artiste, le filtre acoustique ne retient aucun des 43 mots attendus de cet extrait. Ce lot ne qualifie aucun contexte pour les départs automatiques. Les paroles produites restent des observations d’essai.
 
-La file persistante de transcription sans référence, les corrections manuelles attestées, la seconde passe sur les seuls passages incertains et le banc de 50 titres restent à qualifier. Le relevé ci-dessus mesure des erreurs de mots sur des extraits. La précision temporelle de 500 ms demande une annotation indépendante des repères.
+Le relevé ci-dessus mesure des erreurs de mots sur des extraits. La précision temporelle de 500 ms demande une annotation indépendante des repères.
+
+## File de transcriptions à vérifier
+
+En mode nocturne, un échec de recherche sans correspondance peut créer une tâche de transcription lorsque le titre est dépourvu de paroles et de LRC. Les erreurs de fournisseur reportent la recherche. Le même propriétaire de maintenance applique les limites de température, de mémoire et de stockage et traite un seul morceau à la fois. La tâche persiste dans la file Parole et reprend après interruption.
+
+Demucs utilise le cache de Kara. Turbo décode une première fois le mix sans contexte lexical et conserve ses observations dans le cache privé, liées à l’audio, au modèle et aux paramètres. Il propose des lignes de texte et de LRC lorsque les mots de la fenêtre les soutiennent. Les lignes écartées ne sont pas complétées. L’état du brouillon reste à vérifier. La préparation Kara peut réutiliser les observations lorsque la nouvelle référence a le même audio, le même décodeur et le même mode linguistique.
+
+Dans les détails du morceau, **Charger le brouillon Turbo** remplit l’éditeur pour le format manquant sélectionné. Écouter et corriger les paroles ou le minutage avant **Enregistrer**. L’enregistrement conserve la validation manuelle et protège une référence ajoutée entre-temps. Le brouillon ne change aucun fichier musical ni aucun LRC de la bibliothèque.
