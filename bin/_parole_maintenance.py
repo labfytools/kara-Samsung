@@ -1022,14 +1022,8 @@ class Maintenance:
             if event.get("event") == "progress" and type(percent) in (int, float):
                 self.progress = "TRANSCRIPTION", song["title"], max(0, min(100, percent)) / 100
 
-        if not cached_stems(path):
-            self.journal.emit("DEMUCS", f"Séparation réutilisable dans Kara · {song['title']}")
-            code, _ = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path)],
-                                  1800, progress)
-            if code:
-                return "temporary", "séparation indisponible", 6 * HOUR
-        if document(file_token(path)) != song["token"]:
-            return "excluded", "morceau modifié pendant la séparation", 0
+        # The draft and its reusable first pass are signed against the
+        # original mix. Only Kara preparation requires the Demucs pair.
         code, data = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_parole_transcribe.py"),
                                   str(self.cache.root), str(path)], 1800, progress)
         if code:

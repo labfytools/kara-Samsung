@@ -335,8 +335,9 @@ class NightTests(unittest.TestCase):
         self.assertIsNotNone(self.owner.index.claim(("transcription",), time()))
         self.owner.index.recover()
         self.owner.output = Mock(return_value=(0, b'{"event":"draft","lines":2,"omitted":1}'))
-        with patch("_parole_maintenance.cached_stems", return_value=(Path("a"), Path("b"))):
+        with patch("_parole_maintenance.cached_stems", return_value=None) as stems:
             self.assertTrue(self.owner.tick_night(self.settings, time()))
+        stems.assert_not_called()
         self.owner.output.assert_called_once()
         self.assertIn("_parole_transcribe.py", " ".join(self.owner.output.call_args.args[0]))
         with self.owner.index.db() as db:

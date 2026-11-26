@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Produire les brouillons Turbo sur le mix sans réserver une séparation Demucs inutilisée.
 - Rallumer les écrans Sway à la réouverture confirmée après un débranchement et une veille sur batterie.
 - Comparer les contextes Turbo de 5 à 50 mots sur 50 titres, avec confirmation acoustique des substitutions. Conserver cette méthode dans le banc d’essai.
 - Étendre les requêtes LRCLIB aux variantes de crédits et de graphie en conservant les contrôles d’identité.
