@@ -373,6 +373,36 @@ class NightTests(unittest.TestCase):
         self.owner.output.assert_called_once()
         self.assertEqual(self.owner.output.call_args.args[0][-1], "--local-reference-only")
 
+    def test_offline_preparation_spends_its_turn_on_local_text(self):
+        index = self.owner.index
+        missing, local = (index.root / name for name in ("inconnue.opus", "texte.opus"))
+        for path in (missing, local):
+            path.write_bytes(b"fixture")
+        local.with_suffix(".txt").write_text("Texte déjà disponible\n")
+        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
+                  paths=[missing, local], reader=lambda path: ({"title": path.stem, "artist": "Artiste",
+                                                                "duration_seconds": 5}, {}))
+        at = time()
+        with index.db() as db:
+            identities = dict(db.execute("SELECT path,id FROM songs"))
+        unknown, known = (identities[str(path)] for path in (missing, local))
+        index.enqueue("prepare", unknown, "fixture", priority=10, now=at - 10)
+        index.enqueue("prepare", known, "fixture", priority=40, now=at)
+        prepare = self.owner.prepare = Mock(return_value=("done", "prêt", 0))
+
+        with patch("_parole_maintenance.ready_categories", return_value=set()):
+            self.assertTrue(self.owner.tick_night(self.settings, at))
+            self.assertEqual(prepare.call_args.args[0]["subject"], known)
+            self.assertFalse(self.owner.tick_night(self.settings, time()))
+            self.assertEqual(self.night.reason, "Préparation en attente d’un fournisseur de référence")
+        with index.db() as db:
+            deferred = db.execute("SELECT state,due,attempts FROM tasks WHERE subject=?", (unknown,)).fetchone()
+            self.assertEqual(tuple(deferred), ("queued", at - 10, 0))
+
+        with patch("_parole_maintenance.ready_categories", return_value={"lrc"}):
+            self.assertTrue(self.owner.tick_night(self.settings, time()))
+            self.assertEqual(prepare.call_args.args[0]["subject"], unknown)
+
     def test_missing_references_enqueue_a_resumable_review_without_publication(self):
         path = self.owner.index.root / "song.opus"
         path.write_bytes(b"fixture")

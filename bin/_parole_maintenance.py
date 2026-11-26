@@ -25,7 +25,7 @@ from _kara_refine import VERSION as REFINEMENT_VERSION
 from _kara_stems import ROOT as STEM_ROOT, FILES, cached_stems, stem_directory
 from _parole_codex import KINDS, research
 from _parole_artist_groups import recover as recover_artist_groups
-from _parole_index import LOCAL_REFERENCE_MISS, Index, document, encoded_key, inventory, sidecar
+from _parole_index import LOCAL_REFERENCE_MISS, REFERENCE_REUSE_SECONDS, Index, document, encoded_key, inventory, sidecar
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
 from _parole_import_enrichment import paths_for as enrichment_paths, pending as enrichment_pending
@@ -803,7 +803,7 @@ class Maintenance:
                                    settings["lrc"], settings["lyrics"], settings["generate"], sources)
             receipt = db.execute("SELECT checked,value FROM reviews WHERE kind='prepare_reference' AND subject=?",
                                  (song["id"],)).fetchone()
-        if receipt and time() - receipt["checked"] < DAY:
+        if receipt and time() - receipt["checked"] < REFERENCE_REUSE_SECONDS:
             saved = json.loads(receipt["value"])
             lrc_deferred = saved.pop("lrc_deferred", False)
             if saved.pop("revision", None) == revision and not (lrc_deferred and "lrc" in available):
@@ -1469,7 +1469,9 @@ class Maintenance:
         network_due = (self.index.work_due(kinds, now) or
                        self.index.work_due(self.local_reference_kinds(settings), now, local_reference=True))
         transcription_due = settings["night_transcribe"] and self.index.work_due(("transcription",), now)
-        prepare_due = self.index.preparation_due(now)
+        reference_provider_ready = "lrc" in kinds or (settings["generate"] and "lyrics" in kinds)
+        local_preparation = None if reference_provider_ready else (settings["lrc"], settings["generate"])
+        prepare_due = self.index.preparation_due(now, local_preparation=local_preparation)
         # Offer the other class the next turn. A bounded network batch
         # alternates with one song, so neither class can starve the other.
         order = (True, False) if self.night_network_next else (False, True)
@@ -1488,16 +1490,20 @@ class Maintenance:
                     task = self.index.claim(("transcription",), now)
                 if task is None and prepare_due:
                     task = self.index.claim(("prepare",), now,
-                                            night=(self.night.budget, self.resources.storage.get("bytes", 0)))
+                                            night=(self.night.budget, self.resources.storage.get("bytes", 0)),
+                                            local_preparation=local_preparation)
                 if task is None:
                     continue
                 self.execute(task, nocturnal=True)
                 self.transcription_next = task["kind"] == "prepare"
             self.night_network_next = not light
-            if self.night.window is not None or not self.index.preparation_due(time()):
+            if self.night.window is not None or not self.index.preparation_due(time(), local_preparation=local_preparation):
                 self.night.stop_work()
             return True
         self.night.stop_work()
         if not (network_due or prepare_due or transcription_due):
-            self.night.report("Mode nocturne en attente · file prête au prochain travail")
+            if local_preparation is not None and self.index.preparation_due(now):
+                self.night.report("Préparation en attente d’un fournisseur de référence")
+            else:
+                self.night.report("Mode nocturne en attente · file prête au prochain travail")
         return False

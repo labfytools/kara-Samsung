@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Réserver la préparation nocturne aux références locales ou déjà obtenues tant que les fournisseurs de références sont indisponibles.
 - Répéter un extrait de brouillon trois fois et le ralentir à 80 % en préservant la hauteur, avec arrêt sur reprise de Kara ou de Strawberry.
 - Retirer la provenance vérifiée lorsqu’un audio ou sa référence change de version.
 - Préparer les titres munis d’un texte local sans lancer de recherche quand les fournisseurs de minutage sont indisponibles.

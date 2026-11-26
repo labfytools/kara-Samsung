@@ -19,6 +19,8 @@ from _kara_prepare import file_token
 from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, grouped_artist, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
+REFERENCE_REUSE_SECONDS = 86_400
+
 DEFAULTS = {
     "startup": True, "paused": False, "lyrics": True, "lrc": True, "generate": True,
     "albums": True, "discography": True, "cover": True, "metadata": True, "autoprepare": True, "import_tracks": False, "import_albums": False,
@@ -69,10 +71,33 @@ LOCAL_REFERENCE_SCOPE = """
       AND
 """
 
+# With no eligible reference provider, keep the existing queue order among
+# tasks that can try local evidence. Neither cheap catalogue hints nor a
+# recent receipt establish validity. The preparation worker still checks it.
+LOCAL_PREPARATION_SCOPE = """
+    FROM tasks AS candidate JOIN songs AS target ON target.id=candidate.subject
+    WHERE candidate.kind='prepare' AND (
+        target.lrc IN ('local','externe','généré') OR target.kara='partiel'
+        OR (? AND target.lrc='intégré')
+        OR (? AND target.lyrics NOT IN ('absent','instrumental'))
+        OR ((? OR ?) AND length(target.audio)=64 AND EXISTS (
+            SELECT 1 FROM songs AS donor WHERE donor.audio=target.audio AND donor.id<>target.id
+              AND (donor.lrc IN ('local','externe','généré')
+                   OR (? AND donor.lyrics NOT IN ('absent','instrumental')))
+        ))
+        OR EXISTS (SELECT 1 FROM reviews AS saved WHERE saved.kind='prepare_reference'
+                   AND saved.subject=target.id AND saved.state='found' AND saved.checked>?)
+    ) AND
+"""
 
-def task_scope(local_reference):
-    return ((LOCAL_REFERENCE_SCOPE, (LOCAL_REFERENCE_MISS, LOCAL_REFERENCE_MISS)) if local_reference
-            else ("FROM tasks AS candidate WHERE", ()))
+
+def task_scope(local_reference, local_preparation, now):
+    if local_reference:
+        return LOCAL_REFERENCE_SCOPE, (LOCAL_REFERENCE_MISS, LOCAL_REFERENCE_MISS)
+    if local_preparation is not None:
+        timed, plain = local_preparation
+        return LOCAL_PREPARATION_SCOPE, (timed, plain, timed, plain, plain, now - REFERENCE_REUSE_SECONDS)
+    return "FROM tasks AS candidate WHERE", ()
 
 
 def key(text):
@@ -262,14 +287,14 @@ class Index:
                         return started
         return None
 
-    def preparation_due(self, now):
-        return self.work_due(("prepare",), now)
+    def preparation_due(self, now, *, local_preparation=None):
+        return self.work_due(("prepare",), now, local_preparation=local_preparation)
 
-    def work_due(self, kinds, now, *, local_reference=False):
+    def work_due(self, kinds, now, *, local_reference=False, local_preparation=None):
         if not kinds:
             return False
         placeholders = ",".join("?" for _ in kinds)
-        scope, arguments = task_scope(local_reference)
+        scope, arguments = task_scope(local_reference, local_preparation, now)
         with self.db(wait=.15) as db:
             return db.execute(f"""SELECT 1 {scope} candidate.kind IN ({placeholders}) AND candidate.due<=?
                                   AND candidate.state IN ('queued','suspended','temporary') LIMIT 1""",
@@ -398,12 +423,12 @@ class Index:
             return True
 
     def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None,
-              avoid=(), local_reference=False):
+              avoid=(), local_reference=False, local_preparation=None):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
         excluded = ",".join("?" for _ in avoid)
-        scope, arguments = task_scope(local_reference)
+        scope, arguments = task_scope(local_reference, local_preparation, now)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             day = date.fromtimestamp(now).isoformat()
