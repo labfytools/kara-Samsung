@@ -715,6 +715,7 @@
     $("bb-control").textContent = party.blackbox?.active ? "Arrêter BlackBox" : "Activer BlackBox";
     $("bb-control").disabled = !!party.blackbox?.finalizing;
     $("bb-voice-choice").hidden = !!(party.blackbox?.active || party.blackbox?.finalizing);
+    $("bb-mode-choice").hidden = $("bb-voice-choice").hidden || !$("bb-voice").checked;
     $("sound-settings").hidden = !party.audio?.available;
     if (party.audio) {
       $("audio-profile").value = party.audio.profile;
@@ -731,11 +732,19 @@
       const pair = !voice || tracks.includes("wifi") && (tracks.includes("monitor") || tracks.includes("playback"));
       const check = pair ? "" : "\nPrévol AEC incomplet. Sélectionne le micro reçu et une référence de sortie pour les comparer.";
       if (confirm("Confirmer l’accord des participants et des responsables des mineurs pour " + subject + " ?" + check)) {
-        await command("blackbox-start", {consent: true, voice, tracks});
+        await command("blackbox-start", {consent: true, voice, tracks, mode: voice ? $("bb-mode").value : "diagnostic_light"});
         $("bb-voice").checked = false;
+        const witness = $("bb-tracks").querySelector("input[value=witness]");
+        if (witness) witness.checked = false;
       }
     }
   });
+  $("bb-voice").onchange = () => { $("bb-mode-choice").hidden = !$("bb-voice").checked; };
+  $("bb-mode").onchange = () => {
+    const mode = $("bb-mode").value;
+    for (const track of $("bb-tracks").querySelectorAll("input"))
+      if (track.value !== "witness") track.checked = mode !== "calibration" || ["wifi", "monitor", "playback", "return"].includes(track.value);
+  };
   $("music-volume").onchange = () => command("music-volume", {percent: Number($("music-volume").value)}).catch(error => notice(error.message));
   $("audio-output").onchange = () => command("audio-output", {value: $("audio-output").value}).catch(error => notice(error.message));
   $("audio-profile").onchange = () => command("audio-profile", {value: $("audio-profile").value}).catch(error => notice(error.message));

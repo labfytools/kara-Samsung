@@ -102,8 +102,10 @@ class BlackBoxStudio(Gtk.Window):
             self.timer = 0
             return GLib.SOURCE_REMOVE
         status = self.owner.blackbox.status(storage=True)
-        state = ("Deep Analysis" if status["voice"] else "Diagnostic léger") if status["active"] else (
-            "Finalisation" if status["finalizing"] else "Désactivée")
+        state = {"deep_analysis": "Deep Analysis", "diagnostic_light": "Diagnostic léger",
+                 "calibration": "Calibration", "benchmark": "Benchmark", "off": "Désactivée"}[status["mode"]]
+        if status["finalizing"]:
+            state = "Finalisation"
         self.capture.set_text(f"{state} · {status['elapsed_ns'] / 1e9:.0f} s · "
                               f"{status['bytes_written'] / 1024 ** 2:.1f} Mio · {status['dropped']} événements perdus" +
                               (f"\n{status['error']}" if status["error"] else ""))

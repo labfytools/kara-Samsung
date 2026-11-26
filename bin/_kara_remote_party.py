@@ -93,7 +93,7 @@ class RemoteParty:
                 raise RoomError("L’état de la partie a changé. Actualise la commande.", 409)
 
         if action == "blackbox-start":
-            options = {"tracks": data["tracks"]} if "tracks" in data else {}
+            options = {key: data[key] for key in ("tracks", "mode") if key in data}
             control.start_blackbox(data.get("consent"), voice=data.get("voice") is True, **options)
         elif action == "blackbox-stop":
             control.stop_blackbox()

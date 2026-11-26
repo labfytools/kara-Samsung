@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_blackbox import BlackBox, atomic_json, cycle_id, digest, events, validate_recording
 from _kara_blackbox_clock import browser_anchor
 from _kara_blackbox_turbo import receive, submit
+from _kara_blackbox_trials import annotate, packet_simulation, simulate_pcm, simulation_options
 
 
 class RecordingTests(unittest.TestCase):
@@ -188,6 +189,38 @@ class RecordingTests(unittest.TestCase):
         with wave.open(str(result)) as wav:
             self.assertEqual(wav.readframes(wav.getnframes()), block)
         self.assertEqual(result.stat().st_mode & 0o777, 0o600)
+
+    def test_simulation_and_human_revisions_do_not_modify_capture(self):
+        import numpy as np
+
+        with self.assertRaises(ValueError):
+            self.box.start(consent=True, mode="benchmark")
+        self.box.start(consent=True, voice=True, mode="calibration")
+        self.assertIsNone(self.box.voice_session("turbo"))
+        session = self.box.voice_session()
+        self.box.emit("party", "turn-start", **self.turn)
+        for sequence in range(6):
+            self.box.pcm("wifi", 48000, 1, bytes(1920), sequence=sequence, **self.turn)
+        self.box.emit("party", "turn-end", **self.turn)
+        self.box.stop(wait=True)
+        folder = self.box.root / session
+        checksum = digest(folder / "events.jsonl")
+        cycle = cycle_id(session, self.turn["turn"])
+        options = simulation_options({"drop_every": 2, "jitter_ms": 1, "delay_ms": 2, "reconnect": 0})
+        rows = list(packet_simulation(folder, cycle, options, 29, None, None, 6))
+        self.assertEqual(rows, list(packet_simulation(folder, cycle, options, 29, None, None, 6)))
+        self.assertEqual(rows[-1], {"packets": 6, "delivered": 3, "lost": 3})
+        self.assertIsNone(rows[1]["receive_ns"])
+        out = self.box.root.parent / "annotations.jsonl"
+        first = annotate(self.box.root, out, session, cycle, 1, 2, "sung", "", None)
+        revised = annotate(self.box.root, out, session, cycle, 1, 3, "off-key", "", first["id"])
+        self.assertEqual((revised["revision"], revised["source"]), (2, "human"))
+        self.assertEqual(digest(folder / "events.jsonl"), checksum)
+        original = np.ones(16, dtype=np.float32) * .8
+        rendered = np.ones((16, 2), dtype=np.float32) * .7
+        overlay = simulation_options({"gain": 0, "echo_gain": 1, "clip_peak": .5})
+        np.testing.assert_allclose(simulate_pcm(original, rendered, overlay, 48000), .5)
+        np.testing.assert_allclose(original, .8)
 
 
 if __name__ == "__main__":

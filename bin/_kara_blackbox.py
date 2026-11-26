@@ -39,6 +39,8 @@ GRAPH_CLOCK_FIELDS = ("driver", "frame", "monotonic_ns", "xrun", "quantum", "pre
 TRACK_NAME = re.compile(r"[a-f0-9]{16}-(?:wifi|whisper|return|monitor|witness|playback|turbo)-[0-9]{4}\.wav")
 TRACKS = ("wifi", "whisper", "return", "playback", "turbo", *GRAPH_TRACKS)
 DEFAULT_TRACKS = tuple(track for track in TRACKS if track != "witness")
+CAPTURE_MODES = ("diagnostic_light", "deep_analysis", "calibration", "benchmark")
+CALIBRATION_TRACKS = ("wifi", "playback", "monitor", "return")
 STREAM_ROLES = {"wifi": "MIC_RECEIVED", "whisper": "MIC_PROCESSED", "return": "PLAYER_MONITOR",
                 "monitor": "OUTPUT_MONITOR", "witness": "ACOUSTIC_WITNESS",
                 "playback": "PLAYBACK_REFERENCE", "turbo": "TURBO_INPUT"}
@@ -443,6 +445,7 @@ class BlackBox:
                 status["elapsed_ns"] = max(0, time.monotonic_ns() - record.manifest["monotonic_ns"]) if record else 0
                 status["voice"] = bool(record and record.manifest["capture"]["voice"])
                 status["witness"] = bool(record and "witness" in record.tracks)
+                status["mode"] = record.manifest["capture"]["mode"] if record else "off"
                 status["unavailable"] = sorted(record.unavailable) if record else []
             return status
 
@@ -489,14 +492,19 @@ class BlackBox:
             except (OSError, ValueError):
                 continue
 
-    def start(self, *, consent=False, voice=False, configuration=None, tracks=None, identity=None):
+    def start(self, *, consent=False, voice=False, configuration=None, tracks=None, identity=None, mode=None):
         if consent is not True:
             raise ValueError("Confirme l’accord des participants et des responsables des mineurs.")
         allowed = set(TRACKS)
         if tracks is not None and (not isinstance(tracks, list) or len(tracks) > len(allowed)
                                    or any(not isinstance(track, str) or track not in allowed for track in tracks)):
             raise ValueError("Pistes BlackBox invalides.")
-        selected = sorted(DEFAULT_TRACKS if tracks is None else set(tracks)) if voice is True else []
+        if mode is None:
+            mode = "deep_analysis" if voice is True else "diagnostic_light"
+        if mode not in CAPTURE_MODES or (mode != "diagnostic_light") != (voice is True):
+            raise ValueError("Mode BlackBox incompatible avec l’accord vocal.")
+        defaults = CALIBRATION_TRACKS if mode == "calibration" else DEFAULT_TRACKS
+        selected = sorted(defaults if tracks is None else set(tracks)) if voice is True else []
         with self.lock:
             if self.session is not None:
                 return
@@ -516,10 +524,11 @@ class BlackBox:
                             "started": now(), "monotonic_ns": time.monotonic_ns(),
                             "identity": clean(identity or {}),
                             "capture": {"voice": bool(selected), "tracks": selected,
-                                        "mode": "deep_analysis" if voice is True else "diagnostic_light",
+                                        "mode": mode,
                                         "organizer_consent": True, "witness_selected": "witness" in selected},
                             "configuration": config,
-                            "configuration_id": sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+                            "configuration_id": sha256(json.dumps(
+                                {"options": config, "mode": mode, "tracks": selected}, sort_keys=True).encode()).hexdigest(),
                             "clocks": {"server": "CLOCK_MONOTONIC", "graph": "PipeWire spa_io_clock",
                                        "utc": "wall_label_only", "physical_alignment_bound_ns": None},
                             "quota_bytes": self.max_bytes if self.max_bytes is not None else

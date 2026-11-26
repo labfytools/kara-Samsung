@@ -514,14 +514,14 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                  detail="À saisir dans Admin sur ton téléphone. Valable cinq minutes.")
         dialog.show(self)
 
-    def start_blackbox(self, consent, voice=False, tracks=None):
+    def start_blackbox(self, consent, voice=False, tracks=None, mode=None):
         self.blackbox.start(consent=consent, voice=voice, tracks=tracks, configuration={
             "capture": "diagnostics", "score_tolerance_s": self.game_score.tolerance,
             "whisper": "large-v3-turbo", "turbo_device": os.environ.get("KARA_TURBO_DEVICE", "gpu"),
             "lyric_offset_s": self.timing_offset,
-        }, identity={"room": self.bb_room, "party": self.remote_party.identity})
+        }, identity={"room": self.bb_room, "party": self.remote_party.identity}, mode=mode)
         self.bb_line = None
-        self.blackbox.emit("party", "recording-start", mode="diagnostics+pcm" if voice else "diagnostics")
+        self.blackbox.emit("party", "recording-start", mode=self.blackbox.status(storage=True)["mode"])
 
     def stop_blackbox(self, reason="manual", *, wait=False):
         self.acoustic.update()
@@ -567,14 +567,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
             if status["latest"]:
                 detail += f"\n\nDernière session : {status['latest']['session']}"
             dialog = Gtk.AlertDialog(message="Activer BlackBox ?", detail=detail,
-                                     buttons=["Annuler", "Diagnostic léger", "Deep Analysis"],
+                                     buttons=["Annuler", "Diagnostic léger", "Deep Analysis", "Calibration", "Benchmark"],
                                      cancel_button=0, default_button=0)
 
             def confirmed(source, result):
                 try:
                     choice = source.choose_finish(result)
-                    if choice in (1, 2):
-                        self.start_blackbox(True, voice=choice == 2)
+                    modes = ("diagnostic_light", "deep_analysis", "calibration", "benchmark")
+                    if 1 <= choice <= len(modes):
+                        self.start_blackbox(True, voice=choice > 1, mode=modes[choice - 1])
                 except (OSError, ValueError, GLib.Error) as error:
                     Gtk.AlertDialog(message="BlackBox indisponible", detail=str(error)).show(parent)
 

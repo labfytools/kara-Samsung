@@ -56,3 +56,19 @@ bin/kara-blackbox replay-turbo latest --id FENETRE --call 0 --device cpu --beam
 ```
 
 Ces commandes requièrent une entrée Turbo V3 complète. Elles vérifient la taille et le SHA-256 relevé au point d’appel du décodeur. Le rejeu relance le décodeur sur ces octets et compare sa trace aux métadonnées historiques, avec choix du dispositif, de la langue et du décodage beam. Le terminal affiche les segments et les tokens. Une différence de moteur, de modèle, de backend ou de réglage doit être prise en compte dans l’interprétation des divergences.
+
+## Annotations et simulation
+
+```sh
+bin/kara-blackbox annotate latest --cycle SESSION/TOUR \
+  --since DEBUT_NS --until FIN_NS --label word-omitted \
+  --note "Mot omis d’après l’écoute" --output blackbox/reports/annotations.jsonl
+bin/kara-blackbox simulate latest --cycle SESSION/TOUR --seed 7 --limit 1000 \
+  --simulation '{"drop_every":17,"jitter_ms":3,"delay_ms":35,"drift_ppm":120,"cut":[3,4],"reconnect":4}'
+bin/kara-blackbox compare-aec latest --cycle SESSION/TOUR \
+  --simulation '{"gain":0.5,"clip_peak":0.8,"echo_gain":0.4,"echo_delay_ms":50,"room_tail":0.3}'
+```
+
+Les annotations d’intervalle conservent leur identifiant et leur version. Ajouter `--supersedes ID` pour publier une nouvelle version dans le même journal privé. Les marqueurs de partie, les annotations humaines, les paroles attendues et le score ont des provenances distinctes. L’annotation est une observation, utilisable comme vérité terrain si la procédure d’écoute la justifie.
+
+`simulate` rejoue des métadonnées de paquets avec graine, délais, pertes, dérive, coupure et époque de reconnexion explicites. L’ordre JSONL reste celui des paquets sources et les heures simulées permettent de trier les arrivées. `compare-aec --simulation` applique uniquement les perturbations d’amplitude, de saturation, d’écho et de réverbération à une copie PCM de travail. Le journal et les WAV d’origine conservent leurs empreintes.

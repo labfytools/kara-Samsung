@@ -259,7 +259,7 @@ def main():
                                           "score", "inspect", "replay", "extract", "extract-pcm", "replay-whisper",
                                           "extract-turbo", "replay-turbo",
                                           "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
-                                          "delete", "prune"))
+                                          "annotate", "simulate", "delete", "prune"))
     parser.add_argument("session", nargs="?", default="latest")
     for field in ("cycle", "turn", "player", "song", "component", "event"):
         parser.add_argument("--" + field)
@@ -277,6 +277,11 @@ def main():
     parser.add_argument("--frames", type=int)
     parser.add_argument("--reference", choices=("monitor", "playback"), default="monitor")
     parser.add_argument("--aec-delay-ms", type=int, help="délai préalablement mesuré pour le comparatif hors ligne")
+    parser.add_argument("--simulation", help="objet JSON de perturbations hors ligne")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--label")
+    parser.add_argument("--note", default="")
+    parser.add_argument("--supersedes")
     parser.add_argument("--days", type=int)
     parser.add_argument("--device", choices=("cpu", "gpu"))
     parser.add_argument("--language")
@@ -346,6 +351,29 @@ def main():
                 # capture. The writer uses the same private mode as sessions.
                 with open(args.output, "x", opener=private_file, encoding="utf-8") as stream:
                     json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        elif args.action == "annotate":
+            from _kara_blackbox_trials import annotate
+
+            manifest = read(folder / "manifest.json")
+            validate_recording(folder, manifest)
+            cycle = manifest.get("cycles", {}).get(args.cycle)
+            if (not cycle or args.output is None or args.since is None or args.until is None
+                    or cycle["start_ns"] is None or cycle["end_ns"] is None
+                    or not cycle["start_ns"] <= args.since < args.until <= cycle["end_ns"]):
+                raise ValueError("Choisis un cycle et un intervalle connus, puis un journal de sortie distinct.")
+            output(annotate(args.root, args.output, name, args.cycle, args.since, args.until,
+                            args.label, args.note, args.supersedes))
+        elif args.action == "simulate":
+            from _kara_blackbox_trials import packet_simulation, simulation_options
+
+            manifest = read(folder / "manifest.json")
+            validate_recording(folder, manifest)
+            if args.cycle not in manifest.get("cycles", {}) or not 1 <= args.limit <= 100000:
+                raise ValueError("Choisis un cycle V3 et une limite de 1 à 100 000 paquets.")
+            config = simulation_options(json.loads(args.simulation or "{}"))
+            output({"simulated": True, "configuration": config, "seed": args.seed, "cycle": args.cycle})
+            for row in packet_simulation(folder, args.cycle, config, args.seed, args.since, args.until, args.limit):
+                output(row)
         elif args.action == "compare-aec":
             from _kara_blackbox_aec import compare, input_pair
             from _kara_blackbox_lab import analyze
@@ -359,6 +387,14 @@ def main():
             render, mic = input_pair(folder, report, args.cycle, args.reference)
             config = {"cycle": args.cycle, "reference": args.reference, "delay_ms": args.aec_delay_ms,
                       "pcm_sha256": sha256(render.astype("<f4").tobytes() + mic.astype("<f4").tobytes()).hexdigest()}
+            if args.simulation:
+                from _kara_blackbox_trials import simulate_pcm, simulation_options
+
+                overlay = simulation_options(json.loads(args.simulation))
+                if overlay.keys() - {"gain", "clip_peak", "echo_gain", "echo_delay_ms", "room_tail"}:
+                    raise ValueError("Le comparatif AEC accepte uniquement les perturbations du PCM.")
+                mic = simulate_pcm(mic, render, overlay, 48000)
+                config["simulated"] = overlay
             output({"experiment": sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
                     "inputs": config, "comparison": compare(render, mic, args.aec_delay_ms)})
         elif args.action == "extract-pcm":
