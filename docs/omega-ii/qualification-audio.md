@@ -116,3 +116,21 @@ L’égalité de la clé phonétique grossière a produit zéro proposition. Ave
 | Voix séparée | 80 | 51 | 29 | 0 |
 
 Parmi les 51 répétitions retrouvées sur la voix, les deux lectures Turbo n’ont pas le même nombre d’erreurs dans 31 couples. Le nombre d’omissions diffère dans 20, celui des substitutions dans 23 et celui des insertions dans 11. Ces décomptes se recoupent. Le signal vocal augmente le nombre de répétitions retrouvées dans ce lot, mais 29 phrases différentes restent proposées. Les variations et les ad-libs peuvent aussi faire diverger la référence. Ce résultat permet de chiffrer des occasions de comparaison dans l’éditeur. Aucun mot n’a été recopié ni publié. L’essai ne mesure donc aucun gain de WER après correction.
+
+## Séparation vocale Open-Unmix sur CPU
+
+[Le pilote UMX-HQ](../../tests/qualify-parole-unmix.py) fixe le premier extrait de chacun des six genres OMEGA I. Le seul poids téléchargé contient la tête vocale, 17 820 856 octets. Le bac isolé emploie ONNX Runtime sur un fil CPU, la STFT à 44,1 kHz, sept secondes de contexte de chaque côté lorsque disponibles et la phase du mix pour reconstruire la voix. Il réutilise le même Turbo F16 et le même intervalle temporel pour mesurer le WER. Ni la tête instrumentale ni le filtre multicanal de Wiener ne sont évalués. [Export ONNX épinglé](https://huggingface.co/edgetools/umx-hq/commit/87f26a5b2ed19488b5e453059a0a1d530423fe4a) · [Chaîne d’inférence Open-Unmix](https://github.com/sigsep/open-unmix-pytorch/blob/master/docs/inference.md)
+
+| Premier passage | Mots de référence | Erreurs mix F16 | Erreurs Demucs + F16 | Erreurs UMX-HQ + F16 |
+| --- | ---: | ---: | ---: | ---: |
+| Rock | 17 | 1 | 1 | 1 |
+| Rap américain | — | — | — | Report thermique |
+| Rap français | 12 | 12 | 12 | 12 |
+| Chanson française | — | — | — | Report thermique |
+| Reggae | 18 | 3 | 4 | 3 |
+| Soul | 23 | 11 | 8 | 7 |
+| Quatre paires complètes | 70 | 27 (38,57 %) | 25 (35,71 %) | 23 (32,86 %) |
+
+Les quatre séparations terminées prennent de 2,17 à 2,95 s de la création du modèle à l’écriture PCM. Le PSS de groupe échantillonné se situe entre 271 et 362 Mio. Les deux reçus Demucs avec PSS directement exploitable sur le reggae et la soul indiquent respectivement 1 318 et 1 386 Mio, pour 36,43 et 36,88 s. Les réglages locaux de charge et les dates de ces passages diffèrent. Le PSI maximal du pilote terminé vaut 0,41 %. Deux cas ont également attendu en admission. Les échantillons thermiques à 82,5 °C avant le départ du stem reggae font partie de cette attente. L’exécution n’a repris qu’après admission par le gardien commun. Les mesures de 1 781 Mio (sept secondes) et de 1 606 Mio (cinq secondes) sur une chanson entière appartiennent à la campagne Demucs OMEGA I.
+
+Sur ce pilote, un moteur plus léger apporte une réduction de mémoire mesurée et un WER descriptif à vérifier. Il ne qualifie ni le rendu instrumental de Kara, ni le rap américain, ni le coût sur chanson entière. L’export conserve la phase du mix, ce qui peut laisser de l’accompagnement dans une voix estimée. La précision des consonnes et l’impact sur les chœurs n’ont pas d’annotation indépendante dans ce lot.
