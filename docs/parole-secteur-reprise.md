@@ -9,3 +9,7 @@ Si la machine est éveillée et la session active, le retour d'un secteur stable
 Qualification automatisée : tests nocturnes (27 cas) et ressources (5 cas), incluant microcoupures, perte durable, reprise capot fermé, verrouillage, veille manuelle et expiration du budget. L'essai physique de débranchement/rebranchement capot fermé reste nécessaire.
 
 Retour logiciel : redéployer la révision précédente au repos, sans restaurer l'index ni réinitialiser les files. Ne pas modifier logind, le VPN ou les protections matérielles.
+
+## Durée illimitée sur secteur
+
+Le réglage `night_minutes=0` désactive uniquement l’expiration temporelle. Les durées finies restent disponibles dans les paramètres. Le test simule 49 heures de maintien puis une perte secteur et confirme que l’inhibiteur est libéré après le délai de confirmation. Les protections thermiques, mémoire, disque, verrouillage et veille manuelle restent inchangées. Une endurance physique de 48 heures n’a pas été mesurée.

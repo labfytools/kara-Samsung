@@ -265,6 +265,23 @@ class NightTests(unittest.TestCase):
             os.fstat(fd)
         self.assertIsNone(self.night.fd)
 
+    def test_unlimited_night_survives_48_hours_without_bypassing_power(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True, night_minutes=0)
+        self.open()
+        self.assertTrue(self.observe(lid=True))
+        fd = self.night.lid_fd
+        # Simulate more than two days of elapsed boot time, without sleeping.
+        self.night.budget = 1.
+        with patch("_parole_night.clock_gettime", return_value=49 * 3600.):
+            self.assertTrue(self.night.check(self.settings))
+            self.assertEqual(self.night.lid_fd, fd)
+            self.ac = False
+            self.assertFalse(self.night.check(self.settings))
+            self.assertEqual(self.night.lid_fd, fd)
+            self.night.power_loss_since -= POWER_LOSS_GRACE + 1
+            self.assertFalse(self.night.check(self.settings))
+            self.assertIsNone(self.night.lid_fd)
+
     def test_budget_survives_restart_and_real_resume_resets_it(self):
         self.open()
         self.night.close()

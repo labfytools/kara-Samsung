@@ -535,4 +535,7 @@ class Night:
     def expired(self, settings):
         if self.budget is None:
             self.budget = self.index.night_budget()
-        return self.budget is not None and clock_gettime(CLOCK_BOOTTIME) >= self.budget + settings["night_minutes"] * 60
+        # Zero is an explicit opt-in to unlimited AC operation. Retain the
+        # elapsed budget for reports and for switching back to a finite limit.
+        minutes = settings["night_minutes"]
+        return minutes != 0 and self.budget is not None and clock_gettime(CLOCK_BOOTTIME) >= self.budget + minutes * 60

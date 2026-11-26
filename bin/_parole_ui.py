@@ -1309,7 +1309,7 @@ class ParoleView:
             ("night_gpu_temperature", "Limite GPU (°C)", 45, 85),
             ("night_closed_temperature", "Limite capot fermé (°C)", 45, 70),
             ("cache_gib", "Plafond du cache Kara (Gio)", 1, 1000),
-            ("night_minutes", "Maintien éveillé maximal par période d’inactivité (minutes)", 5, 720),
+            ("night_minutes", "Maintien éveillé (minutes, 0 = illimité sur secteur)", 0, 720),
         ):
             number(night, *spec)
         night.append(Gtk.Label(label="Secteur obligatoire. Attendez l’inhibiteur de capot actif avant de fermer.",
