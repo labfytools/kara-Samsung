@@ -37,7 +37,7 @@ from _paroles_lrc import MAX_LRC_BYTES
 
 CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
               "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "SYNC", "IDLE", "CACHE",
-              "SUCCESS", "WARNING", "ERROR", "TRANSCRIPTION")
+              "SUCCESS", "WARNING", "ERROR", "TRANSCRIPTION", "RESSOURCES")
 HEAVY = ("prepare", "transcription")
 NIGHT_NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata")
 NETWORK = (*NIGHT_NETWORK, "codex", "source", "source_probe")

@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_index import DEFAULTS
-from _parole_maintenance import Maintenance
+from _parole_maintenance import Journal, Maintenance
 from _parole_resources import GIB, Resources, contents
 
 
@@ -107,6 +107,20 @@ class ResourceTests(unittest.TestCase):
                         worker.join(timeout=5)
                         runner.interrupt.clear()
                         policy.return_value = True
+
+    def test_memory_diagnostic_remains_in_console_after_restart(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = Maintenance(root, None, state=root / "state")
+            self.addCleanup(runner.close)
+            runner.resources.memory_detail = "PSI · 5440 Mio disponibles · 1.12 %"
+            runner.progress = ("DEMUCS", "Titre privé", .5)
+            runner.log_memory_stop()
+            restarted = Journal(runner.index.folder)
+            self.addCleanup(restarted.close)
+            _, entries = restarted.snapshot()
+            self.assertEqual(entries[-1][1:], ("RESSOURCES", "WARNING",
+                                               "DEMUCS suspendu · PSI · 5440 Mio disponibles · 1.12 %"))
 
 
 if __name__ == "__main__":
