@@ -33,3 +33,7 @@ Les seuils de charge CPU, GPU et disque ne bloquent plus l’admission nocturne 
 ### Douze threads Demucs
 
 Le mode intensif nocturne capot fermé transmet explicitement douze threads à Demucs, qui applique cette valeur aux réglages OMP et MKL. Le mode nocturne capot ouvert conserve deux threads et les autres usages conservent six threads par défaut. Le GPU reste accessible à Turbo via Vulkan, sans seuil bloquant de charge GPU dans le mode capot fermé. Les contrôles de mémoire disponible et de température demeurent actifs. La charge GPU réellement atteinte dépend de l’algorithme ; elle n’est pas forcée par le gouverneur. Les tests de configuration passent ; le débit et la stabilité à douze threads restent à qualifier sur une chanson complète.
+
+### RAM à 80 %, swap sans seuil bloquant
+
+Capot fermé, la réserve de RAM devient dynamique : 20 % du `MemTotal` Linux, arrondis au Mio supérieur, avec conservation de la réserve minimale antérieure en cours de calcul si celle-ci est plus élevée. Ce seuil s’applique au démarrage et à la poursuite des tâches nocturnes. Avec 15 596 740 Kio de RAM détectée, la réserve est de 3 047 Mio. La mesure `MemAvailable` inclut la mémoire récupérable ; ce contrôle périodique n’est pas un quota strict de processus. Un swap entièrement occupé ne bloque pas à lui seul une tâche. Aucun changement de zram, du swap, des protections OOM ou des paramètres noyau. Le test simulant un swap à 100 % et les tests du seuil RAM passent ; l’endurance réelle n’a pas été qualifiée.

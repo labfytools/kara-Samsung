@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_index import DEFAULTS
 from _parole_maintenance import Journal, Maintenance
-from _parole_resources import GIB, Resources, contents, thermal_admission, memory_psi, memory_limits
+from _parole_resources import GIB, Resources, contents, thermal_admission, memory_psi, memory_limits, memory_reserve
 
 
 class ResourceTests(unittest.TestCase):
@@ -63,6 +63,15 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(memory_limits(closed=True, running=True, light=True), (None, None))
         self.assertEqual(memory_limits(closed=False, running=True), (1., 1.))
 
+    def test_closed_memory_reserves_twenty_percent(self):
+        for running in (False, True):
+            self.assertEqual(memory_reserve(DEFAULTS, total_kib=15596740, closed=True, running=running), 3047)
+            self.assertEqual(memory_reserve(DEFAULTS, total_kib=16777216, closed=True, running=running), 3277)
+        self.assertEqual(memory_reserve(DEFAULTS), DEFAULTS["memory_mib"])
+        self.assertEqual(memory_reserve(DEFAULTS, running=True), DEFAULTS["running_memory_mib"])
+        with self.assertRaises(ValueError):
+            memory_reserve(DEFAULTS, closed=True, total_kib=0)
+
     def test_closed_running_memory_policy_and_cooldown(self):
         resources = Resources(Path("/fixture"))
         resources.collect_storage = Mock()
@@ -74,7 +83,7 @@ class ResourceTests(unittest.TestCase):
         gpu = Path("/sys/class/hwmon/hwmon-test-gpu")
         busy = Path("/sys/class/drm/card0/device/gpu_busy_percent")
         readings = {"/proc/stat": "cpu 1 0 1 50 0 0 0 0",
-                    "/proc/meminfo": "MemAvailable: 6324224 kB",
+                    "/proc/meminfo": "MemTotal: 16777216 kB\nMemAvailable: 6324224 kB\nSwapTotal: 6291456 kB\nSwapFree: 0 kB",
                     "/proc/pressure/memory": "some avg10=2.08\nfull avg10=2.00",
                     str(cpu / "name"): "k10temp", str(gpu / "name"): "amdgpu",
                     str(cpu / "temp1_input"): "60000", str(gpu / "temp1_input"): "55000",
@@ -107,18 +116,19 @@ class ResourceTests(unittest.TestCase):
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True, light=True))
             self.assertTrue(resources.check(DEFAULTS, running=True, nocturnal=True, lid=True))
             self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True, lid=False))
-            # Sufficient RAM to continue, but not to admit a new heavy task.
-            readings["/proc/meminfo"] = "MemAvailable: 3145728 kB"
+            # A full swap does not prevent starting or continuing with more
+            # than 20% physical RAM available, even below the old 4-GiB floor.
+            readings["/proc/meminfo"] = "MemTotal: 16777216 kB\nMemAvailable: 3460301 kB\nSwapTotal: 6291456 kB\nSwapFree: 0 kB"
             clock.return_value = 106.
-            self.assertFalse(resources.check(DEFAULTS, nocturnal=True, lid=True))
+            self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True))
             self.assertTrue(resources.check(DEFAULTS, running=True, nocturnal=True, lid=True))
-            readings["/proc/meminfo"] = "MemAvailable: 1310720 kB"
+            readings["/proc/meminfo"] = "MemTotal: 16777216 kB\nMemAvailable: 3145728 kB\nSwapTotal: 6291456 kB\nSwapFree: 0 kB"
             clock.return_value = 108.
             self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True, lid=True))
             self.assertIn("réserve", resources.memory_detail)
             self.assertIn("informatif", resources.memory_detail)
             self.assertEqual(resources.memory_retry_at, 138.)
-            readings["/proc/meminfo"] = "MemAvailable: 6324224 kB"
+            readings["/proc/meminfo"] = "MemTotal: 16777216 kB\nMemAvailable: 6324224 kB\nSwapTotal: 6291456 kB\nSwapFree: 0 kB"
             readings["/proc/pressure/memory"] = "some avg10=0.10\nfull avg10=0.05"
             clock.return_value = 110.
             self.assertFalse(resources.check(DEFAULTS, nocturnal=True, lid=True))

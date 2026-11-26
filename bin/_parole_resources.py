@@ -95,6 +95,17 @@ def memory_limits(*, closed=False, running=False, light=False):
     return (None, None) if closed else (1., 1.)
 
 
+def memory_reserve(settings, *, total_kib=None, closed=False, running=False):
+    floor = min(settings["memory_mib"], settings["running_memory_mib"])
+    if closed:
+        if total_kib is None or total_kib <= 0:
+            raise ValueError("MemTotal indisponible")
+        # Reserve at least 20% of the system's physical memory, rounded up
+        # to a whole MiB. Swap occupancy is not an admission limit.
+        return max(floor, (total_kib + 5119) // 5120)
+    return floor if running else settings["memory_mib"]
+
+
 def thermal_admission(settings, cpu_t, gpu_t, *, nocturnal=False, closed=False):
     cpu_limit = settings["night_cpu_temperature" if nocturnal else "temperature"]
     gpu_limit = settings["night_gpu_temperature" if nocturnal else "temperature"]
@@ -245,8 +256,13 @@ class Resources:
             cpu_sample = sum(cpu_fields), cpu_fields[3] + cpu_fields[4]
             cpu, self.cpu = self.cpu, cpu_sample
             load = 100 * (1 - (cpu_sample[1] - cpu[1]) / max(1, cpu_sample[0] - cpu[0])) if cpu else None
-            available = int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines()
+            meminfo = Path("/proc/meminfo").read_text().splitlines()
+            available = int(next(line.split()[1] for line in meminfo
                                  if line.startswith("MemAvailable:"))) / 1024
+            total_kib = (int(next(line.split()[1] for line in meminfo if line.startswith("MemTotal:")))
+                         if closed else None)
+            if available < 0 or (closed and available * 1024 > total_kib):
+                raise ValueError("Mémoire disponible invalide")
             pressure, full_pressure = memory_psi(Path("/proc/pressure/memory").read_text())
             gpus = [int(p.read_text()) for p in Path("/sys/class/drm").glob("card[0-9]*/device/gpu_busy_percent")]
             sensors = {}
@@ -264,7 +280,7 @@ class Resources:
             # During the task its own CPU/GPU/disk load is expected. User
             # activity, power, pressure, temperature and remaining space
             # still revoke admission and trigger process-group cleanup.
-            minimum = min(settings["memory_mib"], settings["running_memory_mib"]) if running else settings["memory_mib"]
+            minimum = memory_reserve(settings, total_kib=total_kib, closed=closed, running=running)
             some_limit, full_limit = memory_limits(closed=closed, running=running, light=light)
             pressure_ok = some_limit is None or (pressure < some_limit and full_pressure < full_limit)
             self.memory_observation = {"available_mib": available, "minimum_mib": minimum,
@@ -298,7 +314,7 @@ class Resources:
             self.can_continue = True
             # Network maintenance needs the same safety measurements and
             # launch memory floor, but does not need a free compute slot.
-            self.can_start_light = available >= settings["memory_mib"]
+            self.can_start_light = available >= memory_reserve(settings, total_kib=total_kib, closed=closed)
             if closed and not running and now < self.memory_retry_at:
                 self.reason = "Pause mémoire après interruption · reprise différée"
                 return light and self.can_start_light
