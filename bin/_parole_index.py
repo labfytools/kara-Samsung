@@ -79,6 +79,9 @@ class Index:
                     checked REAL NOT NULL, info TEXT NOT NULL, audio TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS songs_owner ON songs(owner, album, edition, disc, track);
+                -- The visible library page stops after its LIMIT in this
+                -- exact order, with id breaking ties between shared credits.
+                CREATE INDEX IF NOT EXISTS songs_display ON songs(owner, album, disc, track, title, id);
                 CREATE INDEX IF NOT EXISTS songs_release_position ON songs(release_id,track,disc) WHERE release_id!='';
                 CREATE INDEX IF NOT EXISTS songs_edition ON songs(edition, disc, track);
                 CREATE INDEX IF NOT EXISTS songs_inode ON songs(dev, inode);
