@@ -780,11 +780,8 @@ class ParoleView:
             text = buffer.get_text(*buffer.get_bounds(), False)
             suffix = ".lrc" if forms.get_selected() else ".txt"
             try:
-                save_correction(self.index, identity, suffix, versions[suffix], text)
-                if draft_format == suffix:
-                    version, _ = sidecar(path, suffix)
-                    self.index.review("transcription_validation", identity + suffix, "validated",
-                                      {"audio": row["token"], "sidecar": version, "source": "Turbo, validé manuellement"})
+                save_correction(self.index, identity, suffix, versions[suffix], text,
+                                expected_audio=row["token"], draft=draft_format == suffix)
             except (OSError, ValueError, sqlite3.Error, SystemExit) as error:
                 status.set_text(str(error))
                 return

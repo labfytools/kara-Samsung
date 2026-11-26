@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Qualifier pour le lexique les corrections manuelles dont l’audio et les paroles ont gardé la version validée.
 - Indexer l’ordre de la liste Parole pour accélérer la lecture des premières pages.
 - Actualiser seulement les lignes modifiées dans la liste Parole et préserver la sélection.
 - Réutiliser les paroles vérifiées entre éditions lorsque le PCM est identique, avec des fichiers associés et leur provenance.

@@ -63,6 +63,24 @@ class Fixture(unittest.TestCase):
 
 
 class InventoryTests(Fixture):
+    def test_manual_correction_in_lexicon_is_bound_to_sidecar_and_audio(self):
+        from _parole_lexicon import records
+
+        path = self.audio()
+        self.scan()
+        song, = self.songs()
+        with self.assertRaisesRegex(ValueError, "l’ouverture"):
+            save_correction(self.index, song["id"], ".txt", None, "J’suis chez Mélo",
+                            expected_audio="old-version")
+        save_correction(self.index, song["id"], ".txt", None, "J’suis chez Mélo", expected_audio=song["token"])
+        self.scan()
+        record, = records(self.index.path, self.root)
+        self.assertEqual(record["source"], "Correction manuelle validée")
+        self.assertIn("J’suis", record["forms"])
+        path.with_suffix(".txt").write_text("Mots jamais validés")
+        self.scan()
+        self.assertEqual(list(records(self.index.path, self.root)), [])
+
     def test_lexicon_excludes_held_out_content_and_generated_lrc(self):
         from _parole_lexicon import records, select_prompt
 

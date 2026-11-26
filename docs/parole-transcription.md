@@ -30,6 +30,8 @@ Le reggae passe de 15 à 3 erreurs avec les deux contextes. Le couplet de rap fr
 
 Le relevé ci-dessus mesure des erreurs de mots sur des extraits. La précision temporelle de 500 ms demande une annotation indépendante des repères.
 
+L’enregistrement d’une correction dans Parole conserve un reçu distinct pour le TXT et le LRC. Un nouveau relevé lexical accepte une correction seulement si son fichier et l’audio ont gardé les versions approuvées. L’éditeur refuse d’enregistrer sur un audio modifié depuis son ouverture. Les poids lexicaux des nouveaux relevés dédupliquent aussi les identités d’enregistrement connues, à partir du PCM, de l’identifiant MusicBrainz ou de l’ISRC. Les relevés historiques restent conservés et les brouillons en attente de validation n’alimentent pas le lexique.
+
 ## Banc ciblé par genre et par taille de contexte
 
 Le [banc de 50 chansons](../tests/qualify-parole-targeted.py) décode le mix original sans contexte ni langue imposée. Il cherche le mot le moins sûr et découpe au plus cinq secondes autour de son début. Une nouvelle lecture en faisceau du même PCM intervient sans contexte. Le lexique est ensuite filtré par genre et langue détectée. Il classe en premier les graphies proches des mots incertains de la fenêtre. En français, cette proximité utilise des équivalences de graphèmes simples, comme `eau` et `o`. Un contexte ne reçoit ni le texte de référence ni celui d’un autre passage du morceau évalué.

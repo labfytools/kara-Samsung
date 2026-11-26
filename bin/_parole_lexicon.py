@@ -9,8 +9,10 @@ import re
 import sqlite3
 from unicodedata import normalize
 
+from _kara_prepare import file_token
 from _kara_words import FORM, IGNORED_HINTS, detect_language, words
-from _parole_index import key, sidecar
+from _parole_index import document, key, sidecar
+from _parole_music_identity import isrc, mbid
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 MAX_FORMS = 512
@@ -28,7 +30,34 @@ def lexical_forms(text):
     return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold(), item[0]))[:MAX_FORMS])
 
 
-def origin(row, info, root):
+def reviewed_text(row, root, approvals):
+    if not approvals:
+        return ""
+    path = Path(row["path"])
+    try:
+        if (not path.is_relative_to(root) or path.resolve(strict=True) != path
+                or document(file_token(path)) != row["token"]):
+            return ""
+    except (OSError, ValueError):
+        return ""
+    for suffix in (".txt", ".lrc"):
+        approval = approvals.get(row["id"] + suffix)
+        if not approval or approval.get("audio") != row["token"]:
+            continue
+        version, text = sidecar(path, suffix)
+        if not text.strip() or version != approval.get("sidecar"):
+            continue
+        if suffix == ".txt":
+            return text
+        lines = [(at, line) for at, line in parse_lrc(text) if line.strip()]
+        if lines and row["duration"] > 0 and lines[-1][0] <= row["duration"] + 3:
+            return "\n".join(line for _, line in lines)
+    return ""
+
+
+def origin(row, info, root, approvals=None):
+    if text := reviewed_text(row, root, approvals):
+        return "Correction manuelle validée", text
     # Generated or uncertain material is excluded even when its timing is
     # structurally valid. This keeps model output out of its own corpus.
     providers = [str(info.get(name, "")).casefold() for name in ("lyrics_provider", "lrc_provider")]
@@ -39,7 +68,7 @@ def origin(row, info, root):
     if row["lyrics"] == "Strawberry" and isinstance(info.get("plain"), str) and info["plain"].strip():
         if len(info["plain"].encode()) <= MAX_LRC_BYTES:
             return "Strawberry ou tags intégrés", info["plain"]
-    if row["lrc"] in {"local", "externe"}:
+    if row["lrc"] in {"local", "externe"} and row["id"] + ".lrc" not in (approvals or {}):
         path = Path(row["path"])
         try:
             usable = path.is_relative_to(root) and path.resolve() == path
@@ -53,12 +82,15 @@ def origin(row, info, root):
     return "", ""
 
 
-def identities(row, info):
+def recording_keys(row, info):
     tags = info.get("tags", {})
-    recording = tags.get("recordingid") or tags.get("musicbrainztrackid")
-    return {("id", row["id"]), ("credit", (key(row["owner"]), key(row["title"])))} | {
-        (kind, value) for kind, value in (("pcm", row["audio"]), ("recording", recording)) if value
-    }
+    recording = mbid(tags.get("musicbrainzrecordingid") or tags.get("recordingid") or tags.get("musicbrainztrackid"))
+    return {(kind, value) for kind, value in (("pcm", row["audio"]), ("recording", recording),
+                                             ("isrc", isrc(tags.get("isrc")))) if value}
+
+
+def identities(row, info):
+    return {("id", row["id"]), ("credit", (key(row["owner"]), key(row["title"])))} | recording_keys(row, info)
 
 
 def records(index_path, root, *, exclude=(), genres=None):
@@ -67,6 +99,8 @@ def records(index_path, root, *, exclude=(), genres=None):
     held_out = set(exclude)
     with closing(sqlite3.connect(index_path.as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
+        approvals = {subject: json.loads(value) for subject, value in db.execute(
+            "SELECT subject,value FROM reviews WHERE kind='transcription_validation' AND state='validated'")}
         blocked = set()
         blocked_text = set()
         for identity in sorted(held_out):
@@ -75,14 +109,14 @@ def records(index_path, root, *, exclude=(), genres=None):
                 raise ValueError("Morceau d’évaluation absent de l’index")
             info = json.loads(row["info"])
             blocked.update(identities(row, info))
-            _, text = origin(row, info, root)
+            _, text = origin(row, info, root, approvals)
             if text:
                 blocked_text.add(text_digest(text))
         for row in db.execute("SELECT * FROM songs ORDER BY id"):
             info = json.loads(row["info"])
             if identities(row, info) & blocked:
                 continue
-            source, text = origin(row, info, root)
+            source, text = origin(row, info, root, approvals)
             if not text or text_digest(text) in blocked_text:
                 continue
             lines = [line for line in text.splitlines() if line.strip()]
@@ -91,7 +125,8 @@ def records(index_path, root, *, exclude=(), genres=None):
                 tag = ((genres or {}).get(row["path"]) or info.get("tags", {}).get("genre") or "").strip()
                 yield dict(song=row["id"], source=source, confidence="local", digest=text_digest(text),
                            language=detect_language(words(text)), genre=tag, artist=row["owner"],
-                           album=row["edition"], forms=forms, lines=len(lines))
+                           album=row["edition"], forms=forms, lines=len(lines),
+                           recording=sorted(f"{kind}:{value}" for kind, value in recording_keys(row, info)))
 
 
 def text_digest(text):
@@ -103,6 +138,7 @@ def text_digest(text):
 def ranked_forms(corpus, *, language="", genre="", artist="", album="", single=False):
     scores = Counter()
     digests = set()
+    recordings = set()
     genre_key, artist_key = key(genre), key(artist)
     for record in corpus:
         if album and record["album"] != album:
@@ -113,7 +149,10 @@ def ranked_forms(corpus, *, language="", genre="", artist="", album="", single=F
             continue
         if language and record["language"] != language:
             continue
-        if record["digest"] in digests:
+        identities = set(record.get("recording", ()))
+        duplicate_recording = bool(identities & recordings)
+        recordings.update(identities)
+        if record["digest"] in digests or duplicate_recording:
             continue
         digests.add(record["digest"])
         for form, count in record["forms"].items():

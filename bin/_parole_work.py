@@ -353,7 +353,7 @@ def main():
     print(document(result))
 
 
-def save_correction(index, identity, suffix, original_version, text):
+def save_correction(index, identity, suffix, original_version, text, *, expected_audio=None, draft=False):
     from _kara_prepare import atomic, lrc_token
     from _musique_oz import share_file
     from _paroles_lrc import MAX_LRC_BYTES
@@ -363,6 +363,8 @@ def save_correction(index, identity, suffix, original_version, text):
     song = index.song(identity)
     if not song or suffix not in (".txt", ".lrc"):
         raise ValueError("Chanson ou format indisponible")
+    if expected_audio is not None and song["token"] != expected_audio:
+        raise ValueError("Le morceau a changé depuis l’ouverture de l’éditeur")
     audio = Path(song["path"])
     if audio.resolve(strict=True) != audio or not audio.is_relative_to(index.root):
         raise ValueError("Morceau hors bibliothèque")
@@ -401,6 +403,14 @@ def save_correction(index, identity, suffix, original_version, text):
                     os.close(directory)
             finally:
                 draft.unlink(missing_ok=True)
+        # A receipt qualifies the exact version saved by this action. If a
+        # crash precedes the receipt, the correction remains safely on disk.
+        version, saved = sidecar(audio, suffix)
+        if saved.encode() != raw or document(file_token(audio)) != song["token"]:
+            raise ValueError("Le morceau ou la correction a changé après l’écriture")
+        index.review("transcription_validation", identity + suffix, "validated",
+                     {"audio": song["token"], "sidecar": version,
+                      "source": "Turbo, validé manuellement" if draft else "Correction manuelle"})
 
 
 if __name__ == "__main__":
