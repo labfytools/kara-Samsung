@@ -10,6 +10,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_blackbox import BlackBox
+from _kara_blackbox_aec import compare, input_pair
+from _kara_blackbox_lab import analyze
 
 REPLAY = runpy.run_path(str(Path(__file__).with_name("qualify-kara-aec-blackbox.py")))
 
@@ -49,6 +51,45 @@ class ReplayTests(unittest.TestCase):
             self.assertGreater(metrics["input_correlation"], .95)
             self.assertLess(metrics["webrtc"]["rms"], metrics["witness_rms"])
             self.assertEqual(REPLAY["matched_cycles"](capture(root / "disjoint", 5)), [])
+
+    def test_v3_pairs_phone_and_output_with_distinct_clock_domains(self):
+        with TemporaryDirectory() as directory:
+            manager = BlackBox(Path(directory) / "blackbox", queue_size=2048)
+            manager.start(consent=True, voice=True, tracks=["wifi", "monitor"])
+            session = manager.voice_session()
+            turn = dict(turn="a" * 16, player="Fixture", song="Synthétique")
+            connection = "c" * 32
+            rate = 48000
+            mono = np.random.default_rng(49).normal(0, .1, 6 * rate).astype("<f4")
+            echo = np.zeros_like(mono)
+            echo[1920:] = mono[:-1920] * .6
+            base = 1_000_000_000
+            manager.emit("party", "turn-start", **turn)
+            for first in range(0, len(mono), 960):
+                stop = first + 960
+                stamp = base + first * 1_000_000_000 // rate
+                monitor = np.column_stack((mono[first:stop], mono[first:stop]))
+                clock = dict(driver=3, epoch=1, frame=first, monotonic_ns=stamp,
+                             xrun=0, quantum=960, route=1, present=6, spa_headers=6)
+                manager.pcm("monitor", rate, 2, monitor.tobytes(), **turn, clock=clock,
+                            recording_session=session)
+                manager.pcm("wifi", rate, 1, (echo[first:stop] * 32768).astype("<i2").tobytes(),
+                            **turn, connection=connection, packet_timing={"frame_end": stop})
+                if first in (rate // 2, (rate * 11) // 2):
+                    manager.emit("clock", "mobile-anchor", **turn, connection=connection, rate=rate,
+                                 context_frame=first, renderer_frame_min_ns=stamp,
+                                 renderer_frame_max_ns=stamp)
+            manager.emit("party", "turn-end", **turn)
+            manager.stop(wait=True)
+            folder = manager.root / session
+            report = analyze(folder)
+            render, mic = input_pair(folder, report, f"{session}/{turn['turn']}", "monitor")
+            self.assertEqual(len(mic), 5 * rate)
+            metrics = compare(render, mic)
+            self.assertEqual(metrics["delay_candidate_ms"], 40)
+            self.assertIsNone(metrics["physical_alignment_bound_ns"])
+            self.assertFalse(metrics["ground_truth_available"])
+            self.assertGreater(metrics["variants"]["unchanged"]["reference_correlation"], .99)
 
 
 if __name__ == "__main__":

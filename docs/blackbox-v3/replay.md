@@ -39,6 +39,13 @@ BlackBox V3 recherche, pour chaque cycle, les runs contigus du microphone et de 
 
 Un recouvrement logiciel ne qualifie pas un délai physique. La chaîne ADC, les tampons du navigateur, la présentation DAC, la latence Bluetooth, le retour micro et le trajet dans la pièce exigent les mesures du [protocole physique](protocole-physique.md). Le banc strict `tests/qualify-kara-aec-blackbox.py` demeure utilisable sur un monitor et un témoin qui partagent réellement leur grille PipeWire. Le banc synthétique `tests/test-kara-aec-blackbox.py` contrôle le comportement sur une paire commune et sur deux pilotes distincts.
 
+```sh
+bin/kara-blackbox compare-aec latest --cycle SESSION/TOUR --reference monitor
+bin/kara-blackbox compare-aec latest --cycle SESSION/TOUR --reference playback --aec-delay-ms 40
+```
+
+La valeur de 40 ms illustre un réglage explicite. Utiliser la mesure de la configuration qualifiée. `compare-aec` sélectionne jusqu’à douze secondes dans le recouvrement, rapproche les grilles par interpolation linéaire et s’arrête si un bloc manque. Les comparaisons sur la même entrée couvrent le signal inchangé, WebRTC AEC3 et Speex. Le résultat journalise l’empreinte de l’entrée alignée, le délai candidat, la corrélation avec la référence, le niveau RMS et le temps de trame des moteurs. Ces métriques peuvent varier pendant le chant simultané. Elles ne quantifient ni l’atténuation d’un écho isolé ni la préservation vocale sans témoin indépendant.
+
 ## Relancer un appel du décodeur
 
 ```sh

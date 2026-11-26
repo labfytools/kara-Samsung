@@ -258,7 +258,7 @@ def main():
     parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
                                           "score", "inspect", "replay", "extract", "extract-pcm", "replay-whisper",
                                           "extract-turbo", "replay-turbo",
-                                          "analyze", "report", "export", "space", "compare", "replay-timeline",
+                                          "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
                                           "delete", "prune"))
     parser.add_argument("session", nargs="?", default="latest")
     for field in ("cycle", "turn", "player", "song", "component", "event"):
@@ -275,6 +275,8 @@ def main():
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--frames", type=int)
+    parser.add_argument("--reference", choices=("monitor", "playback"), default="monitor")
+    parser.add_argument("--aec-delay-ms", type=int, help="délai préalablement mesuré pour le comparatif hors ligne")
     parser.add_argument("--days", type=int)
     parser.add_argument("--device", choices=("cpu", "gpu"))
     parser.add_argument("--language")
@@ -290,6 +292,8 @@ def main():
             raise ValueError("Deux tolérances candidates au maximum, comprises entre 0 et 5 s.")
         if not 0 <= args.call <= 15:
             raise ValueError("Indice d’appel Turbo hors limites.")
+        if args.aec_delay_ms is not None and not 0 <= args.aec_delay_ms <= 500:
+            raise ValueError("Délai AEC hors limites.")
         available = [path.name for path in session_folders(args.root)]
         if args.action == "list":
             output(available)
@@ -342,6 +346,21 @@ def main():
                 # capture. The writer uses the same private mode as sessions.
                 with open(args.output, "x", opener=private_file, encoding="utf-8") as stream:
                     json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        elif args.action == "compare-aec":
+            from _kara_blackbox_aec import compare, input_pair
+            from _kara_blackbox_lab import analyze
+
+            validate_recording(folder, read(folder / "manifest.json"))
+            if args.cycle is None:
+                raise ValueError("Le comparatif AEC exige la sélection explicite d’un --cycle SESSION/TOUR.")
+            report = analyze(folder)
+            if args.cycle not in report["cycles"]:
+                raise ValueError("Cycle V3 absent.")
+            render, mic = input_pair(folder, report, args.cycle, args.reference)
+            config = {"cycle": args.cycle, "reference": args.reference, "delay_ms": args.aec_delay_ms,
+                      "pcm_sha256": sha256(render.astype("<f4").tobytes() + mic.astype("<f4").tobytes()).hexdigest()}
+            output({"experiment": sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+                    "inputs": config, "comparison": compare(render, mic, args.aec_delay_ms)})
         elif args.action == "extract-pcm":
             if args.id is None or args.output is None:
                 raise ValueError("Indique un événement PCM (--id) et un fichier de sortie (--output).")
@@ -413,7 +432,7 @@ def main():
             if kind in ("replay", "compare") and not count:
                 raise ValueError("Aucune fenêtre de notation disponible pour le replay.")
         return 0
-    except (ValueError, KeyError, OSError, wave.Error, subprocess.SubprocessError) as exc:
+    except (ValueError, KeyError, OSError, RuntimeError, wave.Error, subprocess.SubprocessError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
