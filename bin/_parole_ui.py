@@ -681,6 +681,8 @@ class ParoleView:
                                    ORDER BY kind""", (identity,)).fetchall()
             identification = db.execute("SELECT value FROM reviews WHERE kind='metadata' AND subject=? AND state='identified'",
                                         (identity,)).fetchone()
+            unison = db.execute("SELECT value FROM reviews WHERE kind='unison_candidate' AND subject=? AND state='found'",
+                               (identity,)).fetchone()
             provenance = [dict(reference) for reference in db.execute("""
                 SELECT provider,external_id,edition,recording,confidence,tags,evidence FROM canonical_references
                 WHERE path=? AND song IN ('',?) ORDER BY provider,external_id LIMIT 30
@@ -787,6 +789,13 @@ class ParoleView:
             if found.pop("token", None) == row["token"]:
                 editbar.append(button("Identification", lambda widget: show_details(
                     widget, "Identification MusicBrainz", json.dumps(found, indent=2, ensure_ascii=False))))
+        if unison:
+            found = json.loads(unison["value"])
+            if found["token"] == row["token"] and (candidate := found["candidate"]):
+                links = box(Gtk.Orientation.HORIZONTAL)
+                links.append(Gtk.LinkButton.new_with_label(candidate["url"], "Candidat de paroles sur Unison"))
+                links.append(Gtk.LinkButton.new_with_label(candidate["profile"], "Contribution de " + candidate["contributor"]))
+                panel.append(links)
         editbar.append(button("Rechercher avec Codex",
                               lambda *_: self.manual_codex("lrc" if forms.get_selected() else "lyrics", identity, status)))
         song = Song(path, row["title"], row["artist"], row["album"], row["duration"] or None)

@@ -66,6 +66,7 @@ def lookup_song(index, identity, synced, *, read_only=False):
     duration = round(tags.pop("duration_seconds", 0.))
     if not title or not artist or not math.isfinite(duration) or duration <= 0:
         return {"state": "invalid"}
+    missing = "not_found"
     if (synced and (rows := parse_lrc(text)) and rows[-1][0] <= duration + 3
             and any(content for _, content in rows)):
         lyrics, provider = text, "Strawberry"
@@ -75,11 +76,17 @@ def lookup_song(index, identity, synced, *, read_only=False):
                 title, artist, tags.get("album"), duration, tags.get("albumartist"),
                 synced=synced, local_text=local_text, registry=index, strict=True)
         except engine.AmbiguousLyrics:
-            return {"state": "ambiguous"}
+            lyrics, missing = None, "ambiguous"
         except engine.ServiceUnavailable as error:
             return {"state": error.reason}
     if lyrics is None:
-        return {"state": "not_found"}
+        if not read_only:
+            from _parole_unison import discover as unison
+
+            unison(index, song, tags.get("isrc"), lambda data: (
+                engine.normalized(data.get("song")) == engine.normalized(title)
+                and engine.credits(data.get("artist")) == engine.credits(artist)))
+        return {"state": missing}
     if not lyrics:
         return {"state": "instrumental", "source": provider}
     if read_only:

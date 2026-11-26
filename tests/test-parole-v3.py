@@ -287,6 +287,23 @@ class CatalogueTests(unittest.TestCase):
 
 
 class SourceTests(Fixture):
+    def test_unison_exact_isrc_keeps_attribution_and_discards_lyrics(self):
+        from _parole_unison import discover
+
+        seed(self.index)
+        payload = {"success": True, "data": {"isrc": "FR8EU2300090", "matchedBy": "isrc",
+                                              "videoId": "Ugr4KKK_SqY", "format": "lrc",
+                                              "lyrics": "Texte non conservé",
+                                              "submitter": {"keyId": "abcd", "displayName": "Crédit"}}}
+        song = {"id": "fixture", "token": "audio"}
+        with patch("_parole_unison.fetch", return_value=payload) as request:
+            result = discover(self.index, song, "fr-8eu-23-00090", lambda _: True)
+            self.assertEqual(result["profile"], "https://unison.betterlyrics.org/curator/abcd")
+            self.assertNotIn("lyrics", result)
+            self.assertEqual(discover(self.index, song, "FR8EU2300090", lambda _: True), result)
+            self.assertIsNone(discover(self.index, song, "FR8EU2300091", lambda _: True))
+            self.assertEqual(request.call_count, 2)
+
     def test_lrclib_widens_discovery_without_widening_recording_match(self):
         engine = lyrics_engine()
         client = engine.LrcLib()

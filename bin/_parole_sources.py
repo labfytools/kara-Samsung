@@ -28,6 +28,7 @@ BUILTINS = {
     "QQ Music": ("y.qq.com", "lyrics,lrc", ""),
     "Genius": ("genius.com", "lyrics", ""),
     "LyricDown": ("lyricdown.com", "lrc", ""),
+    "Unison": ("unison.betterlyrics.org", "lyrics_candidate", "https://docs.betterlyrics.org/unison"),
     "YouTube Music": ("music.youtube.com", "catalogue,cover,import", ""),
     ARCHIVE: ("archive.org", "catalogue,import", "https://archive.org/developers/md-read.html"),
     JAMENDO: ("api.jamendo.com", "catalogue,import", "https://developer.jamendo.com/v3.0/authentication"),

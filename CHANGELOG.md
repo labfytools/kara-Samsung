@@ -4,6 +4,7 @@
 
 - Étendre les requêtes LRCLIB aux variantes de crédits et de graphie en conservant les contrôles d’identité.
 - Mettre en file les transcriptions nocturnes sans référence et proposer des brouillons éditables avec des observations Turbo réutilisables.
+- Proposer les correspondances Unison par ISRC dans les détails, avec le lien et le crédit d’origine.
 - Supprimer le plafond et l’intervalle globaux de la maintenance réseau, isoler les temporisations par fournisseur et compter les paroles et LRC publiés par heure.
 - Traiter les recherches indépendantes en parallèle et alterner les lots réseau avec une seule préparation Kara.
 - Qualifier expérimentalement des contextes Turbo issus d’un lexique local en excluant les morceaux d’évaluation du corpus.
