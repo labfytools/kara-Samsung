@@ -48,6 +48,22 @@ Le binaire `transcribe.cpp` a été compilé dans l’espace privé sur la révi
 
 Les essais de chant sur CPU ont produit 31 reports en plusieurs passes sur des extraits qui se recouvrent. Vingt-et-un sont attribués à la température, huit au PSI mémoire et deux à l’absence de marge d’admission. Le PSS maximal observé pour un groupe est de 1 736 Mio, le PSI maximum de 1,25 %. Les réglages comptent des passages à un ou deux fils et des plafonds de calcul appliqués seulement au groupe expérimental. Aucun extrait de chant CPU complet ne fournit un WER exploitable. Les températures et les reports mesurent la faisabilité dans l’état observé de l’hôte.
 
+### Pilote Radeon
+
+Le même code compile avec Vulkan dans un répertoire privé. Le processus voit l’ICD RADV, les nœuds DRM et la topologie nécessaire en lecture seule. Sans cette topologie, seul llvmpipe était accessible dans le bac isolé. Le CLI doit confirmer `Vulkan0`. Une réussite Vulkan compte uniquement si le moteur déclare le backend effectivement utilisé. Le groupe limite le CPU à 40 % d’un cœur et le moteur à un fil. [Banc Qwen](../../tests/qualify-parole-qwen.py)
+
+| Premier extrait par genre | Mots attendus | Erreurs Turbo F16 mix | Erreurs Qwen 0.6B Q8_0 mix |
+| --- | ---: | ---: | ---: |
+| Rock | 17 | 1 | 0 |
+| Rap américain | 23 | 12 | 18 |
+| Rap français | 12 | 12 | 12 |
+| Chanson française | — | — | Report PSI |
+| Reggae | 18 | 3 | 3 |
+| Soul | 23 | 11 | 6 |
+| Cinq paires complètes | 93 | 39 (41,94 %) | 39 (41,94 %) |
+
+Le CER vaut 29,69 % pour Turbo et 31,03 % pour Qwen. Turbo totalise 13 substitutions, 14 omissions et 12 insertions. Qwen totalise 12 substitutions, 17 omissions et 10 insertions. Le taux global identique masque six erreurs supplémentaires dans le rap américain. Les cinq exécutions terminent chacune en 4,09 à 4,65 s après admission, avec 188 à 317 Mio de PSS de groupe. Le GTT de l’hôte culmine à 6,83 Gio pendant le pilote, sans attribution exclusive au moteur. Le PSI observé à 1,54 % déclenche l’attente avant l’admission du reggae. Les cinq pistes sont des extraits historiques appariés, distincts de la population complète de 50. Le WER égal à 41,94 % sur ce sous-lot ne constitue pas un gain général face à 47,08 %.
+
 ## Sélection prudente mix ou voix
 
 Sur les reçus historiques, une grille de seuils utilise le nombre de mots au-dessus de 0,62 de confiance et la confiance médiane pendant les cinq premières secondes. Chaque séparation coûte un point d’erreur dans la fonction d’ajustement pour écarter les gains trop faibles. La grille a préféré **zéro séparation**. Les résultats ajustés sur ces 50 mêmes extraits sont descriptifs. Le choix reggae par genre aurait donné 46,01 % avec quatre séparations. Les références de ces quatre extraits avaient déjà motivé la règle. L’ensemble d’évaluation tenu à part fige 20 nouveaux enregistrements, 8 en rap américain, 8 en rap français et 4 en reggae, avec un texte total de 638 mots. Le filtre exclut les identifiants, les couples artiste-titre, les versions audio exactes et les paroles normalisées déjà rencontrées. Il partage des artistes avec le corpus historique, faute de titres admissibles en nombre suffisant avec exclusion de tous les artistes. Le regroupement de genre reprend la table utilisée pour échantillonner OMEGA I. Il ne devient pas un classificateur de production.
