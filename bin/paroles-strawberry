@@ -1539,6 +1539,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if pause and self.track == player.song.path and self.rate > 0:
             self.player_command("Pause")
         played = self.turn_phase in ("playing", "finishing")
+        score_void = bool(played and self.turn_scored and error)
         if played:
             result = self.game_score.breakdown if self.turn_scored else None
             # Evidence from an interrupted round is still diagnostic. It
@@ -1558,7 +1559,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         else:
             player.score, player.done, player.result = self.previous_result
         self.blackbox.emit("party", "turn-end", turn=self.bb_turn, player=player.name, song=player.song.title,
-                           played=played, detail=error, summary=(player.result or {}).get("summary") if played else None)
+                           played=played, detail=error, score_void=score_void,
+                           summary=(player.result or {}).get("summary") if played else None)
         self.remote_party.turn_completed(player, error, played=played)
         self.game_score.diagnostic_turn = {}
         self.bb_turn = None

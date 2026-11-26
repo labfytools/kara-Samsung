@@ -22,10 +22,14 @@ bin/kara-blackbox replay-timeline latest --cycle SESSION/TOUR --speed 10
 bin/kara-blackbox replay-timeline latest --after-id 25 --limit 1
 bin/kara-blackbox replay-timeline latest --since MONOTONE_NS --until MONOTONE_NS
 bin/kara-blackbox replay latest --turn TOUR --limit 10000
+bin/kara-blackbox words latest --turn TOUR
 bin/kara-blackbox compare latest --turn TOUR --tolerance 0.75 --tolerance 1.25
+bin/kara-blackbox replay-round latest --turn TOUR --tolerance 0.75
 ```
 
 `replay-timeline` restitue les événements dans leur ordre de publication, en JSONL. La cadence est instantanée par défaut. `--speed 1` suit les intervalles d’origine. `--id` sélectionne une décision précise. Le comparatif de score A/B/C part des mêmes sorties de reconnaissance et applique la règle historique puis les tolérances candidates. Le score Kara reste distinct du WER, qui nécessite une transcription humaine du chant.
+
+`words` détaille les mots attendus et reconnus, leurs repères, l’écart, la décision, le crédit et la fenêtre. `replay-round` réutilise le même calcul de score que Kara, les dénominateurs finaux enregistrés et la dernière décision de chaque ligne. Cette commande exige une synthèse de fin de tour et les décisions des lignes. Un tour volontairement invalidé conserve son score indisponible.
 
 ```sh
 bin/kara-blackbox extract-pcm latest --id EVENEMENT --output blackbox/reports/bloc.wav

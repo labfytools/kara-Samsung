@@ -17,6 +17,7 @@ from _kara_blackbox import BlackBox, atomic_json, cycle_id, digest, events, vali
 from _kara_blackbox_clock import browser_anchor
 from _kara_blackbox_turbo import receive, submit
 from _kara_blackbox_trials import annotate, packet_simulation, simulate_pcm, simulation_options
+from _kara_scoring import score_breakdown, score_reference_line
 
 
 class RecordingTests(unittest.TestCase):
@@ -221,6 +222,31 @@ class RecordingTests(unittest.TestCase):
         overlay = simulation_options({"gain": 0, "echo_gain": 1, "clip_peak": .5})
         np.testing.assert_allclose(simulate_pcm(original, rendered, overlay, 48000), .5)
         np.testing.assert_allclose(original, .8)
+
+    def test_round_replay_keeps_production_coverage_and_candidate_tolerance(self):
+        self.box.start(consent=True)
+        session = self.box.status()["session"]
+        expected = {"words": [{"id": i, "text": name, "normalized": name, "start": start}
+                              for i, (name, start) in enumerate([("salut", 1.), ("bonjour", 2.)])]}
+        observed = [{"word": "salut", "start": 1.8, "end": 2., "confidence": .92},
+                    {"word": "bonjour", "start": 2., "end": 2.8, "confidence": .86}]
+        decisions = score_reference_line(expected, observed)
+        score = score_breakdown({"lines": [expected]}, {0: decisions})
+        self.box.emit("party", "turn-start", **self.turn)
+        self.box.emit("scoring", "line-decision", **self.turn, line=0, window=1, observed=observed,
+                      reference=expected, source="voice", tolerance=1., decisions=decisions)
+        self.box.emit("party", "turn-end", **self.turn, summary=score)
+        self.box.stop(wait=True)
+        cli = [sys.executable, "-B", str(Path(__file__).resolve().parents[1] / "bin/kara-blackbox"),
+               "--root", str(self.box.root)]
+        output = json.loads(subprocess.check_output([*cli, "replay-round", session, "--turn", self.turn["turn"],
+                                                     "--tolerance", ".75"], text=True))
+        self.assertTrue(output["same"])
+        self.assertEqual(output["variants"]["A"]["summary"]["score"], 100)
+        self.assertEqual(output["variants"]["B"]["summary"]["score"], 50)
+        output = json.loads(subprocess.check_output([*cli, "words", session], text=True))
+        self.assertEqual(output["words"][0]["delay"], .8)
+        self.assertTrue(output["words"][0]["credited"])
 
 
 if __name__ == "__main__":

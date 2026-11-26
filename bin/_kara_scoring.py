@@ -198,9 +198,13 @@ def score_breakdown(reference, results):
             verified += status != "uncertain"
             correct += status == "correct"
             lexical += status in ("correct", "early", "late")
-    # Only evaluated target words enter the denominator. An insertion may be
-    # an omitted lyric in the source or a repeated decode in overlapping jobs.
-    # The coverage gate still uses all written words, including unvisited lines.
+    return score_summary(total, eligible, verified, uncertain, correct, lexical, extras)
+
+
+def score_summary(total, eligible, verified, uncertain, correct, lexical, extras):
+    # Live scoring and replay share the same coverage gate over all written
+    # words, including lines the player never reached. Insertions are reported
+    # separately because a decoder can repeat across overlapping windows.
     scorable = bool(total and verified / total >= MIN_ROUND_COVERAGE)
     return {"score": round(100 * correct / verified) if scorable else None,
             "lyrics": round(100 * lexical / verified) if verified else 0,

@@ -18,7 +18,7 @@ import wave
 
 from _kara_blackbox import (ROOT, TRACK_NAME, digest, events, float_header,
                             private_file, session_folders, validate_recording, wave_layout)
-from _kara_scoring import score_reference_line
+from _kara_scoring import score_reference_line, score_summary
 
 
 def read(path):
@@ -252,11 +252,60 @@ def exact_turbo(args, folder, window):
             "replayed": json.loads(result.stdout)})
 
 
+def replay_round(args, folder):
+    if not args.turn and not args.cycle:
+        raise ValueError("Sélectionne un tour ou un cycle pour rejouer son score final.")
+    decisions, historical, score_void = {}, None, False
+    for row in matching(args, folder):
+        data = row["data"]
+        if row["event"] == "line-decision" and "line" in data:
+            # Production retains the last result for an evaluated line.
+            decisions[data["line"]] = data
+        elif row["event"] == "turn-end":
+            historical = data.get("summary")
+            score_void = data.get("score_void", False)
+    if not historical or not decisions:
+        raise ValueError("Synthèse finale ou décisions du tour indisponibles.")
+    tolerances = [None, *args.tolerance]
+    variants = {}
+    for name, tolerance in zip("ABC", tolerances):
+        counts = {"verified": 0, "uncertain": 0, "correct": 0, "lexical": 0, "extras": 0}
+        for data in decisions.values():
+            limit = data["tolerance"] if tolerance is None else tolerance
+            for item in score_reference_line(data["reference"], data["observed"], limit, source=data["source"]):
+                status = item["status"]
+                if item["id"] is None:
+                    counts["extras"] += status == "extra"
+                elif item.get("expected_start") is not None:
+                    counts["uncertain"] += status == "uncertain"
+                    counts["verified"] += status != "uncertain"
+                    counts["correct"] += status == "correct"
+                    counts["lexical"] += status in ("correct", "early", "late")
+        summary = score_summary(historical["total"], historical["eligible"], **counts)
+        if score_void:
+            summary["score"] = None
+        variants[name] = {"tolerance_s": tolerance, "summary": summary}
+    output({"historical": historical, "same": variants["A"]["summary"] == historical, "variants": variants,
+            "basis": "captured_final_reference_denominators"})
+
+
+def word_details(row):
+    data = row["data"]
+    expected = {word["id"]: word for word in data["reference"]["words"]}
+    return {"cycle": row.get("cycle"), "turn": row["turn"], "event_id": row["id"],
+            "window": data.get("window"), "line": data.get("line"), "source": data["source"],
+            "tolerance_s": data["tolerance"], "words": [
+                {**item, "expected_end": (expected.get(item["id"]) or {}).get("end"),
+                 "evaluated": item["id"] is not None and item["status"] != "uncertain",
+                 "credited": item["status"] == "correct"}
+                for item in data["decisions"]]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
-                                          "score", "inspect", "replay", "extract", "extract-pcm", "replay-whisper",
+                                          "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
                                           "extract-turbo", "replay-turbo",
                                           "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
                                           "annotate", "simulate", "delete", "prune"))
@@ -337,6 +386,9 @@ def main():
             output(validate_recording(folder, read(folder / "manifest.json")))
         elif args.action == "analyze":
             print((folder / "REPORT.md").read_text(), end="")
+        elif args.action == "replay-round":
+            validate_recording(folder, read(folder / "manifest.json"))
+            replay_round(args, folder)
         elif args.action in ("report", "export"):
             from _kara_blackbox_lab import analyze, redacted
 
@@ -434,7 +486,7 @@ def main():
             rows = (item for item in matching(args, folder)
                     if (kind in ("timeline", "replay-timeline") or (kind == "incidents" and item["event"] in INCIDENTS)
                         or (kind == "turns" and item["event"] in ("turn-start", "turn-end"))
-                        or (kind in ("score", "replay", "compare") and item["event"] == "line-decision")))
+                        or (kind in ("score", "words", "replay", "compare") and item["event"] == "line-decision")))
             count = 0
             replay_wall = replay_start = None
             for item in islice(rows, max(0, args.limit)):
@@ -454,6 +506,8 @@ def main():
                             "historical": variants[0] == data["decisions"],
                             "variants": dict(zip("ABC", ({"tolerance_s": tolerance, "result": result}
                                                            for tolerance, result in zip(choices, variants))))})
+                elif kind == "words":
+                    output(word_details(item))
                 elif kind == "replay-timeline":
                     if args.speed is not None:
                         if replay_wall is None:
