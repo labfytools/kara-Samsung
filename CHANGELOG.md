@@ -3,6 +3,7 @@
 ## En développement
 
 - Rallumer les écrans Sway à la réouverture confirmée après un débranchement et une veille sur batterie.
+- Comparer les contextes Turbo de 5 à 50 mots sur 50 titres, avec confirmation acoustique des substitutions. Conserver cette méthode dans le banc d’essai.
 - Étendre les requêtes LRCLIB aux variantes de crédits et de graphie en conservant les contrôles d’identité.
 - Mettre en file les transcriptions nocturnes sans référence et proposer des brouillons éditables avec des observations Turbo réutilisables.
 - Proposer les correspondances Unison par ISRC dans les détails, avec le lien et le crédit d’origine.

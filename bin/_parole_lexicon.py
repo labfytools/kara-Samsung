@@ -61,7 +61,7 @@ def identities(row, info):
     }
 
 
-def records(index_path, root, *, exclude=()):
+def records(index_path, root, *, exclude=(), genres=None):
     """Yield trusted records from an SQLite snapshot opened read-only."""
     index_path, root = index_path.resolve(strict=True), root.resolve(strict=True)
     held_out = set(exclude)
@@ -88,7 +88,7 @@ def records(index_path, root, *, exclude=()):
             lines = [line for line in text.splitlines() if line.strip()]
             forms = lexical_forms(text)
             if forms:
-                tag = (info.get("tags", {}).get("genre") or "").strip()
+                tag = ((genres or {}).get(row["path"]) or info.get("tags", {}).get("genre") or "").strip()
                 yield dict(song=row["id"], source=source, confidence="local", digest=text_digest(text),
                            language=detect_language(words(text)), genre=tag, artist=row["owner"],
                            album=row["edition"], forms=forms, lines=len(lines))
@@ -100,8 +100,7 @@ def text_digest(text):
     return sha256(" ".join(words(text)).encode()).hexdigest()
 
 
-def select_prompt(corpus, *, language="", genre="", artist="", album=""):
-    """Select a bounded context using only the supplied training records."""
+def ranked_forms(corpus, *, language="", genre="", artist="", album="", single=False):
     scores = Counter()
     digests = set()
     genre_key, artist_key = key(genre), key(artist)
@@ -118,13 +117,20 @@ def select_prompt(corpus, *, language="", genre="", artist="", album=""):
             continue
         digests.add(record["digest"])
         for form, count in record["forms"].items():
+            if single and " " in form:
+                continue
             if any(len(token) >= 3 and token not in IGNORED_HINTS for token in form.casefold().split()):
                 scores[form] += min(count, 3)
         # A bounded candidate set keeps the experiment practical on a
         # large library. Pruning is deterministic in corpus row order.
         if len(scores) > 65_536:
             scores = Counter(dict(sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:32_768]))
-    ranked = sorted(scores, key=lambda form: (-scores[form], " " in form, form.casefold(), form))
+    return sorted(scores, key=lambda form: (-scores[form], " " in form, form.casefold(), form))
+
+
+def select_prompt(corpus, **profile):
+    """Select a bounded context using only the supplied training records."""
+    ranked = ranked_forms(corpus, **profile)
     # Leave room under the native tokenizer bound, including multilingual
     # forms whose characters can occupy more than one UTF-8 byte.
     chosen = []

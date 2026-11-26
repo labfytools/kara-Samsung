@@ -219,7 +219,7 @@ static void print_prepared(struct whisper_context *context)
 
 static int prepare_stream(const char *model, bool gpu, int threads, bool require_vulkan)
 {
-    enum { MAX_SAMPLES = 29 * WHISPER_SAMPLE_RATE, MAX_LANG = 15, MAX_PROMPT = 512, MAX_PROMPT_TOKENS = 64 };
+    enum { MAX_SAMPLES = 29 * WHISPER_SAMPLE_RATE, MAX_LANG = 15, MAX_PROMPT = 768, MAX_PROMPT_TOKENS = 128 };
     static struct vulkan_probe probe;
     /* Whisper may fall back to CPU after a GPU request. Its pinned backend
      * reports device selection and initialization failure before it is ready. */

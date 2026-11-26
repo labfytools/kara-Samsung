@@ -20,6 +20,7 @@ from _kara_scoring import prepared_window, score_breakdown, score_reference_line
 from _kara_turbo import ObservedWord, Segment, TurboDecoder, decode_segment, transcribe_file
 from _kara_words import word_boundaries
 from _paroles_lrc import parse_lrc, source_orders
+from _parole_acoustic import prompts, substitutions
 
 ROWS = [(10., "Voici l’été"), (14., "Les oiseaux chantent"), (19., "Un soleil rouge"),
         (24., "Les oiseaux chantent"), (30., "Dormez paisiblement")]
@@ -45,7 +46,19 @@ class TurboProtocolTests(unittest.TestCase):
         decoder.decode(b"\x00\x00", "fr", prompt="été")
         self.assertEqual(decoder.process.stdin.getvalue(), b"\x01\0\0\0\x42fr\x05\0" + "été".encode() + b"\0\0")
         with self.assertRaises(ValueError):
-            decoder.decode(b"\x00\x00", "fr", prompt="é" * 257)
+            decoder.decode(b"\x00\x00", "fr", prompt="é" * 385)
+
+    def test_context_cannot_create_slots_or_override_unprompted_acoustics(self):
+        low = ObservedWord("bato", 1., 1.15, .42)
+        confident = ObservedWord("ici", 1.5, 1.7, .91)
+        corrected = ObservedWord("bateau", 1.08, 1.2, .86)
+        added = ObservedWord("intrus", 2., 2.3, .99)
+        baseline = [low, confident]
+        self.assertEqual(substitutions(baseline, (), (corrected, added), "fr"), baseline)
+        result = substitutions(baseline, (corrected, added), (corrected, added), "fr")
+        self.assertEqual([(w.text, w.start) for w in result], [("bateau", 1.), ("ici", 1.5)])
+        ranked = ["bateau", *(f"terme{i}" for i in range(60))]
+        self.assertEqual([len(value.split()) for value in prompts(ranked, [low], "fr").values()], [5, 10, 20, 50])
 
 
 class AlignmentTests(unittest.TestCase):

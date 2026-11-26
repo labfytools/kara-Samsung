@@ -1,6 +1,6 @@
 # Qualification du contexte linguistique local de Turbo
 
-La version de `whisper.cpp` installée pour cet essai est `4979e04f`. Elle expose un prompt initial et une liste de jetons de prompt. Le décodeur Turbo de l’essai accepte un contexte par fenêtre, avec 512 octets UTF-8 et 64 jetons au plus. Une trame sans contexte garde son encodage. Le décodeur conserve ses réglages, ses poids et ses horodatages acoustiques de production. Seul le banc demande des jetons de contexte.
+La version de `whisper.cpp` installée pour ces essais est `4979e04f`. Elle expose un prompt initial et une liste de jetons de prompt. Le premier essai a utilisé au plus 512 octets UTF-8 et 64 jetons par fenêtre. Le banc ciblé porte ces deux bornes à 768 octets et 128 jetons pour mesurer des contextes de 50 mots. Une trame sans contexte garde son encodage. Le décodeur conserve ses réglages, ses poids et ses horodatages acoustiques de production. Seuls les bancs demandent des jetons de contexte.
 
 Le [banc privé](../tests/qualify-parole-context.py) lit un instantané SQLite de Parole. Il exporte la provenance et les fréquences des formes et expressions de deux mots, par enregistrement. Il conserve les graphies, accents et contractions, et associe les observations à la langue détectée, au genre disponible, à l’artiste et à l’édition. Le corpus de l’essai prend les textes intégrés à la collection Strawberry ou aux tags, et les LRC dont la structure correspond à la durée du morceau. Cette qualification structurelle ne vérifie pas chaque mot. Les LRC classés comme générés et les provenances identifiées comme transcriptions sont écartés. Les fichiers texte sans attestation de correction ne sont pas utilisés dans cet essai.
 
@@ -29,6 +29,39 @@ Le 26 novembre 2026, 8 899 enregistrements ont fourni du vocabulaire. Trois extr
 Le reggae passe de 15 à 3 erreurs avec les deux contextes. Le couplet de rap français passe de 11 à 23 erreurs avec le contexte général. Avec le contexte artiste, le filtre acoustique ne retient aucun des 43 mots attendus de cet extrait. Ce lot ne qualifie aucun contexte pour les départs automatiques. Les paroles produites restent des observations d’essai.
 
 Le relevé ci-dessus mesure des erreurs de mots sur des extraits. La précision temporelle de 500 ms demande une annotation indépendante des repères.
+
+## Banc ciblé par genre et par taille de contexte
+
+Le [banc de 50 chansons](../tests/qualify-parole-targeted.py) décode le mix original sans contexte ni langue imposée. Il cherche le mot le moins sûr et découpe au plus cinq secondes autour de son début. Une nouvelle lecture en faisceau du même PCM intervient sans contexte. Le lexique est ensuite filtré par genre et langue détectée. Il classe en premier les graphies proches des mots incertains de la fenêtre. En français, cette proximité utilise des équivalences de graphèmes simples, comme `eau` et `o`. Un contexte ne reçoit ni le texte de référence ni celui d’un autre passage du morceau évalué.
+
+Pour accepter un changement, la lecture en faisceau sans contexte et la lecture avec contexte doivent toutes deux retrouver la même autre graphie à 220 ms ou moins du début initial, avec une confiance supérieure ou égale à 0,65. Le changement conserve le début et la fin du mot initial. Cette règle interdit les mots ajoutés par le contexte. L’accord des lectures est une condition expérimentale pour proposer un remplacement. La qualité se mesure ensuite sur la référence tenue à l’écart.
+
+Le banc lit les genres dans Strawberry. Sur l’instantané mesuré, les 7 431 pistes à LRC retenues par le filtre disponible portent le genre générique « Music ». Un fichier privé attribue donc des groupes de genre à certains artistes pour cet essai. La sélection n’écrit ni dans Strawberry ni dans les tags. Elle retire du corpus les enregistrements évalués et les copies détectées selon l’identité et le texte. Les références LRC délimitent les premiers extraits chantés, entre 5 et 19 s chacun, et fournissent les mots attendus.
+
+```sh
+"$HOME/.local/share/hyprwhspr/venv/bin/python" -B tests/qualify-parole-targeted.py \
+  .runtime/parole-cible/essai --index /chemin/vers/copie.sqlite3 \
+  --library /chemin/vers/bibliotheque --collection /chemin/vers/strawberry.db \
+  --genres /chemin/vers/genres.json
+```
+
+Le répertoire parent de sortie doit exister. Le JSON de genre associe un nom de genre à une liste de noms d’artistes. Le banc enregistre les mesures après chaque chanson et l’option `--resume` reprend le même plan avec les mêmes entrées. Le test utilise un décodeur Vulkan à la fois. Il attend lorsque le capot est fermé, le secteur absent ou les seuils de mémoire et de température atteints. Le manifeste, le lexique et les mesures restent dans le répertoire privé.
+
+### Résultats de la comparaison ciblée
+
+L’essai du 26 novembre rassemble 20 extraits de rap français, 16 de rap américain, 6 de rock, 4 de reggae, 2 de chanson française et 2 de soul. Il totalise 641 s d’audio et 1 317 mots de référence. Le corpus d’apprentissage issu de l’instantané contient 8 821 enregistrements après les exclusions. Turbo a décodé les 50 extraits sans contexte en 636,19 s, hors chargement du modèle, avec 222 substitutions, 299 omissions et 99 insertions.
+
+| Variante | Fenêtres réellement décodées avec contexte | Corrections admises | Erreurs après décision (50 extraits) | Temps cumulé des fenêtres avec contexte |
+| --- | ---: | ---: | ---: | ---: |
+| Sans contexte | 0 | 0 | 620 (47,1 %) | — |
+| 5 mots | 8 | 0 | 620 (47,1 %) | 47,50 s |
+| 10 mots | 8 | 0 | 620 (47,1 %) | 46,38 s |
+| 20 mots | 8 | 0 | 620 (47,1 %) | 51,68 s |
+| 50 mots | 8 | 0 | 620 (47,1 %) | 65,46 s |
+
+Quarante extraits ont été écartés avant l’envoi d’un contexte faute de seconde lecture sans contexte qui confirme une autre graphie. Deux autres n’ont reçu aucune relecture contextualisée. Les huit autres ont reçu les quatre variantes, dont les cas de contrôle du veto. Le total d’erreurs conserve le premier décodage partout où le relecteur s’abstient. Les durées couvrent les fenêtres contextualisées et leurs éventuelles attentes de ressources. Le temps du faisceau sans contexte n’est pas inclus.
+
+La relecture ciblée a préservé le texte de la première passe, avec un coût supplémentaire et aucun gain mesuré. Elle reste réservée au banc. Cette comparaison utilise le mix original et un extrait par morceau. Elle ne mesure ni l’apport de Demucs sur ces mêmes 50 titres, ni les écarts temporels des mots, ni un taux de LRC validés sur des chansons entières.
 
 ## File de transcriptions à vérifier
 

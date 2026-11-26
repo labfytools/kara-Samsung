@@ -18,7 +18,7 @@ RATE = 16_000
 STRIDE = 24
 OVERLAP = 2
 MAX_SECONDS = 3600
-MAX_PROMPT_BYTES = 512
+MAX_PROMPT_BYTES = 768
 MODEL = DATA / "pywhispercpp/models/ggml-large-v3-turbo.bin"
 SOURCE = BIN.parent / "native/src/_kara_dtw.c"
 
