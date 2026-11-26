@@ -429,7 +429,7 @@ def save_correction(index, identity, suffix, original_version, text, *, expected
         version, saved = sidecar(audio, suffix)
         if saved.encode() != raw or document(file_token(audio)) != song["token"]:
             raise ValueError("Le morceau ou la correction a changé après l’écriture")
-        index.record_validation(identity, suffix, song["token"], version, draft=draft)
+        index.record_validation(identity, suffix, song["token"], version, draft=draft, path=audio)
 
 
 if __name__ == "__main__":

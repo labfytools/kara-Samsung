@@ -239,6 +239,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_refresh_active = False
         self.import_refresh_tasks = {}
         self.import_published_paths = set()
+        self.import_removed_paths = set()
         self.import_toggle = Gtk.ToggleButton(label="Importer un album")
         self.import_toggle.connect("toggled", self.album_import.toggle)
         self.music_sync = MusicSync(self, LIBRARY, BIN)
@@ -424,7 +425,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.parole_ui = ParoleView(self, self.maintenance)
             self.set_titlebar(self.parole_ui.header())
             self.set_child(self.parole_ui.root)
-            self.timers.append(GLib.timeout_add(850, self.parole_ui.refresh))
+            self.timers.append(GLib.timeout_add(350, self.parole_ui.refresh))
         self.present()
 
     def open_import(self, _button=None):
@@ -712,13 +713,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 if Path(name).suffix.lower() in AUDIO:
                     old.add(source / name)
                     new.add(target / name)
-        if self.receiver is not None:
-            self.receiver.room.remove_catalogue_paths(old)
+        self.import_removed_paths.update(old)
         self.import_published_paths.update(new)
         if self.import_refresh_timer is None and not self.import_refresh_active:
             self.import_refresh_timer = GLib.timeout_add(250, self.reload_after_import)
-        if self.music_window:
-            GLib.timeout_add_seconds(4, self.refresh_import_library_window)
         self.maintenance.index_wake.set()
 
     def reload_after_import(self):
@@ -727,6 +725,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         pending, self.import_refresh_tasks = self.import_refresh_tasks, {}
         published, self.import_published_paths = self.import_published_paths, set()
+        removed, self.import_removed_paths = self.import_removed_paths, set()
         generations = [(task.identity, task.refresh_generation) for task, _ in pending.values()]
         receiver = self.receiver
         jobs = [job for _, linked in pending.values() for job in linked]
@@ -737,14 +736,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
         paths.update(published)
 
         def reload():
-            index = self.maintenance.index
-            root = index.root
+            index = self.maintenance.index if getattr(self, "maintenance", None) else None
+            root = index.root if index is not None else LIBRARY.resolve()
             rows, indexed = [], {}
             try:
-                with index.db(wait=.15) as db:
-                    ordered = sorted(paths)
-                    for start in range(0, len(ordered), 128):
-                        indexed.update(path_rows(db, ordered[start:start+128]))
+                if index is not None:
+                    with index.db(wait=.15) as db:
+                        ordered = sorted(paths)
+                        for start in range(0, len(ordered), 128):
+                            indexed.update(path_rows(db, ordered[start:start+128]))
             except sqlite3.Error:
                 pass
             for path in sorted(paths):
@@ -760,18 +760,21 @@ class LyricsWindow(Gtk.ApplicationWindow):
                     except (OSError, ValueError, subprocess.SubprocessError):
                         continue
                 rows.append((song, search_key(f"{song.title} {song.artist} {song.album}")))
-            return rows
+            visible_lrc = {song.path for song, _ in rows if song.path.with_suffix('.lrc').is_file()}
+            if receiver is not None and self.receiver is receiver:
+                if removed:
+                    receiver.room.remove_catalogue_paths(removed)
+                receiver.room.update_catalogue(rows, incremental=True)
+            return rows, visible_lrc
 
         def done(future):
             self.import_refresh_active = False
             if self.closed:
                 return GLib.SOURCE_REMOVE
             try:
-                rows = future.result()
+                rows, visible_lrc = future.result()
                 linked = receiver if self.receiver is receiver else None
                 visible = {song.path for song, _ in rows}
-                if linked is not None:
-                    linked.room.update_catalogue(rows, incremental=True)
                 for task, _ in pending.values():
                     missing = [url for url, outcome in task.outcomes.items()
                                if outcome.get("audio_complete") and
@@ -783,25 +786,18 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 self.album_import.acknowledge_refresh(generations)
                 if pending and getattr(self, "maintenance", None):
                     self.maintenance.journal.emit("DOWNLOAD", f"{len(paths)} pistes signalées après import")
-                if pending and self.music_window:
-                    self.music_window.load_library()
-                    # Strawberry can index files shortly after publication.
-                    GLib.timeout_add_seconds(4, self.refresh_import_library_window)
+                if self.music_window:
+                    self.music_window.publish_rows(rows, visible_lrc, removed)
             except (OSError, sqlite3.Error, RoomError, ValueError) as error:
                 self.album_import.release_refresh(generations)
                 self.blackbox.emit("imports", "error", stage="library-refresh", error=str(error))
-            if self.import_refresh_tasks or self.import_published_paths:
+            if self.import_refresh_tasks or self.import_published_paths or self.import_removed_paths:
                 self.import_refresh_timer = GLib.timeout_add(250 if self.import_refresh_tasks else 3000,
                                                             self.reload_after_import)
             return GLib.SOURCE_REMOVE
 
         self.import_refresh_active = True
         self.tag_reader.submit(reload).add_done_callback(lambda future: GLib.idle_add(done, future))
-        return GLib.SOURCE_REMOVE
-
-    def refresh_import_library_window(self):
-        if not self.closed and self.music_window:
-            self.music_window.load_library()
         return GLib.SOURCE_REMOVE
 
     def show_preparation(self, _button):
@@ -813,6 +809,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if self.music_window is None:
             self.music_window = MusicLibraryWindow(self, COLLECTION, LIBRARY.resolve())
         self.music_window.present()
+        if self.music_window.publications:
+            self.music_window.apply_publications()
         self.music_window.refresh_queue(force=True)
 
     def player_command(self, method, parameters=None, callback=None):

@@ -80,6 +80,7 @@ class Resources:
         self.cpu = None
         self.storage = {}
         self.sample = 0
+        self.index_pressure = None
         self.sample_closed = False
         self.can_start = self.can_start_light = self.can_continue = False
         self.reason = "Mesure des ressources"
@@ -222,6 +223,7 @@ class Resources:
             if nocturnal:
                 temperatures = cpu_t and gpu_t and temperatures
             disk = self.disk_load(now)
+            self.index_pressure = (now, load, available, pressure, disk)
             self.sample = now
             self.sample_closed = closed
             # During the task its own CPU/GPU/disk load is expected. User

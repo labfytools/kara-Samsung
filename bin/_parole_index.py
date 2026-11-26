@@ -155,6 +155,7 @@ class Index:
                 CREATE INDEX IF NOT EXISTS songs_inode ON songs(dev, inode);
                 CREATE INDEX IF NOT EXISTS songs_audio ON songs(audio);
                 CREATE INDEX IF NOT EXISTS songs_lrc_embedded ON songs(lrc) WHERE lrc='intégré';
+                CREATE INDEX IF NOT EXISTS songs_probe_error ON songs(id) WHERE json_extract(info,'$.probe_error')=1;
                 CREATE TABLE IF NOT EXISTS tasks (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL,
                     priority INTEGER NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -162,6 +163,9 @@ class Index:
                     payload TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(kind, subject)
                 );
                 CREATE INDEX IF NOT EXISTS tasks_ready ON tasks(state, due, priority);
+                CREATE INDEX IF NOT EXISTS tasks_draft ON tasks(subject)
+                    WHERE kind='transcription' AND state='review' AND detail='brouillon à vérifier';
+                CREATE INDEX IF NOT EXISTS tasks_analysis ON tasks(kind,state) WHERE kind IN ('prepare','transcription');
                 CREATE TABLE IF NOT EXISTS reviews (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL,
                     checked REAL NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind, subject)
@@ -243,12 +247,15 @@ class Index:
                 CREATE TABLE IF NOT EXISTS inventory_root (
                     id INTEGER PRIMARY KEY CHECK(id=1), dev INTEGER NOT NULL, inode INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS index_schema (name TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS index_events (
                     path TEXT PRIMARY KEY, mask INTEGER NOT NULL, serial TEXT NOT NULL,
                     first REAL NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL,
                     combined INTEGER NOT NULL, proof TEXT
                 );
                 CREATE INDEX IF NOT EXISTS index_events_due ON index_events(due,path);
+                CREATE INDEX IF NOT EXISTS index_events_light ON index_events(due,path)
+                    WHERE proof IS NOT NULL OR mask & 1=0;
                 INSERT OR IGNORE INTO library_stats VALUES(1,0,0,0,0,0);
                 CREATE TRIGGER IF NOT EXISTS song_added AFTER INSERT ON songs BEGIN
                     UPDATE library_stats SET total=total+1, bytes=bytes+new.bytes,
@@ -271,6 +278,66 @@ class Index:
                         ready=ready+(new.kara='prêt')-(old.kara='prêt');
                 END;
             """)
+            if not db.execute("SELECT 1 FROM index_schema WHERE name='dimensions-v1'").fetchone():
+                self.migrate_dimensions(db)
+
+    @staticmethod
+    def migrate_dimensions(db):
+        # Backfill under the same writer transaction as trigger installation.
+        # Every normal publication changes only its old and new dimensions.
+        db.executescript("""
+            BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS library_artists (owner TEXT PRIMARY KEY, tracks INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS library_editions (edition TEXT PRIMARY KEY, tracks INTEGER NOT NULL);
+            INSERT INTO library_artists SELECT owner,count(*) FROM songs
+                WHERE NOT EXISTS(SELECT 1 FROM index_schema WHERE name='dimensions-v1') GROUP BY owner;
+            INSERT INTO library_editions SELECT edition,count(*) FROM songs WHERE album!=''
+                AND NOT EXISTS(SELECT 1 FROM index_schema WHERE name='dimensions-v1') GROUP BY edition;
+            CREATE TRIGGER IF NOT EXISTS library_dimension_added AFTER INSERT ON songs BEGIN
+                INSERT INTO library_artists VALUES(new.owner,1) ON CONFLICT(owner) DO UPDATE SET tracks=tracks+1;
+                INSERT INTO library_editions SELECT new.edition,1 WHERE new.album!=''
+                    ON CONFLICT(edition) DO UPDATE SET tracks=tracks+1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS library_dimension_removed AFTER DELETE ON songs BEGIN
+                UPDATE library_artists SET tracks=tracks-1 WHERE owner=old.owner;
+                DELETE FROM library_artists WHERE owner=old.owner AND tracks=0;
+                UPDATE library_editions SET tracks=tracks-1 WHERE edition=old.edition AND old.album!='';
+                DELETE FROM library_editions WHERE edition=old.edition AND tracks=0;
+            END;
+            CREATE TRIGGER IF NOT EXISTS library_artist_changed AFTER UPDATE OF owner ON songs
+            WHEN old.owner!=new.owner BEGIN
+                UPDATE library_artists SET tracks=tracks-1 WHERE owner=old.owner;
+                DELETE FROM library_artists WHERE owner=old.owner AND tracks=0;
+                INSERT INTO library_artists VALUES(new.owner,1) ON CONFLICT(owner) DO UPDATE SET tracks=tracks+1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS library_edition_changed AFTER UPDATE OF edition,album ON songs
+            WHEN old.edition!=new.edition OR (old.album='')!=(new.album='') BEGIN
+                UPDATE library_editions SET tracks=tracks-1 WHERE edition=old.edition AND old.album!='';
+                DELETE FROM library_editions WHERE edition=old.edition AND tracks=0;
+                INSERT INTO library_editions SELECT new.edition,1 WHERE new.album!=''
+                    ON CONFLICT(edition) DO UPDATE SET tracks=tracks+1;
+            END;
+            INSERT OR IGNORE INTO index_schema VALUES('dimensions-v1');
+            COMMIT;
+        """)
+
+    def audit_dimensions(self):
+        with self.db() as db:
+            db.execute("BEGIN")
+            # Compare complete memberships, including counts in each group.
+            memberships = all(db.execute(f"""WITH expected AS (
+                           SELECT {key},count(*) AS tracks FROM songs {where} GROUP BY {key}
+                       ) SELECT
+                           NOT EXISTS(SELECT * FROM expected EXCEPT SELECT * FROM {table})
+                           AND NOT EXISTS(SELECT * FROM {table} EXCEPT SELECT * FROM expected)""").fetchone()[0]
+                       for key, table, where in (("owner", "library_artists", ""),
+                                                 ("edition", "library_editions", "WHERE album!=''")))
+            expected = db.execute("""SELECT count(*),coalesce(sum(bytes),0),
+                coalesce(sum(lyrics NOT IN ('absent','instrumental','inconnu')),0),
+                coalesce(sum(lrc IN ('local','intégré','externe','généré')),0),coalesce(sum(kara='prêt'),0)
+                FROM songs""").fetchone()
+            saved = db.execute("SELECT total,bytes,lyrics,lrc,ready FROM library_stats").fetchone()
+            return memberships and tuple(saved) == tuple(expected)
 
     @contextmanager
     def db(self, wait=3):
@@ -311,17 +378,20 @@ class Index:
                now + (REMOVAL_DELAY if mask & REMOVE else EVENT_DELAY),
                document(proofs[path]) if path in proofs else None, EVENT_MAX_DELAY) for path in paths))
 
-    def events(self, now, *, size=EVENT_BATCH, light=False):
+    def events(self, now, *, size=None, light=False):
         with self.db(wait=.15) as db:
             backlog = db.execute("SELECT count(*) FROM index_events").fetchone()[0]
+            if size is None:
+                size = 128 if backlog >= 4 * EVENT_BATCH and not light else EVENT_BATCH
             # Select the ready window in index order, then postpone removals
             # within it so that a destination can first inherit a moved ID.
-            rows = db.execute("""
-                SELECT * FROM index_events WHERE
-                  (due<=? OR (? AND attempts=0 AND mask & ?=0))
-                  AND (NOT ? OR proof IS NOT NULL OR mask & ?=0)
-                ORDER BY due,path LIMIT ?
-            """, (now, backlog >= size, REMOVE, light, MEDIA, size)).fetchall()
+            due = "due<=?"
+            if light:
+                due += f" AND (proof IS NOT NULL OR mask & {MEDIA}=0)"
+            elif backlog >= size:
+                due += f" OR (attempts=0 AND mask & {REMOVE}=0)"
+            rows = db.execute(f"SELECT * FROM index_events WHERE {due} ORDER BY due,path LIMIT ?",
+                              (now, size)).fetchall()
         return backlog, sorted(rows, key=lambda row: bool(row["mask"] & REMOVE))
 
     def night_budget(self, since=...):
@@ -618,7 +688,7 @@ class Index:
                                   AND (s.lyrics='absent' OR s.lrc='absent')""").fetchone()[0]
         return hour, day, drafts
 
-    def record_validation(self, identity, suffix, audio, sidecar, *, draft):
+    def record_validation(self, identity, suffix, audio, sidecar, *, draft, path=None):
         now = time()
         value = document({"audio": audio, "sidecar": sidecar,
                           "source": "Turbo, validé manuellement" if draft else "Correction manuelle"})
@@ -628,6 +698,8 @@ class Index:
                          WHERE value<>excluded.value""", (identity + suffix, now, value)).rowcount
             if changed and draft:
                 self.record_activity(db, now, ("validated_lrc" if suffix == ".lrc" else "validated_lyrics",))
+            if path is not None:
+                self.notify([path], SIDECAR, db=db)
 
     def exclude(self, kind, subject):
         with self.db() as db:

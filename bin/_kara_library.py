@@ -4,6 +4,7 @@ Ne lit jamais de fichier directement : Strawberry reste l'unique lecteur audio.
 Lecture, file d'attente et navigation disponibles sans activer le jeu.
 """
 from pathlib import Path
+from heapq import merge
 import sqlite3
 import time
 from urllib.parse import urlsplit, unquote
@@ -42,6 +43,17 @@ def all_songs(database, library):
     return songs
 
 
+def library_snapshot(database, library):
+    rows = all_songs(database, library)
+    rows.sort(key=catalogue_sort)
+    return rows, {song.path for song, _ in rows if song.path.with_suffix('.lrc').is_file()}
+
+
+def catalogue_sort(row):
+    song = row[0]
+    return song.artist.casefold(), song.album.casefold(), song.title.casefold(), str(song.path)
+
+
 class MusicLibraryWindow(Gtk.Window):
     def __init__(self, controller, database, library):
         super().__init__(title='Bibliothèque et liste de lecture — Strawberry', transient_for=controller,
@@ -51,6 +63,11 @@ class MusicLibraryWindow(Gtk.Window):
         self.database = database
         self.library = library
         self.songs = []
+        self.lrc_paths = set()
+        self.publications = {}
+        self.publication_lrc = set()
+        self.rendered_page = None
+        self.updating_filters = False
         self.filtered = []
         self.page = 0
         self.artist_names = ['Tous les artistes']
@@ -167,7 +184,7 @@ class MusicLibraryWindow(Gtk.Window):
         if self.loading:
             return
         self.loading = True
-        task = self.controller.tag_reader.submit(all_songs, self.database, self.library)
+        task = self.controller.tag_reader.submit(library_snapshot, self.database, self.library)
         task.add_done_callback(lambda result: GLib.idle_add(self.library_loaded, result))
 
     def library_loaded(self, future):
@@ -175,34 +192,79 @@ class MusicLibraryWindow(Gtk.Window):
         if self.controller.closed:
             return GLib.SOURCE_REMOVE
         try:
-            self.songs = future.result()
+            self.songs, self.lrc_paths = future.result()
         except (OSError, ValueError, sqlite3.Error) as error:
             self.library_status.set_text(f'Catalogue indisponible : {error}')
             return GLib.SOURCE_REMOVE
-        self.artist_names = ['Tous les artistes', *sorted({song.artist for song, _ in self.songs}, key=search_key)]
-        self.artists.set_model(Gtk.StringList.new(self.artist_names))
-        self.artists.set_selected(0)
-        self.artist_changed()
+        self.apply_publications()
         return GLib.SOURCE_REMOVE
 
-    def artist_changed(self, *_args):
-        artist = self.artist_names[self.artists.get_selected()]
+    def publish_rows(self, rows, lyrics, removed=()):
+        for path in removed:
+            self.publications[path] = None
+            self.publication_lrc.discard(path)
+        for row in rows:
+            self.publications[row[0].path] = row
+            self.publication_lrc.discard(row[0].path)
+        self.publication_lrc.update(lyrics)
+        if not self.loading and self.get_visible():
+            self.apply_publications()
+
+    @staticmethod
+    def selection(widget, values):
+        position = widget.get_selected()
+        return values[position] if position < len(values) else values[0]
+
+    def apply_publications(self):
+        # Keep the active filter and page when a small path delta arrives.
+        # The old catalogue and decorations came from the background load.
+        if self.loading:
+            return
+        if self.publications:
+            remaining = (row for row in self.songs if row[0].path not in self.publications)
+            added = sorted((row for row in self.publications.values() if row is not None), key=catalogue_sort)
+            self.songs = list(merge(remaining, added, key=catalogue_sort))
+            self.lrc_paths.difference_update(self.publications)
+            self.lrc_paths.update(self.publication_lrc)
+            self.publications.clear()
+            self.publication_lrc.clear()
+        artists = ['Tous les artistes', *sorted({song.artist for song, _ in self.songs}, key=search_key)]
+        if artists != self.artist_names:
+            selected = self.selection(self.artists, self.artist_names)
+            self.artist_names = artists
+            self.updating_filters = True
+            self.artists.set_model(Gtk.StringList.new(artists))
+            self.artists.set_selected(artists.index(selected) if selected in artists else 0)
+            self.updating_filters = False
+        self.artist_changed(preserve=True)
+
+    def artist_changed(self, *_args, preserve=False):
+        if self.updating_filters:
+            return
+        artist = self.selection(self.artists, self.artist_names)
         albums = {song.album for song, _ in self.songs
                   if song.album and (artist == 'Tous les artistes' or song.artist == artist)}
-        self.album_names = ['Tous les albums', *sorted(albums, key=search_key)]
-        self.albums.set_model(Gtk.StringList.new(self.album_names))
-        self.albums.set_selected(0)
-        self.update_results()
+        values = ['Tous les albums', *sorted(albums, key=search_key)]
+        selected = self.selection(self.albums, self.album_names) if preserve else values[0]
+        self.updating_filters = True
+        if values != self.album_names:
+            self.album_names = values
+            self.albums.set_model(Gtk.StringList.new(values))
+        self.albums.set_selected(values.index(selected) if selected in values else 0)
+        self.updating_filters = False
+        self.update_results(preserve=preserve)
 
-    def update_results(self, *_args):
+    def update_results(self, *_args, preserve=False):
+        if self.updating_filters:
+            return
         query = search_key(self.search.get_text()).split()
-        artist = self.artist_names[self.artists.get_selected()]
-        album = self.album_names[self.albums.get_selected()]
+        artist = self.selection(self.artists, self.artist_names)
+        album = self.selection(self.albums, self.album_names)
         self.filtered = [song for song, key in self.songs
                          if (artist == 'Tous les artistes' or artist == song.artist)
                          and (album == 'Tous les albums' or album == song.album)
                          and all(term in key for term in query)]
-        self.page = 0
+        self.page = min(self.page, max(0, (len(self.filtered)-1)//PAGE_SIZE)) if preserve else 0
         self.render_library()
 
     def page_change(self, _button, direction):
@@ -217,9 +279,17 @@ class MusicLibraryWindow(Gtk.Window):
             view.remove(child)
 
     def render_library(self):
-        self._empty_list(self.catalogue_list)
         start = self.page * PAGE_SIZE
         shown = self.filtered[start:start+PAGE_SIZE]
+        total = len(self.filtered)
+        self.library_status.set_text(f'{start+1 if total else 0}–{min(start+len(shown),total)} / {total} titres')
+        self.previous_page.set_sensitive(self.page>0)
+        self.next_page.set_sensitive((self.page+1)*PAGE_SIZE<total)
+        signature = [(song, song.path in self.lrc_paths) for song in shown]
+        if self.rendered_page == signature:
+            return
+        self.rendered_page = signature
+        self._empty_list(self.catalogue_list)
         for song in shown:
             row = Gtk.Box(spacing=7, margin_top=5, margin_bottom=5,
                           margin_start=5, margin_end=5)
@@ -228,7 +298,7 @@ class MusicLibraryWindow(Gtk.Window):
                                     ellipsize=Pango.EllipsizeMode.END,
                                     tooltip_text=song.title))
             subtitle = ' · '.join((song.artist, song.album)).strip(' ·')
-            lyric_suffix = ' · ♪ paroles' if song.path.with_suffix('.lrc').is_file() else ''
+            lyric_suffix = ' · ♪ paroles' if song.path in self.lrc_paths else ''
             detail.append(Gtk.Label(label=subtitle+lyric_suffix, xalign=0,
                                     ellipsize=Pango.EllipsizeMode.END,
                                     tooltip_text=subtitle,
@@ -242,10 +312,6 @@ class MusicLibraryWindow(Gtk.Window):
             append.connect('clicked', self.add_song, song, False)
             row.append(append)
             self.catalogue_list.append(row)
-        total = len(self.filtered)
-        self.library_status.set_text(f'{start+1 if total else 0}–{min(start+len(shown),total)} / {total} titres')
-        self.previous_page.set_sensitive(self.page>0)
-        self.next_page.set_sensitive((self.page+1)*PAGE_SIZE<total)
 
     def refresh_queue(self, force=False):
         if self.controller.closed or self.fetching_queue:

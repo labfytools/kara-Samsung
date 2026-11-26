@@ -1,5 +1,7 @@
 """Tableau de bord GTK4 de Parole et consultation ponctuelle des textes."""
+from collections import OrderedDict
 from datetime import datetime
+from difflib import SequenceMatcher
 import json
 from math import ceil
 from pathlib import Path
@@ -26,7 +28,7 @@ STATES = {"absent": "Absent", "prêt": "Prêt", "partiel": "Partiel", "externe":
           "généré": "Généré", "local": "Local", "intégré": "Intégré", "à vérifier": "À vérifier",
           "obsolète": "Obsolète", "instrumental": "Instrumental", "inconnu": "Inconnu"}
 CATEGORY_COLORS = {"DOWNLOAD": "download", "TURBO": "compute", "DEMUCS": "compute", "CODEX": "compute",
-                   "SOURCE": "source", "SCAN": "source", "SYNC": "source", "IDLE": "source", "SUCCESS": "success",
+                   "SOURCE": "source", "SCAN": "source", "INDEX": "source", "SYNC": "source", "IDLE": "source", "SUCCESS": "success",
                    "WARNING": "warning", "ERROR": "error"}
 
 
@@ -97,6 +99,8 @@ class Console:
         self.import_state = ()
         self.import_stats_at = 0.
         self.import_summary = ""
+        self.import_stats_pending = False
+        self.index_metrics = Gtk.Label(xalign=0, wrap=True, css_classes=["muted"])
         self.panel = box(spacing=4, css_classes=["maintenance-console"])
         toolbar = box(Gtk.Orientation.HORIZONTAL, 5)
         self.reveal = Gtk.Revealer(reveal_child=True, transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
@@ -126,6 +130,7 @@ class Console:
         self.panel.append(self.active)
         self.import_metrics = Gtk.Label(xalign=0, wrap=True, css_classes=["muted"])
         self.panel.append(self.import_metrics)
+        self.panel.append(self.index_metrics)
         self.bar = Gtk.ProgressBar(visible=False)
         self.panel.append(self.bar)
         self.store = Gio.ListStore(item_type=Row)
@@ -197,12 +202,21 @@ class Console:
             progress = ("DOWNLOAD", f"{state[0]} lot(s) en cours", summary.get("progress"))
         self.active.set_label(f"{progress[0]} · {progress[1]}" if progress else
                               self.maintenance.block or "En attente")
-        if monotonic() >= self.import_stats_at:
+        if not self.import_stats_pending and monotonic() >= self.import_stats_at:
             self.import_stats_at = monotonic() + 5.
-            try:
-                self.import_summary = self.enrichment_summary()
-            except (OSError, sqlite3.Error, ValueError):
-                pass
+            self.import_stats_pending = True
+
+            def display(future):
+                self.import_stats_pending = False
+                if not self.window.closed:
+                    try:
+                        self.import_summary = future.result()
+                    except (OSError, sqlite3.Error, ValueError):
+                        pass
+                return GLib.SOURCE_REMOVE
+
+            self.window.tag_reader.submit(self.enrichment_summary).add_done_callback(
+                lambda result: GLib.idle_add(display, result))
         lyrics, lrc = self.maintenance.import_activity
         line = (f"{summary.get('downloads', 0)} piste(s) en réception · "
                 f"{summary.get('download_slots', 0)}/{summary.get('download_ceiling', 0)} créneau(x) occupé(s) · "
@@ -214,6 +228,11 @@ class Console:
         if rate := summary.get("audio_bytes_per_second"):
             line += f" · {rate / 1024**2:.2f} Mio/s mesurés"
         self.import_metrics.set_label(f"{line}\n{self.import_summary}" if self.import_summary else line)
+        measured = self.maintenance.metrics
+        if "index_pending" in measured and (auxiliary := measured.get("index_aux")) is not None:
+            self.index_metrics.set_label(f"INDEX · {measured['index_pending']} pistes en file · "
+                                         f"{auxiliary['deep']} analyses à traiter · {auxiliary['drafts']} brouillons · "
+                                         f"{auxiliary['errors']} erreurs média")
         self.bar.set_visible(bool(progress and progress[2] is not None))
         if progress and progress[2] is not None:
             self.bar.set_fraction(progress[2])
@@ -288,6 +307,10 @@ class ParoleView:
         self.settings_dialog = None
         self.night_summary = None
         self.stats_at = 0.
+        self.library_generation = 0
+        self.library_pending = False
+        self.library_page_requested = False
+        self.child_models = OrderedDict()
         self.cards = {}
         gtkroot = self.root = box(spacing=8, css_classes=["parole"], margin_start=12, margin_end=12,
                                   margin_top=10, margin_bottom=8)
@@ -434,20 +457,50 @@ class ParoleView:
         if state != "tv-off" or seen:
             self.maintenance.journal.emit("TV", description, "WARNING" if state == "tv-error" else "INFO")
 
+    @staticmethod
+    def child_rows(db, parts):
+        if len(parts) == 1:
+            return [(*parts, r["edition"], f"{r['album'] or 'Sans album'}"
+                    + (f" · {r['year']}" if r["year"] else ""))
+                    for r in db.execute("SELECT edition,album,year FROM songs WHERE owner=? "
+                                        "GROUP BY edition ORDER BY search,edition", parts)]
+        return [(*parts, r["id"], r["title"]) for r in db.execute(
+            "SELECT id,title FROM songs WHERE edition=? ORDER BY disc,track,title,id", (parts[1],))]
+
+    @staticmethod
+    def patch_tree(model, rows):
+        current = [model.get_item(i).data for i in range(model.get_n_items())]
+        # Keep unchanged list items, including their GtkTreeListRow expansion.
+        for action, i, end, j, stop in reversed(SequenceMatcher(None, current, rows, autojunk=False).get_opcodes()):
+            if action != "equal":
+                model.splice(i, end - i, [Row(value) for value in rows[j:stop]])
+
     def children(self, row):
         parts = row.data
+        if len(parts) == 5:
+            return None
+        if parts in self.child_models:
+            self.child_models.move_to_end(parts)
+            return self.child_models[parts]
         model = Gio.ListStore(item_type=Row)
-        with self.index.db(wait=.15) as db:
-            if len(parts) == 1:
-                rows = db.execute("SELECT edition,album,year FROM songs WHERE owner=? GROUP BY edition ORDER BY search",
-                                  parts).fetchall()
-                model.splice(0, 0, [Row((*parts, r["edition"], f"{r['album'] or 'Sans album'}"
-                                         + (f" · {r['year']}" if r["year"] else ""))) for r in rows])
-            elif len(parts) == 3:
-                rows = db.execute("SELECT id,title FROM songs WHERE edition=? ORDER BY disc,track,title",
-                                  (parts[1],)).fetchall()
-                model.splice(0, 0, [Row((*parts, r["id"], r["title"])) for r in rows])
-        return model if model.get_n_items() else None
+        self.child_models[parts] = model
+        if len(self.child_models) > 64:
+            self.child_models.popitem(last=False)
+
+        def load():
+            with self.index.db(wait=.15) as db:
+                return self.child_rows(db, parts)
+
+        def display(future):
+            if not self.control.closed:
+                try:
+                    self.patch_tree(model, future.result())
+                except (sqlite3.Error, ValueError, OSError):
+                    pass
+            return GLib.SOURCE_REMOVE
+
+        self.control.tag_reader.submit(load).add_done_callback(lambda result: GLib.idle_add(display, result))
+        return model
 
     @staticmethod
     def render_tree(expander, raw):
@@ -493,6 +546,10 @@ class ParoleView:
         self.render_songs()
 
     def render_songs(self):
+        self.library_generation += 1
+        self.request_library(page=True)
+
+    def page_query(self):
         conditions, args = [], []
         for term in key(self.search.get_text())[:180].split():
             conditions.append("instr(search,?)")
@@ -509,13 +566,95 @@ class ParoleView:
         if expression := SQL_FILTER.get(FILTERS[self.filter.get_selected()][0]):
             conditions.append(expression)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        return where, tuple(args), self.page
+
+    def load_library(self, page, artists, branches, stats):
+        began = monotonic()
+        result = {}
+        with self.index.db(wait=.15) as db:
+            # Use one SQLite snapshot for the visible page, dimension counts
+            # and expanded nodes. No transaction spans a GTK callback.
+            db.execute("BEGIN")
+            if page is not None:
+                where, args, number = page
+                count = (db.execute("SELECT count(*) FROM songs" + where, args).fetchone()[0] if where
+                         else db.execute("SELECT total FROM library_stats").fetchone()[0])
+                number = min(number, max(0, (count-1) // PAGE))
+                rows = db.execute("SELECT * FROM songs" + where + " ORDER BY owner,album,disc,track,title,id LIMIT ? OFFSET ?",
+                                  (*args, PAGE, number * PAGE)).fetchall()
+                result["page"] = number, count, rows
+            if artists:
+                result["artists"] = [tuple(r) for r in db.execute(
+                    "SELECT owner FROM library_artists ORDER BY owner COLLATE NOCASE,owner")]
+                result["branches"] = [(parts, self.child_rows(db, parts)) for parts in branches]
+            if stats:
+                counts = dict(db.execute("SELECT * FROM library_stats WHERE id=1").fetchone())
+                counts.update(artists=db.execute("SELECT count(*) FROM library_artists").fetchone()[0],
+                              albums=db.execute("SELECT count(*) FROM library_editions").fetchone()[0],
+                              errors=db.execute("SELECT count(*) FROM songs WHERE json_extract(info,'$.probe_error')=1").fetchone()[0],
+                              drafts=db.execute("""SELECT count(*) FROM tasks AS t JOIN songs AS s ON s.id=t.subject
+                                WHERE t.kind='transcription' AND t.state='review' AND t.detail='brouillon à vérifier'
+                                AND (s.lyrics='absent' OR s.lrc='absent')""").fetchone()[0],
+                              deep=db.execute("""SELECT count(*) FROM tasks WHERE kind IN ('prepare','transcription')
+                                AND state IN ('queued','running','temporary','suspended')""").fetchone()[0],
+                              incomplete=db.execute("SELECT count(*) FROM reviews WHERE kind='album' AND state='incomplete'").fetchone()[0],
+                              missing=db.execute("""SELECT count(DISTINCT json_extract(j.value,'$.id'))
+                                FROM reviews r, json_each(r.value,'$.missing') j
+                                WHERE r.kind='discography' AND NOT EXISTS(SELECT 1 FROM exclusions
+                                    WHERE kind='release' AND subject=json_extract(j.value,'$.id'))""").fetchone()[0],
+                              sources=db.execute("SELECT count(*) FROM sources WHERE state='active'").fetchone()[0],
+                              codex=db.execute("SELECT count(*) FROM tasks WHERE kind='codex' AND state IN ('queued','running','temporary','suspended')").fetchone()[0])
+                result["stats"] = counts
+        return result, monotonic() - began
+
+    def request_library(self, *, page=False):
+        revision = self.maintenance.revision
+        dirty = self.change != revision
+        self.library_page_requested |= page
+        if self.library_pending:
+            return
+        now = monotonic()
+        stats = dirty or now >= self.stats_at + 3.
+        page = self.library_page_requested or dirty
+        if not (stats or page):
+            return
+        generation = self.library_generation
+        self.library_page_requested = False
+        self.library_pending = True
+        branches = tuple(self.child_models) if dirty else ()
+
+        def finish(future):
+            self.library_pending = False
+            if self.control.closed:
+                return GLib.SOURCE_REMOVE
+            try:
+                snapshot, read_seconds = future.result()
+            except (sqlite3.Error, ValueError, OSError):
+                self.library_page_requested |= page
+                return GLib.SOURCE_REMOVE
+            began = monotonic()
+            if "artists" in snapshot:
+                self.patch_tree(self.artists, snapshot["artists"])
+                for parts, rows in snapshot["branches"]:
+                    if model := self.child_models.get(parts):
+                        self.patch_tree(model, rows)
+                self.change = revision
+            if "page" in snapshot and generation == self.library_generation:
+                self.display_page(*snapshot["page"])
+            if "stats" in snapshot:
+                self.stats_at = now
+                self.display_stats(snapshot["stats"])
+            self.maintenance.metrics.update(gtk_library_read=read_seconds, gtk_library_update=monotonic()-began)
+            self.request_library()
+            return GLib.SOURCE_REMOVE
+
+        self.control.tag_reader.submit(self.load_library, self.page_query() if page else None, dirty, branches,
+                                       stats).add_done_callback(lambda result: GLib.idle_add(finish, result))
+
+    def display_page(self, number, count, rows):
+        self.page = number
         old = self.song_selection.get_selected_item()
         old_id = old.data["id"] if old else None
-        with self.index.db(wait=.2) as db:
-            count = db.execute("SELECT count(*) FROM songs" + where, args).fetchone()[0]
-            self.page = min(self.page, max(0, (count-1) // PAGE))
-            rows = db.execute("SELECT * FROM songs" + where + " ORDER BY owner,album,disc,track,title,id LIMIT ? OFFSET ?",
-                              (*args, PAGE, self.page * PAGE)).fetchall()
         if self.update_song_rows(rows):
             self.song_selection.set_selected(next((i for i, r in enumerate(rows) if r["id"] == old_id),
                                                   Gtk.INVALID_LIST_POSITION))
@@ -528,27 +667,19 @@ class ParoleView:
     def update_song_rows(self, rows):
         current = [self.songs.get_item(i) for i in range(self.songs.get_n_items())]
         rendered = ("id", "title", "artist", "album", "duration", "lyrics", "lrc", "kara")
-
-        def retained(item, row):
-            if any(item.data[key] != row[key] for key in rendered):
-                return False
-            # Details still need the latest provenance and file version. A
-            # metadata-only revision leaves the visible Gtk row and selection intact.
-            item.data = row
-            return True
-
-        first, tail = 0, 0
-        common = min(len(current), len(rows))
-        while first < common and retained(current[first], rows[first]):
-            first += 1
-        while first + tail < common and retained(current[-tail - 1], rows[-tail - 1]):
-            tail += 1
-        removed = len(current) - first - tail
-        added = rows[first:len(rows) - tail]
-        if removed or added:
-            self.songs.splice(first, removed, [Row(row) for row in added])
-            return True
-        return False
+        before = [tuple(item.data[k] for k in rendered) for item in current]
+        after = [tuple(row[k] for k in rendered) for row in rows]
+        changed = False
+        for action, i, end, j, stop in reversed(SequenceMatcher(None, before, after, autojunk=False).get_opcodes()):
+            if action == "equal":
+                # Keep the row's identity while supplying current provenance
+                # and versions to the detail editor.
+                for item, row in zip(current[i:end], rows[j:stop]):
+                    item.data = row
+            else:
+                changed = True
+                self.songs.splice(i, end - i, [Row(row) for row in rows[j:stop]])
+        return changed
 
     @staticmethod
     def render_cell(widget, row, field):
@@ -588,29 +719,12 @@ class ParoleView:
     def refresh_state(self):
         self.update_tv()
         self.console.update()
-        dirty = self.change != self.maintenance.revision
-        if dirty:
-            self.change = self.maintenance.revision
-            with self.index.db(wait=.15) as db:
-                artists = [r[0] for r in db.execute("SELECT DISTINCT owner FROM songs ORDER BY owner COLLATE NOCASE")]
-                if [self.artists.get_item(i).data[0] for i in range(self.artists.get_n_items())] != artists:
-                    self.artists.splice(0, self.artists.get_n_items(), [Row((a,)) for a in artists])
-            self.render_songs()
-        if not dirty and monotonic() < self.stats_at + 3.:
-            return
-        self.stats_at = monotonic()
+        self.request_library()
         if self.night_summary is not None and self.night_summary.get_mapped():
-            self.refresh_night_summary()
-        with self.index.db(wait=.15) as db:
-            stats = dict(db.execute("SELECT * FROM library_stats WHERE id=1").fetchone())
-            stats.update(artists=self.artists.get_n_items(), albums=db.execute("SELECT count(DISTINCT edition) FROM songs WHERE album!=''").fetchone()[0],
-                         incomplete=db.execute("SELECT count(*) FROM reviews WHERE kind='album' AND state='incomplete'").fetchone()[0],
-                         missing=db.execute("""SELECT count(DISTINCT json_extract(j.value,'$.id'))
-                              FROM reviews r, json_each(r.value,'$.missing') j
-                              WHERE r.kind='discography' AND NOT EXISTS(SELECT 1 FROM exclusions
-                                  WHERE kind='release' AND subject=json_extract(j.value,'$.id'))""").fetchone()[0],
-                         sources=db.execute("SELECT count(*) FROM sources WHERE state='active'").fetchone()[0],
-                         codex=db.execute("SELECT count(*) FROM tasks WHERE kind='codex' AND state IN ('queued','running','temporary','suspended')").fetchone()[0])
+            self.request_night_summary()
+
+    def display_stats(self, stats):
+        self.maintenance.metrics["index_aux"] = {key: stats[key] for key in ("errors", "deep", "drafts")}
         stats["cache"] = self.maintenance.resources.storage.get("bytes")
         for name, value in self.cards.items():
             data = stats[name]
@@ -637,8 +751,28 @@ class ParoleView:
             f"{counts.get('quota', 0)} reports quota",
         )
 
-    def refresh_night_summary(self):
-        ready, references, remaining, report = self.index.night_progress()
+    def request_night_summary(self):
+        if monotonic() < getattr(self, "night_summary_at", 0.):
+            return
+        self.night_summary_at = monotonic() + 3.
+
+        def load():
+            return self.index.night_progress(), self.index.activity_progress(), self.index.closed_progress()
+
+        def finish(future):
+            if not self.control.closed and self.night_summary is not None:
+                try:
+                    self.refresh_night_summary(future.result())
+                except (OSError, sqlite3.Error, ValueError):
+                    pass
+            return GLib.SOURCE_REMOVE
+
+        self.control.tag_reader.submit(load).add_done_callback(lambda result: GLib.idle_add(finish, result))
+
+    def refresh_night_summary(self, snapshot=None):
+        progress, activity, closed = snapshot or (self.index.night_progress(), self.index.activity_progress(),
+                                                    self.index.closed_progress())
+        ready, references, remaining, report = progress
         lines = [f"Bibliothèque · {ready} préparations complètes · {references} références temporelles validées · "
                  f"{remaining} restantes dans la file"]
         night = self.maintenance.night
@@ -652,11 +786,11 @@ class ParoleView:
         lines.extend((f"{lid} · {power} · {screens} · {lock}", inhibitor))
         if night.reason:
             lines.append(night.reason)
-        hour, day, drafts = self.index.activity_progress()
+        hour, day, drafts = activity
         lines.extend((f"Brouillons à vérifier · {drafts}",
                       *self.activity_lines("Dernière heure révolue", hour),
                       *self.activity_lines("Dernières 24 h révolues", day)))
-        if closed := self.index.closed_progress():
+        if closed:
             stamp = datetime.fromtimestamp(closed["started"]).strftime("%d/%m à %H:%M")
             completed = closed["completed"]
             labels = {"prepare": "préparations", "lyrics": "paroles", "lrc": "LRC", "cover": "pochettes",
@@ -816,7 +950,7 @@ class ParoleView:
             except (OSError, ValueError, sqlite3.Error, SystemExit) as error:
                 status.set_text(str(error))
                 return
-            self.maintenance.rescan()
+            self.maintenance.index_wake.set()
             reload_text()
             status.set_text("Minutage validé" if suffix == ".lrc" else "Texte validé")
 

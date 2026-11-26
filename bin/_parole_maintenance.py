@@ -175,6 +175,8 @@ class Maintenance:
         self.priority_until = 0.
         self.next_scan = time() + 3
         self.plan_policy = None
+        self.next_stats_audit = 0.
+        self.index_constraint = ""
         self.network_cursor = 0
         self.network_width = 2
         self.local_reference_next = True
@@ -359,6 +361,10 @@ class Maintenance:
             self.night.report("Mode nocturne actif · traitement en cours")
         return True
 
+    def changed(self):
+        with self.lock:
+            self.revision += 1
+
     def index_stopped(self):
         return self.shutdown.is_set() or self.index_priority or monotonic() < self.priority_until
 
@@ -366,10 +372,13 @@ class Maintenance:
         started = monotonic()
         self.index_progress = 0
         self.journal.emit("INDEX", "Réconciliation de la bibliothèque")
+        def stopped():
+            return self.index_stopped() or bool(self.index_limit(settings))
+
         try:
             args = () if self.state_root is None else (self.state_root,)
             associations = self.index.associations(*args)
-            result = inventory(self.index, self.collection, self.inspect_cache, lambda: self.index_stopped() or self.priority,
+            result = inventory(self.index, self.collection, self.inspect_cache, stopped,
                                lambda scanned: setattr(self, "index_progress", scanned), limit=limit)
             elapsed = monotonic() - started
             self.metrics.update(result, scan_seconds=elapsed, associations=associations)
@@ -378,16 +387,26 @@ class Maintenance:
                               f"{result['errors']} erreurs · {elapsed:.2f} s · {result['probes']} FFprobe")
             changed = result["changed"] or result["missing"]
             if changed:
-                self.revision += 1
+                self.changed()
+            if not stopped() and time() >= self.next_stats_audit:
+                before_stats = monotonic()
+                if not self.index.audit_dimensions():
+                    self.journal.emit("INDEX", "Écart détecté dans les agrégats de bibliothèque", "WARNING")
+                self.metrics["index_stats_seconds"] = monotonic() - before_stats
+                self.next_stats_audit = time() + DAY
             policy = tuple(settings[name] for name in ("lyrics", "lrc", "autoprepare", "metadata", "albums",
                                                        "discography", "cover", "night_enabled", "generate", "releases"))
-            if not self.index_stopped() and (changed or replan or self.plan_policy != policy):
+            if not stopped() and (changed or replan or self.plan_policy != policy):
                 before_plan = monotonic()
                 self.plan(settings)
                 self.metrics["plan_seconds"] = monotonic() - before_plan
-                if not self.index_stopped():
+                if not stopped():
                     self.plan_policy = policy
         finally:
+            if stopped():
+                self.next_scan = min(self.next_scan, time() + 10)
+                if replan:
+                    self.scan_now.set()
             self.index_progress = None
 
     def index_loop(self):
@@ -420,6 +439,11 @@ class Maintenance:
         if settings["paused"]:
             return .5
         now = time()
+        limit = self.index_limit(settings)
+        if limit != self.index_constraint:
+            self.index_constraint = limit
+            if limit:
+                self.journal.emit("INDEX", f"Traitement léger · {limit}")
         if watch is not None:
             changes, gap = watch.poll()
             if gap:
@@ -435,34 +459,51 @@ class Maintenance:
                     # reconciliation used for an overflow.
                     self.scan_now.set()
                     raise
-        backlog, events = self.index.events(now, light=self.priority)
+        backlog, events = self.index.events(now, light=bool(limit))
         self.metrics["index_pending"] = backlog
         if events:
             started = monotonic()
             with self.index_lock:
                 result = inventory(self.index, self.collection, self.inspect_cache, self.index_stopped,
-                                   lambda *_: None, events=events, allow_probe=not self.priority,
+                                   lambda *_: None, events=events, allow_probe=not limit,
                                    plan_events=lambda db, paths: self.plan_events(db, settings, paths))
             duration = monotonic() - started
             self.metrics.update(index_last=result, index_seconds=duration)
             if result["changed"] or result["missing"]:
-                self.revision += 1
+                self.changed()
             delivered = result["delivered"]
             if delivered:
                 self.journal.emit("INDEX", f"{result['changed']} intégrées · {result['changed']/max(duration,.001):.1f} pistes/s · "
                                   f"{result['unchanged']} inchangées · {result['combined']} regroupées · "
                                   f"{result['receipts']+result['reused']} métadonnées réutilisées · "
-                                  f"retard {result['lag']/delivered:.2f} s · {max(0,backlog-delivered)} en file · "
+                                  f"retard {result['lag']/delivered:.2f} s · {backlog} en file à l’admission · "
                                   f"SQLite {result['phase_seconds'].get('sqlite_lock',0)*1000:.1f} ms")
                 self.wake.set()
             return 0. if backlog > len(events) and delivered else .25
-        if not self.priority and (self.scan_now.is_set() or settings["startup"] and now >= self.next_scan and
+        if not limit and (self.scan_now.is_set() or settings["startup"] and now >= self.next_scan and
                                   (not backlog or now >= self.next_scan + 30)):
             replan = self.scan_now.is_set()
             self.scan_now.clear()
             self.next_scan = now + max(1, settings["scan_minutes"]) * 60
             self.scan(settings, replan=replan)
         return .25 if backlog else .5
+
+    def index_limit(self, settings):
+        if self.priority:
+            return "lecture Strawberry prioritaire"
+        active = self.active
+        if active and active[0] in HEAVY:
+            return "préparation ou transcription en cours"
+        sample = self.resources.index_pressure
+        if sample and monotonic() - sample[0] < 5:
+            _, cpu, memory, psi, disk = sample
+            if memory < settings["running_memory_mib"] or psi >= 1:
+                return "pression mémoire"
+            if cpu is not None and cpu >= max(60, settings["cpu"]):
+                return "CPU occupé"
+            if disk is not None and disk >= max(60, settings["disk_busy"]):
+                return "stockage occupé"
+        return ""
 
     def plan_tracks(self, db, settings, songs):
         now = time()
@@ -497,30 +538,34 @@ class Maintenance:
                 elif settings.get("autoprepare" if kind == "prepare" else kind):
                     self.index.enqueue(kind, subject, revision, priority, db=db)
 
-    def plan_groups(self, db, settings, songs=None):
-        for kind, column in (("album", "edition"), ("discography", "owner"), ("cover", "edition")):
-            if not settings["albums" if kind == "album" else kind]:
+    @staticmethod
+    def group_kinds(settings):
+        return tuple((kind, column, priority) for kind, column, priority in (
+            ("album", "edition", 42), ("discography", "owner", 45), ("cover", "edition", 46))
+            if settings["albums" if kind == "album" else kind])
+
+    def plan_group(self, db, settings, kind, column, priority, names):
+        if not names:
+            return
+        marks = ",".join("?" for _ in names)
+        entries = db.execute(f"""SELECT {column} AS subject, max(added) AS revision, count(*) AS tracks,
+                   max(owner IN (SELECT subject FROM exclusions WHERE kind='artist')) AS blocked
+                   FROM songs WHERE album!='' AND {column} IN ({marks}) GROUP BY {column}""", names)
+        for row in entries:
+            subject = row["subject"]
+            if row["blocked"] or db.execute("SELECT 1 FROM exclusions WHERE kind=? AND subject=?", (kind, subject)).fetchone():
+                db.execute("UPDATE tasks SET state='excluded' WHERE kind=? AND subject=? AND state!='running'",
+                           (kind, subject))
                 continue
-            values = sorted({song[column] for song in songs if song["album"]}) if songs is not None else []
-            if songs is not None and not values:
-                continue
-            specific = f" AND {column} IN ({','.join('?' for _ in values)})" if values else ""
-            entries = db.execute(f"""SELECT {column} AS subject, max(added) AS revision, count(*) AS tracks,
-                       max(owner IN (SELECT subject FROM exclusions WHERE kind='artist')) AS blocked
-                       FROM songs WHERE album!='' {specific} GROUP BY {column}""", values)
-            for row in entries:
-                subject = row["subject"]
-                if row["blocked"] or db.execute("SELECT 1 FROM exclusions WHERE kind=? AND subject=?", (kind, subject)).fetchone():
-                    db.execute("UPDATE tasks SET state='excluded' WHERE kind=? AND subject=? AND state!='running'",
-                               (kind, subject))
-                    continue
-                revision = encoded_key(row["revision"], row["tracks"], settings["releases"])
-                self.index.enqueue(kind, subject, revision, {"album": 42, "cover": 46, "discography": 45}[kind], db=db)
+            revision = encoded_key(row["revision"], row["tracks"], settings["releases"])
+            self.index.enqueue(kind, subject, revision, priority, db=db)
 
     def plan_events(self, db, settings, paths):
         songs = list(path_rows(db, paths).values())
         self.plan_tracks(db, settings, songs)
-        self.plan_groups(db, settings, songs)
+        for kind, column, priority in self.group_kinds(settings):
+            names = sorted({song[column] for song in songs if song["album"]})
+            self.plan_group(db, settings, kind, column, priority, names)
 
     def plan(self, settings, *, paths=None):
         if paths is not None:
@@ -538,8 +583,18 @@ class Maintenance:
                 if not songs:
                     break
                 self.plan_tracks(db, settings, songs)
-                self.plan_groups(db, settings, songs)
                 after = songs[-1]["id"]
+        for kind, column, priority in self.group_kinds(settings):
+            after = ""
+            while not self.index_stopped():
+                with self.index.db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    names = [row[0] for row in db.execute(f"""SELECT DISTINCT {column} FROM songs
+                             WHERE {column}>? AND album!='' ORDER BY {column} LIMIT 128""", (after,))]
+                    if not names:
+                        break
+                    self.plan_group(db, settings, kind, column, priority, names)
+                    after = names[-1]
         if self.index_stopped():
             return
         with self.index.db() as db:
@@ -649,7 +704,7 @@ class Maintenance:
                 details = json.loads(fresh["info"])
                 details.update(changes.pop("provenance", {}))
                 self.index.update(song["id"], checked=time(), info=document(details), **changes)
-        self.revision += 1
+        self.changed()
 
     def do_song(self, task, result):
         identity, kind = task["subject"], task["kind"]
@@ -677,7 +732,7 @@ class Maintenance:
             self.journal.emit("SUCCESS", f"{song['title']} · {'LRC' if kind == 'lrc' else 'Paroles'} vérifiés")
         elif outcome == "instrumental":
             self.index.update(identity, lyrics="instrumental", checked=time())
-            self.revision += 1
+            self.changed()
         elif outcome == "present":
             self.refresh_song(song)
         elif outcome == "local_miss":
@@ -705,7 +760,7 @@ class Maintenance:
         if state == "temporary":
             return "temporary", state, min(DAY, 600 * 2**min(task["attempts"], 7))
         self.index.review(kind, subject, state, result.get("value", {}))
-        self.revision += 1
+        self.changed()
         if state in ("not_found", "ambiguous", "partial"):
             self.queue_codex(kind, subject, state)
         if kind == "metadata" and state == "identified":
@@ -782,7 +837,7 @@ class Maintenance:
             result = "temporary", "opération indisponible", min(DAY, 300 * 2**min(task["attempts"], 8))
         self.index.finish(task, *result, closed=self.closed_outcome(window, result), network_found=publication,
                           activity=activity)
-        self.revision += 1
+        self.changed()
         return self.network_completed(result)
 
     @staticmethod
@@ -1177,7 +1232,7 @@ class Maintenance:
         if query["kind"] == "import_failure" and self.import_queue is not None:
             self.import_queue.reconsider_import(task["subject"])
             self.journal.emit("DOWNLOAD", "Diagnostic mutualisé disponible dans l’historique Codex")
-        self.revision += 1
+        self.changed()
         self.journal.emit("CODEX", {"found": "Sources identifiées", "not_found": "Aucune source trouvée",
                                     "ambiguous": "Correspondance à vérifier"}[result["status"]])
         for source in result["sources"]:
@@ -1334,7 +1389,7 @@ class Maintenance:
         if import_suspended:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
-        self.revision += 1
+        self.changed()
         return result
 
     def authorized_imports(self, settings):

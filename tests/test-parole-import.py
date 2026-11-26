@@ -1550,7 +1550,8 @@ room = SimpleNamespace(update_catalogue=lambda rows, **_kwargs: catalogues.appen
 control = SimpleNamespace(receiver=SimpleNamespace(room=room), closed=False, music_window=None,
                           blackbox=SimpleNamespace(emit=lambda *args, **kwargs: None),
                           remote_party=SimpleNamespace(locked=False), import_refresh_tasks={},
-                          import_refresh_timer=None, import_refresh_active=False, import_published_paths=set())
+                          import_refresh_timer=None, import_refresh_active=False, import_published_paths=set(),
+                          import_removed_paths=set())
 for name in ("refresh_after_import", "reload_after_import"):
     setattr(control, name, MethodType(getattr(window, name), control))
 
@@ -1595,7 +1596,7 @@ with ThreadPoolExecutor(max_workers=1) as pool:
         while context.pending():
             context.iteration(False)
         panel.launch_next()
-        if catalogues:
+        if catalogues and not control.import_refresh_active:
             break
         time.sleep(.02)
     assert len(catalogues) == 1

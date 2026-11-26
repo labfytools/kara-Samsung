@@ -3,6 +3,7 @@
 from multiprocessing import get_context
 import os
 from pathlib import Path
+from subprocess import CalledProcessError
 import sys
 from tempfile import TemporaryDirectory
 from time import monotonic
@@ -111,6 +112,19 @@ class Delivery(unittest.TestCase):
         with self.index.db() as db:
             self.assertEqual(db.execute("SELECT attempts FROM index_events").fetchone()[0], 1)
 
+    def test_corrupt_media_keeps_one_error_and_a_retry(self):
+        self.notify()
+
+        def corrupt(_):
+            raise CalledProcessError(1, "ffprobe")
+
+        result = self.take(reader=corrupt)
+        self.assertEqual((result["errors"], result["delivered"]), (1, 0))
+        self.assertEqual(len(self.rows()), 1)
+        self.notify(proof=True)
+        self.assertEqual(self.take()["delivered"], 1)
+        self.assertEqual(len(self.rows()), 1)
+
     def test_move_keeps_previous_path_and_authorized_delete(self):
         self.notify(proof=True)
         self.take()
@@ -168,6 +182,24 @@ class Delivery(unittest.TestCase):
         limited = Watch(self.index, limit=1)
         self.assertEqual(limited.poll(), ({}, True))
         self.assertIsNone(limited.fd)
+
+    def test_dimension_counts_follow_song_and_artist_changes(self):
+        self.notify(proof=True)
+        second = self.path.with_name("02.flac")
+        second.write_bytes(b"autre piste")
+        self.notify(path=second, proof=True)
+        self.take()
+        with self.index.db() as db:
+            self.assertEqual(tuple(db.execute("SELECT * FROM library_artists").fetchone()), ("Artiste", 2))
+            self.assertEqual(db.execute("SELECT count(*) FROM library_editions").fetchone()[0], 1)
+            db.execute("UPDATE songs SET owner='Rattaché', edition='autre' WHERE path=?", (str(second),))
+        self.assertTrue(self.index.audit_dimensions())
+        second.unlink()
+        self.notify(REMOVE, path=second)
+        self.take()
+        self.assertTrue(self.index.audit_dimensions())
+        with self.index.db() as db:
+            self.assertEqual(tuple(db.execute("SELECT * FROM library_artists").fetchone()), ("Artiste", 1))
 
 
 if __name__ == "__main__":

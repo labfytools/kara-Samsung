@@ -40,3 +40,44 @@ Un descripteur inotify surveille les répertoires de la bibliothèque, sous la l
 Pendant une partie Kara, l’indexeur diffère ses tours. Pendant la lecture Strawberry, les événements avec preuve et les mises à jour des fichiers associés restent éligibles. Les conciliations et les nouveaux appels FFprobe attendent la fin de la lecture. Le fil d’indexation et son processus FFprobe éventuel réduisent leur priorité CPU sous Linux.
 
 Le code amont de Strawberry regroupe les dossiers modifiés, attend deux secondes après la dernière notification, puis effectue une lecture ciblée de ces dossiers. En cas de débordement il répare les watches et prévoit un inventaire. Parole laisse cette coordination à Strawberry et n’écrit jamais dans sa base. [CollectionWatcher upstream](https://github.com/strawberrymusicplayer/strawberry/blob/master/src/collection/collectionwatcher.cpp)
+
+## Vue Parole et statistiques
+
+La vue virtuelle demande une page, les artistes, les branches ouvertes et les agrégats sur le lecteur de fond existant. Chaque réponse est liée à la recherche et aux filtres qui l’ont demandée. La vue garde les lignes stables, la sélection et les branches ouvertes. La console charge aussi la synthèse des enrichissements en fond. Le navigateur de lecture reçoit les chemins publiés et conserve son filtre quand ils arrivent.
+
+Les compteurs de pistes, paroles, LRC, octets et préparations restent dans `library_stats`. Des déclencheurs appliquent les deltas aux artistes et aux éditions dès l’écriture de la piste. Les indices partiels couvrent les erreurs média et les brouillons. Parole vérifie les agrégats au premier passage complet, puis une fois par jour lorsqu’une réconciliation est possible. Un écart est signalé dans INDEX.
+
+La cadence consomme 64 événements par transaction, jusqu’à 128 quand au moins 256 chemins attendent et que les ressources le permettent. La pression mémoire, l’activité CPU et disque récente et les préparations en cours déclenchent le mode léger. La queue d’événements reste durable pendant ce report. Les tâches d’import, de préparation et de preuve PCM gardent leurs mécanismes de reprise et leurs limites.
+
+## Banc et limites de mesure
+
+Le [banc exécutable](../tests/benchmark-parole-index.py) fait travailler le véritable inventaire sur des FLAC synthétiques de 0,5 s et une collection Strawberry simulée. Les gros inventaires tirent leurs tags de cette collection. Les publications qui simulent l’import fournissent une preuve versionnée comme le trieur de production. Les timings d’admission groupée partent du moment où l’audio est disponible et omettent le téléchargement, le tri et le temps de regroupement. Les séries solo 1, 10 et 100 modélisent autant de fins de lots historiques séparées. Une fin de lot historique pouvait contenir plusieurs albums.
+
+| Cas | Référence | V2 | Fichiers vérifiés, référence → V2 | FFprobe, référence → V2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 admission de 10 pistes | 0,84 s | 0,039 s | 2 510 → 10 | 10 → 0 |
+| 10 admissions de 10 pistes | 11,71 s | 0,36 s | 26 100 → 100 | 100 → 0 |
+| 100 admissions de 10 pistes | 127,30 s | 3,70 s | 361 000 → 1 000 | 1 000 → 0 |
+| 1 000 pistes en un lot | 45,71 s | 0,73 s | 4 610 → 1 000 | 1 000 → 0 |
+| 1 000 LRC associés à des pistes existantes | 0,68 s | 0,74 s | 4 610 → 1 000 | 0 → 0 |
+| 1 000 fichiers retagués en externe | 44,75 s | 47,52 s | 4 610 → 1 000 | 1 000 → 1 000 |
+| Déplacement d’un album de 10 pistes | 0,97 s | 0,042 s | 4 610 → 10 | 10 → 0 |
+| 50 000 pistes inchangées | 6,25 s | 3,64 s | 50 000 → 50 000 | 0 → 0 |
+| 100 000 pistes inchangées | 14,67 s | 8,79 s | 100 000 → 100 000 | 0 → 0 |
+| Construction à 100 000 pistes | 37,32 s | 32,74 s | 100 000 → 100 000 | 0 → 0 |
+
+Les deux tailles passent `quick_check` et conservent `songs_display` pour la première page. À 100 000 pistes inchangées, le moteur passe de 392 commits d’inventaire à zéro. Le temps CPU de ce passage est de 8,65 s puis 8,58 s. La différence de temps mural inclut les écritures et la charge de fond. La passe de 100 admissions consomme 26,34 s de CPU Python et 49,81 s de CPU enfant dans la référence, contre 1,39 s et zéro en V2. Elle effectue 1 602 commits d’inventaire dans la référence et 100 commits de traitement dans V2, hors admission de ses reçus. Les compteurs `/proc/self/io` passent d’environ 1,43 Go d’écritures à 146 Mo sur ce témoin. Les maxima RSS du banc s’échelonnent entre 33 et 323 Mio selon le lanceur et la phase. Ces maxima processus ne mesurent pas une allocation propre à chaque cas.
+
+Sur 1 024 pistes munies de reçus, les lots de 1, 16, 32, 64 et 128 prennent respectivement 20,95 s, 1,87 s, 1,09 s, 0,67 s et 0,50 s. Ils utilisent 1 024, 64, 32, 16 et 8 transactions de traitement. Sur 24 notifications espacées de 25 ms, le p95 de disponibilité SQLite est de 0,342 s avec la fenêtre de 250 ms, 0,592 s à 500 ms, 1,079 s à 1 s et 2,079 s à 2 s. Les quatre fenêtres utilisent 14 à 15 transactions sur ce flux. Le choix garde 250 ms comme délai usuel et élargit les lots surtout quand la file est dense.
+
+Pour SQLite, le plan ciblé utilise l’index unique de chemin, les déplacements utilisent `songs_inode`, et l’échéance des événements utilise `index_events_due`. Les lectures côté interface utilisent des instantanés WAL brefs. Les lots d’écriture préparent les changements avant d’ouvrir le verrou `BEGIN IMMEDIATE`. La copie du banc conserve `synchronous=2` et l’auto-checkpoint de 1 000 pages. Un checkpoint passif sur la copie stabilisée a renvoyé `(0,0,0)`. Le banc ne modifie ni les paramètres de durabilité ni la base Strawberry.
+
+### Métadonnées
+
+Sur 50 FLAC avec FFprobe, 1, 2, 4, 8 et 16 travailleurs donnent respectivement 15,0, 27,3, 19,0, 11,4 et 16,4 pistes/s. Le coût CPU des enfants monte de 2,55 s avec un travailleur à 3,46 s avec seize. La charge varie pendant ces mesures. Parole garde un seul appel FFprobe simultané dans l’indexeur pour les cas sans preuve exploitable.
+
+TagLib C 2.3.2 lit les cinq formats testés dans le banc Opus, FLAC, MP3, Ogg Vorbis et M4A. Il redonne les crédits du témoin et fournit une durée à la seconde entière par l’entrée C testée, contre la durée fractionnaire utilisée pour qualifier le dernier repère LRC. Ses valeurs sont des listes et ses noms canoniques diffèrent selon le format. Dix lectures TagLib prennent quelques millisecondes par format, contre environ 0,4 à 0,5 s avec dix lancements FFprobe. Mutagen annonce la prise en charge des cinq formats et le Python du service ne l’installe pas. La production réutilise les tags du trieur ou de Strawberry et conserve FFprobe comme secours. Le retagage externe massif reste limité par ce secours. [TagLib](https://taglib.org/) · [Mutagen](https://mutagen.readthedocs.io/en/latest/)
+
+Une empreinte acoustique utilisée pour qualifier un fournisseur ou une édition reste à la charge de la vérification d’import existante. L’indexation n’ajoute aucun calcul d’empreinte et une preuve de copie des flux peut préserver l’identité PCM au retagage. Les résultats du banc portent sur l’inventaire et la livraison. Ils ne mesurent ni le débit d’un fournisseur distant, ni la latence de l’application Strawberry, ni une partie Kara physique.
+
+Sous Sway headless et D-Bus isolés, une publication sur fixture est devenue visible dans la liste GTK **0,441 s** après admission. La mise à jour des modèles GTK a pris **0,82 ms** pour ce passage. Le test a également vérifié la conservation de l’objet de ligne lors d’une mise à jour de provenance, la sélection, le regroupement d’artistes et les parcours d’import et de synchronisation USB simulée.

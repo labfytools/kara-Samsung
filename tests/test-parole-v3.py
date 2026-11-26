@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from time import time
+from time import monotonic, sleep, time
 from threading import Event
 import unittest
 from unittest.mock import Mock, patch
@@ -23,7 +23,7 @@ from _kara_audio_identity import pcm_digest
 from _kara_prepare import lrc_token
 from _parole_catalogue import check_album, check_discography, check_recording, compare
 from _parole_codex import authenticate, daily_slot, validate
-from _parole_index import Index, inventory, encoded_key
+from _parole_index import Index, inventory, encoded_key, revision
 from _parole_maintenance import Journal, Maintenance
 from _parole_process import Interrupted, run
 from _parole_sources import LyricsEndpoint, discover, external_ips, public_url, seed, controls, validate_endpoint
@@ -775,6 +775,15 @@ class GtkTests(Fixture):
         self.assertIs(window.maintenance, background)
         self.assertTrue(background.foreground.is_set())
         view = window.parole_ui
+        def wait_library():
+            context = GLib.MainContext.default()
+            deadline = monotonic() + 3
+            while view.library_pending:
+                if monotonic() >= deadline:
+                    self.fail("Le résultat SQLite n’est pas revenu dans GTK")
+                if not context.iteration(False):
+                    sleep(.005)
+
         self.addCleanup(window.destroy)
         self.addCleanup(window.close_window, window)
         window.maintenance.pause(True)
@@ -782,13 +791,17 @@ class GtkTests(Fixture):
                   lambda: False, lambda *_: None)
         window.maintenance.revision += 1
         view.refresh_state()
+        wait_library()
         self.assertEqual(view.cards["total"].get_label(), "1")
         self.assertEqual(view.songs.get_n_items(), 1)
         view.card_action("no_lyrics")
+        wait_library()
         self.assertEqual(view.songs.get_n_items(), 1)
         view.card_action("ready")
+        wait_library()
         self.assertEqual(view.songs.get_n_items(), 0)
         view.all()
+        wait_library()
         self.assertIsNone(window.legacy_controls.get_root())
         visible = view.songs.get_item(0)
         view.song_selection.set_selected(0)
@@ -797,12 +810,14 @@ class GtkTests(Fixture):
         window.maintenance.index.update(visible.data["id"], checked=42.)
         window.maintenance.revision += 1
         view.refresh_state()
+        wait_library()
         self.assertEqual(modifications, [])
         self.assertIs(view.song_selection.get_selected_item(), visible)
         self.assertEqual(visible.data["checked"], 42.)
         window.maintenance.index.update(visible.data["id"], lyrics="Strawberry")
         window.maintenance.revision += 1
         view.refresh_state()
+        wait_library()
         self.assertEqual(modifications, [True])
         self.assertEqual(view.song_selection.get_selected_item().data["id"], visible.data["id"])
         draft = {"duration": 5., "language": "fr", "plain": "Brouillon vocal",
@@ -919,7 +934,6 @@ class GtkTests(Fixture):
         self.assertIn("0 reports mémoire · 0 reports quota", summary)
         self.assertNotIn("Moyennes", summary)
 
-        from time import sleep
 
         # Exercise the real multi-selection, preview and confirmation in a
         # mounted GTK dialog. The fixture collection alone is mutated.
@@ -962,6 +976,27 @@ class GtkTests(Fixture):
                 break
             sleep(.01)
         self.assertTrue((self.root / "Lune" / album.name / "Piste.opus").is_file())
+
+        # A publication receipt must traverse the real background owner and
+        # the GTK list without a manual inventory or a provider request.
+        fresh = self.audio("02 Événement.flac", title="Événement")
+        views = window.maintenance
+        views.index.configure(startup=False, lyrics=False, lrc=False, autoprepare=False, night_enabled=False)
+        views.pause(False)
+        begin = monotonic()
+        views.index.notify([fresh], proofs={str(fresh): {"token": revision(fresh.stat()), "tags": {
+            "title": "Événement", "artist": "Groupe, Invité", "albumartist": "Groupe", "album": "Album",
+            "track": "2", "duration_seconds": 5., "codec": "flac"}}})
+        views.index_wake.set()
+        deadline = begin + 3
+        while not any(view.songs.get_item(i).data["path"] == str(fresh) for i in range(view.songs.get_n_items())):
+            if monotonic() >= deadline:
+                self.fail("La piste publiée n’est pas apparue dans la vue GTK")
+            if not context.iteration(False):
+                sleep(.005)
+        if os.environ.get("PAROLE_TEST_INDEX_TIMING"):
+            print(f"SQLite → liste GTK sur fixture: {monotonic()-begin:.3f} s; "
+                  f"mise à jour GTK: {views.metrics['gtk_library_update']*1000:.2f} ms")
         window.maintenance.journal.emit("SCAN", "Fixture")
         view.console.update()
         self.assertTrue(any(e[-1] == "Fixture" for e in view.console.lines))
