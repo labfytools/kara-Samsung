@@ -823,6 +823,13 @@ class GtkTests(Fixture):
         with patch.object(view.draft_audition, "start") as preview:
             controls_by_label["Mix"].emit("clicked")
             self.assertEqual(preview.call_args.args[2:6], (path, visible.data["token"], .75, 1.99))
+            self.assertEqual(preview.call_args.kwargs, {"isolated": False, "slow": False, "repeat": False})
+            options = {widget.get_label(): widget for widget in descendants(expander.get_child())
+                       if isinstance(widget, Gtk.CheckButton)}
+            options["Répéter 3 fois"].set_active(True)
+            options["Vitesse 80 %"].set_active(True)
+            controls_by_label["Mix"].emit("clicked")
+            self.assertEqual(preview.call_args.kwargs, {"isolated": False, "slow": True, "repeat": True})
         self.assertFalse(window.permits_draft_audition())
         self.assertIn("désactivé", window.seek_draft_review(path, .75))
         with patch.dict(os.environ, {"KARA_SILENT": "0"}), patch.object(window, "player_command") as seek:

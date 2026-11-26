@@ -855,9 +855,15 @@ class ParoleView:
 
             expander.connect("notify::expanded", expanded)
 
+            options = box(Gtk.Orientation.HORIZONTAL, 6)
+            repeat = Gtk.CheckButton(label="Répéter 3 fois")
+            slow = Gtk.CheckButton(label="Vitesse 80 %")
+            options.append(repeat)
+            options.append(slow)
+
             def preview(start, end, isolated):
                 audition.start(panel, self.index.root, path, row["token"], start, end, status.set_text,
-                               isolated=isolated)
+                               isolated=isolated, slow=slow.get_active(), repeat=repeat.get_active())
 
             def jump(_widget, start):
                 error = self.control.seek_draft_review(path, start)
@@ -871,7 +877,8 @@ class ParoleView:
                 audition.stop(panel)
                 status.set_text("")
 
-            review.append(button("Arrêter l’écoute", stop_preview))
+            options.append(button("Arrêter l’écoute", stop_preview))
+            review.append(options)
             for start, end, text in ranges:
                 line = box(Gtk.Orientation.HORIZONTAL, 6)
                 line.append(button(f"{stamp(start)} – {stamp(end)}", lambda widget, at=start: jump(widget, at)))

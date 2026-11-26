@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Répéter un extrait de brouillon trois fois et le ralentir à 80 % en préservant la hauteur, avec arrêt sur reprise de Kara ou de Strawberry.
 - Retirer la provenance vérifiée lorsqu’un audio ou sa référence change de version.
 - Préparer les titres munis d’un texte local sans lancer de recherche quand les fournisseurs de minutage sont indisponibles.
 - Annuler une correction de brouillon sans écriture et garder l’historique d’annulation dans le format en cours.

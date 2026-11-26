@@ -75,7 +75,7 @@ Dans les détails du morceau, **Charger le brouillon Turbo** remplit l’éditeu
 
 **Annuler la correction** recharge le dernier texte enregistré. `Ctrl+Z` annule les saisies dans le format en cours. Enregistrer ou annuler avant de passer du texte au minutage. La confirmation indique le format validé.
 
-Le volet **Passages à vérifier** affiche jusqu’à vingt segments écartés avec leur intervalle et la proposition de Turbo. Les boutons repositionnent dans Strawberry le morceau déjà sélectionné. Le parcours de vérification respecte les préparations et les tours Kara en cours. La correction se fait toujours dans l’éditeur du format choisi.
+Le volet **Passages à vérifier** affiche jusqu’à vingt segments écartés avec leur intervalle et la proposition de Turbo. Le bouton du repère repositionne dans Strawberry le morceau déjà sélectionné. **Mix** et **Voix** ouvrent jusqu’à douze secondes dans un lecteur local lorsque Kara et Strawberry sont au repos. **Répéter 3 fois** rejoue le même extrait. **Vitesse 80 %** ralentit sa lecture en préservant autant que possible la hauteur. Fermer le volet ou reprendre la lecture dans Kara ou Strawberry interrompt l’extrait. La correction se fait dans l’éditeur du format choisi.
 
 ### Essai du brouillon Vulkan sur un extrait réel
 

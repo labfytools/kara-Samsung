@@ -11,6 +11,8 @@ from _parole_index import document
 RATE = 48_000
 FRAME_BYTES = 4
 MAX_SECONDS = 12
+SLOW_RATE = .8
+REPEAT_COUNT = 3
 
 
 def vocal_file(song):
@@ -58,7 +60,7 @@ class DraftAudition:
         report("Délai de lecture dépassé." if allowed else "Écoute interrompue.")
         return GLib.SOURCE_REMOVE
 
-    def start(self, owner, root, song, expected, start, end, report, *, isolated=False):
+    def start(self, owner, root, song, expected, start, end, report, *, isolated=False, slow=False, repeat=False):
         self.stop()
         if not self.permitted():
             report("L’écoute est disponible lorsque Kara et Strawberry sont au repos.")
@@ -82,11 +84,14 @@ class DraftAudition:
             report("Voix séparée indisponible pour cette version.")
             return
         seconds = min(end - start, MAX_SECONDS)
+        duration = seconds / SLOW_RATE if slow else seconds
+        repetitions = REPEAT_COUNT if repeat else 1
+        tempo = ("-af", f"atrim=duration={seconds:.6f},atempo={SLOW_RATE}") if slow else ()
         # FFmpeg decodes a bounded, fixed-format PCM interval over a private
-        # pipe. No original metadata or source URI reaches the audio sink.
+        # pipe. Trim before slowing so the next phrase cannot enter the loop.
         command = ("ffmpeg", "-v", "error", "-xerror", "-nostdin", "-protocol_whitelist", "file,pipe",
-                   "-ss", f"{start:.6f}", "-threads", "1", "-i", str(source), "-t", f"{seconds:.6f}",
-                   "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "2", "-ar", str(RATE),
+                   "-ss", f"{start:.6f}", "-threads", "1", "-i", str(source), "-t", f"{duration:.6f}",
+                   "-map", "0:a:0", "-vn", "-sn", "-dn", *tempo, "-ac", "2", "-ar", str(RATE),
                    "-f", "s16le", "pipe:1")
         try:
             self.process = Gio.Subprocess.new(command, Gio.SubprocessFlags.STDOUT_PIPE |
@@ -95,12 +100,12 @@ class DraftAudition:
             report("Décodeur audio indisponible.")
             return
         self.owner = owner
-        self.timer = GLib.timeout_add(150, self.watch, monotonic() + seconds + 8, report)
+        self.timer = GLib.timeout_add(150, self.watch, monotonic() + duration * repetitions + 8, report)
         report("Ouverture de la voix isolée…" if isolated else "Ouverture du mix…")
-        self.process.communicate_async(None, None, self.decoded, (original, seconds, report))
+        self.process.communicate_async(None, None, self.decoded, (original, duration, repetitions, report))
 
     def decoded(self, process, result, data):
-        original, seconds, report = data
+        original, duration, repetitions, report = data
         try:
             _, pcm, _ = process.communicate_finish(result)
         except GLib.Error:
@@ -108,7 +113,7 @@ class DraftAudition:
         if process is not self.process:
             return
         size = pcm.get_size() if pcm is not None else 0
-        if (not 0 < size <= (MAX_SECONDS * RATE + 1) * FRAME_BYTES
+        if (not 0 < size <= (duration * RATE + 1) * FRAME_BYTES
                 or size % FRAME_BYTES or not process.get_successful()):
             self.stop()
             report("Extrait audio illisible.")
@@ -117,13 +122,17 @@ class DraftAudition:
             self.stop()
             report("Écoute annulée. Le lecteur ou le fichier a changé.")
             return
+        # Replay the same verified PCM in the same owned process. Repetition
+        # neither reopens the source nor bypasses the priority watchdog.
+        if repetitions > 1:
+            pcm = GLib.Bytes.new(pcm.get_data() * repetitions)
         try:
             self.process = self.player()
         except GLib.Error:
             self.stop()
             report("Sortie audio indisponible.")
             return
-        report(f"Écoute en cours · {seconds:g} s")
+        report(f"Écoute en cours · {size * repetitions / (FRAME_BYTES * RATE):.2f} s")
         self.process.communicate_async(pcm, None, self.played, report)
 
     @staticmethod

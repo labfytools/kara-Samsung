@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -B
 """Écoute bornée sur PCM local, sans connexion au serveur audio du bureau."""
 from array import array
+from math import sin, tau
 from pathlib import Path
 import subprocess
 import sys
@@ -66,16 +67,50 @@ class Audition(unittest.TestCase):
         self.assertTrue(self.reported, self.messages)
 
     def test_audio_decodes_only_the_requested_frames(self):
+        self.assertEqual(self.capture(), b"\xc8\x00\xc8\x00" * (review.RATE // 4))
+
+    def capture(self, **options):
         sink = self.root / "pcm.raw"
         command = (sys.executable, "-c", "import sys; open(sys.argv[1], 'wb').write(sys.stdin.buffer.read())",
                    str(sink))
         with patch.object(review.DraftAudition, "player",
                           side_effect=lambda: Gio.Subprocess.new(command, Gio.SubprocessFlags.STDIN_PIPE)):
-            self.wait_for(self.start)
+            self.wait_for(lambda report: self.start(report, **options))
         self.assertEqual(self.messages[-1], "Extrait terminé.")
-        self.assertEqual(sink.read_bytes(), b"\xc8\x00\xc8\x00" * (review.RATE // 4))
         self.assertIsNone(self.audition.process)
         self.assertEqual(self.audition.timer, 0)
+        return sink.read_bytes()
+
+    def test_repetition_plays_the_same_passage_three_times(self):
+        once = self.capture()
+        self.assertEqual(self.capture(repeat=True), once * 3)
+
+    def test_slow_passage_retains_pitch_and_repeats_the_trimmed_audio(self):
+        with wave.open(str(self.song), "wb") as stream:
+            stream.setparams((2, 2, review.RATE, 0, "NONE", "not compressed"))
+            # Distinct pitches on either side expose a misplaced trim.
+            frames = array("h")
+            for pos in range(review.RATE):
+                pitch = 440 if review.RATE // 2 <= pos < 3 * review.RATE // 4 else 880
+                sample = round(8000 * sin(tau * pitch * pos / review.RATE))
+                frames.extend((sample, sample))
+            if sys.byteorder != "little":
+                frames.byteswap()
+            stream.writeframes(frames.tobytes())
+        self.version = document(file_token(self.song))
+        once = self.capture(slow=True)
+        self.assertEqual(self.capture(slow=True, repeat=True), once * 3)
+        mono = array("h", once)
+        if sys.byteorder != "little":
+            mono.byteswap()
+        mono = mono[::2]
+        duration = len(mono) / review.RATE
+        self.assertGreater(duration, .25)
+        self.assertLessEqual(duration, .25 / review.SLOW_RATE)
+        middle = mono[960:-960]
+        crossings = sum(a <= 0 < b for a, b in zip(middle, middle[1:]))
+        measured = crossings * review.RATE / (len(middle) - 1)
+        self.assertAlmostEqual(measured, 440, delta=12)
 
     def test_blocked_missing_stale_and_unmapped_previews(self):
         with patch.object(review.DraftAudition, "player") as player:
