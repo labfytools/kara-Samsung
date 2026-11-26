@@ -149,6 +149,28 @@ class NightTests(unittest.TestCase):
         self.assertFalse(self.observe(screen_off=False))
         self.assertTrue(self.night.reopened)
 
+    def test_protected_closure_restores_display_after_battery_sleep(self):
+        self.settings.update(night_lid=True, night_lid_qualified=True)
+        self.state = replace(self.state, screen_off=False)
+        self.open()
+        self.assertFalse(self.observe(lid=True))
+        self.login.display.assert_called_once_with(False)
+        self.assertTrue(self.observe(screen_off=True))
+        self.ac = False
+        self.assertFalse(self.observe(sleeping=True))
+        self.assertIsNone(self.night.lid_fd)
+        self.assertFalse(self.observe(lid=False))
+        self.assertEqual(self.login.display.call_count, 1)
+        self.assertFalse(self.observe(sleeping=False))
+        self.night.open_since -= 3
+        self.night.next_display = 0
+        with patch("_parole_night.acpi_lid_closed", return_value=False):
+            self.assertFalse(self.observe(lid=False))
+        self.login.display.assert_called_with(True)
+        self.assertIsNone(self.night.lid_fd)
+        self.assertFalse(self.observe(screen_off=False))
+        self.assertFalse(self.night.restore_display)
+
     def test_expiry_releases_lid_even_when_no_work_is_due(self):
         self.settings.update(night_lid=True, night_lid_qualified=True)
         self.assertTrue(self.night.refresh(self.settings))

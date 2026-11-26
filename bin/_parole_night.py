@@ -312,7 +312,6 @@ class Night:
             self.journal.emit("IDLE", "Capot fermé" if state.lid else "Capot ouvert · signal confirmé")
             self.reopened = bool(previous and previous.lid and not state.lid)
             if self.reopened:
-                self.restore_display = self.lid_fd is not None
                 self.end_window("réouverture du capot")
                 if self.restore_display:
                     self.activity()
@@ -373,9 +372,21 @@ class Night:
             if now >= self.next_desktop:
                 self.next_desktop = now + .85
                 self.observe(now)
+            state = self.desktop
+            waking_display = False
+            # The protected closure owns the display transition even after
+            # logind gets its lid policy back. A confirmed wake on battery
+            # can restore the display without admitting work or inhibitors.
+            if self.restore_display and state and state.active and not state.sleeping and not state.lid:
+                waking_display = state.screen_off
+                if waking_display:
+                    self.set_display(True, now)
+                else:
+                    self.restore_display = False
+                    if self.delay is None:
+                        self.stop_work()
         except self.errors():
             return self.suspend("état de la session Sway ou logind indisponible", running=running)
-        state = self.desktop
         if power is not True:
             return self.suspend("secteur requis", running=running)
         if state is None or state.sleeping:
@@ -392,6 +403,7 @@ class Night:
                 self.lid_fd = self.login.inhibit("handle-lid-switch", "block")
                 self.journal.emit("IDLE", "Inhibiteur de capot actif · prêt avant fermeture")
             if self.lid_fd is not None and state.lid:
+                self.restore_display = True
                 self.start_budget()
                 # Keep logind's idle action inhibited across tasks, including
                 # when the queue is empty. Manual sleep has only a delay FD.
@@ -400,13 +412,8 @@ class Night:
                     self.window = self.index.start_closed_report()
                 if not self.secure_closed(now):
                     return False
-            if self.restore_display and not state.lid:
-                if state.screen_off:
-                    self.set_display(True, now)
-                    return self.report("Réouverture du capot · réactivation des écrans")
-                self.restore_display = False
-                if self.delay is None:
-                    self.stop_work()
+            if waking_display:
+                return self.report("Réouverture du capot · réactivation des écrans")
         except self.errors():
             return self.suspend("inhibiteur de capot ou commande Sway indisponible", running=running)
         return True

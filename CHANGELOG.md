@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Rallumer les écrans Sway à la réouverture confirmée après un débranchement et une veille sur batterie.
 - Étendre les requêtes LRCLIB aux variantes de crédits et de graphie en conservant les contrôles d’identité.
 - Mettre en file les transcriptions nocturnes sans référence et proposer des brouillons éditables avec des observations Turbo réutilisables.
 - Proposer les correspondances Unison par ISRC dans les détails, avec le lien et le crédit d’origine.
