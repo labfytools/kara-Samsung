@@ -144,6 +144,14 @@ Sur la pop, l’alignement F16 du découpage affiche encore un pire début de mo
 
 Les trois décodages Q5 sur chansons entières ont fini au seuil de PSI de 1 % avec leurs séparations déjà disponibles. Sur les titres anglais et français, les pics enregistrés sont de 0,06 % et 0,36 %. Les réserves minimales mesurées sont de 5,33 Gio et 5,20 Gio. La tentative F16 espagnole a été arrêtée à environ 4 Gio disponibles pendant la lecture de la voix. La tentative F16 française a été interrompue par une variation de capot ou d’alimentation. Ces essais laissent ouverte la qualification complète de Demucs au seuil de production. Le titre pop n’indique pas un gain de vitesse lié à la quantification.
 
+### Paroles superposées et exécution réelle du brouillon
+
+La pop française *Pas que t’es pas* d’AZUL possède le marqueur `LyricOverlap` dans JamendoLyrics. Les deux passes Q5 terminent cette chanson de 202,41 s sous le seuil de 1 %, avec un PSI maximal de 0,44 %. Sur 296 mots de référence, le mix produit 43 erreurs, soit 14,53 %, et la voix isolée 35, soit 11,82 %. Le CER passe de 7,51 % à 5,74 %. Le décodeur prend environ 78 s par entrée. Parmi les 240 débuts de mot annotés, 86,67 % sont à ±500 ms sur le mix et 88,33 % sur la voix. Le p95 de fin de ligne passe de 1 208 à 1 084 ms. Chaque entrée produit un mot dans un grand intervalle entre annotations. Ces mesures couvrent le morceau entier, avec une seule annotation chronologique et sans référence séparée par voix. [JamendoLyrics](https://huggingface.co/datasets/jamendolyrics/jamendolyrics)
+
+Le folk espagnol *Esencia* de NandoMalo porte le marqueur `Polyphonic`. Demucs a été arrêté après 89 s de séparation à 3,99 Gio disponibles au seuil manuel de 4 Gio, avec un PSI de 0 %. Le stem n’a donc pas été évalué. Les entrées d’AZUL et de NandoMalo ont été utilisées pour le calcul local sous CC BY-NC-SA et CC BY-SA respectivement. Les pistes, annotations et stems restent dans l’espace privé d’essai. [CC BY-NC-SA](https://creativecommons.org/licenses/by-nc-sa/4.0/) · [CC BY-SA](https://creativecommons.org/licenses/by-sa/4.0/)
+
+Le chemin exact du brouillon de production F16 a également été exécuté sur une copie du titre country français. Il a atteint la transcription du mix et a été arrêté à 1,09 % de PSI, avec 4,21 Gio disponibles, après environ 10 s. Le relevé ne contient aucune phase Demucs et aucun brouillon n’a été publié pendant cette tentative.
+
 ### Détection d’activité sur un titre entier
 
 Un second banc a comparé les niveaux RMS, le rapport de niveau entre le stem et le mix, et Silero VAD sur le même titre complet de 193,68 s. Chaque décision s’applique à un intervalle de 100 ms. Le centre appartient soit à un mot annoté, soit à un intervalle éloigné d’au moins 500 ms des annotations. Les 1 401 intervalles de la première catégorie et les 201 de la seconde déterminent les fractions du tableau. La seconde catégorie peut contenir des sons vocaux non annotés.
