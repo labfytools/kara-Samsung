@@ -20,6 +20,7 @@ class RemoteParty:
         self.receipts = OrderedDict()
         self.history = defaultdict(list)
         self.phase = "lobby"
+        self.identity = uuid4().hex
         self.queue = deque()
         self.plan = []
         self.current = None
@@ -506,6 +507,7 @@ class RemoteParty:
 
     def reset(self):
         self.phase = "lobby"
+        self.identity = uuid4().hex
         self.history.clear()
         self.plan.clear()
         self.queue.clear()

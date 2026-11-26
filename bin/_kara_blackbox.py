@@ -3,8 +3,10 @@ from collections import Counter
 from datetime import datetime, timezone
 from fcntl import LOCK_EX, LOCK_NB, flock
 from hashlib import file_digest, sha256
+from hmac import digest as hmac_digest
 import importlib.metadata
 import json
+from math import isfinite
 import os
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -22,8 +24,10 @@ from uuid import uuid4
 from _kara_paths import BIN, STATE
 
 ROOT = STATE / "kara/blackbox"
-FORMAT = 1
+FORMAT = 3
+LEGACY_FORMAT = 1
 SESSION = re.compile(r"session-[0-9]{8}T[0-9]{6}-[a-f0-9]{12}")
+TURN = re.compile(r"[a-f0-9]{16}")
 MAX_EVENT = 65536
 DEFAULT_BYTES = 128 * 1024 * 1024
 DEFAULT_VOICE_BYTES = 16 * 1024 ** 3
@@ -33,6 +37,10 @@ GRAPH_TRACKS = ("monitor", "witness")
 GRAPH_CLOCK_FIELDS = ("driver", "frame", "monotonic_ns", "xrun", "quantum", "present",
                       "spa_headers", "route", "epoch")
 TRACK_NAME = re.compile(r"[a-f0-9]{16}-(?:wifi|whisper|return|monitor|witness)-[0-9]{4}\.wav")
+TRACKS = ("wifi", "whisper", "return", *GRAPH_TRACKS)
+DEFAULT_TRACKS = tuple(track for track in TRACKS if track != "witness")
+STREAM_ROLES = {"wifi": "MIC_RECEIVED", "whisper": "MIC_PROCESSED", "return": "PLAYER_MONITOR",
+                "monitor": "OUTPUT_MONITOR", "witness": "ACOUSTIC_WITNESS"}
 FLOAT_WAV = struct.Struct("<4sI4s4sIHHIIHH4sII4sI")
 INCIDENTS = {"error", "disconnect", "interrupted", "capture-gap", "overflow",
              "partial", "xrun", "write-error", "marker", "tv-timeout", "clipping"}
@@ -57,6 +65,13 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def cycle_id(session, turn):
+    # Kara turn identity is independent of a PipeWire driver cycle or a
+    # mobile activation. Prefix it with the capture ID for offline joins.
+    if isinstance(turn, str) and TURN.fullmatch(turn):
+        return f"{session}/{turn}"
+
+
 def digest(path):
     with path.open("rb") as stream:
         return file_digest(stream, "sha256").hexdigest()
@@ -72,8 +87,7 @@ def sync_directory(path):
 
 def atomic_text(path, text):
     draft = path.with_name("." + path.name + ".tmp")
-    with os.fdopen(os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
-                   "w", encoding="utf-8") as stream:
+    with open(draft, "w", opener=private_file, encoding="utf-8") as stream:
         stream.write(text)
         stream.flush()
         os.fsync(stream.fileno())
@@ -86,7 +100,7 @@ def atomic_json(path, value):
 
 
 def events(path):
-    with path.open("rb") as stream:
+    with open(path, "rb", opener=private_file) as stream:
         for row in iter(lambda: stream.readline(MAX_EVENT + 1), b""):
             if len(row) > MAX_EVENT or not row.endswith(b"\n"):
                 raise ValueError("Événement incomplet ou trop long.")
@@ -107,9 +121,9 @@ def session_folders(root):
 def recover_events(path):
     # A killed writer may leave one partial line. Keep all preceding
     # complete records and record the interrupted status in the manifest.
-    if not path.exists():
-        path.touch(mode=0o600)
-    with path.open("rb+") as stream:
+    with open(path, "ab", opener=private_file):
+        pass
+    with open(path, "rb+", opener=private_file) as stream:
         valid_end = 0
         while row := stream.readline(MAX_EVENT + 1):
             try:
@@ -128,13 +142,34 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
     log = folder / "events.jsonl"
     recover_events(log)
     by_component, by_event = Counter(), Counter()
-    acoustic = {}
-    with os.fdopen(os.open(folder / "incidents.jsonl", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600),
-                   "w", encoding="utf-8") as incidents:
+    acoustic, cycles = {}, {}
+    capture = manifest.get("capture", {})
+    modern = manifest["format"] == FORMAT
+    missing = recover_segments(folder, log) if modern and reason in ("interrupted", "write-error") else 0
+    with open(folder / "incidents.jsonl", "w", opener=private_file, encoding="utf-8") as incidents:
         for item in events(log):
             by_component[item["component"]] += 1
             by_event[item["event"]] += 1
             data, turn = item["data"] if "data" in item else {}, item.get("turn")
+            if modern and item.get("cycle"):
+                cycle = cycles.setdefault(item["cycle"], {"turn": turn, "start_ns": None, "end_ns": None,
+                                                           "streams": {}, "player": None, "identity": {}})
+                cycle["player"] = item.get("player_id") or cycle["player"]
+                if item["event"] == "turn-start":
+                    cycle["start_ns"] = item["monotonic_ns"]
+                    cycle["identity"] = data.get("identity", {})
+                elif item["event"] == "turn-end":
+                    cycle["end_ns"] = item["monotonic_ns"]
+                elif item["component"] == "audio" and item["event"] == "reference":
+                    cycle["references"] = data.get("files", {})
+                elif item["event"] == "pcm":
+                    track = data["track"]
+                    entry = cycle["streams"].setdefault(STREAM_ROLES[track], {
+                        "id": data["stream"], "state": "available", "frames": 0, "formats": []})
+                    entry["frames"] += data["frames"]
+                    layout = [data["rate"], data["channels"], data.get("sample_format", "s16le")]
+                    if layout not in entry["formats"]:
+                        entry["formats"].append(layout)
             if item["component"] == "acoustic" and item["event"] == "tap":
                 record = acoustic.setdefault(turn, {}).setdefault(data["track"], {
                     "frames": 0, "drivers": [], "states": [], "epochs": 0})
@@ -162,7 +197,8 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
         os.fsync(incidents.fileno())
     complete = not (dropped or error or reason == "interrupted")
     summary = {"session": manifest["session"], "complete": complete, "reason": reason, "dropped": dropped,
-               "error": error, "events": sum(by_event.values()), "by_component": dict(by_component),
+               "error": error, "unrecoverable_pcm_events": missing,
+               "events": sum(by_event.values()), "by_component": dict(by_component),
                "by_event": dict(by_event), "incidents": sum(by_event[kind] for kind in INCIDENTS)}
     atomic_json(folder / "summary.json", summary)
     atomic_text(folder / "REPORT.md",
@@ -172,12 +208,14 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
                 f"- Événements perdus : {dropped}\n\n"
                 "Les identifiants de preuve figurent dans `incidents.jsonl`.\n")
     names = ["events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"]
-    for path in sorted((folder / "audio").glob("*.wav")):
-        if not TRACK_NAME.fullmatch(path.name) or path.is_symlink():
-            continue
-        if reason == "interrupted" and not recover_wave(path):
-            continue
-        names.append(f"audio/{path.name}")
+    audio = folder / "audio"
+    if not audio.is_symlink():
+        for path in sorted(audio.glob("*.wav")):
+            if not TRACK_NAME.fullmatch(path.name) or path.is_symlink():
+                continue
+            if reason == "interrupted" and not modern and not recover_wave(path):
+                continue
+            names.append(f"audio/{path.name}")
     manifest.update(status="complete" if complete else "incomplete", ended=now(),
                     files={name: {"sha256": digest(folder / name), "bytes": (folder / name).stat().st_size}
                            for name in names})
@@ -190,6 +228,30 @@ def finish_manifest(folder, manifest, *, reason, dropped, error=None):
                                      else "recorded" if track["frames"] else "unavailable")
         manifest["capture"]["acoustic"] = {"turns": acoustic, "clock": "pipewire_host_monotonic",
                                            "cross_device_calibrated": False, "hardware_bound_ns": None}
+    if modern:
+        for cycle in cycles.values():
+            for track, role in STREAM_ROLES.items():
+                stream = cycle["streams"].setdefault(role, {
+                    "id": f"{cycle_id(manifest['session'], cycle['turn'])}/{track}",
+                    "state": "absent" if track in capture["tracks"] else "disabled", "frames": 0})
+                graph = acoustic.get(cycle["turn"], {}).get(track, {})
+                if stream["frames"] and (not complete or not cycle["start_ns"] or not cycle["end_ns"]
+                                         or graph.get("coverage") == "partial"):
+                    stream["state"] = "incomplete"
+                elif not stream["frames"] and "unavailable" in graph.get("states", ()):
+                    stream["state"] = "unusable"
+            for role in ("MIC_RAW", "PLAYBACK_REFERENCE", "MIC_AEC", "TURBO_INPUT"):
+                cycle["streams"].setdefault(role, {"state": "not_applicable"})
+            for role, name in (("MUSIC_REFERENCE", "instrumental"), ("ORIGINAL_VOCAL", "original_voice")):
+                reference = cycle.get("references", {}).get(name)
+                cycle["streams"][role] = {"state": "available", "reference": reference} if reference else {"state": "absent"}
+        manifest["cycles"] = cycles
+        manifest["total_bytes"] = sum(file["bytes"] for file in manifest["files"].values())
+        capture["state"] = ("incomplete" if not complete or any(
+            not cycle["start_ns"] or not cycle["end_ns"] or capture["voice"] and any(
+                cycle["streams"][STREAM_ROLES[track]]["state"] in ("absent", "incomplete", "unusable")
+                for track in capture["tracks"]) for cycle in cycles.values())
+                            else "recorded" if cycles else "empty")
     # Publish the terminal manifest last. Its hashes cover the final report
     # and indexes so readers never mistake an interrupted write for success.
     atomic_json(folder / "manifest.json", manifest)
@@ -348,21 +410,22 @@ class BlackBox:
         for folder in session_folders(self.root):
             manifest = folder / "manifest.json"
             try:
-                data = json.loads(manifest.read_text())
+                with open(manifest, opener=private_file) as stream:
+                    data = json.load(stream)
                 if data.get("status") == "recording":
                     finish_manifest(folder, data, reason="interrupted", dropped=None)
                 self.last = json.loads((folder / "summary.json").read_text())
             except (OSError, ValueError):
                 continue
 
-    def start(self, *, consent=False, voice=False, configuration=None, tracks=None):
+    def start(self, *, consent=False, voice=False, configuration=None, tracks=None, identity=None):
         if consent is not True:
             raise ValueError("Confirme l’accord des participants et des responsables des mineurs.")
-        allowed = {"wifi", "whisper", "return", *GRAPH_TRACKS}
+        allowed = set(TRACKS)
         if tracks is not None and (not isinstance(tracks, list) or len(tracks) > len(allowed)
                                    or any(not isinstance(track, str) or track not in allowed for track in tracks)):
             raise ValueError("Pistes BlackBox invalides.")
-        selected = sorted(allowed if tracks is None else set(tracks)) if voice is True else []
+        selected = sorted(DEFAULT_TRACKS if tracks is None else set(tracks)) if voice is True else []
         with self.lock:
             if self.session is not None:
                 return
@@ -374,13 +437,20 @@ class BlackBox:
                 flock(owner, LOCK_EX | LOCK_NB)
                 if (self.disk_available() or 0) < self.reserve + 65536:
                     raise OSError("Espace disque insuffisant pour BlackBox.")
-                identity = datetime.now(timezone.utc).strftime("session-%Y%m%dT%H%M%S-") + uuid4().hex[:12]
-                folder = self.root / identity
+                session = datetime.now(timezone.utc).strftime("session-%Y%m%dT%H%M%S-") + uuid4().hex[:12]
+                folder = self.root / session
                 folder.mkdir(mode=0o700)
-                manifest = {"format": FORMAT, "session": identity, "status": "recording",
+                config = clean(configuration or {})
+                manifest = {"format": FORMAT, "session": session, "status": "recording",
                             "started": now(), "monotonic_ns": time.monotonic_ns(),
-                            "capture": {"voice": bool(selected), "tracks": selected},
-                            "configuration": clean(configuration or {}),
+                            "identity": clean(identity or {}),
+                            "capture": {"voice": bool(selected), "tracks": selected,
+                                        "mode": "deep_analysis" if voice is True else "diagnostic_light",
+                                        "organizer_consent": True, "witness_selected": "witness" in selected},
+                            "configuration": config,
+                            "configuration_id": sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+                            "clocks": {"server": "CLOCK_MONOTONIC", "graph": "PipeWire spa_io_clock",
+                                       "utc": "wall_label_only", "physical_alignment_bound_ns": None},
                             "quota_bytes": self.max_bytes if self.max_bytes is not None else
                                 (DEFAULT_VOICE_BYTES if voice is True else DEFAULT_BYTES)}
                 atomic_json(folder / "manifest.json", manifest)
@@ -414,6 +484,8 @@ class BlackBox:
                 return
             if component == "acoustic" and event == "tap" and data.get("state") == "unavailable":
                 record.unavailable.add(data["track"])
+            if component == "party" and event == "turn-end" and turn:
+                record.ended.add(turn)
             record.sequence += 1
             item = record.item(component, event, player, song, turn, position, data)
             try:
@@ -425,7 +497,7 @@ class BlackBox:
             clock=None, recording_session=None, packet_timing=None):
         # Explicit voice consent is independent of metadata collection. This
         # admission check lives before the copy and never performs file I/O.
-        if track not in ("wifi", "whisper", "return", *GRAPH_TRACKS) or not re.fullmatch(r"[a-f0-9]{16}", turn):
+        if track not in TRACKS or not isinstance(turn, str) or not TURN.fullmatch(turn):
             return
         graph = track in GRAPH_TRACKS
         width = 4 if graph else 2
@@ -438,29 +510,29 @@ class BlackBox:
                       or len(block) != clock["quantum"] * channels * width):
             return
         if (sequence is not None and type(sequence) is not int
-                or capture_end is not None and type(capture_end) not in (int, float)):
+                or capture_end is not None and (type(capture_end) not in (int, float) or not isfinite(capture_end))):
             return
         with self.lock:
             record = self.session
-            if (record is None or record.stop.is_set() or track not in record.tracks
+            if (record is None or record.stop.is_set() or track not in record.tracks or turn in record.ended
                     or recording_session is not None and recording_session != record.identity):
                 return
             # The per-packet schema only contains typed numeric clock fields
             # and generated identifiers. Cache the already-scrubbed labels
             # once per turn so routine PCM never scans its metadata for secrets.
-            if turn not in record.pcm_labels:
-                record.pcm_labels[turn] = clean(player), clean(song)
-            player, song = record.pcm_labels[turn]
+            if turn not in record.pcm_titles:
+                record.pcm_titles[turn] = clean(song)
             record.sequence += 1
-            item = record.item("audio", "pcm", player, song, turn, None,
+            item = record.item("audio", "pcm", player, record.pcm_titles[turn], turn, None,
                                {"track": track, "rate": rate, "channels": channels,
-                                "sequence": sequence, "capture_end_s": capture_end})
+                                "sequence": sequence, "capture_end_s": capture_end,
+                                "stream": f"{cycle_id(record.identity, turn)}/{track}"})
             if graph:
                 item["data"].update(clock={key: clock[key] for key in GRAPH_CLOCK_FIELDS}, sample_format="f32le")
             if packet_timing is not None and track in ("wifi", "whisper"):
                 item["data"]["packet_timing"] = {
                     key: packet_timing[key] for key in ("frame_end", "send_ms", "received_s")
-                    if type(packet_timing.get(key)) in (int, float)
+                    if type(packet_timing.get(key)) in (int, float) and isfinite(packet_timing[key])
                 }
             try:
                 record.pending.put_nowait((item, bytes(block)))
@@ -469,7 +541,7 @@ class BlackBox:
 
 
 def private_file(path, flags):
-    return os.open(path, flags | os.O_NOFOLLOW, 0o600)
+    return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
 
 
 def float_header(rate, channels, size):
@@ -535,8 +607,9 @@ def recover_wave(path):
 class Segment:
     def __init__(self, path, rate, channels, *, floating=False):
         self.path, self.rate, self.channels = path, rate, channels
+        self.draft = path.with_suffix(".part")
         self.size = 0
-        self.file = open(path, "wb", opener=private_file)
+        self.file = open(self.draft, "xb", opener=private_file)
         self.width = 4 if floating else 2
         self.writer = None if floating else wave.open(self.file, "wb")
         if self.writer is None:
@@ -564,16 +637,57 @@ class Segment:
             os.fsync(self.file.fileno())
         finally:
             self.file.close()
+        # File contents and the RIFF header are durable before the final
+        # name becomes visible. Recovery can still salvage an open draft.
+        self.draft.replace(self.path)
+        sync_directory(self.path.parent)
+
+
+def recover_segments(folder, log):
+    """Salvage PCM drafts and remove only journal rows whose payload is gone."""
+    audio = folder / "audio"
+    layouts = {}
+    if not audio.is_symlink():
+        for path in audio.iterdir() if audio.is_dir() else ():
+            target = path.with_suffix(".wav")
+            if path.is_symlink() or not TRACK_NAME.fullmatch(target.name) or not path.is_file():
+                continue
+            if path.suffix == ".part" and not target.exists() and recover_wave(path):
+                path.replace(target)
+                sync_directory(audio)
+            if target.is_file() and not target.is_symlink():
+                try:
+                    layouts[f"audio/{target.name}"] = wave_layout(target)[2]
+                except (ValueError, OSError, EOFError, wave.Error):
+                    continue
+    # Keep original event IDs, making each removed PCM record visible as a
+    # sequence gap. Stream the rewrite so recovery memory is independent of audio size.
+    draft = log.with_name(".events.recovering")
+    missing = 0
+    with open(draft, "w", opener=private_file, encoding="utf-8") as stream:
+        for item in events(log):
+            if item.get("event") == "pcm":
+                data = item["data"]
+                if data["sample"] + data["frames"] > layouts.get(data["file"], 0):
+                    missing += 1
+                    continue
+            stream.write(json.dumps(item, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    draft.replace(log)
+    sync_directory(folder)
+    return missing
 
 
 def validate_recording(folder, manifest):
-    if manifest["format"] != FORMAT or manifest["session"] != folder.name:
+    if manifest["format"] not in (FORMAT, LEGACY_FORMAT) or manifest["session"] != folder.name:
         raise ValueError("Manifeste incompatible.")
-    if manifest["status"] == "recording":
+    modern = manifest["format"] == FORMAT
+    if manifest["status"] not in ("complete", "incomplete"):
         raise ValueError("La session est en cours ou doit être récupérée par Parole.")
     if not {"events.jsonl", "incidents.jsonl", "summary.json", "REPORT.md"} <= set(manifest["files"]):
         raise ValueError("Inventaire de session invalide.")
-    audio = {}
+    audio, tails, cycles = {}, {}, set()
     for name, entry in manifest["files"].items():
         path = folder / name
         if path.is_symlink():
@@ -589,6 +703,12 @@ def validate_recording(folder, manifest):
     for item in events(folder / "events.jsonl"):
         if item["session"] != folder.name or item["id"] <= previous:
             raise ValueError("Identité ou ordre d’événement invalide.")
+        if modern:
+            cycle = cycle_id(folder.name, item.get("turn"))
+            if cycle != item.get("cycle"):
+                raise ValueError("Identité de cycle invalide.")
+            if cycle:
+                cycles.add(cycle)
         if item["event"] == "pcm":
             data = item["data"]
             rate, channels, frames, width, _ = audio[data["file"]]
@@ -596,6 +716,14 @@ def validate_recording(folder, manifest):
             if (data["rate"], data["channels"], width) != (rate, channels, 4 if graph else 2) or not (
                     0 <= data["sample"] < data["sample"] + data["frames"] <= frames):
                 raise ValueError("Index PCM invalide.")
+            if modern:
+                prefix = f"audio/{item['turn']}-{data['track']}-"
+                tail = tails.get(data["file"], 0)
+                if (not cycle or data.get("stream") != f"{cycle}/{data['track']}"
+                        or not data["file"].startswith(prefix) or data["sample"] < tail
+                        or manifest["status"] == "complete" and data["sample"] != tail):
+                    raise ValueError("Identité du flux ou continuité de l’index PCM invalide.")
+                tails[data["file"]] = data["sample"] + data["frames"]
             if graph:
                 clock = data["clock"]
                 expected_planes = 6 if data["track"] == "monitor" else 1
@@ -614,6 +742,11 @@ def validate_recording(folder, manifest):
                     gaps += clock["frame"] > last["frame"] + last["quantum"]
                 graph_tail[key] = clock
         previous = item["id"]
+    if modern and (cycles != set(manifest["cycles"]) or any(
+            cycle_id(folder.name, entry["turn"]) != identity for identity, entry in manifest["cycles"].items())):
+        raise ValueError("Inventaire des cycles invalide.")
+    if modern and manifest["status"] == "complete" and any(tails.get(name) != layout[2] for name, layout in audio.items()):
+        raise ValueError("Échantillons PCM dépourvus de journal.")
     return {"valid": True, "status": manifest["status"], "session": folder.name, "graph_index_gaps": gaps}
 
 
@@ -627,13 +760,23 @@ class Recording:
         self.reason = "interrupted"
         self.dropped = self.sequence = 0
         self.segments = {}
-        self.pcm_labels = {}
+        self.pcm_titles = {}
+        self.players = {}
+        self.pseudonym_key = uuid4().bytes
+        self.ended = set()
         self.tracks = frozenset(manifest["capture"]["tracks"])
         self.unavailable = set()
 
     def item(self, component, event, player, song, turn, position, data):
+        if isinstance(player, str) and player:
+            if player not in self.players:
+                self.players[player] = hmac_digest(self.pseudonym_key, player.encode(), "sha256").hex()[:24]
+            player = self.players[player]
+        else:
+            player = None
         return {"id": self.sequence, "session": self.identity, "component": component, "event": event,
                 "monotonic_ns": time.monotonic_ns(), "turn": turn, "player": player,
+                "player_id": player, "cycle": cycle_id(self.identity, turn), "configuration_id": self.manifest["configuration_id"],
                 "song": song, "position": position, "data": data}
 
     def append_pcm(self, item, block):
@@ -688,7 +831,7 @@ class Recording:
                             raise OSError("Limite de taille BlackBox atteinte.")
                         self.append_pcm(item, block)
                         written += len(block) + 44
-                    if item["event"] == "turn-end":
+                    if item["component"] == "party" and item["event"] == "turn-end":
                         self.close_turn(item["turn"])
                     try:
                         raw = (json.dumps(item if pcm else clean(item), ensure_ascii=False, allow_nan=False,

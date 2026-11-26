@@ -723,7 +723,7 @@
     if (state.party.blackbox?.active) await command("blackbox-stop");
     else {
       const voice = $("bb-voice").checked;
-      const subject = voice ? "les diagnostics, les pistes vocales, le monitor de sortie et le micro témoin pendant les tours" : "les diagnostics";
+      const subject = voice ? "les diagnostics et les pistes audio sélectionnées pendant les tours" : "les diagnostics";
       if (confirm("Confirmer l’accord des participants et des responsables des mineurs pour " + subject + " ?")) {
         const tracks = Array.from($("bb-tracks").querySelectorAll("input:checked"), input => input.value);
         await command("blackbox-start", {consent: true, voice, tracks});
@@ -742,7 +742,7 @@
     ["return", "Retour vocal numérique"], ["monitor", "Monitor PipeWire"], ["witness", "Micro témoin du Vivobook"]]) {
     const label = element("label");
     const input = element("input");
-    input.type = "checkbox"; input.checked = true; input.value = value;
+    input.type = "checkbox"; input.checked = value !== "witness"; input.value = value;
     label.append(input, title); $("bb-tracks").append(label);
   }
   $("defaults-form").oninput = event => { event.target.dataset.dirty = "true"; };

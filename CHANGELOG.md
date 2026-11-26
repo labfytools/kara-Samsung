@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Identifier chaque cycle et flux BlackBox V3, pseudonymiser les joueurs, publier les blocs WAV atomiquement et réserver le micro témoin à une sélection explicite.
+
 - Réserver la préparation nocturne aux références locales ou déjà obtenues tant que les fournisseurs de références sont indisponibles.
 - Répéter un extrait de brouillon trois fois et le ralentir à 80 % en préservant la hauteur, avec arrêt sur reprise de Kara ou de Strawberry.
 - Retirer la provenance vérifiée lorsqu’un audio ou sa référence change de version.

@@ -217,6 +217,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.turn_phase = ""
         self.countdown_end = 0.
         self.receiver = None
+        self.bb_room = token_hex(16)
         self.mobile_players = {}  # Identifiant de session -> Singer éphémère
         self.mobile_leaving = set()  # Déconnexions pendant un tour actif
         self.next_tv_update = 0.0
@@ -514,7 +515,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             "capture": "diagnostics", "score_tolerance_s": self.game_score.tolerance,
             "whisper": "large-v3-turbo", "turbo_device": os.environ.get("KARA_TURBO_DEVICE", "gpu"),
             "lyric_offset_s": self.timing_offset,
-        })
+        }, identity={"room": self.bb_room, "party": self.remote_party.identity})
         self.bb_line = None
         self.blackbox.emit("party", "recording-start", mode="diagnostics+pcm" if voice else "diagnostics")
 
@@ -529,12 +530,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
         elif not status["finalizing"]:
             detail = "Confirme l’accord des participants et des responsables des mineurs. "
             detail += "Le mode diagnostics enregistre les événements, les paroles et la notation. "
-            detail += ("Le mode audio enregistre aussi le monitor et le micro témoin pendant la lecture des tours. "
+            detail += ("Deep Analysis enregistre le microphone du joueur et la sortie PipeWire pendant les tours. "
+                       "Le micro témoin peut être sélectionné explicitement depuis Admin sur mobile. "
                        "Obtiens l’accord explicite de chaque participant. Prévois environ 4 à 5 Go par heure de jeu.")
             if status["latest"]:
                 detail += f"\n\nDernière session : {status['latest']['session']}"
             dialog = Gtk.AlertDialog(message="Activer BlackBox ?", detail=detail,
-                                     buttons=["Annuler", "Diagnostics", "Diagnostics + audio"],
+                                     buttons=["Annuler", "Diagnostic léger", "Deep Analysis"],
                                      cancel_button=0, default_button=0)
 
             def confirmed(source, result):
@@ -1272,6 +1274,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.party.active = player
         self.game_score.diagnostic_turn = {"turn": self.bb_turn, "player": player.name, "song": player.song.title}
         self.blackbox.emit("party", "turn-start", **self.game_score.diagnostic_turn, scored=scored, training=player.training,
+                           identity={"room": self.bb_room, "party": self.remote_party.identity},
                            reference={**{key: reference.get(key) for key in ("song_id", "prepared_at", "lrc_sha256",
                                        "language", "duration", "settings")},
                                       "audio_sha256": reference["audio"]["sha256"]} if reference else None)
@@ -1725,6 +1728,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.tv_address.set_text(str(error))
             self.tv_copy.set_visible(False)
         else:
+            self.bb_room = token_hex(16)
             self.tv_address.set_text(
                 f"TV : {self.receiver.url} · Joueurs : {self.receiver.join_url}")
             if self.receiver.qr:

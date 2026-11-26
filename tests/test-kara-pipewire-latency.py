@@ -209,7 +209,7 @@ class IsolatedGraphTests(unittest.TestCase):
 
                 before = output_driver()
                 recorder = BlackBox(root / "blackbox")
-                recorder.start(consent=True, voice=True)
+                recorder.start(consent=True, voice=True, tracks=["monitor", "witness"])
                 session = recorder.voice_session()
                 turn = AcousticTurn(recorder, session, {"turn": "0123456789abcdef", "player": "Fixture",
                                                       "song": "Synthétique"}, SINK, helper=self.helper,
