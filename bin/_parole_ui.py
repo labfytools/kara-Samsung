@@ -1305,9 +1305,9 @@ class ParoleView:
                         ("night_lid_qualified", "Refroidissement capot fermé vérifié sur cet ordinateur")))
         for spec in (
             ("night_idle", "Inactivité minimale (secondes)", 30, 3600),
-            ("night_cpu_temperature", "Limite CPU (°C)", 45, 90),
-            ("night_gpu_temperature", "Limite GPU (°C)", 45, 90),
-            ("night_closed_temperature", "Limite capot fermé (°C)", 45, 90),
+            ("night_cpu_temperature", "Limite CPU (°C)", 45, 95),
+            ("night_gpu_temperature", "Limite GPU (°C)", 45, 95),
+            ("night_closed_temperature", "Limite capot fermé (°C)", 45, 95),
             ("cache_gib", "Plafond du cache Kara (Gio)", 1, 1000),
             ("night_minutes", "Maintien éveillé (minutes, 0 = illimité sur secteur)", 0, 720),
         ):

@@ -72,9 +72,9 @@ def thermal_admission(settings, cpu_t, gpu_t, *, nocturnal=False, closed=False):
     cpu_limit = settings["night_cpu_temperature" if nocturnal else "temperature"]
     gpu_limit = settings["night_gpu_temperature" if nocturnal else "temperature"]
     if closed:
-        # Explicitly configurable, with a hard application ceiling of 90°C.
+        # Explicitly configurable, with a hard application ceiling of 95°C.
         # Keep the conservative defaults and all sensor validation.
-        closed_limit = min(90, settings["night_closed_temperature"])
+        closed_limit = min(95, settings["night_closed_temperature"])
         cpu_limit, gpu_limit = min(cpu_limit, closed_limit), min(gpu_limit, closed_limit)
     temperatures = ((cpu_t or gpu_t) and all(0 < value < cpu_limit for value in cpu_t)
                     and all(0 < value < gpu_limit for value in gpu_t))

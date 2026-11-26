@@ -20,16 +20,16 @@ class ResourceTests(unittest.TestCase):
     def test_configurable_closed_lid_thermal_ceiling(self):
         self.assertFalse(thermal_admission(DEFAULTS, [70], [60], nocturnal=True, closed=True))
         self.assertTrue(thermal_admission(DEFAULTS, [69], [60], nocturnal=True, closed=True))
-        settings = dict(DEFAULTS, night_cpu_temperature=90, night_gpu_temperature=90,
-                        night_closed_temperature=90)
-        self.assertTrue(thermal_admission(settings, [89.9], [89.9], nocturnal=True, closed=True))
-        self.assertFalse(thermal_admission(settings, [90], [70], nocturnal=True, closed=True))
-        self.assertFalse(thermal_admission(settings, [70], [90], nocturnal=True, closed=True))
+        settings = dict(DEFAULTS, night_cpu_temperature=95, night_gpu_temperature=95,
+                        night_closed_temperature=95)
+        self.assertTrue(thermal_admission(settings, [94.9], [94.9], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [95], [70], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [70], [95], nocturnal=True, closed=True))
         self.assertFalse(thermal_admission(settings, [], [60], nocturnal=True, closed=True))
         self.assertFalse(thermal_admission(settings, [60], [], nocturnal=True, closed=True))
         self.assertFalse(thermal_admission(settings, [0], [60], nocturnal=True, closed=True))
         settings.update(night_cpu_temperature=100, night_gpu_temperature=100, night_closed_temperature=100)
-        self.assertFalse(thermal_admission(settings, [90], [60], nocturnal=True, closed=True))
+        self.assertFalse(thermal_admission(settings, [95], [60], nocturnal=True, closed=True))
         settings.update(night_gpu_temperature=75)
         self.assertFalse(thermal_admission(settings, [80], [75], nocturnal=True, closed=True))
 
