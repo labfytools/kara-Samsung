@@ -45,6 +45,17 @@ STREAM_ROLES = {"wifi": "MIC_RECEIVED", "whisper": "MIC_PROCESSED", "return": "P
 FLOAT_WAV = struct.Struct("<4sI4s4sIHHIIHH4sII4sI")
 INCIDENTS = {"error", "disconnect", "interrupted", "capture-gap", "overflow",
              "partial", "xrun", "write-error", "marker", "tv-timeout", "clipping"}
+MARKERS = {
+    "problem": "Problème observé", "calibration": "Calibration",
+    "silence": "Je ne chante pas", "music-only": "Musique seule", "artist-only": "Artiste seul",
+    "speech": "Voix parlée", "sung": "Chant normal", "off-key": "Chant volontairement faux",
+    "wrong-words": "Paroles volontairement incorrectes", "duet": "Chant avec l’artiste",
+    "music-volume": "Changement du volume musical", "mic-volume": "Changement du volume micro",
+    "rap": "Rap rapide", "reggae": "Reggae", "full-song": "Chanson complète",
+    "recognition": "Turbo ne m’a pas reconnu", "return": "Je n’entends pas mon retour",
+    "echo": "Écho important", "display": "Retard des paroles", "score": "Problème de score",
+    "dropout": "Coupure audio",
+}
 SECRET_FIELDS = {"authorization", "proxyauthorization", "cookie", "cookies", "setcookie",
                  "password", "passwd", "secret", "token", "key", "admincode", "mobileid",
                  "apikey", "privatekey", "credential", "credentials", "sessioncookie",
@@ -281,6 +292,7 @@ def provenance():
         except importlib.metadata.PackageNotFoundError:
             pass
     for component, arguments in (("pipewire", ("pipewire", "--version")), ("ffmpeg", ("ffmpeg", "-version")),
+                                 ("wireplumber", ("wireplumber", "--version")),
                                  ("openssl", ("openssl", "version"))):
         try:
             lines = check_output(arguments, timeout=2, stderr=DEVNULL).decode(errors="replace").splitlines()
@@ -343,9 +355,40 @@ def system_snapshot():
         result["writer_cpu_s"] = time.thread_time()
     except (OSError, ValueError):
         pass
+    for label, path, wanted in (
+        ("process_memory_kib", "/proc/self/smaps_rollup", {"Rss", "Pss"}),
+        ("cpu_pressure", "/proc/pressure/cpu", {"some", "full"}),
+        ("memory_pressure", "/proc/pressure/memory", {"some", "full"}),
+        ("io_pressure", "/proc/pressure/io", {"some", "full"}),
+    ):
+        try:
+            if label == "process_memory_kib":
+                result[label] = {key: int(value.split()[0]) for row in Path(path).read_text().splitlines()
+                                 for key, _, value in [row.partition(":")] if key in wanted}
+            else:
+                result[label] = {fields[0]: float(fields[1].removeprefix("avg10="))
+                                 for row in Path(path).read_text().splitlines()
+                                 if (fields := row.split()) and fields[0] in wanted}
+        except (OSError, ValueError, IndexError):
+            continue
+    online = []
+    for path in sorted(Path("/sys/class/power_supply").glob("*/online"))[:8]:
+        try:
+            online.append(path.read_text().strip() == "1")
+        except OSError:
+            continue
+    if online:
+        result["external_power"] = any(online)
+    try:
+        profile = Path("/sys/firmware/acpi/platform_profile").read_text().strip()
+        if re.fullmatch(r"[a-z-]{1,40}", profile):
+            result["platform_profile"] = profile
+    except OSError:
+        pass
     for label, paths, units in (
         ("cpu_temp_c", Path("/sys/class/thermal").glob("thermal_zone*/temp"), 1000),
         ("gpu_percent", Path("/sys/class/drm").glob("card[0-9]/device/gpu_busy_percent"), 1),
+        ("gpu_temp_c", Path("/sys/class/drm").glob("card[0-9]/device/hwmon/hwmon*/temp1_input"), 1000),
         ("cpu_mhz", Path("/sys/devices/system/cpu/cpufreq").glob("policy[0-9]/scaling_cur_freq"), 1000),
     ):
         values = []
@@ -357,6 +400,10 @@ def system_snapshot():
         if values:
             result[label] = values
     try:
+        with Path("/proc/stat").open() as source:
+            fields = source.readline().split()
+            if fields and fields[0] == "cpu":
+                result["cpu_ticks"] = [int(value) for value in fields[1:9]]
         result["io_bytes"] = {key: int(value.strip()) for row in Path("/proc/self/io").read_text().splitlines()
                               for key, _, value in [row.partition(":")] if key in ("read_bytes", "write_bytes")}
     except (OSError, ValueError):
@@ -393,6 +440,7 @@ class BlackBox:
                 status["free_bytes"] = self.free_bytes
                 status["verified"] = self.verified
                 status["voice"] = bool(record and record.manifest["capture"]["voice"])
+                status["witness"] = bool(record and "witness" in record.tracks)
                 status["unavailable"] = sorted(record.unavailable) if record else []
             return status
 
@@ -513,6 +561,11 @@ class BlackBox:
                 record.pending.put_nowait(item)
             except Full:
                 record.dropped += 1
+
+    def mark(self, kind, note="", **context):
+        if not isinstance(kind, str) or kind not in MARKERS or not isinstance(note, str) or len(note) > 240:
+            raise ValueError("Marqueur ou commentaire invalide.")
+        self.emit("annotation", "marker", **context, kind=kind, note=note.strip(), provenance="human")
 
     def pcm(self, track, rate, channels, block, *, turn, player, song, sequence=None, capture_end=None,
             clock=None, recording_session=None, packet_timing=None, connection=None,
@@ -864,8 +917,13 @@ class Recording:
                             raise OSError("Réserve disque BlackBox atteinte.")
                         next_disk = clock + 2
                     if clock >= next_sample:
-                        self.manager.emit("system", "sample", **system_snapshot())
-                        next_sample = clock + 5
+                        # During backlog prioritize draining PCM over reading
+                        # optional kernel metrics or building a sample event.
+                        if self.pending.qsize() < self.manager.queue_size // 2:
+                            self.manager.emit("system", "sample", **system_snapshot())
+                            next_sample = clock + 5
+                        else:
+                            next_sample = clock + 15
                     try:
                         item = self.pending.get(timeout=.20)
                     except Empty:

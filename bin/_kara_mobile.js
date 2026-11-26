@@ -203,7 +203,8 @@
     } else if (!organizer) search(true);
   };
   async function mark() {
-    await api("signaler", {});
+    await api("signaler", {kind: $("mark-kind").value, note: $("mark-note").value});
+    $("mark-note").value = "";
     notice("Le moment a été marqué dans BlackBox.");
   }
   $("mark-live").onclick = () => run($("mark-live"), mark);
@@ -807,6 +808,7 @@
     $("micro").hidden = phase === "countdown" || phase === "opening" || phase === "finishing" || phase === "playing" && !!mic;
     $("micro").textContent = phase === "playing" ? "Réactiver le micro" : starting ? "Connexion du micro…" : "Démarrer";
     $("voice-consent-label").hidden = !party.recording_voice || !enabled || !!mic;
+    $("witness-consent").hidden = !party.recording_witness;
     $("turn-title").textContent = phase === "countdown" ? "Départ dans " + party.countdown :
       phase === "playing" ? "Tu chantes" : phase === "finishing" ? "Calcul du résultat…" : "À toi de chanter !";
     $("turn-song").textContent = state.me.name + " · " + (party.song || "");
@@ -815,7 +817,7 @@
       phase === "playing" ? "Le microphone ne transmet plus." :
       phase === "preparing" ? "Préparation du microphone…" : enabled ? "Appuie quand tu es prêt." : "");
     $("return-volume").hidden = phase === "finishing";
-    $("mark-live").hidden = !party.recording;
+    $("mark-area").hidden = !party.recording;
     const mix = state.me.mix || {};
     const ceiling = party.audio?.music_ceiling ?? 100;
     for (const [key, id, fallback] of [["music", "live-music", 100], ["original", "live-original", 0]]) {

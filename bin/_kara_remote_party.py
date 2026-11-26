@@ -570,6 +570,7 @@ class RemoteParty:
                        "progress": control.align_fraction, "notice": control.align_status if control.validating else self.notice,
                        "tv": time.monotonic() - (receiver.secure_tv_seen if receiver.display_key else receiver.tv_seen) < 4,
                        "recording": blackbox["active"], "recording_voice": blackbox["voice"],
+                       "recording_witness": blackbox["witness"],
                        "last_result": self.last_result,
                        "ranking": self.ranking(), "audio": audio, "player_start": self.opened_early,
                        "original_voice_levels": ORIGINAL_VOICE_LEVELS},

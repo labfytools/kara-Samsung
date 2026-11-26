@@ -1865,6 +1865,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             "players": self.party.board(), "connected": connected,
             "recording": self.blackbox.status()["active"],
             "party_phase": self.remote_party.phase, "turn": self.bb_turn, "turn_phase": self.turn_phase,
+            "position": position, "line": active,
             "countdown": self.countdown(),
             "current_player": self.party.active.name if self.party.active else "",
             "current_song": self.party.active.song.title if self.party.active else "",

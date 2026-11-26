@@ -1,5 +1,6 @@
 """Sert une vue de la partie en lecture seule sur le réseau local."""
 from base64 import b64encode
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import IPv4Address, ip_network
 import json
@@ -214,6 +215,9 @@ class Receiver(RoomListener):
         self.secure_tv_seen = 0.
         self.display_key = display_key
         self.tv_diagnostic_seen = 0.
+        self.capture_turn = None
+        self.capture_position = None
+        self.capture_revisions = OrderedDict()
         self.diagnostics = diagnostics
         self.commands = commands
         self.imports = imports
@@ -266,6 +270,14 @@ class Receiver(RoomListener):
             self._update_states(payload)
 
     def _update_states(self, payload):
+        self.capture_turn = payload.get("turn")
+        self.capture_position = payload.get("position")
+        revision = payload.get("line_revision")
+        if revision is not None and revision not in self.capture_revisions:
+            self.capture_revisions[revision] = (self.capture_turn, self.capture_position, time.monotonic_ns(),
+                                                payload.get("line"))
+            if len(self.capture_revisions) > 128:
+                self.capture_revisions.popitem(last=False)
         self.state_no_qr = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         self.state = json.dumps({**payload, 'qr_data': self.qr_data}, ensure_ascii=False, separators=(",", ":")).encode()
 
@@ -315,7 +327,8 @@ class Receiver(RoomListener):
             with self._state_lock:
                 clock = time.monotonic()
                 if clock - self.tv_seen > 4 and self.diagnostics:
-                    self.diagnostics.emit("television", "reconnect" if self.tv_seen else "connect")
+                    self.diagnostics.emit("television", "reconnect" if self.tv_seen else "connect",
+                                          turn=self.capture_turn)
                 self.tv_seen = clock
                 if secure_display:
                     self.secure_tv_seen = clock
@@ -345,7 +358,18 @@ class Receiver(RoomListener):
             if re.fullmatch(r"[0-9]{1,12}(?:\.[0-9]{1,3})?", value):
                 fields[name] = float(value)
         if self.diagnostics:
-            self.diagnostics.emit("television", "error" if event == "render-error" else event, **fields)
+            with self._state_lock:
+                evidence = self.capture_revisions.get(fields.get("revision"))
+                turn, position = self.capture_turn, self.capture_position
+            if evidence:
+                turn, position, published, line = evidence
+                fields.update(line=line, software_observation_ns=time.monotonic_ns() - published)
+            elif event == "rendered":
+                # A stale or unknown revision cannot be assigned to the
+                # currently displayed line or to a different turn.
+                turn, position = None, None
+            self.diagnostics.emit("television", "error" if event == "render-error" else event,
+                                  turn=turn, position=position, **fields)
 
 
 class Page(BaseHTTPRequestHandler):
@@ -565,7 +589,13 @@ class Page(BaseHTTPRequestHandler):
             if request.path == base + '/api/signaler':
                 name = receiver.room.identity(token)
                 if receiver.diagnostics:
-                    receiver.diagnostics.emit("mobile", "marker", player=name)
+                    with receiver._state_lock:
+                        context = dict(turn=receiver.capture_turn, position=receiver.capture_position)
+                    try:
+                        receiver.diagnostics.mark(data.get("kind", "problem"), data.get("note", ""),
+                                                  player=name, **context)
+                    except ValueError as error:
+                        raise RoomError(str(error)) from error
                 return self._send(200, {"ok": True})
             if request.path == base + '/api/diagnostic':
                 name = receiver.room.identity(token)

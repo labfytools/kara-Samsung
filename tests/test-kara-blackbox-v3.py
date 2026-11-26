@@ -54,6 +54,18 @@ class RecordingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Identité du flux"):
             validate_recording(folder, manifest)
 
+    def test_marker_is_human_and_scoped_to_turn(self):
+        self.box.start(consent=True)
+        self.box.mark("off-key", "annotation fixture", **self.turn, position=1.5)
+        with self.assertRaises(ValueError):
+            self.box.mark("typed-script")
+        self.box.stop(wait=True)
+        folder = self.box.root / self.box.status()["latest"]["session"]
+        row = next(row for row in events(folder / "events.jsonl") if row["event"] == "marker")
+        self.assertEqual(row["cycle"], cycle_id(folder.name, self.turn["turn"]))
+        self.assertEqual(row["position"], 1.5)
+        self.assertEqual(row["data"], {"kind": "off-key", "note": "annotation fixture", "provenance": "human"})
+
     def test_interrupted_draft_keeps_valid_pcm_and_later_marker(self):
         root = self.box.root
         root.mkdir(mode=0o700)

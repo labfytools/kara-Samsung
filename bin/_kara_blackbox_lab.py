@@ -14,6 +14,8 @@ OBSERVATIONS = {
     "tv-timeout": "client TV sans réponse", "transport-end": "connexion microphone terminée",
     "disconnect": "connexion fermée", "write-error": "écriture interrompue",
     "error": "erreur du composant",
+    "tv-software-delay": "reçu logiciel TV tardif",
+    "memory-pressure": "attente sous pression mémoire",
 }
 
 
@@ -158,6 +160,7 @@ class Cycle:
 
 def analyze(folder):
     cycles, occurrences, transport = {}, Counter(), Counter()
+    clients, metrics = {}, {}
     evidence = []
     first, last = None, None
     for row in events(folder / "events.jsonl"):
@@ -179,6 +182,26 @@ def analyze(folder):
             cycle.score_decision(data)
         elif cycle and event == "turn-end" and row["component"] == "party":
             cycle.score = data.get("summary")
+        if event == "browser-capture" and data.get("connection"):
+            client = clients.setdefault(data["connection"], {})
+            for key in ("sent", "dropped", "buffered_bytes_max"):
+                value = data.get("client", {}).get(key)
+                if type(value) is int and value >= 0:
+                    client[key] = max(client.get(key, 0), value)
+        if row["component"] == "system" and event == "sample":
+            for key in ("cpu_temp_c", "gpu_temp_c", "gpu_percent"):
+                values = data.get(key)
+                if values:
+                    metrics[key + "_peak"] = max(metrics.get(key + "_peak", 0), max(values))
+            memory = data.get("memory_kib", {}).get("MemAvailable")
+            if type(memory) is int:
+                metrics["memory_kib_min"] = min(memory, metrics.get("memory_kib_min", memory))
+            psi = data.get("memory_pressure", {}).get("some", 0)
+            metrics["memory_psi_some_avg10_peak"] = max(psi, metrics.get("memory_psi_some_avg10_peak", 0))
+            if psi >= 1:
+                event = "memory-pressure"
+        elif event == "rendered" and data.get("software_observation_ns", 0) > SECOND:
+            event = "tv-software-delay"
         if event == "transport-end" and row["component"] == "audio":
             transport.update({key: data[key] for key in ("received", "missing", "duplicates", "reordered", "invalid")})
             if cycle:
@@ -190,7 +213,11 @@ def analyze(folder):
                                  "description": OBSERVATIONS[event], "elapsed_ns": stamp - first})
     return {"version": 1, "duration_ns": last - first if last is not None else 0,
             "cycles": {key: cycle.describe() for key, cycle in cycles.items()},
-            "transport": dict(transport), "counts": dict(occurrences), "evidence": evidence,
+            "transport": dict(transport), "browser_counters": {
+                "sent_reported": sum(item.get("sent", 0) for item in clients.values()),
+                "dropped_reported": sum(item.get("dropped", 0) for item in clients.values()),
+                "max_buffered_bytes": max((item.get("buffered_bytes_max", 0) for item in clients.values()), default=0),
+            }, "resources": metrics, "counts": dict(occurrences), "evidence": evidence,
             "physical_alignment_bound_ns": None}
 
 

@@ -76,7 +76,7 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
 </section>
   <section id="view-mic" class="card hero" hidden>
     <h2 id="turn-title"></h2><p id="turn-song"></p><p id="live-score"></p><p id="micro-status" class="muted">Le micro apparaît quand c’est ton tour.</p>
-    <label id="voice-consent-label" hidden><input id="voice-consent" type="checkbox">J’accepte la collecte audio BlackBox pendant mon tour</label>
+    <label id="voice-consent-label" hidden><input id="voice-consent" type="checkbox">J’accepte la collecte audio BlackBox pendant mon tour<span id="witness-consent">, y compris le microphone témoin de la pièce</span></label>
     <button id="micro" class="primary mic-button" disabled>Démarrer</button>
     <meter id="micro-level" min="0" max="1" value="0" aria-label="Niveau vocal"></meter>
     <div id="return-volume" hidden>
@@ -87,7 +87,22 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
       <small id="live-guide-note" hidden>La notation signale les passages où l’attribution des paroles est incertaine.</small>
       <label for="voice">Ma voix <output id="voice-applied"></output></label>
       <input type="range" id="voice" min="0" max="100" step="1" value="60">
-      <div class="actions"><button id="return-cut" class="danger">Couper le retour</button><button id="mark-live" class="quiet" hidden>Signaler un problème</button></div>
+      <div class="actions"><button id="return-cut" class="danger">Couper le retour</button></div>
+      <details id="mark-area" hidden><summary>Marqueur BlackBox</summary>
+        <label>Observation <select id="mark-kind"><option value="problem">Problème observé</option>
+          <option value="silence">Je ne chante pas</option><option value="music-only">Musique seule</option>
+          <option value="artist-only">Artiste seul</option><option value="speech">Voix parlée</option>
+          <option value="sung">Chant normal</option><option value="off-key">Chant volontairement faux</option>
+          <option value="wrong-words">Paroles volontairement incorrectes</option><option value="duet">Chant avec l’artiste</option>
+          <option value="music-volume">Changement du volume musical</option><option value="mic-volume">Changement du volume micro</option>
+          <option value="rap">Rap rapide</option><option value="reggae">Reggae</option><option value="full-song">Chanson complète</option>
+          <option value="recognition">Turbo ne m’a pas reconnu</option><option value="return">Je n’entends pas mon retour</option>
+          <option value="echo">Écho important</option><option value="display">Retard des paroles</option>
+          <option value="score">Problème de score</option><option value="dropout">Coupure audio</option>
+        </select></label>
+        <label>Commentaire facultatif <input id="mark-note" maxlength="240"></label>
+        <button id="mark-live" class="quiet">Marquer ce moment</button>
+      </details>
     </div>
   </section>
 

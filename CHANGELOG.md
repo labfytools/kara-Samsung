@@ -7,6 +7,7 @@
 - Vérifier les recouvrements par cycle, afficher le prévol et produire un rapport BlackBox avec rejeu chronologique, comparaison de tolérances et export expurgé.
 - Conserver les entrées PCM exactes du Turbo préparé avec accord vocal, les tokens natifs et les temps de décodage, puis permettre le rejeu d’un appel vérifié.
 - Comparer hors ligne la paire microphone et sortie sur une fenêtre commune avec WebRTC AEC3, Speex et le signal inchangé.
+- Associer les reçus de rendu Tizen et les marqueurs humains à leur cycle, et relever la pression mémoire et les ressources avec une cadence adaptable.
 
 - Réserver la préparation nocturne aux références locales ou déjà obtenues tant que les fournisseurs de références sont indisponibles.
 - Répéter un extrait de brouillon trois fois et le ralentir à 80 % en préservant la hauteur, avec arrêt sur reprise de Kara ou de Strawberry.
