@@ -1,4 +1,5 @@
 """Run the existing offline AEC engines on a bounded V3 interval."""
+from hashlib import sha256
 from math import ceil, floor
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -6,7 +7,8 @@ from tempfile import TemporaryDirectory
 import numpy as np
 from scipy.signal import correlate
 
-from _kara_aec_prototype import FRAME, RATE, Speex, WebRtc, build_webrtc, find_delay, process, with_engine
+from _kara_aec_prototype import FRAME, RATE, Speex, WebRtc, build_webrtc, find_delay, pcm, process, with_engine
+from _kara_aec_pipewire import PipeWire, build as build_pipewire
 from _kara_blackbox import atomic_json, events, float_header, private_file, wave_layout
 from _kara_blackbox_lab import MIN_AEC_NS, SECOND
 
@@ -136,19 +138,41 @@ def compare(render, mic, candidate_delay=None, *, output=None):
 
     variants = {"unchanged": stats(mic)}
     exports = {"reference": render, "unchanged": mic} if output else {}
+    common = {name: sha256(pcm(signal).astype("<i2", copy=False).tobytes()).hexdigest()
+              for name, signal in (("render", render), ("mic", mic))}
+    unavailable = {}
     with TemporaryDirectory(prefix="kara-blackbox-aec-") as draft:
         library = Path(draft) / "webrtc.so"
         build_webrtc(library)
-        for name, factory in (("aec3", lambda n: WebRtc(library, n)), ("speex", Speex)):
-            signal, _, times = with_engine(factory, render.shape[1], process, render, mic, delay)
-            algorithm_delay = find_delay(factory)
+        spa = Path(draft) / "pipewire.so"
+        engines = [("aec3", lambda n: WebRtc(library, n)), ("speex", Speex)]
+        try:
+            build_pipewire(spa)
+        except FileNotFoundError as error:
+            unavailable["pipewire_spa"] = str(error)
+        else:
+            engines.append(("pipewire_spa", lambda n: PipeWire(spa, n)))
+        for name, factory in engines:
+            try:
+                signal, _, times = with_engine(factory, render.shape[1], process, render, mic, delay)
+                algorithm_delay = find_delay(factory)
+            except OSError as error:
+                if name != "pipewire_spa":
+                    raise
+                unavailable[name] = str(error)
+                continue
             variants[name] = {**stats(signal[algorithm_delay:]),
                               "algorithm_delay_ms": algorithm_delay * 1000 / RATE,
+                              "delay_hint_ms": delay if name == "aec3" else None,
+                              "frame_pcm_sha256": common,
                               "frame_p95_us": float(np.percentile(times, 95))}
             if output:
                 exports[name] = signal
     result = {"frames": len(mic), "rate": RATE, "delay_candidate_ms": delay,
               "variants": variants, "physical_alignment_bound_ns": None,
+              "frame_input": {"sha256": common, "sample_format": "s16le", "render_channels": render.shape[1],
+                              "mic_channels": 1, "quantum": FRAME},
+              "unavailable": unavailable,
               "ground_truth_available": False, "method": "software_clock_linear_alignment"}
     if output:
         # Audition is an explicit, private offline export. Preserve the
@@ -156,9 +180,9 @@ def compare(render, mic, candidate_delay=None, *, output=None):
         output.mkdir(mode=0o700)
         for name, signal in exports.items():
             channels = signal.shape[1] if signal.ndim == 2 else 1
-            pcm = signal.astype("<f4").tobytes()
+            payload = signal.astype("<f4").tobytes()
             with open(output / f"{name}.wav", "xb", opener=private_file) as stream:
-                stream.write(float_header(RATE, channels, len(pcm)))
-                stream.write(pcm)
+                stream.write(float_header(RATE, channels, len(payload)))
+                stream.write(payload)
         atomic_json(output / "comparison.json", result)
     return result

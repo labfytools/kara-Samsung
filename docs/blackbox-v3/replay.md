@@ -54,6 +54,8 @@ bin/kara-blackbox compare-aec latest --cycle SESSION/TOUR --reference playback -
 
 La valeur de 40 ms illustre un réglage explicite. Utiliser la mesure de la configuration qualifiée. `compare-aec` sélectionne jusqu’à douze secondes dans le recouvrement, rapproche les grilles par interpolation linéaire et s’arrête si un bloc manque. Les comparaisons sur la même entrée couvrent le signal inchangé, WebRTC AEC3 et Speex. Le résultat journalise l’empreinte de l’entrée alignée, le délai candidat, la corrélation avec la référence, le niveau RMS et le temps de trame des moteurs. Ces métriques peuvent varier pendant le chant simultané. Elles ne quantifient ni l’atténuation d’un écho isolé ni la préservation vocale sans témoin indépendant. Ajouter `--output blackbox/reports/aec-essai` pour écrire les WAV privés et les écouter ensuite. Le répertoire doit être nouveau.
 
+Si le greffon installé est disponible, le comparatif ajoute `pipewire_spa`, le moteur de `module-echo-cancel` chargé directement en mémoire. Ce témoin traite les mêmes trames de 480 échantillons et la conversion en float32 planaire préserve chacun des échantillons s16. Les deux empreintes PCM effectives figurent dans le rapport de chaque candidat. Le moteur SPA utilise sa politique interne de délai. Le comparatif ne lance aucun serveur PipeWire et ne mesure pas les tampons, le routage ou la latence du module dans un graphe en direct. [Module PipeWire 1.6.11](https://github.com/PipeWire/pipewire/blob/1.6.11/src/modules/module-echo-cancel.c) · [Moteur SPA WebRTC](https://github.com/PipeWire/pipewire/blob/1.6.11/spa/plugins/aec/aec-webrtc.cpp)
+
 ## Relancer un appel du décodeur
 
 ```sh

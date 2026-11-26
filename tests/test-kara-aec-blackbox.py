@@ -2,6 +2,7 @@
 """The offline replay accepts shared frames and refuses a different graph."""
 from pathlib import Path
 import json
+from hashlib import sha256
 import runpy
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_blackbox import BlackBox, wave_layout
 from _kara_blackbox_aec import compare, input_pair
+from _kara_aec_prototype import pcm
 from _kara_blackbox_lab import analyze
 
 REPLAY = runpy.run_path(str(Path(__file__).with_name("qualify-kara-aec-blackbox.py")))
@@ -95,6 +97,15 @@ class ReplayTests(unittest.TestCase):
             self.assertIsNone(metrics["physical_alignment_bound_ns"])
             self.assertFalse(metrics["ground_truth_available"])
             self.assertGreater(metrics["variants"]["unchanged"]["reference_correlation"], .99)
+            expected = {"render": sha256(pcm(render).astype("<i2").tobytes()).hexdigest(),
+                        "mic": sha256(pcm(mic).astype("<i2").tobytes()).hexdigest()}
+            self.assertEqual(metrics["frame_input"]["sha256"], expected)
+            for candidate in ("aec3", "speex", "pipewire_spa"):
+                if candidate in metrics["variants"]:
+                    self.assertEqual(metrics["variants"][candidate]["frame_pcm_sha256"], expected)
+                else:
+                    self.assertEqual(candidate, "pipewire_spa")
+                    self.assertIn(candidate, metrics["unavailable"])
             self.assertEqual(wave_layout(export / "reference.wav")[:3], (rate, 2, len(mic)))
             self.assertEqual((export / "aec3.wav").stat().st_mode & 0o777, 0o600)
             receipt = Path(directory) / "calibration.json"
