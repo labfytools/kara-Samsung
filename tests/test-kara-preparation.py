@@ -491,6 +491,16 @@ class ScoreTests(unittest.TestCase):
                       for index, item in enumerate(self.ref["lines"])}
         self.assertEqual(score_breakdown(self.ref, all_silent)["score"], 0)
 
+    def test_wrong_words_and_late_refrain_cannot_credit_the_known_text(self):
+        wrong, late = {}, {}
+        for index, line in enumerate(self.ref["lines"]):
+            unrelated = [{**heard, "word": "intrus"} for heard in self.heard(line)]
+            wrong[index] = score_reference_line(line, unrelated)
+            late[index] = score_reference_line(line, self.heard(line, 2.))
+        self.assertEqual(score_breakdown(self.ref, wrong)["score"], 0)
+        delayed = score_breakdown(self.ref, late)
+        self.assertEqual((delayed["lyrics"], delayed["timing"], delayed["score"]), (100, 0, 0))
+
     def test_empty_reference_word_is_excluded(self):
         line = self.ref["lines"][0]
         heard = self.heard(line)
@@ -623,6 +633,41 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(decoder.decode.call_count, 2)
         self.assertEqual([(w["word"], w["start"], w["end"]) for w in received],
                          [("bonjour", 15.8, 16.4)])
+
+    def test_original_voice_and_interrupted_capture_cannot_reach_recognition(self):
+        try:
+            import numpy as np
+            from _kara_voice import Microphone, process_jobs, transcribe_prepared_job
+        except ImportError:
+            self.skipTest("Dépendances du moteur vocal absentes")
+        model = Mock()
+        rng = np.random.default_rng(8)
+        backing = rng.normal(0, .06, 32_000).astype("<f4")
+        original = (backing * .2 + rng.normal(0, .08, 32_000)).astype("<f4")
+        # Represent replay of the original singer, shifted relative to the
+        # backing, then low-pass filtered as in the playback-only witness.
+        replay = original[3200:19200] * .25
+        low = np.hanning(23)
+        filtered = np.convolve(replay, low / low.sum(), mode="same").astype("<f4")
+        files = {"backing": backing, "original": original, "guide": original}
+        job = {"instrumental": True, "track_start": 0., "track_end": 1., "language": "fr",
+               "backing": "backing", "original": "original"}
+        with patch.object(subprocess, "check_output", side_effect=lambda cmd, **kw: files[cmd[cmd.index("-i") + 1]].tobytes()):
+            self.assertEqual(transcribe_prepared_job(model, replay, job), ([], "backing"))
+            self.assertEqual(transcribe_prepared_job(model, filtered, job), ([], "backing"))
+            self.assertEqual(transcribe_prepared_job(model, replay, job | {"guide": "guide"}), ([], "guide"))
+        model.decode.assert_not_called()
+
+        microphone = Microphone(None)
+        block = (replay[:4800] * 32768).astype("<i2").tobytes()
+        microphone.blocks.extend([(.30, block), (1., block)])
+        queued = Mock()
+        queued.get.side_effect = [{"begin": 0., "end": 1., "prepared": True, "id": 1}, StopIteration()]
+        with patch("_kara_voice.emit") as emit, patch("_kara_voice.transcribe_prepared_job") as decode:
+            with self.assertRaises(StopIteration):
+                process_jobs(microphone, queued, model, True)
+        decode.assert_not_called()
+        emit.assert_called_once_with("skipped", id=1, source="capture")
 
 
 
