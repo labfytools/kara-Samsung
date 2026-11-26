@@ -162,6 +162,11 @@ class SyncTests(unittest.TestCase):
             wait_for(dialog.confirm.get_sensitive)
             confirm(dialog)
             self.assertEqual(dialog.file_progress.get_fraction(), 1)
+            self.assertEqual(dialog.usb_progress.get_text(), "Transfert USB terminé")
+            self.assertEqual(dialog.usb_progress.get_fraction(), 1)
+            self.assertTrue(dialog.transfer_status.get_visible())
+            self.assertIn("1 fichier(s) transféré(s) · 1 vérifié(s)", dialog.media_status.get_text())
+            self.assertIn("2 piste(s) indexée(s) · 0 piste(s) restant à indexer", dialog.media_status.get_text())
             self.assertEqual((phone / new).read_bytes(), (pc / new).read_bytes())
             for original in (track, cover, lyrics):
                 final = Path("Conservé/Album") / original.name
@@ -286,7 +291,7 @@ class SyncTests(unittest.TestCase):
             for fragment in ("Aperçu prêt", "Inventaire PC", "commandes ADB", "Transport ADB sur USB",
                              "Fichier transféré · Android · Nouvelle piste.opus",
                              "Fichier actualisé · Android · Conservé/Album/cover.jpg", "Fichier renommé",
-                             "[ERROR] La bibliothèque est déjà utilisée", "Bilan de la session",
+                             "[ERROR] La bibliothèque est déjà utilisée", "Bilan de la session", "chevauchement USB/MediaStore",
                              "Copie vérifiée · Android · Piste à reprendre.opus"):
                 self.assertTrue(any(fragment in line for line in lines), fragment)
             self.assertTrue(all("[SYNC]" in line for line in lines))

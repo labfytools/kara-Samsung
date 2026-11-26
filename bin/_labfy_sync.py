@@ -224,6 +224,8 @@ class SyncWindow(Gtk.Window):
         summary_box.append(self.saved_progress)
         self.progress = Gtk.ProgressBar(visible=False)
         summary_box.append(self.progress)
+        self.usb_progress = Gtk.ProgressBar(visible=False, show_text=True)
+        summary_box.append(self.usb_progress)
         self.file_progress = Gtk.ProgressBar(visible=False, show_text=True)
         summary_box.append(self.file_progress)
         self.transfer_status = Gtk.Label(xalign=0, wrap=True, visible=False, css_classes=["lyrics-info"])
@@ -329,7 +331,13 @@ class SyncWindow(Gtk.Window):
                 saved += (f"\n{resume['recovered']} fichiers déjà vérifiés sur Android · "
                           f"{GLib.format_size(resume['bytes_recovered'])}")
             if resume.get("in_flight"):
-                saved += "\nUne opération interrompue sera vérifiée."
+                phase = resume.get("file_phase")
+                if phase == "verified":
+                    saved += "\nL’intégrité du transfert interrompu a été vérifiée. La reprise contrôle la publication."
+                elif phase == "transferred":
+                    saved += "\nOctets reçus avant l’interruption. La reprise vérifie leur intégrité."
+                else:
+                    saved += "\nUne opération interrompue sera vérifiée."
             if resume.get("last_error") and self.process is None:
                 saved += f"\nDernière erreur · {resume['last_error']}"
             self.saved_progress.set_text(saved)
@@ -433,11 +441,13 @@ class SyncWindow(Gtk.Window):
         self.pending_operation = None
         self.copy_kinds = {}
         self.media_errors = 0
+        self.usb_finished = False
         self.rescan_on_finish = args[1] == "resume" or "--recover" in args
         self.summary.set_text(message)
         self.controller.log(message)
         self.text.get_buffer().set_text("")
         self.progress.set_visible(True)
+        self.usb_progress.set_visible(False)
         self.file_progress.set_visible(False)
         self.transfer_status.set_visible(False)
         self.media_status.set_visible(False)
@@ -586,6 +596,11 @@ class SyncWindow(Gtk.Window):
             if "adb_commands" in data:
                 self.controller.log(f"Mesures · {data['adb_commands']} commandes ADB · {data['elapsed']:.2f} s · "
                                     f"{GLib.format_size(data['verified_bytes'])} vérifiés dans le plan")
+            if phases := data.get("phases"):
+                self.controller.log(
+                    f"Phases USB · transfert {phases['transfer_s']:.2f} s · vérification {phases['verify_s']:.2f} s · "
+                    f"publication {phases['publish_s']:.2f} s · MediaStore {phases['index_s']:.2f} s · "
+                    f"chevauchement USB/MediaStore {phases['overlap_s']:.2f} s · total {phases['total_s']:.2f} s")
             self.end_report(message, "WARNING" if pending else "INFO", pending=pending)
 
     def on_event(self, data):
@@ -593,7 +608,7 @@ class SyncWindow(Gtk.Window):
         self.record_event(event, data)
         if self.closed:
             return
-        if self.stopping and event in {"progress", "preview", "transfer"}:
+        if self.stopping and event in {"progress", "preview", "transfer", "media"}:
             return
         if event == "progress":
             count, total = data["count"], data["total"]
@@ -601,9 +616,8 @@ class SyncWindow(Gtk.Window):
                                   else f"{data['message']} · {count}")
             self.progress.set_visible(True)
             self.progress.set_show_text(False)
-            if not data["message"].startswith("Transfert"):
+            if data["message"].startswith(("Renommage", "Mise en réserve")):
                 self.file_progress.set_visible(False)
-                self.transfer_status.set_visible(False)
             if total:
                 self.progress.set_fraction(min(1, count / total))
             else:
@@ -624,9 +638,9 @@ class SyncWindow(Gtk.Window):
             if deferred := self.statistics.get("deferred"):
                 self.controller.log(f"{deferred} fichier(s) en cours de modification reporté(s).", "WARNING")
         elif event == "transfer" and not self.stopping:
-            self.progress.set_fraction(min(1, data["transferred"] / data["total"]))
-            self.progress.set_show_text(True)
-            self.progress.set_text(f"{GLib.format_size(data['transferred'])} / {GLib.format_size(data['total'])}")
+            self.usb_progress.set_visible(True)
+            self.usb_progress.set_fraction(min(1, data["transferred"] / data["total"]))
+            self.usb_progress.set_text(f"USB · {GLib.format_size(data['transferred'])} / {GLib.format_size(data['total'])}")
             self.file_progress.set_visible(True)
             self.file_progress.set_fraction(min(1, data["file_bytes"] / data["file_total"]))
             self.file_progress.set_text(f"{GLib.format_size(data['file_bytes'])} / {GLib.format_size(data['file_total'])}")
@@ -638,21 +652,31 @@ class SyncWindow(Gtk.Window):
             self.transfer_status.set_text(f"{rate}/s instantané{average} · "
                                           f"{GLib.format_size(data['remaining'])} restants · {estimate}")
         elif event == "media":
-            transferred, indexed = data["transferred"], data["indexed"]
-            errors = data["errors"]
-            file_plural = "s" if transferred != 1 else ""
-            track_plural = "s" if indexed != 1 else ""
-            error_plural = "s" if errors != 1 else ""
-            self.media_status.set_text(
-                f"{transferred} fichier{file_plural} transféré{file_plural} · "
-                f"{indexed} piste{track_plural} indexée{track_plural}\n"
-                f"{data['pending']} en attente d’indexation · {errors} erreur{error_plural} d’indexation")
+            transferred, indexed, errors = data["transferred"], data["indexed"], data["errors"]
+            verified = data.get("verified", transferred)
+            remaining = data.get("remaining_tracks", data["pending"])
+            finished = data.get("transfers_finished", False)
+            if finished and not self.usb_finished and (transferred or self.usb_progress.get_visible()):
+                # MediaStore may continue after the last published file.
+                # Keep definitive USB progress and throughput on screen.
+                self.usb_finished = True
+                self.file_progress.set_visible(False)
+                self.summary.set_text("Transfert USB terminé · indexation Android en cours"
+                                      if data["pending"] else "Transfert USB terminé")
+                self.usb_progress.set_fraction(1)
+                self.usb_progress.set_text("Transfert USB terminé")
+                self.usb_progress.set_visible(True)
+            detail = f"{indexed} piste(s) indexée(s) · {remaining} piste(s) restant à indexer"
+            eta = data.get("index_eta")
+            if eta is not None:
+                detail += f" · env. {eta // 60} min {eta % 60:02d} s"
+            self.media_status.set_text(f"{transferred} fichier(s) transféré(s) · {verified} vérifié(s)\n"
+                                       f"{detail} · {errors} erreur(s) d’indexation")
             self.media_status.set_visible(True)
-            pending = data["pending"]
-            total = indexed + pending
+            total = indexed + remaining
             self.media_progress.set_fraction(indexed / total if total else 1.0)
-            self.media_progress.set_text(f"Indexation : {indexed} validées · {pending} restantes")
-            self.media_progress.set_visible(bool(total))
+            self.media_progress.set_text("Indexation Android" if data["pending"] else "Indexation Android à jour")
+            self.media_progress.set_visible(bool(total or data["pending"]))
         elif event == "power":
             self.power_status.set_text(data["message"])
             self.power_status.set_visible(bool(data.get("active") or data.get("pending")))

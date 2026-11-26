@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Afficher en parallèle les débits et la vérification USB ainsi que l’indexation Android, avec un bilan des temps par phase dans la console.
 - Publier les pistes vérifiées pendant les transferts suivants et livrer leur reçu à l’index V2 dès le tri.
 - Traiter les pochettes indépendamment des paroles et du minutage, et notifier chaque fichier associé dès sa publication.
 - Mettre à jour les contributions du lexique local piste par piste à partir des références vérifiées et des corrections approuvées.

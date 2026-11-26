@@ -12,6 +12,8 @@ Labfy copie les fichiers audio, images et LRC en vérifiant leur empreinte SHA-2
 
 Le moteur contrôle les fichiers du périmètre capturé au début de l’aperçu. Le verrou `.labfy-music.lock` partagé avec les publications d’import, le tri, les enrichissements et les regroupements d’artistes protège les validations et les écritures PC. Les envois et l’indexation Android laissent les publications d’import se poursuivre. Le moteur propage les renommages identifiés avec sa référence commune. Parole lui transmet aussi les déplacements du registre canonique. Un déplacement sans référence USB antérieure exige des chemins non ambigus et un SHA-256 complet identique. Si un ancien chemin Android risque de recréer un fichier sous un artiste regroupé ou de doubler sa copie, Parole signale le chemin à vérifier avant la confirmation.
 
+Le dialogue garde la progression USB et ses débits à l’écran pendant que MediaStore actualise la bibliothèque Android. Les nombres de fichiers reçus et vérifiés sont distincts. Les pistes indexées, celles encore en file et les erreurs apparaissent dans la progression Android. Le journal **SYNC** indique les durées des phases et le chevauchement mesuré. La fin de la copie est visible même lorsque le fournisseur Android traite encore des pistes.
+
 ## Possession et persistance
 
 | Données | Emplacement | Récupération |
