@@ -50,6 +50,38 @@ Le relevé par étape place le pic du worker pendant la séparation proprement d
 
 Les trois premiers extraits du manifeste, en rock et dans les deux groupes de rap, ont fourni 52 mots de référence. Le mix a rendu 25 erreurs, la voix brute et la voix normalisée 30 chacune et la segmentation adaptative 31. La relecture ciblée et la relecture phonétique ont laissé toutes les graphies du stem en place. L’écart entre le mix et le stem est concentré sur le rap américain du pilote. Ce résultat décrit ces trois cas et motive une qualification par genre.
 
+### Résultat apparié des 50 extraits F16
+
+Les **50 extraits et 1 317 mots** sont couverts. Les substitutions, suppressions et insertions du mix reproduisent les valeurs historiques pour chacun des 50 titres. La première passe a terminé 39 extraits. La deuxième a récupéré les 11 cas reportés en relisant les séparations et les variantes terminées. Les deux passes ont conservé le profil d’essai et le même manifeste. Les poids F16 et les variantes restent distincts de l’essai Q5 sur chanson entière.
+
+| Variante | Erreurs | WER | CER | Substitutions / suppressions / insertions | Passages incertains | Temps mesuré |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A · mix | 620 | 47,08 % | 37,55 % | 222 / 299 / 99 | 138 | 501,87 s |
+| B · voix | 645 | 48,97 % | 37,02 % | 206 / 343 / 96 | 134 | 496,56 s |
+| C · niveau | 644 | 48,90 % | 37,20 % | 212 / 340 / 92 | 138 | 490,09 s |
+| D · filtre léger | 634 | 48,14 % | 38,48 % | 180 / 367 / 87 | 123 | 486,48 s |
+| E · découpage | 691 | 52,47 % | 41,17 % | 195 / 401 / 95 | 135 | 723,74 s |
+| F · relecture | 652 | 49,51 % | 37,58 % | 213 / 343 / 96 | 134 | 246,28 s en plus |
+| G · combinaison | 628 | 47,68 % | 38,52 % | 228 / 300 / 100 | 138 | moins de 0,01 s en plus |
+| Relecture phonétique de F | 652 | 49,51 % | 37,58 % | 213 / 343 / 96 | 134 | 281,21 s en plus |
+
+Les durées A à E cumulent les mesures du décodeur par variante, hors chargement et séparation. F et la passe phonétique chiffrent leur travail supplémentaire. G compare les observations déjà obtenues en A, B et D. Les insertions mesurent les ajouts face à la référence, avec une ambiguïté possible pour les ad-libs ou les chœurs. La relecture F a changé 11 mots et la combinaison G en a changé 43, avec une dégradation du WER dans les deux cas. La relecture phonétique a été tentée sur chaque extrait, sans remplacement accepté. Les extraits n’offrent pas d’annotation statistique des noms propres, des contractions ou de l’argot. Aucune occurrence n’entrait dans le compteur des formes d’argot de cette version.
+
+| Genre | Extraits / mots | A mix | B voix | C niveau | D filtre | E découpage | F relecture | G combinaison |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rock | 6 / 124 | 22,58 % | 29,84 % | 29,03 % | 20,97 % | 37,90 % | 29,84 % | 21,77 % |
+| Rap américain | 16 / 431 | 57,54 % | 66,59 % | 67,52 % | 66,13 % | 62,18 % | 67,05 % | 58,00 % |
+| Rap français | 20 / 594 | 47,81 % | 46,80 % | 46,30 % | 46,63 % | 55,22 % | 47,47 % | 48,82 % |
+| Chanson française | 2 / 36 | 8,33 % | 11,11 % | 11,11 % | 13,89 % | 11,11 % | 11,11 % | 16,67 % |
+| Reggae | 4 / 83 | 49,40 % | 32,53 % | 31,33 % | 31,33 % | 37,35 % | 33,73 % | 48,19 % |
+| Soul | 2 / 49 | 32,65 % | 24,49 % | 24,49 % | 30,61 % | 26,53 % | 24,49 % | 30,61 % |
+
+Un rééchantillonnage descriptif de 4 000 tirages appariés par titre, avec quotas de genre fixes, estime l’écart voix moins mix entre −4,05 et +8,05 points pour l’intervalle à 95 %. Pour le découpage, l’intervalle va de +0,15 à +10,77 points. La sélection par confiance a essayé des marges entre 0 et 0,12 avec un rapport de nombres de mots entre 80 et 120 % du mix. Le choix de la règle a été entraîné sur les autres genres à chaque tour. Cette sélection donne 47,53 % de WER. Un choix rétrospectif par titre entre le mix, la voix brute et la voix filtrée descendrait à 40,17 %. Il utilise les références et borne seulement le gain possible entre ces trois hypothèses. Les effectifs de deux à quatre titres demandent davantage de données avant de qualifier un réglage spécifique au genre.
+
+Les 47 nouvelles séparations ont duré 32,45 s en médiane, avec des pics PSS de groupe de 1 189 à 1 514 Mio et une température CPU maximale de 57,38 °C pendant les traitements terminés. Trois séparations ont été reprises du pilote. Les pics PSS échantillonnés pendant les phases Turbo terminées vont de 160 à 258 Mio. Les compteurs DRM du décodeur F16 indiquent jusqu’à 2 089 Mio de GTT résident. Le GTT de l’hôte a atteint jusqu’à 7,14 Gio pendant les phases Turbo terminées. La mémoire disponible minimale est restée à 4,24 Gio sur ces phases. Parmi les 11 reports, 10 correspondent au PSI et un à la réserve disponible. Deux reports se produisent dans Demucs et neuf dans Turbo, parmi le chargement du modèle, les buffers PCM et le décodage du mix.
+
+Sur la chanson entière de 193,68 s, le premier essai Demucs avec fenêtres de cinq secondes s’est arrêté après environ treize secondes pendant la séparation. Le PSI valait 1,24 % pour 5,40 Gio disponibles et 54,5 °C côté CPU. Le réglage de cinq secondes n’est ainsi pas qualifié au seuil de production.
+
 ### Turbo Q5 sur une chanson entière
 
 Turbo Q5_0 a terminé les trois variantes sur le titre espagnol de 193,68 s, avec la séparation validée réutilisée et le seuil de PSI de 1 %. Le poids officiel occupe environ 548 Mio et porte le SHA-256 `394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2`. Les écarts entre variantes comparent la préparation du signal avec le même poids sur le même titre. La tentative F16 avait été interrompue et les conditions de l’hôte avaient changé. [Poids Turbo Q5_0 officiel](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-large-v3-turbo-q5_0.bin)
