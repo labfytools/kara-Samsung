@@ -124,6 +124,33 @@ class InventoryTests(Fixture):
         self.assertEqual(len(self.songs()), 1)
         self.assertEqual(self.scan()["missing"], 1)
 
+    def test_reconciliation_reuses_sidecars_and_writes_only_changes(self):
+        path = self.audio()
+        path.with_suffix(".txt").write_text("Texte local")
+        path.with_suffix(".lrc").write_text("[00:01.00]Texte local\n")
+        self.scan()
+        with patch("_parole_index.sidecar", side_effect=AssertionError("relecture du fichier associé")):
+            result = self.scan(reader=lambda _: self.fail("relecture des tags"))
+        self.assertEqual((result["unchanged"], result["transactions"]), (1, 0))
+        path.with_suffix(".lrc").write_text("[00:12.00]Repère hors durée\n")
+        result = self.scan(reader=lambda _: self.fail("relecture des tags"))
+        self.assertEqual(result["phase_calls"]["sidecar_read"], 1)
+        row, = self.songs()
+        self.assertEqual((row["lyrics"], row["lrc"]), ("fichier texte", "à vérifier"))
+
+    def test_reconciliation_refuses_an_unmounted_replacement_root(self):
+        self.audio()
+        self.scan()
+        parked = self.root.with_name("parked")
+        self.root.rename(parked)
+        self.root.mkdir()
+        with self.assertRaisesRegex(OSError, "Stockage"):
+            self.scan()
+        self.assertEqual(len(self.songs()), 1)
+        self.root.rmdir()
+        parked.rename(self.root)
+        self.assertEqual(self.scan()["unchanged"], 1)
+
     def test_read_only_strawberry_and_lrc_correction(self):
         song = self.audio()
         db = self.base / "collection.db"

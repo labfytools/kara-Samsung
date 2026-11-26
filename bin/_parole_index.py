@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 from datetime import date
 import stat
-from time import time
+from time import perf_counter, time
 from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
@@ -231,6 +231,9 @@ class Index:
                     id INTEGER PRIMARY KEY CHECK(id=1), total INTEGER NOT NULL,
                     bytes INTEGER NOT NULL, lyrics INTEGER NOT NULL, lrc INTEGER NOT NULL,
                     ready INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS inventory_root (
+                    id INTEGER PRIMARY KEY CHECK(id=1), dev INTEGER NOT NULL, inode INTEGER NOT NULL
                 );
                 INSERT OR IGNORE INTO library_stats VALUES(1,0,0,0,0,0);
                 CREATE TRIGGER IF NOT EXISTS song_added AFTER INSERT ON songs BEGIN
@@ -695,30 +698,77 @@ def sidecar(path, suffix, limit=MAX_LRC_BYTES):
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
             return "invalid", ""
         with os.fdopen(os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                return "invalid", ""
             raw = stream.read(limit + 1)
             if len(raw) > limit:
                 return "invalid", ""
             version = os.fstat(stream.fileno())
-            return document([version.st_dev, version.st_ino, version.st_size, version.st_mtime_ns,
-                             version.st_ctime_ns]), raw.decode("utf-8-sig")
+            if revision(before) != revision(version):
+                return "invalid", ""
+            return revision(version), raw.decode("utf-8-sig")
     except FileNotFoundError:
         return "", ""
     except (OSError, UnicodeError, ValueError):
         return "invalid", ""
 
 
-def local_state(path, embedded, duration):
-    lrc_token_text, lrc = sidecar(path, ".lrc")
-    plain_token, txt = sidecar(path, ".txt")
-    embedded_rows = parse_lrc(embedded)
-    timed = [stamp for stamp, text in parse_lrc(lrc) if text.strip()]
-    lrc_state = ("local" if timed and (not duration or 0 < timed[-1] <= duration + 3)
-                 else "à vérifier" if lrc_token_text else
-                 "intégré" if embedded_rows and (not duration or 0 < embedded_rows[-1][0] <= duration + 3)
-                 else "absent")
-    lyrics = ("fichier texte" if txt.strip() else "Strawberry" if embedded.strip() else
-              "LRC" if lrc_state == "local" else "absent")
-    return document([lrc_token_text, plain_token]), lyrics, lrc_state
+def revision(info):
+    return document([info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns])
+
+
+def sidecar_token(path):
+    try:
+        info = path.lstat()
+        return revision(info) if stat.S_ISREG(info.st_mode) and info.st_size <= MAX_LRC_BYTES else "invalid"
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return "invalid"
+
+
+def local_state(path, embedded, duration, old, info, stable, measure):
+    # Versions are kept separately for the two sidecars. A new LRC can reuse
+    # the existing TXT result, and a duration change can reuse parsed timing.
+    with measure("sidecar_stat"):
+        tokens = [sidecar_token(path.with_suffix(suffix)) for suffix in (".lrc", ".txt")]
+    previous = json.loads(old["side"]) if old and old["side"] else [None, None]
+    if stable and tokens == previous and "invalid" not in tokens:
+        return old["side"], old["lyrics"], old["lrc"]
+    saved = info.get("side_state", [None, None])
+    evidence = []
+    for i, suffix in enumerate((".lrc", ".txt")):
+        if not tokens[i]:
+            evidence.append(-1 if i == 0 else False)
+        elif tokens[i] == previous[i] and tokens[i] != "invalid" and saved[i] is not None:
+            evidence.append(saved[i])
+        else:
+            with measure("sidecar_read"):
+                tokens[i], raw = sidecar(path, suffix)
+            if i == 0:
+                with measure("lrc"):
+                    evidence.append(max((stamp for stamp, text in parse_lrc(raw) if text.strip()), default=-1))
+            else:
+                evidence.append(bool(raw.strip()))
+    info["side_state"] = evidence
+    end, plain = evidence
+    if end >= 0 and (not duration or 0 < end <= duration + 3):
+        lrc = "local"
+    elif tokens[0]:
+        lrc = "à vérifier"
+    else:
+        with measure("lrc"):
+            rows = parse_lrc(embedded) if embedded else []
+        lrc = "intégré" if rows and (not duration or 0 < rows[-1][0] <= duration + 3) else "absent"
+    lyrics = "fichier texte" if plain else "Strawberry" if embedded.strip() else "LRC" if lrc == "local" else "absent"
+    # Reference provenance belongs to its exact file and audio versions.
+    if old and stable:
+        if tokens[0] == previous[0] and lrc == "local" and old["lrc"] in ("externe", "généré"):
+            lrc = old["lrc"]
+        if tokens == previous and lyrics == "absent" and old["lyrics"] == "instrumental":
+            lyrics = old["lyrics"]
+    return document(tokens), lyrics, lrc
 
 
 def audio_paths(root, onerror=None):
@@ -731,54 +781,73 @@ def audio_paths(root, onerror=None):
 
 
 def probe_track(path):
-    return probe(path, include_duration=True)
+    return probe(path, include_duration=True, include_codec=True)
+
+
+def index_path(root, path):
+    if not path.is_relative_to(root) or path.suffix.lower() not in AUDIO:
+        return False
+    parts = path.relative_to(root).parts
+    return bool(parts and parts[0] not in SKIP_TOP and not any(p.startswith(".") for p in parts))
+
+
+def path_rows(db, paths):
+    values = tuple(map(str, paths))
+    if not values:
+        return {}
+    marks = ",".join("?" for _ in values)
+    return {row["path"]: row for row in db.execute(f"SELECT * FROM songs WHERE path IN ({marks})", values)}
+
+
+def missing_on_device(path, device):
+    # A vanished submount exposes a different device on the nearest existing
+    # ancestor. Errors other than absence must leave the historical row intact.
+    for candidate in (path, *path.parents):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        return candidate != path and stat.S_ISDIR(info.st_mode) and info.st_dev == device
+    return False
 
 
 def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, paths=None, reader=probe_track):
     root = index.root
-    if not root.is_dir():
-        raise OSError("Bibliothèque indisponible")
-    # Read the previous generation once. Only changed files need a tag probe;
-    # presence and sidecar tokens are checked independently of the audio file.
-    with index.db() as db:
-        rows = (db.execute("SELECT * FROM songs") if paths is None else
-                (row for path in paths for row in db.execute("SELECT * FROM songs WHERE path=?", (str(path),))))
-        previous = {r["path"]: r for r in rows}
-    inodes = defaultdict(list)
-    for row in previous.values():
-        inodes[row["dev"], row["inode"]].append(row)
+    counts = dict(scanned=0, changed=0, missing=0, errors=0, unchanged=0, probes=0,
+                  reused=0, strawberry=0, transactions=0)
+    phases = defaultdict(float)
+    calls = defaultdict(int)
+
+    @contextmanager
+    def measure(name):
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            phases[name] += perf_counter() - started
+            calls[name] += 1
+
+    def root_identity():
+        st = root.lstat()
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError("Bibliothèque indisponible")
+        return st.st_dev, st.st_ino
+
+    identity = root_identity()
+    # Keep a narrow snapshot for absence detection. Unchanged songs do not
+    # need a generation write. The conditional delete protects newer rows.
+    with measure("sqlite_read"), index.db() as db:
+        saved_root = db.execute("SELECT dev,inode FROM inventory_root WHERE id=1").fetchone()
+        if saved_root is not None and tuple(saved_root) != identity:
+            raise OSError("Stockage de la bibliothèque remplacé ou indisponible")
+        missing = ({r["path"]: (r["id"], r["token"], r["checked"])
+                    for r in db.execute("SELECT id,path,token,checked FROM songs")}
+                   if paths is None and limit is None else {})
+    had_rows = bool(missing)
     generation = uuid4().hex
     group_rules = album_groups(index.path)
-    counts = dict(scanned=0, changed=0, missing=0, errors=0)
-    pending, unchanged = [], []
+    pending = []
     now = time()
-
-    def flush():
-        with index.db() as db:
-            db.executemany("UPDATE songs SET seen=? WHERE id=?", ((generation, i) for i in unchanged))
-            db.executemany("""
-                INSERT INTO songs VALUES(
-                  :id,:path,:token,:dev,:inode,:bytes,:side,:cache,:previous,:title,:artist,:owner,
-                  :album,:edition,:duration,:disc,:track,:year,:artist_id,:release_id,:plays,
-                  :lyrics,:lrc,:kara,:search,:seen,:added,:checked,:info,:audio
-                ) ON CONFLICT(id) DO UPDATE SET
-                  path=excluded.path,token=excluded.token,dev=excluded.dev,inode=excluded.inode,
-                  bytes=excluded.bytes,side=excluded.side,cache=excluded.cache,previous=excluded.previous,
-                  title=excluded.title,artist=excluded.artist,owner=excluded.owner,album=excluded.album,
-                  edition=excluded.edition,duration=excluded.duration,disc=excluded.disc,track=excluded.track,
-                  year=excluded.year,artist_id=excluded.artist_id,release_id=excluded.release_id,
-                  plays=excluded.plays,lyrics=excluded.lyrics,lrc=excluded.lrc,kara=excluded.kara,
-                  search=excluded.search,seen=excluded.seen,checked=excluded.checked,info=excluded.info,audio=excluded.audio
-            """, pending)
-            # Existing inode-based inventory decisions can move a provenance
-            # pointer without changing the canonical recording or edition ID.
-            db.executemany("""
-                UPDATE canonical_references SET path=:path,song=:id
-                WHERE (path=:path AND song='') OR (path=:canonical_previous AND song IN ('',:id))
-            """, pending)
-        pending.clear()
-        unchanged.clear()
-
     walk_failed = False
 
     def error(_):
@@ -786,120 +855,195 @@ def inventory(index, collection, inspect_cache, stop, progress, *, limit=None, p
         walk_failed = True
         counts["errors"] += 1
 
-    def files():
-        with collection_reader(collection, root, targeted=paths is not None) as read_batch:
-            paths_iter = iter(audio_paths(root, error) if paths is None else paths)
-            while batch := tuple(islice(paths_iter, 128)):
-                rows = read_batch(batch)
-                for path in batch:
-                    yield path, rows.get(str(path))
+    def flush():
+        if not pending:
+            return
+        if root_identity() != identity:
+            raise OSError("Stockage de la bibliothèque changé pendant l’inventaire")
+        with measure("sqlite_transaction"), index.db() as db:
+            with measure("sqlite_lock"):
+                db.execute("BEGIN IMMEDIATE")
+            counts["transactions"] += 1
+            for song in pending:
+                written = db.execute("""
+                    INSERT INTO songs VALUES(
+                      :id,:path,:token,:dev,:inode,:bytes,:side,:cache,:previous,:title,:artist,:owner,
+                      :album,:edition,:duration,:disc,:track,:year,:artist_id,:release_id,:plays,
+                      :lyrics,:lrc,:kara,:search,:seen,:added,:checked,:info,:audio
+                    ) ON CONFLICT(id) DO UPDATE SET
+                      path=excluded.path,token=excluded.token,dev=excluded.dev,inode=excluded.inode,
+                      bytes=excluded.bytes,side=excluded.side,cache=excluded.cache,previous=excluded.previous,
+                      title=excluded.title,artist=excluded.artist,owner=excluded.owner,album=excluded.album,
+                      edition=excluded.edition,duration=excluded.duration,disc=excluded.disc,track=excluded.track,
+                      year=excluded.year,artist_id=excluded.artist_id,release_id=excluded.release_id,plays=excluded.plays,
+                      lyrics=excluded.lyrics,lrc=excluded.lrc,kara=excluded.kara,search=excluded.search,
+                      seen=excluded.seen,checked=excluded.checked,info=excluded.info,audio=excluded.audio
+                    WHERE songs.token=:old_token AND songs.checked=:old_checked
+                """, song).rowcount
+                counts["changed"] += written
+                # Keep the canonical edition and recording IDs when a known
+                # inode moves. The path is changed in the song transaction.
+                if written and (song["old_token"] is None or song["canonical_previous"] is not None):
+                    db.execute("""
+                        UPDATE canonical_references SET path=:path,song=:id
+                        WHERE (path=:path AND song='') OR (path=:canonical_previous AND song IN ('',:id))
+                    """, song)
+        pending.clear()
 
-    for path, strawberry in files():
-        if stop() or (limit is not None and counts["scanned"] >= limit):
-            break
-        try:
-            st = path.lstat()
-            if not stat.S_ISREG(st.st_mode):
+    started = perf_counter()
+    with collection_reader(collection, root, targeted=paths is not None) as read_batch, index.db() as db:
+        phases["strawberry"] += perf_counter() - started
+        candidates = iter(audio_paths(root, error) if paths is None else dict.fromkeys(paths))
+        while not stop() and (limit is None or counts["scanned"] < limit):
+            size = 128 if limit is None else min(128, limit - counts["scanned"])
+            with measure("walk"):
+                window = tuple(islice(candidates, size))
+                batch = tuple(path for path in window if index_path(root, path))
+            if not window:
+                break
+            if not batch:
                 continue
-            token = document([st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns])
-            old = previous.get(str(path))
-            canonical_previous = None
-            matches = inodes[st.st_dev, st.st_ino]
-            if old is None and len(matches) == 1:
-                known = json.loads(matches[0]["token"])
-                if not Path(matches[0]["path"]).exists() and known[2:4] == [st.st_size, st.st_mtime_ns]:
-                    old = matches.pop()
-                    canonical_previous = old["path"]
-            same_audio = old is not None and old["token"] == token
-            same_metadata = same_audio and old["path"] == str(path)
-            duration = strawberry["length"] / 1e9 if strawberry and (strawberry["length"] or 0) > 0 else (
-                old["duration"] if same_audio else 0)
-            catalog_text = (strawberry["lyrics"] or "") if strawberry else ""
-            catalog_matches = strawberry and (st.st_size, int(st.st_mtime)) == (strawberry["filesize"], strawberry["mtime"])
-            # Append the genre to the existing signature only when the
-            # collection can supply it. Older Strawberry schemas keep the
-            # same revision and do not trigger another audio probe.
-            catalog_values = tuple(strawberry) if strawberry else ()
-            if strawberry and not strawberry["genre"]:
-                catalog_values = catalog_values[:-1]
-            catalog_revision = encoded_key(catalog_values)
-            info = json.loads(old["info"]) if old else {}
-            if (same_metadata and catalog_revision == info.get("catalogue") and not info.get("probe_error")):
-                tags = info["tags"]
-            else:
-                if catalog_matches:
-                    tags = dict(strawberry)
-                    tags["albumid"] = strawberry["musicbrainz_album_id"]
-                    tags["artistid"] = strawberry["musicbrainz_album_artist_id"]
-                    tags["recordingid"] = strawberry["musicbrainz_recording_id"]
-                else:
-                    try:
-                        tags, _ = reader(path)
-                    except (OSError, ValueError, subprocess.SubprocessError):
-                        tags = dict(strawberry) if strawberry else {}
-                        info["probe_error"] = True
-                        counts["errors"] += 1
-                    else:
-                        info.pop("probe_error", None)
-            duration = tags.get("duration_seconds") or duration
-            embedded = (info.get("plain", "") if same_metadata and catalog_revision == info.get("catalogue") else
-                        next((tags.get(k) for k in LYRIC_KEYS if tags.get(k)), "") or catalog_text)
-            if len(embedded.encode()) > MAX_LRC_BYTES:
-                embedded = ""
-            side, lyrics, lrc = local_state(path, embedded, duration)
-            cache, kara, report = inspect_cache(path, old, token, side)
-            if same_metadata and side == old["side"] and catalog_revision == info.get("catalogue"):
-                if lyrics == "absent" and old["lyrics"] == "instrumental":
-                    lyrics = old["lyrics"]
-                if lrc == "local" and old["lrc"] in ("externe", "généré"):
-                    lrc = old["lrc"]
-                if cache == old["cache"] and kara == old["kara"] and lyrics == old["lyrics"] and lrc == old["lrc"]:
-                    unchanged.append(old["id"])
+            with measure("strawberry"):
+                catalogue = read_batch(batch)
+            with measure("sqlite_read"):
+                previous = path_rows(db, batch)
+            for path in batch:
+                if stop():
+                    break
+                missing.pop(str(path), None)
+                old = previous.get(str(path))
+                try:
+                    with measure("file_stat"):
+                        st = path.lstat()
+                        if not stat.S_ISREG(st.st_mode) or paths is not None and path.resolve() != path:
+                            continue
+                        token = revision(st)
+                    canonical_previous = None
+                    if old is None:
+                        with measure("sqlite_read"):
+                            matches = db.execute("SELECT * FROM songs WHERE dev=? AND inode=? LIMIT 2",
+                                                 (st.st_dev, st.st_ino)).fetchall()
+                        if len(matches) == 1:
+                            known = matches[0]
+                            if (json.loads(known["token"])[2:4] == [st.st_size, st.st_mtime_ns]
+                                    and not Path(known["path"]).exists()):
+                                old = known
+                                canonical_previous = old["path"]
+                    strawberry = catalogue.get(str(path))
+                    fresh = bool(strawberry and (st.st_size, int(st.st_mtime)) ==
+                                 (strawberry["filesize"], strawberry["mtime"]))
+                    values = tuple(strawberry) if strawberry else ()
+                    if strawberry and not strawberry["genre"]:
+                        values = values[:-1]
+                    catalogue_revision = encoded_key(values)
+                    info = json.loads(old["info"]) if old else {}
+                    same_audio = old is not None and old["token"] == token
+                    same_path = old is not None and old["path"] == str(path)
+                    same_catalogue = catalogue_revision == info.get("catalogue")
+                    reuse = same_audio and not info.get("probe_error") and (same_catalogue or not fresh)
+                    with measure("metadata"):
+                        if reuse:
+                            tags = info["tags"]
+                            embedded = info.get("plain", "")
+                            duration = old["duration"]
+                            counts["reused"] += 1
+                        else:
+                            old_stamp = json.loads(old["token"]) if old is not None else None
+                            same_coarse_stamp = old_stamp is not None and (old_stamp[2], old_stamp[3] // 10**9) == (
+                                st.st_size, st.st_mtime_ns // 10**9)
+                            if fresh and (old is None or same_audio or not same_coarse_stamp):
+                                tags = dict(strawberry)
+                                for dest, source in (("albumid", "album"), ("artistid", "album_artist"),
+                                                     ("recordingid", "recording")):
+                                    tags[dest] = strawberry[f"musicbrainz_{source}_id"]
+                                counts["strawberry"] += 1
+                                info.pop("probe_error", None)
+                            else:
+                                try:
+                                    with measure("ffprobe"):
+                                        counts["probes"] += 1
+                                        tags, _ = reader(path)
+                                except (OSError, ValueError, subprocess.SubprocessError):
+                                    tags = info.get("tags", {}) if old else {}
+                                    info["probe_error"] = True
+                                    counts["errors"] += 1
+                                else:
+                                    info.pop("probe_error", None)
+                            duration = tags.get("duration_seconds") or (
+                                strawberry["length"] / 1e9 if fresh and (strawberry["length"] or 0) > 0 else 0)
+                            embedded = next((tags.get(k) for k in LYRIC_KEYS if tags.get(k)), "") or (
+                                (strawberry["lyrics"] or "") if fresh else "")
+                            if len(embedded.encode()) > MAX_LRC_BYTES:
+                                embedded = ""
+                    stable = same_audio and embedded == info.get("plain", "") and duration == old["duration"]
+                    side, lyrics, lrc = local_state(path, embedded, duration, old, info, stable, measure)
+                    with measure("cache"):
+                        cache, kara, report = inspect_cache(path, old, token, side)
                     counts["scanned"] += 1
-                    if len(unchanged) >= 256:
-                        flush()
-                        progress(counts["scanned"])
-                    continue
-            title = tags.get("title") or path.stem
-            artist = tags.get("artist") or UNKNOWN_ARTIST
-            owner = tags.get("albumartist") or artist
-            album = tags.get("album") or ""
-            artist_id = tags.get("artistid") or tags.get("musicbrainzalbumartistid") or ""
-            owner = grouped_artist(group_rules, owner, album, artist_id) or owner
-            release_id = tags.get("albumid") or tags.get("musicbrainzalbumid") or ""
-            year = integer(str(tags.get("year") or tags.get("date") or "")[:4])
-            edition = encoded_key(owner, album, release_id or year, str(path.parent))
-            # The provider approved one version of the reference. A later
-            # inventory is evidence of presence only, even if the replacement
-            # audio eventually receives the same PCM identity.
-            if not same_audio or embedded != info.get("plain", ""):
-                info.pop("lyrics_provider", None)
-            if not same_audio or json.loads(side)[0] != json.loads(old["side"])[0]:
-                info.pop("lrc_provider", None)
-            info.update(tags={k: v for k, v in tags.items() if k not in LYRIC_KEYS},
-                        plain=embedded, catalogue=catalog_revision, report=report)
-            pending.append(dict(id=old["id"] if old else uuid4().hex, path=str(path), token=token,
-                                dev=st.st_dev, inode=st.st_ino, bytes=st.st_size, side=side, cache=cache,
-                                previous=(old["path"] if old["path"] != str(path) else old["previous"]) if old else None,
-                                title=title, artist=artist, owner=owner, album=album, edition=edition, duration=duration,
-                                disc=integer(tags.get("disc") or tags.get("discnumber")), track=integer(tags.get("track") or tags.get("tracknumber")),
-                                year=year, artist_id=artist_id,
-                                release_id=release_id, plays=integer(strawberry["playcount"]) if strawberry else 0,
-                                lyrics=lyrics, lrc=lrc, kara=kara, search=key(" ".join((title, artist, owner, album))),
-                                seen=generation, added=old["added"] if old else now, checked=now, info=document(info),
-                                audio=old["audio"] if same_audio else "", canonical_previous=canonical_previous))
-            counts["scanned"] += 1
-            counts["changed"] += 1
-            if len(pending) >= 128:
-                flush()
-                progress(counts["scanned"])
-        except (OSError, ValueError, UnicodeError):
-            if old := previous.get(str(path)):
-                unchanged.append(old["id"])
-            counts["errors"] += 1
-    flush()
-    # A partial or interrupted scan is never proof of disappearance.
-    if paths is None and limit is None and not stop() and not walk_failed:
-        with index.db() as db:
-            counts["missing"] = db.execute("DELETE FROM songs WHERE seen!=?", (generation,)).rowcount
-    return counts
+                    plays = integer(strawberry["playcount"]) if strawberry else old["plays"] if old else 0
+                    if (same_path and stable and same_catalogue and side == old["side"] and cache == old["cache"]
+                            and kara == old["kara"] and lyrics == old["lyrics"] and lrc == old["lrc"]
+                            and plays == old["plays"] and not info.get("probe_error")):
+                        counts["unchanged"] += 1
+                        continue
+                    if revision(path.lstat()) != token:
+                        error("version audio modifiée pendant l’inventaire")
+                        continue
+                    if canonical_previous is not None:
+                        missing.pop(canonical_previous, None)
+                    title = tags.get("title") or path.stem
+                    artist = tags.get("artist") or UNKNOWN_ARTIST
+                    owner = tags.get("albumartist") or artist
+                    album = tags.get("album") or ""
+                    artist_id = tags.get("artistid") or tags.get("musicbrainzalbumartistid") or ""
+                    owner = grouped_artist(group_rules, owner, album, artist_id) or owner
+                    release_id = tags.get("albumid") or tags.get("musicbrainzalbumid") or ""
+                    year = integer(str(tags.get("year") or tags.get("date") or "")[:4])
+                    edition = encoded_key(owner, album, release_id or year, str(path.parent))
+                    if not same_audio or embedded != info.get("plain", ""):
+                        info.pop("lyrics_provider", None)
+                    if not same_audio or json.loads(side)[0] != json.loads(old["side"])[0]:
+                        info.pop("lrc_provider", None)
+                    info.update(tags={k: v for k, v in tags.items() if k not in LYRIC_KEYS},
+                                plain=embedded, catalogue=catalogue_revision, report=report)
+                    pending.append(dict(id=old["id"] if old else uuid4().hex, path=str(path), token=token,
+                                        dev=st.st_dev, inode=st.st_ino, bytes=st.st_size, side=side, cache=cache,
+                                        previous=(old["path"] if not same_path else old["previous"]) if old else None,
+                                        title=title, artist=artist, owner=owner, album=album, edition=edition, duration=duration,
+                                        disc=integer(tags.get("disc") or tags.get("discnumber")),
+                                        track=integer(tags.get("track") or tags.get("tracknumber")), year=year,
+                                        artist_id=artist_id, release_id=release_id, plays=plays, lyrics=lyrics, lrc=lrc,
+                                        kara=kara, search=key(" ".join((title, artist, owner, album))), seen=generation,
+                                        added=old["added"] if old else now, checked=now, info=document(info),
+                                        audio=old["audio"] if same_audio else "", canonical_previous=canonical_previous,
+                                        old_token=old["token"] if old else None, old_checked=old["checked"] if old else None))
+                except (OSError, ValueError, UnicodeError) as exc:
+                    error(exc)
+            flush()
+            progress(counts["scanned"])
+
+    # A missing or replaced mount, interrupted walk or unreadable directory
+    # is not proof of absence. A legacy index first needs a readable witness.
+    if (paths is None and limit is None and not stop() and not walk_failed
+            and root_identity() == identity and (saved_root or counts["scanned"] or not had_rows)):
+        if saved_root is None:
+            with measure("sqlite_transaction"), index.db() as db:
+                db.execute("INSERT OR IGNORE INTO inventory_root VALUES(1,?,?)", identity)
+                counts["transactions"] += 1
+        remaining = iter(missing.items())
+        while not stop() and (batch := tuple(islice(remaining, 128))):
+            absent = []
+            for pathname, (song_id, token, checked) in batch:
+                try:
+                    if missing_on_device(Path(pathname), json.loads(token)[0]):
+                        absent.append((song_id, pathname, token, checked))
+                except OSError as exc:
+                    error(exc)
+            if absent and root_identity() == identity:
+                with measure("sqlite_transaction"), index.db() as db:
+                    with measure("sqlite_lock"):
+                        db.execute("BEGIN IMMEDIATE")
+                    counts["transactions"] += 1
+                    counts["missing"] += db.executemany(
+                        "DELETE FROM songs WHERE id=? AND path=? AND token=? AND checked=?", absent).rowcount
+    return dict(counts, phase_seconds=dict(phases), phase_calls=dict(calls))

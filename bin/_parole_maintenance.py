@@ -36,7 +36,7 @@ from _parole_resources import Resources
 from _parole_sources import discover, seed, controls, ready_categories
 from _paroles_lrc import MAX_LRC_BYTES
 
-CATEGORIES = ("SYSTEM", "SCAN", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
+CATEGORIES = ("SYSTEM", "SCAN", "INDEX", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
               "COVER", "CODEX", "SOURCE", "DEMUCS", "TURBO", "KARA", "TV", "SYNC", "IDLE", "CACHE",
               "SUCCESS", "WARNING", "ERROR", "TRANSCRIPTION", "RESSOURCES")
 HEAVY = ("prepare", "transcription")
@@ -168,6 +168,7 @@ class Maintenance:
         self.cancelled = None
         self.priority_until = 0.
         self.next_scan = 0
+        self.plan_policy = None
         self.network_cursor = 0
         self.network_width = 2
         self.local_reference_next = True
@@ -237,13 +238,18 @@ class Maintenance:
         self.wake.set()
 
     def inspect_cache(self, path, old, token, side):
+        def available(candidate):
+            try:
+                return file_token(candidate)
+            except FileNotFoundError:
+                return None
+
         try:
             reference = self.cache.folder(path) / "prepared.json"
-            rt = file_token(reference) if reference.is_file() else None
-            model = file_token(self.cache.model) if self.cache.model.is_file() else None
+            rt = available(reference)
+            model = available(self.cache.model)
             stem = stem_directory(path)
-            stem_tokens = [file_token(stem / name) if (stem / name).is_file() else None
-                           for name in ("meta.json", *FILES)]
+            stem_tokens = [available(stem / name) for name in ("meta.json", *FILES)]
             # A previous inventory contains coverage but cannot distinguish a
             # rejected reference from a validated reference awaiting stems.
             saved = document([rt, model, stem_tokens, REFINEMENT_VERSION, "reference-status"])
@@ -343,22 +349,32 @@ class Maintenance:
             self.night.report("Mode nocturne actif · traitement en cours")
         return True
 
-    def scan(self, settings, *, limit=None):
+    def scan(self, settings, *, limit=None, replan=False):
         started = monotonic()
         self.active = ("scan", "")
         self.progress = None
-        self.journal.emit("SCAN", "Analyse incrémentale de la bibliothèque")
+        self.journal.emit("INDEX", "Réconciliation de la bibliothèque")
         try:
             args = () if self.state_root is None else (self.state_root,)
             associations = self.index.associations(*args)
             result = inventory(self.index, self.collection, self.inspect_cache, self.stopped,
                                lambda scanned: setattr(self, "progress", ("SCAN", f"{scanned} chansons vérifiées", None)),
                                limit=limit)
-            self.metrics.update(result, scan_seconds=monotonic() - started, associations=associations)
-            self.journal.emit("SCAN", "{scanned} vérifiées · {changed} mises à jour · {missing} disparues · {errors} erreurs".format(**result))
-            self.revision += 1
-            if not self.stopped():
+            elapsed = monotonic() - started
+            self.metrics.update(result, scan_seconds=elapsed, associations=associations)
+            self.journal.emit("INDEX", f"{result['scanned']} vérifiées · {result['unchanged']} inchangées · "
+                              f"{result['changed']} mises à jour · {result['missing']} disparues · "
+                              f"{result['errors']} erreurs · {elapsed:.2f} s · {result['probes']} FFprobe")
+            changed = result["changed"] or result["missing"]
+            if changed:
+                self.revision += 1
+            policy = tuple(settings[name] for name in ("lyrics", "lrc", "autoprepare", "metadata", "albums",
+                                                       "discography", "cover", "night_enabled", "generate", "releases"))
+            if not self.stopped() and (changed or replan or self.plan_policy != policy):
+                before_plan = monotonic()
                 self.plan(settings)
+                self.metrics["plan_seconds"] = monotonic() - before_plan
+                self.plan_policy = policy
         finally:
             self.active = None
             self.progress = None
@@ -1354,9 +1370,10 @@ class Maintenance:
                 and not enrichment_pending(self.index, now)):
             return
         if self.scan_now.is_set() or settings["startup"] and now >= self.next_scan:
+            replan = self.scan_now.is_set()
             self.scan_now.clear()
             self.next_scan = now + max(1, settings["scan_minutes"]) * 60
-            self.scan(settings)
+            self.scan(settings, replan=replan)
             return
         if self.priority:
             return
