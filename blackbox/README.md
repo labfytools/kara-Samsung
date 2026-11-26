@@ -20,6 +20,8 @@ bin/kara-blackbox incidents IDENTIFIANT_SESSION
 
 Remplacer `IDENTIFIANT_SESSION` par l'identifiant renvoyé par `list`. Voir `bin/kara-blackbox --help` pour les autres commandes. Les rapports et fichiers dérivés doivent rester locaux dans `blackbox/reports/` (ou dans un autre emplacement privé).
 
+Les fenêtres de rejeu lisent des fichiers WAV ordinaires dans le dossier `audio/` de leur session. Ce dossier et ses fichiers doivent être présents directement dans la capture.
+
 ## Après un nouveau clone
 
 Les données locales ne sont pas clonées avec le dépôt. Une fois la racine BlackBox privée créée par Kara, recréer le lien et le dossier d'analyse si nécessaire :

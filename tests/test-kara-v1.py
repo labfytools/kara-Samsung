@@ -105,6 +105,19 @@ class BlackBoxTests(unittest.TestCase):
         with wave.open(str(destination), "rb") as source:
             self.assertEqual(source.readframes(320), block)
         self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+        # A WAV with the right name and format must still be owned by the capture.
+        recorded = next((session / "audio").glob("*.wav"))
+        saved = recorded.with_suffix(".original")
+        recorded.rename(saved)
+        recorded.symlink_to(destination)
+        rejected = self.root.parent / "refus.wav"
+        result = subprocess.run([sys.executable, "-B",
+                                 str(Path(__file__).resolve().parents[1] / "bin/kara-blackbox"),
+                                 "--root", str(self.root), "extract", "--id", str(window["id"]),
+                                 "--output", str(rejected)], capture_output=True, timeout=12)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(rejected.exists())
+        saved.replace(recorded)
         manager.start(consent=True)
         manager.pcm("whisper", 16000, 1, block, **context)
         manager.stop(wait=True)

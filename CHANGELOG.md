@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Limiter l’extraction des fenêtres BlackBox aux pistes WAV de leur dossier de capture.
 - Journaliser la mesure PSI et la mémoire disponible ayant suspendu un calcul de maintenance.
 - Produire les brouillons Turbo sur le mix sans réserver une séparation Demucs inutilisée.
 - Rallumer les écrans Sway à la réouverture confirmée après un débranchement et une veille sur batterie.
