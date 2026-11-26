@@ -359,7 +359,7 @@ def main():
                                           "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
                                           "extract-turbo", "replay-turbo", "compare-recognition",
                                           "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
-                                          "annotate", "simulate", "delete", "prune"))
+                                          "annotate", "simulate", "diagnose", "delete", "prune"))
     parser.add_argument("session", nargs="?", default="latest")
     for field in ("cycle", "turn", "player", "song", "component", "event"):
         parser.add_argument("--" + field)
@@ -393,10 +393,24 @@ def main():
     parser.add_argument("--ctc-vocab", type=Path)
     parser.add_argument("--ctc-python", type=Path)
     parser.add_argument("--truth", type=Path, help="transcription humaine indépendante de l’appel sélectionné")
+    parser.add_argument("--hours", type=float, default=4, help="heures de jeu effectif pour le diagnostic")
+    parser.add_argument("--witness", action="store_true", help="inclure le témoin dans l’estimation disque uniquement")
+    parser.add_argument("--budget-bytes", type=int, help="plafond de capture envisagé lors du diagnostic")
     parser.add_argument("--backing", type=Path)
     parser.add_argument("--original", type=Path)
     args = parser.parse_args()
     try:
+        if args.action == "diagnose":
+            from _kara_blackbox_preflight import diagnostic, DEFAULT_VOICE_BYTES
+
+            if args.budget_bytes is not None and not 1 <= args.budget_bytes < 2 ** 63:
+                raise ValueError("Plafond de diagnostic hors limites.")
+            if (args.ctc_model is None) != (args.ctc_vocab is None) or args.ctc_python and not args.ctc_model:
+                raise ValueError("Fournis le modèle et le vocabulaire CTC ensemble.")
+            report = diagnostic(args.root, args.hours, args.witness, args.budget_bytes or DEFAULT_VOICE_BYTES,
+                                args.ctc_python, args.ctc_model, args.ctc_vocab)
+            output(report)
+            return 0 if report["ready_software"] else 2
         if args.speed is not None and (not isfinite(args.speed) or not 0.1 <= args.speed <= 1000):
             raise ValueError("Cadence attendue de 0,1 à 1 000.")
         if len(args.tolerance) > 2 or any(not isfinite(value) or not 0 <= value <= 5 for value in args.tolerance):

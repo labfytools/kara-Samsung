@@ -2,6 +2,17 @@
 
 ## Prévol
 
+Lancer le contrôle hors ligne avant de brancher les sources de test. La durée correspond au temps de jeu effectif. `--witness` ajoute son coût au calcul.
+
+```sh
+bin/kara-blackbox diagnose --hours 2
+bin/kara-blackbox diagnose --hours 4 --witness
+```
+
+La commande vérifie le chemin du modèle Turbo, le moteur SPA s’il est installé, le service, l’espace, le plafond, la reprise d’un enregistreur de fixture et les quatre cas négatifs du score avec un témoin positif. Le code de sortie 2 indique un contrôle logiciel bloquant. On peut fournir les mêmes options locales CTC que dans le comparatif. Les contrôles qui impliquent consentement, téléphone, référence de sortie, horloges et latence restent à faire pendant le protocole.
+
+À 6 Go par heure sans témoin, prévoir 12 Go pour deux heures et 24 Go pour quatre. Le plafond de 16 Gio couvre environ 2 h 52 de jeu actif à ce débit. Avec le témoin, l’estimation est de 6,9 Go/h, soit environ 2 h 29 avec le même plafond. `--budget-bytes` permet de vérifier le scénario d’un autre plafond. L’option ne change pas le plafond réel de Kara. Les WAV et le journal consomment le budget de collecte. Les petits rapports de finalisation s’ajoutent ensuite.
+
 1. Ouvrir **Parole → BlackBox → Capture** et vérifier espace disque, serveur microphone, sortie, références et Turbo. Prévoir environ 6 Go par heure de lecture active, plus la réserve. Préparer les morceaux et choisir le premier tour avant de lancer la phase de mesure.
 2. Ouvrir le client mobile et Tizen. Recharger la page mobile pour obtenir les réglages BlackBox, marqueurs et échanges d’horloge de V3. Le client Tizen installé peut garder son protocole actuel. Désigner les participants, recueillir leur accord, puis activer **Deep Analysis** ou **Benchmark**. Le joueur confirme l’accord sur son téléphone à chaque activation de micro. Laisser le témoin décoché, ou le sélectionner avec l’accord explicite des personnes concernées.
 3. Relever le dispositif, la géométrie, le profil, les volumes Kara, le codec lorsqu’il est disponible, le retour et les traitements externes visibles. Stabiliser la pièce et garder les volumes système et EasyEffects sous contrôle manuel. À chaque changement de dispositif, codec, sortie, position du téléphone ou profil de traitement, consigner une nouvelle configuration et refaire la calibration pertinente.

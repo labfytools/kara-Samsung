@@ -943,6 +943,14 @@ class Recording:
         written = 0
         next_sample = 0.
         next_disk = 0.
+        disk_ceiling = 0
+
+        def check_budget(additional):
+            if written + additional > self.manifest["quota_bytes"]:
+                raise OSError("Limite de taille BlackBox atteinte.")
+            if written + additional > disk_ceiling:
+                raise OSError("Réserve disque BlackBox atteinte.")
+
         try:
             self.manifest["provenance"] = provenance()
             atomic_json(self.folder / "manifest.json", self.manifest)
@@ -950,8 +958,13 @@ class Recording:
                 while not self.stop.is_set() or not self.pending.empty():
                     clock = time.monotonic()
                     if clock >= next_disk:
-                        if (self.manager.disk_available() or 0) < self.manager.reserve:
+                        free = self.manager.disk_available() or 0
+                        if free < self.manager.reserve:
                             raise OSError("Réserve disque BlackBox atteinte.")
+                        # Account for our writes between statvfs samples.
+                        # Other processes can change filesystem usage and
+                        # are observed on the next periodic sample.
+                        disk_ceiling = written + free - self.manager.reserve
                         next_disk = clock + 2
                     if clock >= next_sample:
                         # During backlog prioritize draining PCM over reading
@@ -968,8 +981,7 @@ class Recording:
                     pcm = isinstance(item, tuple)
                     if pcm:
                         item, block = item
-                        if written + len(block) + 1024 > self.manifest["quota_bytes"]:
-                            raise OSError("Limite de taille BlackBox atteinte.")
+                        check_budget(len(block) + 1024)
                         self.append_pcm(item, block)
                         written += len(block) + 44
                     if item["component"] == "party" and item["event"] == "turn-end":
@@ -983,8 +995,7 @@ class Recording:
                         with self.manager.lock:
                             self.dropped += 1
                         continue
-                    if written + len(raw) > self.manifest["quota_bytes"]:
-                        raise OSError("Limite de taille BlackBox atteinte.")
+                    check_budget(len(raw))
                     stream.write(raw)
                     written += len(raw)
                     self.bytes_written = written
