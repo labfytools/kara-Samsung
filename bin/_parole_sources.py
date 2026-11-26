@@ -296,7 +296,7 @@ def fetch_response(parts, interval, accept, registry, provider, validation):
             raise ProviderUnavailable("Source indisponible") from error
 
 
-def provider_backoff(index, identity, host, minimum, status):
+def provider_backoff(index, identity, host, minimum, status, *, lookup_access=False):
     if host == "lrclib.net" and status == 429:
         from random import uniform
 
@@ -304,7 +304,7 @@ def provider_backoff(index, identity, host, minimum, status):
     if index is None or not identity:
         return minimum
     delay = backoff(index, identity, minimum)
-    limited(index, identity, delay, status)
+    limited(index, identity, delay, status, lookup_access=lookup_access)
     return delay
 
 

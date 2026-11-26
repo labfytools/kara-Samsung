@@ -30,6 +30,7 @@ from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_art
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _kara_import_resources import PROCESSING, RATE_DIRECTORY, defer_service, resource_slot, wait_service
 from _kara_import_result import ImportIssue
+from _parole_import_metrics import ACCESS_DENIED, ACCESS_REVIEW_DELAY
 from _parole_lyrics_lookup import (KeepAlive, cache_identity, cached, contexts, provider_profiles,
                                    record_profile, remember)
 
@@ -123,7 +124,8 @@ class RequestGate:
             if self.provider:
                 from _parole_sources import provider_backoff
 
-                delay = provider_backoff(*self.provider, host, delay, status)
+                delay = provider_backoff(*self.provider, host, delay, status,
+                                         lookup_access=status in ACCESS_DENIED)
             defer_service(host, delay)
             return
         with self.lock:
@@ -151,7 +153,13 @@ class RequestGate:
                     with opener.open(request, timeout=budget) as response:
                         yield response
                 except HTTPError as error:
-                    if self.provider and (error.code == 429 or error.code >= 500):
+                    error.close()
+                    if error.code in ACCESS_DENIED:
+                        # An access refusal says nothing about a track. Apply
+                        # the provider's existing gate before any other lookup.
+                        self.defer(host, retry_delay(error.headers.get("Retry-After"), ACCESS_REVIEW_DELAY),
+                                   error.code)
+                    elif self.provider and (error.code == 429 or error.code >= 500):
                         self.defer(host, retry_delay(error.headers.get("Retry-After"), 5), error.code)
                     raise
                 except (URLError, TimeoutError):
@@ -269,7 +277,7 @@ class LyricsOvh:
                 return None
             return json.loads(raw)
         except HTTPError as error:
-            if error.code == 429 or error.code >= 500:
+            if error.code in ACCESS_DENIED or error.code == 429 or error.code >= 500:
                 self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
             if not self.gate.provider and (error.code == 429 or error.code >= 500):
                 self.gate.defer(urlsplit(request.full_url).hostname,
@@ -334,7 +342,7 @@ class PublicLyrics:
                 return raw.decode("utf-8") if html else json.loads(raw)
             self.failure = ServiceUnavailable("Réponse trop volumineuse")
         except HTTPError as error:
-            if error.code == 429 or error.code >= 500:
+            if error.code in ACCESS_DENIED or error.code == 429 or error.code >= 500:
                 self.failure = ServiceUnavailable(f"Service HTTP {error.code}", "limited" if error.code == 429 else "unavailable")
             if not self.gate.provider and (error.code == 429 or error.code >= 500):
                 self.gate.defer(urlsplit(request.full_url).hostname,

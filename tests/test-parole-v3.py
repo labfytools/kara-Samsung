@@ -305,6 +305,54 @@ class CatalogueTests(unittest.TestCase):
 
 
 class SourceTests(Fixture):
+    def test_access_denial_is_not_negative_cache_and_is_local_to_provider(self):
+        from contextlib import nullcontext
+        from urllib.error import HTTPError
+        from _parole_import_metrics import snapshot
+        from _parole_sources import recent_source
+
+        seed(self.index)
+        with self.index.db() as db:
+            db.execute("UPDATE sources SET state='disabled' WHERE id NOT IN ('NetEase', 'QQ Music')")
+        engine = lyrics_engine()
+        clients = engine.LyricsSources()
+        denied = HTTPError("https://music.163.com/", 403, "Forbidden", {"Retry-After": "380"}, None)
+        song = ("Chanson", "Groupe", "Album", 30, "Groupe")
+        # No real quota or HTTP call is needed to exercise the routing,
+        # durable episode, fallback and negative-cache behavior together.
+        with patch("_parole_sources.wait_service"), patch.object(
+                engine, "resource_slot", side_effect=lambda *_args, **_kw: nullcontext()), patch.object(
+                engine, "defer_service") as pause, patch.object(
+                clients.netease.opener, "open", side_effect=denied) as transport, patch.object(
+                clients.qqmusic, "find", return_value="Texte vérifié"):
+            self.assertEqual(clients.find(*song, synced=False, strict=True, registry=self.index),
+                             ("Texte vérifié", "QQ Music"))
+            pause.assert_called_once_with("music.163.com", 380)
+            self.assertEqual(snapshot(self.index)["NetEase"]["last_http"], 403)
+            self.assertEqual(recent_source(self.index, "NetEase")["résultats"], {"error": 1})
+            with self.index.db() as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM reviews WHERE kind='lyrics_query_v1'").fetchone()[0], 1)
+            self.assertEqual(clients.find(*song, synced=False, strict=True, registry=self.index),
+                             ("Texte vérifié", "QQ Music"))
+            transport.assert_called_once()
+
+    def test_lyrics_ovh_distinguishes_missing_text_and_denied_access(self):
+        from urllib.error import HTTPError
+
+        engine = lyrics_engine()
+        client = engine.LyricsOvh()
+        with patch.object(client.gate, "wait", return_value=True), patch.object(
+                client.gate, "defer") as pause, patch.object(client.opener, "open") as transport:
+            client.failure = None
+            transport.side_effect = HTTPError("https://api.lyrics.ovh/", 404, "Not found", {}, None)
+            self.assertIsNone(client.get("v1/Groupe/Chanson"))
+            self.assertIsNone(client.failure)
+            pause.assert_not_called()
+            transport.side_effect = HTTPError("https://api.lyrics.ovh/", 451, "Denied", {}, None)
+            self.assertIsNone(client.get("v1/Groupe/Chanson"))
+            self.assertEqual(client.failure.reason, "unavailable")
+            pause.assert_called_once_with("api.lyrics.ovh", 300, 451)
+
     def test_exact_pcm_reference_crosses_editions_without_network_or_retag(self):
         from _parole_local_reference import SOURCE, local_reference
         from _parole_index import sidecar

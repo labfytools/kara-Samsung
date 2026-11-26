@@ -12,6 +12,8 @@ TOTAL = "total"
 SUCCEEDED = "succeeded"
 MEASURES = {LOOKUP, STARTUP, THROUGHPUT, TOTAL, SUCCEEDED}
 WEEK = 7 * 86_400
+ACCESS_DENIED = frozenset((401, 403, 451))
+ACCESS_REVIEW_DELAY = 300
 
 
 def observe(index, source, values, *, now=None):
@@ -43,8 +45,11 @@ def observe(index, source, values, *, now=None):
         return
 
 
-def limited(index, source, seconds, status, *, now=None):
-    provider_limit = status == 429 or 500 <= status < 600 or source == JAMENDO and status == 6
+def limited(index, source, seconds, status, *, now=None, lookup_access=False):
+    # An individual audio asset can be forbidden while that provider still
+    # allows other imports. Only a lookup can request an access cooldown.
+    provider_limit = (lookup_access and status in ACCESS_DENIED or status == 429 or 500 <= status < 600
+                      or source == JAMENDO and status == 6)
     if index is None or not source or not provider_limit:
         return
     deadline = (time() if now is None else now) + max(0, seconds)

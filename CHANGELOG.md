@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Enregistrer les refus d’accès HTTP des fournisseurs de paroles et appliquer leur temporisation avant de réessayer.
 - Mesurer le décalage et la dérive des repères Turbo en réservant des blocs d’annotations pour leur évaluation.
 - Mesurer la part des paroles annotées conservée par des seuils d’activité vocale sur chanson entière.
 - Rejouer les pistes AEC BlackBox lorsque le moniteur et le témoin partagent leurs cycles PipeWire.
