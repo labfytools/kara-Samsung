@@ -372,8 +372,23 @@ class Maintenance:
         started = monotonic()
         self.index_progress = 0
         self.journal.emit("INDEX", "Réconciliation de la bibliothèque")
+        next_delivery = started
+        yield_delivery = False
+
         def stopped():
-            return self.index_stopped() or bool(self.index_limit(settings))
+            nonlocal next_delivery, yield_delivery
+            if yield_delivery or self.index_stopped() or self.index_limit(settings):
+                return True
+            tick = monotonic()
+            if tick < next_delivery:
+                return False
+            next_delivery = tick + .25
+            # The same worker yields a full sweep to ready publications.
+            # A retry with a bad file must not starve reconciliation.
+            with self.index.db(wait=.15) as db:
+                yield_delivery = db.execute("SELECT 1 FROM index_events WHERE due<=? AND attempts=0 LIMIT 1",
+                                            (time(),)).fetchone() is not None
+            return yield_delivery
 
         try:
             args = () if self.state_root is None else (self.state_root,)

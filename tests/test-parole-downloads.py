@@ -14,7 +14,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -27,7 +27,7 @@ import _kara_catalogue as catalogue
 from _kara_import_queue import ImportQueue
 from _kara_import_result import ImportIssue
 from _parole_import_metrics import DownloadConcurrency
-from _parole_index import Index
+from _parole_index import Index, inventory
 from _parole_sources import configure_limits, seed
 
 # The child replaces only the transport and the fixture's allowed cadence.
@@ -80,6 +80,7 @@ class FixtureServer(ThreadingHTTPServer):
         self.originals = originals
         self.lock = Lock()
         self.release = None
+        self.release_first = None
         self.delay = .95
         self.active = 0
         self.peak = 0
@@ -143,7 +144,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             with server.lock:
                 server.prefixes += 1
-            if server.release is not None:
+            if path == server.originals[0][0]["name"] and server.release_first is not None:
+                server.release_first.wait(15)
+            elif server.release is not None:
                 server.release.wait(15)
             else:
                 sleep(server.delay)
@@ -358,6 +361,8 @@ class FullEngineTests(unittest.TestCase):
             finally:
                 if server.release is not None:
                     server.release.set()
+                if server.release_first is not None:
+                    server.release_first.set()
                 server.shutdown()
                 thread.join()
 
@@ -439,6 +444,33 @@ class FullEngineTests(unittest.TestCase):
                     print(f"{cap:2d} créneaux · pic {server.peak:2d} · {elapsed:.3f} s · "
                           f"{server.received / 2**20 / elapsed:.3f} Mio/s · {36 * 60 / elapsed:.1f} pistes/min",
                           flush=True)
+
+    def test_ready_track_reaches_v2_while_first_body_is_held(self):
+        with self.server() as server:
+            server.release_first = Event()
+            server.delay = .15
+            root, music, queue, identity = case = self.case(3, ["concurrence"])
+            index = Index(music, root / "state")
+            with self.worker(case, server) as (process, output):
+                try:
+                    self.until(lambda: bool(index.events(time())[1]))
+                    _, events = index.events(time())
+                    self.assertTrue(any(row["proof"] for row in events))
+                    result = inventory(index, None, lambda *_: ("", "absent", {}),
+                                       lambda: False, lambda *_: None, events=events)
+                    self.assertGreater(result["changed"], 0)
+                    with server.lock:
+                        self.assertGreaterEqual(server.active, 1)
+                    self.assertEqual(queue.outcomes(identity), {})
+                    self.assertIsNone(process.poll())
+                    with index.db() as db:
+                        self.assertFalse(db.execute("SELECT 1 FROM songs WHERE track=1").fetchone())
+                finally:
+                    server.release_first.set()
+                self.result(process, output)
+            outcome, = queue.outcomes(identity).values()
+            self.assertTrue(outcome["audio_complete"], outcome["diagnostics"])
+            self.assertEqual((outcome["added"], len(outcome["tracks"])), (36, 36))
 
     def test_pause_twenty_body_streams_and_resume_with_verified_ranges(self):
         with self.server() as server:

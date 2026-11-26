@@ -1,7 +1,7 @@
 """Cross-process admission and cooldowns for the import engine."""
 from contextlib import ExitStack, contextmanager
 from collections import Counter, deque
-from concurrent.futures import wait as wait_futures
+from concurrent.futures import FIRST_COMPLETED, wait as wait_futures
 from contextvars import ContextVar, copy_context
 from fcntl import LOCK_EX, LOCK_NB, LOCK_SH, flock
 import json
@@ -180,10 +180,13 @@ def track_results(executor, handler, values, *, window=MAX_DOWNLOADS):
 
     def results():
         while pending:
-            result = pending[0].result()
-            pending.popleft()
-            admit()
-            yield result
+            done, _ = wait_futures(pending, return_when=FIRST_COMPLETED)
+            for future in tuple(pending):
+                if future in done:
+                    pending.remove(future)
+                    result = future.result()
+                    admit()
+                    yield result
 
     try:
         for _ in range(window):

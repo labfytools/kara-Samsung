@@ -19,7 +19,7 @@ import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Event, Lock, RLock, Thread
-from time import monotonic
+from time import monotonic, time
 from unicodedata import normalize
 from urllib.parse import parse_qs, urlsplit
 from zipfile import BadZipFile
@@ -41,6 +41,7 @@ from _musique_oz import (AUDIO, INBOX, SHARED_LIBRARY, album_groups, audio_file,
 from _parole_import_providers import ARCHIVE, AUDIO_HOSTS, JAMENDO, YOUTUBE, archive_identifier, jamendo_identifier
 from _parole_import_metrics import LOOKUP, SUCCEEDED, THROUGHPUT, TOTAL, Transfer, limited, observe, snapshot
 from _parole_import_enrichment import schedule as schedule_enrichment
+from _parole_index import Index
 from _parole_music_identity import (CONFIRMED, DIFFERENT, Track, compare as compare_music, duration_ms,
                                     from_catalogue as music_facts, position, same_track)
 from _parole_music_registry import (acoustic_evidence, original_tags, possible_duplicates, registered_positions,
@@ -204,7 +205,7 @@ class ImportProgress:
 
 def run(label, command, *, progress=None, fraction=None, download=False, announce=True,
         total=0, unit="pistes traitées", span=0.0, resource=None, disk=None, cooperative=False,
-        download_context=None, phase_changed=None):
+        download_context=None, phase_changed=None, publication=None):
     if announce:
         if progress is None:
             print(f"\n{label}", flush=True)
@@ -239,7 +240,8 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
         with resource_slot(directory, PROCESSING, lambda: progress.emit("En attente d’un traitement…")) as slot:
             progress.measured(label, "processing_queue", monotonic() - waiting)
             return run(label, command, progress=progress, fraction=fraction, announce=False,
-                       total=total, unit=unit, span=span, resource=(slot,), cooperative=cooperative)
+                       total=total, unit=unit, span=span, resource=(slot,), cooperative=cooperative,
+                       publication=publication)
     started = monotonic()
     try:
         if resource and not download:
@@ -283,6 +285,9 @@ def run(label, command, *, progress=None, fraction=None, download=False, announc
     with process:
         for raw in iter(lambda: process.stdout.readline(65536), ""):
             line = raw.rstrip("\r\n")
+            if publication and line.startswith("KARA_PUBLICATION "):
+                publication(line.removeprefix("KARA_PUBLICATION "))
+                continue
             if phase_changed and line.startswith("KARA_PHASE "):
                 phase = line.removeprefix("KARA_PHASE ")
                 phase_changed(phase)
@@ -761,9 +766,9 @@ def download_track(source, folder, progress):
 
 
 def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, folder_hint=None, filing_artist=None,
-               selected=None):
+               selected=None, partial_credits=False, staged_proof=None):
     if not selected and not any(audio_files(batch)):
-        return 0, []
+        return 0, [], {}
     with TemporaryDirectory(prefix="kara-rapport-") as temporary:
         report = Path(temporary) / "pistes.json"
         credit = ["--artiste-album", album_artist] if album_artist else []
@@ -772,18 +777,35 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
         selection = []
         if selected is not None:
             paths = Path(temporary) / "selection.json"
-            paths.write_text(json.dumps(sorted(selected)), encoding="utf-8")
+            proofs = {"paths": sorted(selected), "proof": staged_proof} if staged_proof else sorted(selected)
+            paths.write_text(json.dumps(proofs), encoding="utf-8")
             selection = ["--liste-import", str(paths)]
+        delivered = set()
+
+        def notify(line):
+            try:
+                path, proof = json.loads(line)
+                progress.measure_index.notify([path], proofs={path: proof} if proof else None)
+                delivered.add(path)
+                if proof:
+                    progress.measured("Index", "publication_queue", time() - proof["published"])
+            except (OSError, TypeError, ValueError, sqlite3.Error):
+                # Retry with the complete report. The on-disk receipt and V2
+                # watcher also cover a process exit before delivery.
+                progress.log("Index", "Publication à rapprocher de l’index")
+
         code = run("Tri dans l’audiothèque",
                    [str(BIN / "musique-tri"), "--bibliotheque", str(SHARED_LIBRARY),
                     "--rapport", str(report), "--rapport-detaille", "--reprise-interne", str(receipt),
                     *credit, *(["--garder-tags-import"] if preserve_tags else ()), *destination, *filing,
-                    *selection, "--", str(batch)],
-                   progress=progress, fraction=0.76, resource="processing", cooperative=True)
+                    *selection, *(["--credits-partiels"] if partial_credits else ()),
+                    *(["--suivi-publication"] if progress.measure_index is not None else ()), "--", str(batch)],
+                   progress=progress, fraction=0.76, resource="processing", cooperative=True,
+                   publication=notify if progress.measure_index is not None else None)
         if not report.is_file():
             if not code:
                 progress.issue("Tri dans l’audiothèque", "processing", "Rapport du tri absent.")
-            return 0, []
+            return 0, [], {}
         data = json.loads(report.read_text(encoding="utf-8"))
         tracks = available_tracks(data["tracks"], SHARED_LIBRARY)
         if len(tracks) != len(data["tracks"]):
@@ -792,12 +814,13 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
             try:
                 # The sorter already read these exact files. Store the
                 # versioned tags before the managed album outcome is emitted.
-                progress.measure_index.notify(tracks, proofs=data.get("verified", {}))
+                progress.measure_index.notify([path for path in tracks if path not in delivered],
+                                              proofs=data.get("verified", {}))
             except (OSError, sqlite3.Error):
                 # The durable import receipts still describe the published
                 # subset. Album settlement can send the same paths again.
                 progress.log("Index", "Publication à rapprocher de l’index")
-    return data["added"], tracks
+    return data["added"], tracks, data.get("sources", {})
 
 
 def enrich_tracks(tracks, progress):
@@ -1108,7 +1131,7 @@ def reuse_duplicate(index, name, record, folder, inbox, progress):
     return None
 
 
-def publish_staged(item, root, inbox, folder, records, active, targets, receipt, manifest, reuse):
+def publish_staged(item, root, inbox, folder, records, active, targets, receipt, manifest, reuse, staged_proof):
     progress = item.progress
     if progress.measure_index is not None:
         for stage, name in tuple(active.items()):
@@ -1140,14 +1163,20 @@ def publish_staged(item, root, inbox, folder, records, active, targets, receipt,
     hint = grouped_destination(reuse, root)
     # A prefetched original may be complete while validation is paused or
     # stopped. Publish the verified subset and leave other originals staged.
-    item.added, _ = sort_audio(folder, progress, None, receipt, preserve_tags=True, folder_hint=hint, selected=active)
-    published = local_receipts(receipt)
+    added, _, released = sort_audio(folder, progress, None, receipt, preserve_tags=True,
+                                   folder_hint=hint, selected=active, staged_proof=staged_proof)
+    item.added += added
     for stage, name in active.items():
-        target = local_destination(records[name], published.get(stage, []), root)
-        if target:
-            targets[name] = target
-        else:
+        result = released.get(stage)
+        if not result:
             progress.issue("Tri local", "processing", f"Publication non vérifiée : {name}")
+            continue
+        path, version = result
+        if checked := available_tracks([path], root):
+            records[name].update(path=path, published_revision=version)
+            targets[name] = Path(checked[0])
+        else:
+            progress.issue("Tri local", "path", f"Publication inaccessible : {name}")
 
 
 def import_entries(item, root, inbox, previous, stop, seen, reader, source, reference, license_url, verification,
@@ -1181,6 +1210,55 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                 published = local_receipts(receipt)
                 targets = {}
                 active = {}
+
+                provenance = {}
+
+                def persist_targets():
+                    new = []
+                    for name in sorted(targets.keys() - provenance.keys()):
+                        record = records[name]
+                        entry = entries[name]
+                        proof = {"provider": item.provider, "external_id": entry.external_id or record["sha256"],
+                                 "sha256": record["sha256"], "member": name, "source": source, "path": str(targets[name]),
+                                 "edition_ref": reference, "verification": verification, "pcm": record["pcm"],
+                                 "tags": record["tags"], "catalogue_tags": record["catalogue_tags"]}
+                        proof.update({key: record[key] for key in ("acoustic", "canonical_reference") if record.get(key)})
+                        if entry.position:
+                            proof["position"] = list(entry.position)
+                        if license := entry.license or license_url:
+                            proof["license"] = license
+                        new.append(proof)
+                    if not new:
+                        return
+                    write_checkpoint(manifest, records)
+                    item.tracks = sorted(set(item.tracks).union(proof["path"] for proof in new))
+                    if progress.measure_index is not None:
+                        store_import(progress.measure_index, new, fingerprints={
+                            proof["pcm"]: records[proof["member"]]["fingerprint"] for proof in new
+                            if records[proof["member"]].get("fingerprint")
+                        })
+                    provenance.update((proof["member"], proof) for proof in new)
+
+                def publish_ready(selected, staged_proof=None):
+                    if not selected:
+                        return
+                    # An exact original or a PCM-equivalent edition may be
+                    # admitted by another album. Only matching identities
+                    # share a lock, held through registration of the proof.
+                    keys = sorted({record[field][:2] for name in selected.values()
+                                   for record in (records[name],) for field in ("sha256", "pcm")})
+                    with ExitStack() as stack:
+                        previous_guard = progress.guard
+                        progress.guard += tuple(stack.enter_context(lease(workspace.parent / f"identity-{key}.lock"))
+                                                for key in keys)
+                        try:
+                            publish_staged(item, root, inbox, folder, records, selected, targets, receipt,
+                                           manifest, reuse, staged_proof)
+                            persist_targets()
+                        except sqlite3.Error as error:
+                            record_error(progress, "Registre canonique", error)
+                        finally:
+                            progress.guard = previous_guard
 
                 def pending_entries():
                     for number, name in enumerate(audio, 1):
@@ -1274,6 +1352,7 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                             if not checksum:
                                 break
                             with resource_slot(inbox / ".kara-traitements", PROCESSING) as processing:
+                                version = stamp(draft.lstat())
                                 tags, _ = probe(draft, include_codec=True, include_duration=True)
                                 if not (tags.get("title") and (tags.get("album") or len(audio) == 1)
                                         and (tags.get("albumartist") or tags.get("artist"))):
@@ -1300,8 +1379,8 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                         value = measured.document() if measured else ""
                                     if value:
                                         record["fingerprint"] = value
-                            active[stage] = name
-                            item.processed += 1
+                            if stamp(draft.lstat()) != version:
+                                raise ImportIssue("path", "L’original a changé pendant sa vérification.")
                         except (OSError, ValueError, BadZipFile, RuntimeError, subprocess.SubprocessError) as error:
                             if not draft.is_symlink():
                                 draft.unlink(missing_ok=True)
@@ -1309,39 +1388,22 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                                          error if isinstance(error, ImportIssue) else ImportIssue("path", str(error)))
                             if progress.failures[-1]["category"] == "space":
                                 break
-                # Serialize identity decisions only through publication.
-                # Network transfers and the subsequent enrichment stay parallel.
-                with lease(workspace.parent / "identification.lock") as ownership:
-                    progress.guard += (ownership,)
-                    try:
-                        if active:
-                            publish_staged(item, root, inbox, folder, records, active, targets, receipt, manifest, reuse)
-                        if targets:
-                            write_checkpoint(manifest, records)
-                            item.provenance = [
-                                {"provider": item.provider, "external_id": entries[name].external_id or records[name]["sha256"],
-                                 "sha256": records[name]["sha256"], "member": name, "source": source, "path": str(track),
-                                 "edition_ref": reference, "verification": verification, "pcm": records[name]["pcm"],
-                                 "tags": records[name]["tags"], "catalogue_tags": records[name]["catalogue_tags"],
-                                 **({"acoustic": records[name]["acoustic"]} if records[name].get("acoustic") else {}),
-                                 **({"canonical_reference": records[name]["canonical_reference"]}
-                                    if records[name].get("canonical_reference") else {}),
-                                 **({"position": list(entries[name].position)} if entries[name].position else {}),
-                                 **({"license": entries[name].license or license_url}
-                                    if entries[name].license or license_url else {})}
-                                for name, track in sorted(targets.items())
-                            ]
-                            if progress.measure_index is not None:
-                                store_import(progress.measure_index, item.provenance, fingerprints={
-                                    records[name]["pcm"]: records[name]["fingerprint"]
-                                    for name in targets if records[name].get("fingerprint")
-                                })
-                    except sqlite3.Error as error:
-                        record_error(progress, "Registre canonique", error)
-                    finally:
-                        progress.guard = progress.guard[:-1]
+                        else:
+                            item.processed += 1
+                            # Only a credit needing other album tracks to
+                            # resolve a collaboration waits for that evidence.
+                            if not tags.get("albumartist") and ", " in tags.get("artist", ""):
+                                active[stage] = name
+                            else:
+                                proof = [stage, version, tags]
+                                if len(json.dumps(proof)) > 900_000:
+                                    proof = None  # The sorter can reread unusually large tags.
+                                publish_ready({stage: name}, proof)
+                publish_ready(active)
+                persist_targets()
                 if targets or reuse:
                     item.tracks = sorted(set(item.tracks).union(map(str, targets.values()), (p["path"] for p in reuse.values())))
+                    item.provenance = [proof for _, proof in sorted(provenance.items())]
                     item.provenance.extend(reuse.values())
                     if targets:
                         local_sidecars(targets, entries, root, progress)
@@ -1663,6 +1725,13 @@ def import_album(item, root, inbox, previous, stop, seen):
                 tasks = [source for source in item.sources if (source.position, source_video(source.url)) not in staged]
                 progress.selected = tuple(source.position for source in tasks)
 
+                def publish_youtube(*, selected=None, partial_credits=False):
+                    check_space(folder, extra=MAX_MEDIA * PROCESSING)
+                    added, tracks, _ = sort_audio(folder, progress, item.artist, receipt, filing_artist=filing_artist,
+                                                  selected=selected, partial_credits=partial_credits)
+                    item.added += added
+                    item.tracks = sorted(set(item.tracks).union(tracks))
+
                 def transfer(source):
                     if stop.is_set():
                         progress.audio_event("audio-dropped")
@@ -1677,8 +1746,11 @@ def import_album(item, root, inbox, previous, stop, seen):
                     try:
                         with watch_download(observed):
                             code = download_track(source, folder, progress)
-                        if not code and source.position not in progress.finished_positions:
-                            raise ImportIssue("download", "Le téléchargeur n’a publié aucun fichier pour cette piste.")
+                        if not code:
+                            if source.position not in progress.finished_positions:
+                                raise ImportIssue("download", "Le téléchargeur n’a publié aucun fichier pour cette piste.")
+                            identity = source.position, source_video(source.url)
+                            return [track.name for track in audio_files(folder) if staged_key(track.name) == identity]
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         record_error(progress, f"Téléchargement · piste {source.position}", error, "download")
                     finally:
@@ -1691,12 +1763,14 @@ def import_album(item, root, inbox, previous, stop, seen):
                 if tasks:
                     progress.audio_event("audio-queued", amount=len(tasks))
                     with track_results(progress.track_pools["youtube"], transfer, tasks) as results:
-                        for _ in results:
-                            pass
+                        if staged:
+                            publish_youtube(selected=[track.name for track in audio_files(folder)
+                                                      if staged_key(track.name) in staged], partial_credits=True)
+                        for selected in results:
+                            if selected:
+                                publish_youtube(selected=selected, partial_credits=True)
                 if any(audio_files(folder)):
-                    check_space(folder, extra=MAX_MEDIA * PROCESSING)
-                    item.added, sorted_tracks = sort_audio(folder, progress, item.artist, receipt, filing_artist=filing_artist)
-                    item.tracks = sorted(set(item.tracks).union(sorted_tracks))
+                    publish_youtube()
                 if not item.tracks and not progress.failures:
                     raise ImportIssue("download", "Aucune piste complète n’a été reçue.")
             item.audio_complete = bool(item.tracks) and not progress.failures and (
@@ -1725,8 +1799,6 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
     if not root.is_dir() or not inbox.is_dir() or inbox.is_symlink():
         raise ImportIssue("path", f"Bibliothèque ou dossier de réception absent ou symbolique : {inbox}")
     require_commands("ffmpeg", "ffprobe", BIN / "musique-tri")
-    from _parole_index import Index
-
     try:
         metrics = Index(root)
     except (OSError, sqlite3.Error):

@@ -1351,6 +1351,10 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
             reader.start()
             self.assertTrue(waiting.wait(20))
             reader.join()
+            # The first sorter owns one track; the second conversion may
+            # finish while it waits. Hold the mutation lease until both are
+            # staged so restart must reuse both without another transfer.
+            self.until(lambda: len(list(self.inbox.glob(".kara-reprise-*/*.opus"))) == 2)
             worker.kill()
             worker.communicate(timeout=10)
             self.assertEqual(queue.job(identity)["state"], "running")
@@ -1358,7 +1362,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
                 self.assertIsNone(fd)
             self.assertEqual(queue.outcomes(identity), {})
             self.assertEqual(list(self.library.rglob("*.lrc")), [])
-        self.until(lambda: len(list((self.library / "Atelier test").rglob("*.opus"))) == 2)
+        self.until(lambda: len(list((self.library / "Atelier test").rglob("*.opus"))) == 1)
         with lease(lock) as fd:
             self.assertTrue(queue.transition(identity, "running", "queued", "Interrompu"))
             self.assertTrue(queue.claim(identity))
