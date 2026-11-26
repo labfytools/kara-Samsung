@@ -69,6 +69,23 @@ Aucune variante n’a produit de mots dans les intervalles de plus de deux secon
 
 Le p95 porte sur les repères retrouvés. La dernière valeur de chaque cellule conserve toutes les annotations au dénominateur. Le découpage a perdu 26 débuts de mots face au stem continu malgré un p95 calculé sur les repères restants plus bas. Le pire écart de début de mot sur le stem continu atteint 1 761 ms. Ces mesures font du stem continu un candidat à comparer sur d’autres genres et laissent l’objectif de 500 ms ouvert.
 
+#### Décalage et dérive sur blocs tenus à part
+
+Pour chacun des six blocs de 30 secondes contenant du chant annoté, un décalage médian et une dérive ont été estimés à partir des débuts de mots situés dans les autres blocs. Une marge de deux secondes sépare l’estimation du bloc évalué. Les appariements d’origine restent fixes, de même que le dénominateur. Le tableau donne le p95 des écarts sur le stem continu. Le banc contrôle que les mesures brutes sont identiques à celles du reçu initial.
+
+| Repère | Brut | Décalage seul | Décalage et dérive |
+| --- | ---: | ---: | ---: |
+| Début de mot | 440 ms | 328 ms | 325 ms |
+| Fin de mot | 503 ms | 409 ms | 393 ms |
+| Début de ligne | 359 ms | 253 ms | 248 ms |
+| Fin de ligne | 741 ms | 732 ms | 731 ms |
+
+Le décalage estimé sur le stem varie de −123 à −106 ms suivant le bloc. La part de tous les débuts de mots à ±500 ms passe de 92,79 % à 94,32 % avec chacune des corrections. Sur le mix, le décalage fait passer le p95 de fin de ligne de 877 à 981 ms. Sur le découpage adaptatif, il fait passer la médiane de fin de ligne de 60 à 154 ms. Cette estimation utilise des annotations du même titre. Il reste à quantifier la transférabilité entre chansons et à estimer un éventuel décalage uniquement à partir du signal ou de mesures indépendantes en production.
+
+```sh
+python3 -B tests/qualify-parole-clock-drift.py /dossier/prive/es-recuerdo/case.json vocals
+```
+
 ### Détection d’activité sur un titre entier
 
 Un second banc a comparé les niveaux RMS, le rapport de niveau entre le stem et le mix, et Silero VAD sur le même titre complet de 193,68 s. Chaque décision s’applique à un intervalle de 100 ms. Le centre appartient soit à un mot annoté, soit à un intervalle éloigné d’au moins 500 ms des annotations. Les 1 401 intervalles de la première catégorie et les 201 de la seconde déterminent les fractions du tableau. La seconde catégorie peut contenir des sons vocaux non annotés.
