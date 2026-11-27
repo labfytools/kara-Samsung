@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Générer les paroles manquantes d’un artiste dans la file Parole, proposer une relecture ciblée et permettre le chant expérimental sans note sur le mix original. Conserver la provenance dans CHRONOS et BlackBox.
+
 - Rechercher progressivement les paroles depuis les tags, comparer les réponses ambiguës et afficher le résultat exclusif de chaque titre avec le rendement des fournisseurs.
 
 - Mutualiser les quotas, les recherches concurrentes et le cache par fournisseur de paroles. Ajouter le tableau de bord, les repères au mot LRCLIB et le lecteur facultatif d’une sauvegarde SQLite.

@@ -435,12 +435,44 @@ class Index:
                         return started
         return None
 
+    def queue_transcription(self, song, *, manual=False, now=None, db=None):
+        if song["lyrics"] != "absent" or song["lrc"] != "absent" or not 1 <= song["duration"] <= 3600:
+            return False
+        if db is None:
+            with self.db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                return self.queue_transcription(song, manual=manual, now=now, db=db)
+        from _parole_transcribe import VERSION
+
+        now = time() if now is None else now
+        identity = song["id"]
+        version = encoded_key(song["token"], song["side"], "transcription", VERSION)
+        inserted = self.enqueue("transcription", identity, version,
+                                priority=12 if manual else 20 if song["plays"] else 35,
+                                payload={"manual": True} if manual else {}, now=now, db=db)
+        if manual and not inserted:
+            # Promote an existing claim without superseding its generation
+            # or overwriting a finished draft for this exact audio.
+            return db.execute("""UPDATE tasks SET payload=?,priority=min(priority,12),due=min(due,?)
+                                 WHERE kind='transcription' AND subject=? AND revision=?
+                                 AND state IN ('queued','suspended','temporary','running')
+                                 AND json_extract(payload,'$.manual') IS NULL""",
+                              (document({"manual": True}), now, identity, version)).rowcount > 0
+        return inserted
+
+    def queue_artist_transcriptions(self, owner):
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            songs = db.execute("""SELECT * FROM songs WHERE owner=? AND lyrics='absent' AND lrc='absent'
+                                  ORDER BY plays DESC,album,disc,track,id""", (owner,)).fetchall()
+            return len(songs), sum(self.queue_transcription(song, manual=True, db=db) for song in songs)
+
     def queue_offline_transcription(self, now):
         # When remote references cannot be searched, propose one draft at a
         # time. Do not mark lyrics absent or consume the original search task.
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("""SELECT s.id,s.token,s.side,s.plays
+            row = db.execute("""SELECT s.id,s.token,s.side,s.plays,s.lyrics,s.lrc,s.duration
                                 FROM tasks p JOIN songs s ON s.id=p.subject
                                 WHERE p.kind='prepare' AND p.state IN ('queued','suspended','temporary')
                                 AND p.due<=? AND s.lyrics='absent' AND s.lrc='absent'
@@ -450,8 +482,7 @@ class Index:
                                 ORDER BY p.priority,p.due,p.subject LIMIT 1""", (now,)).fetchone()
             if row is None:
                 return False
-            return self.enqueue("transcription", row["id"], encoded_key(row["token"], row["side"], "v1"),
-                                priority=20 if row["plays"] else 35, now=now, db=db)
+            return self.queue_transcription(row, now=now, db=db)
 
     def preparation_due(self, now, *, local_preparation=None):
         return self.work_due(("prepare",), now, local_preparation=local_preparation)

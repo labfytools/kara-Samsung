@@ -251,9 +251,13 @@ def playback_candidates(path, root):
     # Read-only consumer for BlackBox and CHRONOS. No index is created on
     # playback, and evidence for a file replaced in place is ignored.
     from _kara_paths import STATE
+    location = STATE / "kara/parole" / encoded_key(str(root.resolve())) / "maintenance.sqlite3"
+    return recording_candidates(location, path)
+
+
+def recording_candidates(location, path, *, include_text=False):
     from _kara_prepare import file_token
 
-    location = STATE / "kara/parole" / encoded_key(str(root.resolve())) / "maintenance.sqlite3"
     if not location.is_file():
         return {}
     try:
@@ -262,7 +266,7 @@ def playback_candidates(path, root):
                              (EVIDENCE_KIND, encoded_key(str(path)))).fetchone()
         value = json.loads(row[0]) if row else {}
         if value.get("token") == list(file_token(path)):
-            return {form: [{k: v for k, v in item.items() if k != "text"}
+            return {form: [item if include_text else {k: v for k, v in item.items() if k != "text"}
                            for item in value.get(form, [])] for form in ("synced", "plain")}
     except (sqlite3.Error, ValueError, OSError):
         pass

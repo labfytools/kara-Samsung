@@ -1011,6 +1011,7 @@ class GtkTests(Fixture):
         self.assertEqual(view.songs.get_n_items(), 1)
         view.tree_selection.set_selected(0)
         self.assertTrue(view.search_lyrics.get_sensitive())
+        self.assertTrue(view.generate_lyrics.get_sensitive())
         view.search_lyrics.emit("clicked")
         search = view.artist_search
         self.addCleanup(search["window"].destroy)
@@ -1026,7 +1027,8 @@ class GtkTests(Fixture):
         while widget is not None:
             widgets_on_dialog.append(widget)
             widget = widget.get_next_sibling()
-        cancel = next(widget for widget in widgets_on_dialog if isinstance(widget, Gtk.Button))
+        cancel = next(widget for widget in widgets_on_dialog
+                      if isinstance(widget, Gtk.Button) and widget.get_label() == "Annuler la recherche")
         cancel.emit("clicked")
         deadline = monotonic() + 4
         while not search["done"] and monotonic() < deadline:

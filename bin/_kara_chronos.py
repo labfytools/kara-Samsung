@@ -44,11 +44,13 @@ def local_tokens(song):
     return [file_token(song), lrc_token(song.with_suffix(".lrc")), lrc_token(song.with_suffix(".txt"))]
 
 
-def source_for(song, cache, *, fallback=None):
+def source_for(song, cache, *, fallback=None, include_draft=False):
     # The exact editor/source text and order remain available when no time
     # survives alignment. A validated legacy receipt supplies its own order.
     before = local_tokens(song)
-    reference = cache.cached(song, verify=False) or cache.cached(song, verify=False, insufficient=True)
+    reference = cache.cached(song, verify=False)
+    if not reference and not include_draft:
+        reference = cache.cached(song, verify=False, insufficient=True)
     lrc, plain = song.with_suffix(".lrc"), song.with_suffix(".txt")
     if before[2]:
         raw = read_source(plain).decode("utf-8")
@@ -65,6 +67,11 @@ def source_for(song, cache, *, fallback=None):
         tags, _ = probe(song)
         fallback = next((tags[key] for key in ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
                          if tags.get(key)), "")
+    if not fallback and include_draft:
+        from _parole_transcribe import draft_source
+
+        if draft := draft_source(cache, song):
+            return draft
     return {"kind": "embedded" if fallback else "unavailable", "original": fallback, "timed": False}
 
 
@@ -101,15 +108,40 @@ def display_index(lines):
     return times, indices
 
 
-def cached(song, engine):
+def cached(song, engine, *, cache=None):
     try:
         result = load_json(cache_path(song, engine))
         if (result["version"] == 1 and result["status"] in ("experimental", "abstained")
                 and result["engine"] == engine and result["tokens"] == local_tokens(song)
                 and result["implementation"] == implementation()):
+            if result.get("source", {}).get("kind") == "generated-transcription":
+                from _kara_prepare import PreparedCache
+                from _parole_transcribe import draft_source
+
+                if draft_source(cache or PreparedCache(), song) != result["source"]:
+                    return None
             return result
     except (OSError, ValueError, KeyError, TypeError):
         pass
+
+
+def playback_experiment(song, cache, engine, *, before=None):
+    if not engine:
+        return None
+    try:
+        before = local_tokens(song) if before is None else before
+    except (OSError, ValueError):
+        return None
+    experiment = cached(song, engine, cache=cache)
+    if experiment or before[1] or before[2]:
+        return experiment
+    if engine != "huang":
+        candidate = cached(song, "huang", cache=cache)
+        if candidate and candidate.get("source", {}).get("kind") == "generated-transcription":
+            return candidate
+    from _parole_transcribe import draft_display
+
+    return draft_display(cache, song, before)
 
 
 @lru_cache(maxsize=1)
@@ -193,12 +225,14 @@ def prepare(song, cache, engine, *, supplied=None, allow_demucs=True):
     if not reference_lines(source):
         raise ValueError("Aucune parole de référence disponible pour cet enregistrement.")
     key = sha256(json.dumps(source, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    previous = cached(song, engine)
+    previous = cached(song, engine, cache=cache)
     if (previous and previous["source_sha256"] == key
             and (not allow_demucs or previous.get("separation_allowed", True))):
         return previous["status"]
     result = calculate(song, source, engine, allow_demucs=allow_demucs)
-    if local_tokens(song) != before or supplied is None and source_for(song, cache) != source:
+    if (local_tokens(song) != before or supplied is None and source_for(song, cache) != source
+            or source["kind"] == "generated-transcription"
+            and source_for(song, cache, include_draft=True) != source):
         raise ValueError("Le morceau ou les paroles ont changé pendant la préparation CHRONOS.")
     result.update(tokens=before, source_sha256=key, separation_allowed=allow_demucs)
     from _kara_paths import music_library

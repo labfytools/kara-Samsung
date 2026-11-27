@@ -21,16 +21,9 @@ est insuffisante, choisir le parcours de chant sans note proposé par Kara.
 Une protection déclenchée pendant le calcul signale le repli dans le
 lecteur et conserve son motif dans la capture ouverte.
 
-Les calculs CHRONOS sont limités à la préparation interactive et aux
-recalculs explicites. Ils réutilisent le superviseur Parole et le verrou
-local du moteur. Les protections secteur, température, PSI, RAM et disque
-peuvent suspendre le calcul et laissent le parcours historique disponible.
-Le groupe de calcul est limité à 8 Gio et à deux cœurs de calcul. Les vues
-vocales temporaires sont supprimées à la fin du travail, y compris sur sortie
-contrôlée. Les reçus de minutage privés occupent au maximum 128 Mio.
-Les tâches nocturnes continuent leur parcours de recherche de paroles et
-de préparation existant. Le moteur expérimental ne publie aucun LRC dans
-la bibliothèque.
+Les calculs CHRONOS réutilisent le superviseur Parole et le verrou local du moteur. Les protections secteur, température, PSI, RAM et disque peuvent suspendre le calcul. Le groupe de calcul est limité à 8 Gio et à deux cœurs. Les vues vocales temporaires sont supprimées à la fin du travail, y compris sur sortie contrôlée. Les reçus de minutage privés occupent au maximum 128 Mio.
+
+Une piste qui dispose seulement d’un brouillon Turbo peut être préparée dans un mode **Minutage CHRONOS**. Après la préparation, choisir **Autoriser le chant sans note**, puis **Chanter sans note** pour utiliser le brouillon et le mix original dans une partie locale. Cette préparation n’engage ni le calcul d’un score ni la séparation des pistes. CHRONOS Huang peut proposer un calage privé sous les protections existantes. Le lecteur indique que les paroles sont générées et affiche les débuts observés. Si CHRONOS est indisponible, les débuts de ligne du brouillon Turbo servent au défilement expérimental. Une référence publiée garde la priorité à la préparation suivante.
 
 ## BlackBox Studio
 
@@ -38,7 +31,9 @@ Démarrer une capture avant le tour. Le mode vocal et le consentement du
 microphone restent ceux de BlackBox V3. Dans **Rapport et rejeu**, sélectionner
 **Référence des paroles** pour consulter ensemble les paroles originales,
 les repères historiques et expérimentaux, les modèles et leurs empreintes,
-les refus, le moteur de vérification et les indices par mot.
+les refus, le moteur de vérification et les indices par mot. Un tour avec
+paroles générées conserve leur provenance et leur niveau de fiabilité dans
+la capture consentie, avec l’état du tour sans note.
 
 Dans **Chronologie**, choisir le tour et afficher un intervalle. Studio
 projette les repères musicaux entre deux ancres de position Strawberry

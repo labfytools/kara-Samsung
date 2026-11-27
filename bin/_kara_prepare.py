@@ -444,7 +444,7 @@ class Preparer:
                                         logs=self.logs, require_vulkan=self.require_vulkan)
         return self.decoder
 
-    def transcribe(self, song, language, progress):
+    def transcribe(self, song, language, progress, *, review=None):
         load_seconds = 0.
         if self.decoder is None:
             start = monotonic()
@@ -453,7 +453,8 @@ class Preparer:
             load_seconds = monotonic() - start
         progress("transcription", 20)
         start = monotonic()
-        result = transcribe_file(song, self.decoder, language, lambda f: progress("transcription", 20 + int(55 * f)))
+        result = transcribe_file(song, self.decoder, language,
+                                 lambda f: progress("transcription", 20 + int(55 * f)), review=review)
         return *result, load_seconds, monotonic() - start
 
     def trace_text(self, song, kind, text, **data):
@@ -798,6 +799,31 @@ def main():
                     send("chronos", song, engine="huang", status="unavailable", message=str(error))
                 else:
                     send("chronos", song, engine="huang", status=status)
+            if args.chronos and plain is None and timed is None:
+                from _kara_chronos import prepare as prepare_chronos, source_for
+                from _parole_process import Interrupted
+                from _parole_transcribe import draft_source
+
+                try:
+                    draft = draft_source(preparer.cache, song)
+                    use_draft = draft and source_for(song, preparer.cache, include_draft=True) == draft
+                except (OSError, ValueError):
+                    use_draft = False
+                if use_draft:
+                    # Draft text must never become a historical/scoring
+                    # reference. Admit only the bounded Huang path here.
+                    preparer.close()
+                    progress("chronos", 95)
+                    try:
+                        status = prepare_chronos(song, preparer.cache, "huang", supplied=draft, allow_demucs=False)
+                    except (OSError, ValueError, RuntimeError, KeyError, Interrupted, subprocess.SubprocessError):
+                        status = "unavailable"
+                    send("chronos", song, engine="huang", status=status)
+                    send("result", song, ready=False, experimental=True,
+                         report={"message": "Paroles générées expérimentalement · chant sans note"},
+                         duration=0., seconds=0.)
+                    failed = True
+                    continue
             result_available = False
             try:
                 ready, report, elapsed, duration = preparer.prepare(

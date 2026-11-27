@@ -116,6 +116,44 @@ class ChronosTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 calculate(song, source, "wav2vec2", allow_demucs=False)
 
+    def test_generated_draft_uses_private_reference_and_stays_outside_score(self):
+        from _kara_chronos import playback_experiment, source_for
+        from _kara_prepare import PreparedCache, file_token
+        from _parole_transcribe import NAME
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            song = root / "sound.flac"
+            song.write_bytes(b"fixture")
+            cache = PreparedCache(root / "prepared")
+            manifest = cache.folder(song) / NAME
+            manifest.parent.mkdir(parents=True)
+            draft = {"version": 2, "audio": {"file": file_token(song), "sha256": digest(song)}, "duration": 5.,
+                     "plain": "Hello night", "timed": "[00:01.00]Hello night", "omitted": 1}
+            manifest.write_text(json.dumps(draft))
+            with patch("_kara_chronos.ROOT", root / "chronos"), patch.object(cache, "cached", return_value=None), patch(
+                    "_musique_oz.probe", return_value=({}, [])):
+                self.assertEqual(source_for(song, cache)["kind"], "unavailable")
+                fallback = playback_experiment(song, cache, "huang")
+                self.assertEqual(fallback["source"]["kind"], "generated-transcription")
+                self.assertEqual(display_index(fallback["lines"]), ([1.0], [0]))
+                self.assertEqual(fallback["lines"][0]["words"], [])
+                self.assertIsNone(playback_experiment(song, cache, ""))
+                source = source_for(song, cache, include_draft=True)
+                result = {**alignment(), "source": source, "engine": "huang", "version": 1,
+                          "audio_sha256": digest(song), "status": "experimental", "implementation": implementation()}
+                with patch("_kara_chronos.calculate", return_value=result) as calculate:
+                    prepare(song, cache, "huang", supplied=source, allow_demucs=False)
+                    self.assertFalse(calculate.call_args.kwargs["allow_demucs"])
+                    self.assertEqual(playback_experiment(song, cache, "wav2vec2")["engine"], "huang")
+                draft["timed"] = "[00:02.00]Hello night"
+                manifest.write_text(json.dumps(draft))
+                self.assertIsNone(cached(song, "huang", cache=cache))
+                self.assertEqual(playback_experiment(song, cache, "huang")["engine"], "Turbo")
+                self.assertFalse(song.with_suffix(".lrc").exists())
+                song.with_suffix(".txt").write_text("A corrected reference")
+                self.assertIsNone(playback_experiment(song, cache, "huang"))
+
     @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK") == "1", "requires GTK")
     def test_actual_kara_display_preserves_score_clock_and_uses_only_observed_onsets(self):
         executable = Path(__file__).resolve().parents[1] / "bin/paroles-strawberry"
@@ -127,6 +165,48 @@ class ChronosTests(unittest.TestCase):
         self.assertEqual(window.view_anchor(subject, 4.), 0)
         self.assertEqual(window.display_progress(subject, 2., 0), 5 / 11)
         self.assertEqual(subject.times, [.5, 4.])
+
+    @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK") == "1", "requires GTK")
+    def test_experimental_plot_and_capture_preserve_original_mix_and_no_score(self):
+        from _kara_blackbox_lyrics import load
+
+        executable = Path(__file__).resolve().parents[1] / "bin/paroles-strawberry"
+        window = runpy.run_path(str(executable), run_name="kara_generated_fixture")["LyricsWindow"]
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            song = root / "audio"
+            song.write_bytes(b"fixture")
+            box = BlackBox(root / "blackbox")
+            box.start(consent=True)
+            session = box.status()["session"]
+            context = {"turn": "b" * 16, "player": "Fixture", "song": "Fixture"}
+            experiment = {"engine": "Turbo", "audio_sha256": digest(song),
+                          "lines": [{"start": 1., "text": "Hello night", "words": []}],
+                          "source": {"kind": "generated-transcription", "original": "Hello night",
+                                     "transcription": {"status": "experimental", "reliability": "partial"}}}
+            player = SimpleNamespace(song=SimpleNamespace(path=song))
+            queue = SimpleNamespace(submit=lambda work: work())
+            calls = []
+            subject = SimpleNamespace(blackbox=box, game_score=SimpleNamespace(diagnostic_turn=context),
+                                      scoring_source=lambda: None, active_reference=None, tag_text="",
+                                      chronos_reference=experiment, tag_reader=queue,
+                                      music_volume=.5, turn_original_mix=True,
+                                      room_audio=SimpleNamespace(enable_return=lambda: None),
+                                      guide_intervals=[], apply_player_mix=lambda player: None,
+                                      vocal_effect=SimpleNamespace(disable=lambda: None),
+                                      player_command=lambda name, *args: calls.append(name),
+                                      write_music_volume=lambda *_a, **_kw: self.fail("Strawberry must stay audible"),
+                                      refresh_game=lambda: None)
+            window.begin_playback(subject, player)
+            self.assertEqual(calls, ["OpenUri"])
+            with patch.dict(window.log_playback_reference.__globals__, {"LIBRARY": root}):
+                window.log_playback_reference(subject, song)
+            box.stop(wait=True)
+            item = load(box.root / session, context["turn"])["reference"]
+            self.assertIsNone(item["historical"])
+            self.assertEqual(item["source"], "generated-transcription")
+            self.assertEqual(item["transcription"]["reliability"], "partial")
+            self.assertEqual(item["displayed"], [[1., "Hello night"]])
 
     def test_existing_capture_replay_and_historical_score_invariance(self):
         with TemporaryDirectory() as directory:

@@ -371,6 +371,8 @@ class ParoleView:
         artist_pane.append(scroller(tree_view, min_content_width=160, vexpand=True))
         self.search_lyrics = button("Rechercher les paroles", self.search_artist_lyrics, sensitive=False)
         artist_pane.append(self.search_lyrics)
+        self.generate_lyrics = button("Générer les paroles manquantes", self.generate_artist_lyrics, sensitive=False)
+        artist_pane.append(self.generate_lyrics)
         panes.set_start_child(artist_pane)
         panes.set_shrink_start_child(False)
         self.songs = Gio.ListStore(item_type=Row)
@@ -525,6 +527,7 @@ class ParoleView:
         selected = self.tree_selection.get_selected_item()
         self.scope = selected.get_item().data if selected else ()
         self.search_lyrics.set_sensitive(bool(self.scope))
+        self.generate_lyrics.set_sensitive(bool(self.scope))
         self.reset()
 
     def open_tree(self, _, pos):
@@ -905,7 +908,16 @@ class ParoleView:
             editbar.append(button("Provenance", lambda widget: show_details(
                 widget, "Identité et provenance", json.dumps(provenance, ensure_ascii=False, indent=2))))
         path = Path(row["path"])
+        from _parole_lyrics_lookup import recording_candidates
+
+        candidates = recording_candidates(self.index.path, path, include_text=True)
+        decisions = [{item["decision"] for item in group} for group in candidates.values()]
+        if any("ambiguous" in group and "selected" not in group for group in decisions):
+            panel.append(button("Correspondances à vérifier", lambda widget: show_details(
+                widget, "Candidats conservés pour cet enregistrement",
+                json.dumps(candidates, ensure_ascii=False, indent=2))))
         versions = {}
+        from _parole_transcribe import correction_identity, correction_input, provenance as draft_provenance
         from _parole_transcribe import read_draft, review_ranges
 
         draft = (read_draft(self.maintenance.cache, path)
@@ -985,6 +997,44 @@ class ParoleView:
                 status.set_text("Minutage du brouillon à vérifier." if suffix == ".lrc" else "Texte du brouillon à vérifier.")
 
             editbar.append(button("Charger le brouillon Turbo", load_draft))
+
+            def show_draft(widget):
+                value = {"provenance": draft_provenance(draft), "structure": draft.get("structure", {}),
+                         "comparaisons": draft.get("comparisons", [])}
+                show_details(widget, "Transcription expérimentale", json.dumps(value, ensure_ascii=False, indent=2))
+
+            panel.append(button("Fiabilité et répétitions du brouillon", show_draft))
+        if draft and correction_input(draft):
+            def review_with_codex(widget):
+                task = correction_identity(identity, draft)
+                with self.index.db() as db:
+                    prior = db.execute("SELECT value FROM reviews WHERE kind='codex' AND subject=? AND state='proposal'",
+                                       (task,)).fetchone()
+                if prior:
+                    result = json.loads(prior[0])
+                    passages = {item["id"]: item["first"] for item in correction_input(draft)}
+                    rows = [f"{passages[item['id']]}\n→ {item['suggestion']}\n{item['reason']}"
+                            for item in result["suggestions"] if item["id"] in passages]
+                    show_details(widget, "Suggestions à écouter", "\n\n".join(rows) or "Codex n’a proposé aucune correction.")
+                    return
+                confirm = Gtk.AlertDialog(message="Soumettre les passages incertains à Codex ?",
+                                          detail="Seuls les extraits de transcription sont envoyés. "
+                                                 "Les propositions seront consultables ici pour correction manuelle.",
+                                          buttons=["Annuler", "Soumettre"], cancel_button=0, default_button=0)
+
+                def answered(dialog, result):
+                    try:
+                        if dialog.choose_finish(result) != 1:
+                            return
+                        queued = self.maintenance.queue_draft_correction(identity, draft)
+                    except (GLib.Error, OSError, ValueError, sqlite3.Error):
+                        status.set_text("Relecture momentanément indisponible.")
+                    else:
+                        status.set_text("Relecture mise en file." if queued else "Active Codex dans les paramètres.")
+
+                confirm.choose(window, None, answered)
+
+            panel.append(button("Relire les passages avec Codex", review_with_codex))
         if draft and (ranges := review_ranges(draft)):
             expander = Gtk.Expander(label="Passages à vérifier")
             review = box()
@@ -1077,6 +1127,28 @@ class ParoleView:
     def research_scope(self, kind):
         if self.scope and (kind != "album" or len(self.scope) >= 3):
             self.manual_codex(kind, self.scope[1] if kind == "album" else self.scope[0])
+
+    def generate_artist_lyrics(self, widget):
+        if not self.scope:
+            return
+        owner = self.scope[0]
+
+        def finished(future):
+            widget.set_sensitive(bool(self.scope))
+            try:
+                missing, queued = future.result()
+            except (OSError, ValueError, sqlite3.Error):
+                message = "La file de transcription est temporairement indisponible."
+            else:
+                self.maintenance.wake.set()
+                message = (f"{owner} · {missing} pistes sans référence · {queued} transcriptions ajoutées ou prioritaires. "
+                           "Les brouillons seront traités un par un lorsque les ressources le permettront.")
+            show_details(widget, "Génération locale des paroles", message)
+            return GLib.SOURCE_REMOVE
+
+        widget.set_sensitive(False)
+        self.control.tag_reader.submit(self.index.queue_artist_transcriptions, owner).add_done_callback(
+            lambda future: GLib.idle_add(finished, future))
 
     def search_artist_lyrics(self, _widget):
         if not self.scope:

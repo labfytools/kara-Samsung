@@ -219,7 +219,7 @@ def pcm_file(path):
         yield size // 2, read
 
 
-def transcribe_file(path, decoder, language, progress):
+def transcribe_file(path, decoder, language, progress, *, review=None):
     with pcm_file(path) as (samples, read):
         observed, segments, languages = [], [], {}
         stride = STRIDE * RATE
@@ -238,5 +238,10 @@ def transcribe_file(path, decoder, language, progress):
                     observed.extend(owned)
                     languages[detected] = languages.get(detected, 0) + len(owned)
             progress(high / samples)
-        return (samples / RATE, max(languages, key=languages.get, default=language or "auto"),
-                sorted(observed, key=lambda w: w.start), segments)
+        result = (samples / RATE, max(languages, key=languages.get, default=language or "auto"),
+                  sorted(observed, key=lambda w: w.start), segments)
+        if review is not None:
+            # The targeted second pass reuses this bounded PCM. The
+            # borrowed read callable is valid only inside this callback.
+            review(decoder, read, result)
+        return result

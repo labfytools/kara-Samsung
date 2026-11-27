@@ -539,6 +539,31 @@ class NightTests(unittest.TestCase):
         self.assertEqual(states["lyrics"], "queued")
         self.assertEqual(states["transcription"], "review")
 
+    def test_artist_transcription_reuses_queue_and_manual_jobs_run_at_night(self):
+        index = self.owner.index
+        missing = index.root / "inconnue.opus"
+        known = index.root / "connue.opus"
+        for path in (missing, known):
+            path.write_bytes(b"fixture")
+        known.with_suffix(".txt").write_text("Une référence locale")
+        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
+                  paths=[known, missing], reader=lambda p: ({"title": p.stem, "artist": "Artiste",
+                                                            "duration_seconds": 5}, {}))
+        with index.db() as db:
+            songs = {row["path"]: row for row in db.execute("SELECT * FROM songs")}
+        subject = songs[str(missing)]["id"]
+        self.assertTrue(index.queue_transcription(songs[str(missing)]))
+        self.assertEqual(index.queue_artist_transcriptions("Artiste"), (1, 1))
+        self.assertEqual(index.queue_artist_transcriptions("Artiste"), (1, 0))
+        index.configure(night_transcribe=False)
+        self.owner.current_settings = index.settings()
+        self.owner.transcribe_task = Mock(return_value=("review", "brouillon à vérifier", 0))
+        with patch("_parole_maintenance.ready_categories", return_value=set()):
+            self.assertTrue(self.owner.tick_night(self.owner.current_settings, time()))
+        self.assertEqual(self.owner.transcribe_task.call_args.args[0]["subject"], subject)
+        self.assertEqual(index.queue_artist_transcriptions("Artiste"), (1, 0))
+        self.assertFalse(missing.with_suffix(".txt").exists())
+
     def test_missing_references_enqueue_a_resumable_review_without_publication(self):
         path = self.owner.index.root / "song.opus"
         path.write_bytes(b"fixture")
@@ -613,12 +638,35 @@ class NightTests(unittest.TestCase):
         draft["first_pass"]["segments"] = [{"start": "invalid"}]
         self.assertEqual(review_ranges(draft), ())
 
+    def test_distinct_second_reading_and_refrains_stay_experimental(self):
+        from _parole_codex import validate_draft
+        from _parole_transcribe import compare_windows, provenance, repeated_lines
+
+        spans = [SimpleNamespace(no_speech=.1, words=[ObservedWord("autre", 2.2, 2.3, .9)])]
+        decoder = SimpleNamespace(decode=Mock(return_value=("fr", spans)))
+        parts = [dict(start=2., end=3., text="Vrai chant", no_speech=.1)]
+        findings = compare_windows(decoder, lambda *_: b"pcm", (5., "fr", [], parts), lambda *_: None)
+        self.assertEqual(findings, [dict(start=2., end=3., first="Vrai chant", alternate="autre",
+                                         decision="divergent")])
+        self.assertTrue(decoder.decode.call_args.kwargs["beam"])
+        self.assertEqual(repeated_lines("Premier vers\nMême refrain\nPremier vers\nMême refrain"),
+                         {"repeated_lines": [[1, 3], [2, 4]], "possible_choruses": [[1, 3]]})
+        report = provenance({"plain": "Brouillon", "timed": "[00:01]Brouillon", "omitted": 1,
+                             "comparisons": findings})
+        self.assertEqual((report["status"], report["reliability"]), ("experimental", "partial"))
+        query = {"research_id": "fixture", "ranges": [{"id": 0}]}
+        suggestion = {"id": 0, "suggestion": "Un mot", "reason": "Proposition à écouter"}
+        with self.assertRaises(ValueError):
+            validate_draft({"research_id": "fixture", "suggestions": [suggestion, suggestion]}, query)
+        self.assertEqual(validate_draft({"research_id": "fixture", "suggestions": [suggestion]}, query)
+                         ["suggestions"], [suggestion])
+
     def test_local_lrc_rejected_acoustically_gets_one_alternate_lookup(self):
         path = self.owner.index.root / "song.opus"
         path.write_bytes(b"fixture")
         path.with_suffix(".lrc").write_text("[00:04.000]Refrain")
         song = {"id": "fixture", "path": str(path), "token": document(file_token(path)), "title": "Chanson",
-                "side": document([sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]), "lrc": "local",
+                "side": document([sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]), "lrc": "local", "lyrics": "LRC",
                 "duration": 25, "previous": None, "info": document({"plain": "Refrain"})}
         self.owner.index.song = Mock(return_value=song)
         self.owner.refresh_song = Mock()
