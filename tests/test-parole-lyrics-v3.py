@@ -72,6 +72,48 @@ class LyricsTests(unittest.TestCase):
         self.engine.save_lrc(destination, TIMED, original=True)
         self.assertEqual(destination.read_bytes(), original.encode("utf-8"))
 
+    def test_timed_lookup_prioritizes_clean_edition_and_refreshes_only_old_misses(self):
+        from _parole_lyrics_lookup import cache_identity, cache_value, remember
+
+        self.only("LRCLIB")
+        song = ("03 - L’Été (feat. Invité)", "Artiste, Invité", "Édition", 30, "Artiste")
+        config = lyrics_rows(self.index)[0]["config"]
+        key = cache_identity("LRCLIB", (*song, ""), True, "", True, config, original_lrc=True)
+        remember(self.index, key, cache_value(None))
+        client = self.engine.LyricsSources()
+        record = dict(id=800, trackName="L’Été", artistName="Artiste, Invité",
+                      albumName="Édition", duration=30, syncedLyrics=TIMED)
+
+        def lookup(endpoint, **terms):
+            if endpoint == "get":
+                return None
+            self.assertEqual(terms, {"track_name": "L’Été", "artist_name": "Artiste", "album_name": "Édition"})
+            return [dict(record, id=801, albumName="Autre édition"), record]
+
+        with patch.object(client.lrc, "get", side_effect=lookup) as query:
+            self.assertEqual(client.find(*song, synced=True, original_lrc=True, strict=True, registry=self.index),
+                             (TIMED, "LRCLIB"))
+            self.assertEqual(query.call_count, 2)
+        with patch.object(client.lrc, "get", side_effect=AssertionError("LRC déjà vérifié")):
+            self.assertEqual(client.find(*song, synced=True, original_lrc=True, strict=True, registry=self.index),
+                             (TIMED, "LRCLIB"))
+
+    def test_exact_plain_lookup_populates_native_cache_before_quota_expires(self):
+        self.only("LRCLIB")
+        raw = "\ufeff[00:01.00]Premier mot  \r\n"
+        record = dict(trackName=SONG[0], artistName=SONG[1], albumName=SONG[2], duration=30,
+                      plainLyrics="Premier mot", syncedLyrics=raw)
+        client = self.engine.LyricsSources()
+        with patch.object(client.lrc, "get", return_value=record) as query:
+            self.assertEqual(client.find(*SONG, synced=False, strict=True, registry=self.index),
+                             ("Premier mot", "LRCLIB"))
+        query.assert_called_once()
+        configure_limits(self.index, "LRCLIB", 0, 0)
+        other = self.engine.LyricsSources()
+        with patch.object(other.lrc, "get", side_effect=AssertionError("quota local en pause")):
+            self.assertEqual(other.find(*SONG, synced=True, original_lrc=True, strict=True, registry=self.index),
+                             (raw, "LRCLIB"))
+
     def test_two_independent_429_fallback_and_no_false_negative(self):
         self.only("LRCLIB", "NetEase", "QQ Music", "lyrics.ovh")
         client = self.engine.LyricsSources()
@@ -258,7 +300,7 @@ class LyricsTests(unittest.TestCase):
             choose([(marks, {}), (marks.replace("01.50", "01.76"), {})], True, True)
 
     def test_artist_outcomes_are_exclusive_and_provider_yield_counts_publications(self):
-        from _parole_import_enrichment import ARTIST_OUTCOMES, artist_summary
+        from _parole_import_enrichment import ARTIST_OUTCOMES, artist_lrc_summary, artist_summary
 
         cases = (("present", "present"), ("found", "limited"), ("found", "found"), ("present", "review"),
                  ("missing", "missing"), ("missing", "limited"), ("temporary", "missing"))
@@ -269,6 +311,9 @@ class LyricsTests(unittest.TestCase):
         rows[2]["audit"] = audit
         self.assertEqual(artist_summary(rows), (dict.fromkeys(ARTIST_OUTCOMES, 1),
                          {"LRCLIB": {"requests": 1, "found": 1, "published_lrc": 1}}))
+        self.assertEqual(artist_lrc_summary(rows),
+                         {"present": 1, "limited": 2, "found": 1, "review": 1, "missing": 2})
+
 
     def test_quota_dashboard_keeps_local_and_remote_limits_distinct(self):
         configure_limits(self.index, "NetEase", 2, 1)

@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Privilégier l’édition de la piste lors de la recherche de LRC. Réutiliser les réponses exactes de LRCLIB, afficher les résultats LRC séparément et indiquer la prochaine échéance des quotas.
+
 - Rendre l’import d’albums accessible depuis la bibliothèque, le raccourci Parole et Ctrl+I. Rouvrir la fenêtre d’import dans l’application existante.
 
 - Archiver le retour micro logiciel, la notation, les moteurs acoustiques et leurs tests. Réserver BlackBox au diagnostic d’affichage et à la lecture des captures.

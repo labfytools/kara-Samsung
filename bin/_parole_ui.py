@@ -16,11 +16,12 @@ from _kara_import import show_details
 from _kara_paths import BIN, STATE
 from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, undo as undo_group
 from _parole_index import key, document, encoded_key, sidecar
-from _parole_import_enrichment import artist_results, queue_artist, ARTIST_OUTCOMES, artist_summary, track_outcome
+from _parole_import_enrichment import (artist_results, queue_artist, ARTIST_OUTCOMES, LRC_OUTCOMES,
+                                      artist_lrc_summary, artist_summary, track_outcome)
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_music_registry import set_alias
-from _parole_sources import configure_limits, controls, lyrics_rows, move_lyrics_source, provider_limits
+from _parole_sources import configure_limits, controls, lyrics_rows, move_lyrics_source, night_lrc_providers, provider_limits
 from _parole_resources import GIB
 from _parole_work import save_correction
 
@@ -993,8 +994,11 @@ class ParoleView:
         def show_audit(widget):
             results = state["results"]
             outcomes, sources = artist_summary(results)
+            timed = artist_lrc_summary(results)
             report = {"morceaux": len(results), "bilan": {label: outcomes.get(key, 0)
-                      for key, label in ARTIST_OUTCOMES.items()}, "fournisseurs": sources,
+                      for key, label in ARTIST_OUTCOMES.items()},
+                      "bilan LRC": {label: timed.get(key, 0)
+                                    for key, label in LRC_OUTCOMES.items()}, "fournisseurs": sources,
                       "détails": {str(Path(path).relative_to(self.index.root)): {
                           "état": ARTIST_OUTCOMES[track_outcome(row)], **row} for path, row in results.items()}}
             show_details(widget, "Bilan détaillé de la recherche", json.dumps(report, ensure_ascii=False, indent=2))
@@ -1010,7 +1014,7 @@ class ParoleView:
             if state["done"] or state["cancelling"]:
                 return GLib.SOURCE_REMOVE
             try:
-                results, running = future.result()
+                results, running, resumes = future.result()
             except (OSError, ValueError, sqlite3.Error):
                 status.set_text("État de la file momentanément indisponible.")
                 return GLib.SOURCE_REMOVE
@@ -1018,9 +1022,13 @@ class ParoleView:
             values = state["results"]
             total, completed = len(state["paths"]), len(values)
             counts, sources = artist_summary(values)
-            lines = [" · ".join(f"{counts.get(key, 0)} {ARTIST_OUTCOMES[key].lower()}"
-                                for key in group) for group in (("present", "lyrics", "lrc"),
-                                                               ("review", "missing", "limited", "error"))]
+            timed = artist_lrc_summary(values)
+            lrc_line = "LRC d’origine · " + " · ".join(f"{timed.get(key, 0)} {label}"
+                                                       for key, label in LRC_OUTCOMES.items()
+                                                       if key in ("found", "present") or timed.get(key))
+            lines = [lrc_line, f"Textes simples récupérés · {counts.get('lyrics', 0)}"]
+            if resumes is not None:
+                lines.append(f"Prochain quota LRC · {datetime.fromtimestamp(resumes):%d/%m à %H:%M}")
             counters.set_text("\n".join(lines))
             if sources:
                 errors.set_text("\n".join(f"{name} · {data.get('requests', 0)} requêtes · "
@@ -1032,7 +1040,8 @@ class ParoleView:
             current.set_text("Recherche en cours · " + ", ".join(Path(path).stem for path in running[:4])
                              if running else "")
             if completed == total and not running:
-                finish("Recherche terminée.")
+                finish("Recherche terminée · des LRC restent reportés pour quota."
+                       if timed.get("limited") else "Recherche terminée.")
             else:
                 status.set_text("Recherche en cours" if running else "En attente d’un créneau de recherche Parole")
             return GLib.SOURCE_REMOVE
@@ -1047,7 +1056,11 @@ class ParoleView:
             # A live result can precede the committed full audit. Wait for
             # the receipt before declaring the window complete.
             running = [path for path in live if path in paths and path not in durable]
-            return results, running
+            next_quota = None
+            if any(row["lrc"] == "limited" for row in results.values()):
+                next_quota = min((row["next_available"] for row in night_lrc_providers(self.index)
+                                  if row["next_available"] is not None), default=None)
+            return results, running, next_quota
 
         def poll():
             if state["done"] or self.control.closed:

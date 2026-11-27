@@ -48,6 +48,7 @@ REMASTER_SUFFIX = re.compile(r"\s*[\[(](?:\d{4}\s+)?remaster(?:ed)?(?:\s+(?:\d{4
 MAX_RESPONSE = 2 * 1024 * 1024
 TRACK_WORKERS = 4
 MAX_LRC_SEARCHES = 8
+LRC_SEARCH_VERSION = 2
 
 
 class ServiceUnavailable(Exception):
@@ -231,7 +232,7 @@ class LrcLib:
         self.answers = None
         self.edition_candidate = False
         self.candidates = []
-        self.exact_complement = None
+        self.exact_complements = {}
 
     def get(self, endpoint, **params):
         url = f"https://lrclib.net/api/{endpoint}?{urlencode(params)}"
@@ -300,7 +301,7 @@ class LrcLib:
             exact["album_name"] = album
         record = self.get("get", **exact)
         scores = []
-        def assess(record, *, exact=False):
+        def assess(record):
             score = recording_score(record, *signature, isrc=code, synced=synced,
                                     on_reject=lambda item, reason: observe(
                                         item, transcript(item, duration, synced, original_lrc=original_lrc), reason))
@@ -310,19 +311,22 @@ class LrcLib:
             observe(record, text, "compatible" if text is not None else "format-indisponible")
             if text is not None:
                 scores.append((score, text, record))
-                # A plain match with looser evidence cannot seed the timed
-                # cache. Validate the reverse form independently.
-                if not original_lrc and exact and recording_score(record, *signature, isrc=code, synced=True) is not None:
-                    if companion := transcript(record, duration, not synced):
-                        self.exact_complement = cache_value(companion, candidate_evidence(record, text, "")["metadata"])
             return text
 
-        result = assess(record, exact=True)
-        if result is not None and (synced or recording_score(record, *signature, isrc=code) is not None):
-            return result
-        if result is not None:
-            self.exact_complement = None
-        for label, credit, edition in lyric_queries(title, artist, album, album_artist)[:MAX_LRC_SEARCHES]:
+        result = assess(record)
+        # One exact response may establish both forms. Validate the timed
+        # identity independently before sharing either native or legacy data.
+        if recording_score(record, *signature, isrc=code, synced=True) is not None:
+            forms = ((False, False),) if synced else ((True, True), (True, False))
+            for timed, native in forms:
+                if companion := transcript(record, duration, timed, original_lrc=native):
+                    self.exact_complements[timed, native] = cache_value(
+                        companion, candidate_evidence(record, companion, "")["metadata"])
+            if result is not None:
+                return result
+
+        for label, credit, edition in lyric_queries(title, artist, album, album_artist,
+                                                   timed=synced)[:MAX_LRC_SEARCHES]:
             query = {"track_name": label, "artist_name": credit}
             if edition:
                 query["album_name"] = edition
@@ -903,6 +907,10 @@ class LyricsSources:
             try:
                 with lookup_slot(registry, lock_key) if lock_key else nullcontext():
                     hit, result = cached(registry, identity) if identity and not refresh else (False, None)
+                    if (hit and synced and original_lrc and result["text"] is None
+                            and result.get("metadata", {}).get("search_version") != LRC_SEARCH_VERSION):
+                        hit = False
+
                     def note(event):
                         if audit:
                             audit({**event, "provider": name, "form": "lrc" if synced else "lyrics"})
@@ -941,14 +949,18 @@ class LyricsSources:
                         entries.extend(dict(item, provider=name) for item in candidates)
                         if identity:
                             if not error and not conflict:
+                                if synced and original_lrc and result["text"] is None:
+                                    result["metadata"]["search_version"] = LRC_SEARCH_VERSION
                                 remember(registry, identity, result)
-                                if name == "LRCLIB" and self.lrc.exact_complement:
-                                    other = cache_identity(name, (*signature, code), not synced,
-                                                           "", strict, row["config"])
-                                    if not cached(registry, other)[0]:
-                                        remember(registry, other, self.lrc.exact_complement)
                             elif error:
                                 temporary(registry, identity, name, str(error))
+                            if name == "LRCLIB" and not conflict:
+                                for (timed, native), value in self.lrc.exact_complements.items():
+                                    other = cache_identity(name, (*signature, code), timed, "", strict, row["config"],
+                                                           original_lrc=native)
+                                    previous, old = cached(registry, other)
+                                    if not previous or old["text"] is None:
+                                        remember(registry, other, value)
             except ImportIssue as error:
                 failed = ServiceUnavailable(str(error))
                 if audit:
@@ -1015,7 +1027,7 @@ class LyricsSources:
             client.gate.audit = audit
             requests = client.gate.requests
             if name == "LRCLIB":
-                client.exact_complement = None
+                client.exact_complements = {}
             try:
                 if kwargs is None:
                     value = client.find(*signature, local_text)
@@ -1023,7 +1035,7 @@ class LyricsSources:
                     value = client.find(*signature, **kwargs)
                 else:
                     title, artist, album, _, album_artist = signature
-                    variants = lyric_queries(title, artist, album, album_artist)
+                    variants = lyric_queries(title, artist, album, album_artist, timed=synced)
                     # Catalogue queries need a fallback without the album
                     # and reserve one alternate for accents or artist aliases.
                     terms = list(dict.fromkeys(" ".join(filter(None, (credit, label, edition)))
@@ -1062,7 +1074,7 @@ class LyricsSources:
             try:
                 title, artist, album, _, album_artist = signature
                 variants = list(dict.fromkeys([(title, artist, album),
-                                                *lyric_queries(title, artist, album, album_artist)]))
+                                                *lyric_queries(title, artist, album, album_artist, timed=synced)]))
                 endpoint = LyricsEndpoint(conf["host"], conf["path"])
                 for label, credit, edition in variants[:3]:
                     response = endpoint.search(label, credit, edition, registry=registry, provider=name,
@@ -1144,7 +1156,7 @@ def artist_parts(title, artist, album_artist):
     return main, [name for name in guests if name and credits(name) - credits(main)]
 
 
-def lyric_queries(title, artist, album, album_artist):
+def lyric_queries(title, artist, album, album_artist, *, timed=False):
     numberless = without_track_number(title)
     base, _ = split_feature(clean_title(numberless))
     main, guests = artist_parts(title, artist, album_artist)
@@ -1152,6 +1164,10 @@ def lyric_queries(title, artist, album, album_artist):
     folded_artist = " ".join(re.findall(r"\w+", folded(main)))
     queries = [(base, main, None), (title, artist, album), (title, artist, None),
                (numberless, artist, None), (base, artist, None), (folded_title, folded_artist, None)]
+    if timed and album:
+        # Broad searches can fill the result window with releases that
+        # cannot supply timing for this recording. Try the cleaned edition first.
+        queries[:0] = [(base, main, album), (title, artist, album)]
     queries.extend((base, guest, None) for guest in guests[:2])
     return list(dict.fromkeys((t, a, ed) for t, a, ed in queries if t and a))
 

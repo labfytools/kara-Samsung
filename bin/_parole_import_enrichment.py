@@ -154,6 +154,22 @@ def track_outcome(row):
     return "missing"
 
 
+LRC_OUTCOMES = {
+    "found": "récupérés",
+    "present": "déjà présents",
+    "limited": "reportés pour quota",
+    "review": "à vérifier",
+    "missing": "sans résultat",
+    "instrumental": "instrumentaux",
+    "error": "indisponibles",
+}
+
+
+def artist_lrc_summary(results):
+    # A local TXT can coexist with a timed search in quota or review.
+    return Counter(row["lrc"] if row["lrc"] in LRC_OUTCOMES else "error" for row in results.values())
+
+
 def artist_summary(results):
     outcomes = Counter(track_outcome(row) for row in results.values())
     sources = defaultdict(Counter)
