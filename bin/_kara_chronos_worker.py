@@ -192,7 +192,7 @@ def work(song, scratch, engine, expected):
                     separate(weights, song, seconds, ft)
                 record_view(result, ft, "htdemucs-ft")
                 deep, deep_contrast = evaluate(ft)
-            except (OSError, RuntimeError, ValueError) as error:
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                 if engine == "huang-ft":
                     raise
                 result["separation_deferral"] = str(error)
