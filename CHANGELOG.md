@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Afficher les paroles de Strawberry en plein écran sur la Samsung, avec surlignage des mots d’origine, pause, pochette et texte simple. Version Tizen 2.2.0.
+
 - Limiter les tâches nocturnes à la récupération des LRC d’origine manquants. Conserver les quotas, les recherches sans résultat et la progression entre les redémarrages.
 
 - Revenir au karaoké classique avec le mix d’origine, le tour suivant automatique et l’écoute micro préalable. Retirer la notation, la reconnaissance vocale et la préparation acoustique du parcours. Conserver les fonctions de bibliothèque Parole.

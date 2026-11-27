@@ -2,46 +2,19 @@
 *{box-sizing:border-box}
 html,body{margin:0;min-height:100%;background:#1e1e2e;color:#cdd6f4;font-family:Inter,Arial,sans-serif}
 body{padding:6vh 7vw;background:radial-gradient(ellipse at 50% 45%,#292a45 0,#1e1e2e 58%,#181825 100%)}
-header{position:relative;min-height:14vh;border-bottom:1px solid #45475a;padding:0 22vw 2vh 0}
+header{position:relative;min-height:14vh;border-bottom:1px solid #45475a;padding:0 0 2vh}
 h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 #artist{font-size:2.25vw;color:#a6adc8;margin-top:1vh}
 #lyrics{text-align:center;margin-top:7vh}
 .line{white-space:pre-wrap;overflow-wrap:break-word;line-height:1.14;font-weight:600;margin:2.5vh auto;max-width:87vw}
 #previous{font-size:2.5vw;color:#7f849c;min-height:4vh}
 #current{font-size:5.4vw;font-weight:700;color:#919bb8;min-height:9vh}
-#current .sung{color:#ffe16b;text-shadow:0 0 .22em rgba(255,225,107,.24)}
+#sung{color:#ffe16b;text-shadow:0 0 .22em rgba(255,225,107,.24)}
 #next{font-size:3.2vw;color:#a6adc8}
 #following{font-size:2.7vw;color:#7f849c}
-#progress{height:.8vh;min-height:5px;overflow:hidden;border-radius:20px;background:#45475a;max-width:60vw;margin:3vh auto}
-#fill{height:100%;background:#ffe16b;width:0;transition:width 150ms linear}
-
-#stage{display:flex;align-items:flex-start}
-#performance{flex:1;min-width:0}
-#stage.with-players #current{font-size:4.25vw}
-#stage.with-players #previous{font-size:2.1vw}
-#stage.with-players #next{font-size:2.65vw}
-#stage.with-players #following{font-size:2.25vw}
-#party{width:26vw;flex:none;margin:1.5vh 0 0 2vw;padding:2.1vh 1.2vw;border:1px solid #45475a;border-radius:1.15vw;background:#242437;max-height:82vh;display:flex;flex-direction:column;gap:1vh}
-#party h2{margin:0 0 1.7vh .4vw;color:#cdd6f4;font-size:1.8vw}
-#players{position:relative;margin:0;padding:0;max-height:41vh;min-height:0;overflow-y:auto;list-style:none}
-#players li{position:relative;display:block;padding:1.35vh .75vw 1.9vh;margin:0 0 .75vh;border:2px solid var(--player-color,#45475a);border-radius:.7vw;background:#1e1e2e}
-#players li:last-child{margin-bottom:0}
-#players li.singing{border-color:var(--player-color,#b4befe);background:#313244;box-shadow:0 0 0 1px var(--player-color,#b4befe)}
-.player-identity{flex:1;min-width:0}
-.player-name,.player-song{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.player-name{font-size:1.65vw;line-height:1.25;color:var(--player-color,#cdd6f4)}
-.player-song{color:#a6adc8;font-size:1.05vw;margin-top:.35vh}
-.player-song:empty{display:none}
+#timed-lyrics.advance{animation:advance 180ms ease-out}
+@keyframes advance{from{transform:translateY(1.4vh)}to{transform:translateY(0)}}
 #status{text-align:center;color:#a6adc8;font-size:1.8vw;margin-top:4vh}
-#party h2{display:flex;align-items:center;justify-content:space-between;margin-bottom:1vh}
-#player-count{font-size:1.3vw;color:#b4befe;background:#313244;padding:.45vh .9vw;border-radius:2vw}
-#no-players{color:#a6adc8;font-size:1.25vw;line-height:1.4;margin:1vh .5vw}
-#players:not(:empty) + #no-players{display:none}
-#mobile-room{margin-top:auto;display:flex;align-items:center;gap:1.0vw;padding:1.15vh .6vw;border-top:1px solid #45475a;min-width:0}
-#room-qr{width:10vw;height:10vw;max-width:170px;max-height:170px;object-fit:contain;background:#fff;border-radius:.6vw;padding:.4vw;flex:none}
-#room-info{display:flex;flex-direction:column;gap:.75vh;min-width:0;font-size:1.3vw;line-height:1.2}
-#room-info strong{color:#b4befe}#room-info small{color:#a6adc8;font-size:1.0vw}
-#room-url{font-size:1.0vw;color:#a6adc8;overflow-wrap:anywhere;word-break:break-word}
 #tv-closed{position:fixed;inset:0;z-index:20;background:#181825;display:flex;align-items:center;justify-content:center;flex-direction:column;text-align:center;padding:8vw}
 #tv-closed h2{font-size:4vw;color:#b4befe}#tv-closed p{font-size:2vw;color:#a6adc8}
 #reopen-tv{padding:1.3vh 2.3vw;border-radius:10px;font-size:2vw;color:#181825;background:#b4befe;border:0}
@@ -53,11 +26,5 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 #connect p{font-size:2.5vw}
 #retry{padding:1vh 2vw;border:0;border-radius:10px;background:#b4befe;color:#181825;font-size:2vw}
 #retry:focus{outline:3px solid #f9e2af}
-header .logo{float:left;margin-right:1.5vw}
-#mobile-room{flex-wrap:wrap}#organizer-code{display:flex;flex-direction:column;min-width:100%;gap:.4vh}
-#organizer-code small{color:#a6adc8;font-size:1.25vw}
-#pin{color:#b4befe;font-size:3vw;letter-spacing:.18em;font-variant-numeric:tabular-nums}
-#server-status{color:#a6e3a1;font-size:1.15vw;margin:1vh 0 0}
-#upcoming{color:#a6adc8;max-width:38vw;margin:0 auto;font-size:1.5vw;line-height:1.5}
-#album-art{float:right;width:13vh;height:13vh;margin-right:-20vw;border-radius:.7vw;object-fit:contain}
+#album-art{float:right;width:13vh;height:13vh;margin-left:2vw;border-radius:.7vw;object-fit:contain}
 #plain-lyrics{max-height:38vh;overflow:auto;white-space:pre-wrap;color:#cdd6f4;font:2.25vw/1.4 Inter,Arial,sans-serif}

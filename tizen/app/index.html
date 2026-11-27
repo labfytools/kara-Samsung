@@ -14,41 +14,24 @@
   <button type="button" id="retry">Réessayer</button>
 </section>
 <div id="screen" hidden>
-<header><img class="logo" src="icon.png" alt=""><img id="album-art" alt="Pochette de l’album" hidden><h1 id="title">Kara</h1><div id="artist"></div>
-<p id="server-status">Serveur Kara connecté</p></header>
-<div id="stage">
-<section id="performance">
+<header>
+  <img id="album-art" alt="Pochette de l’album" hidden>
+  <h1 id="title">Kara</h1>
+  <div id="artist"></div>
+</header>
 <main id="lyrics">
-<div id="previous" class="line"></div>
-<div id="current" class="line">En attente de Strawberry…</div>
-<div id="progress"><div id="fill"></div></div>
-<div id="next" class="line"></div>
-<div id="following" class="line"></div>
-<pre id="plain-lyrics" hidden></pre>
+  <div id="timed-lyrics">
+    <div id="previous" class="line"></div>
+    <div id="current" class="line"><span id="sung"></span><span id="pending">En attente de Strawberry…</span></div>
+    <div id="next" class="line"></div>
+    <div id="following" class="line"></div>
+  </div>
+  <div id="plain-lyrics" hidden></div>
 </main>
-<p id="status"></p>
-<ol id="upcoming" aria-label="Prochains tours"></ol>
-</section>
-<aside id="party" aria-labelledby="party-title">
-  <h2 id="party-title">Joueurs connectés <span id="player-count">0</span></h2>
-  <ol id="players"></ol>
-  <div id="no-players">Scanne le QR code pour rejoindre la soirée.</div>
-  <section id="mobile-room" aria-label="Rejoindre la salle sur un téléphone">
-    <img id="room-qr" alt="QR code pour rejoindre le karaoké" width="180" height="180">
-    <div id="room-info">
-      <strong>Rejoins la soirée !</strong>
-      <small>Android et iPhone</small>
-      <span id="room-url"></span>
-    </div>
-      <div id="organizer-code" hidden><small>Code organisateur</small><strong id="pin"></strong></div>
-  </section>
-</aside>
-</div>
+<p id="status" role="status"></p>
 </div>
 <div id="tv-closed" hidden>
   <h2>Affichage TV fermé</h2>
-  <p>Les joueurs et la musique restent connectés au PC.</p>
-  <p>Rouvre l’écran pour retrouver la soirée.</p>
   <button type="button" id="reopen-tv">Rouvrir l’écran</button>
 </div>
 <script src="display-config.js"></script>
