@@ -102,3 +102,38 @@ proposé par lien externe dans le README. La documentation consultée
 n’explicite pas séparément les droits de redistribution de ce fichier.
 Le déploiement expérimental utilise exclusivement le checkpoint local
 épinglé par SHA-256. [Projet Huang et Benetos](https://github.com/jhuang448/LyricsAlignment-Multilingual)
+
+## Contrôles de l’installation locale du 27 novembre 2026
+
+Le service Kara a été basculé depuis `cda9175` pendant que le salon était
+vide. L’état de la salle répond sur le processus expérimental et la fenêtre
+Parole a été ouverte sous Sway. Le mode local par défaut est Huang. Les
+autres parcours sont accessibles depuis le menu **Minutage**.
+
+| Piste annotée | Parcours | Propositions à ±300 ms | Débuts corroborés à ±300 ms | Médiane des propositions |
+| --- | --- | ---: | ---: | ---: |
+| Crowd, rap anglais | Wav2Vec2 / HTDemucs | 518/521 | 443/521 | 28,9 ms |
+| Séculaire, rap français | Wav2Vec2 / HTDemucs | 338/345 | 266/345 | 27,8 ms |
+| Embers, rock anglais | Huang / HTDemucs-FT | 176/189 | 79/189 | 76,5 ms |
+| Back In Time, piste scellée anglaise | Huang / UMX-HQ | 232/238 | 188/238 | 30,1 ms |
+
+Les annotations n’entrent que dans le calcul des métriques. La colonne des
+propositions implique le texte fourni. Les mesures corroborées incluent les
+refus au dénominateur. Les traces sont privées dans
+`.runtime/chronos-hardware-*.json` et `.runtime/replay-smoke/`.
+
+La vérification technique couvre 119 tests ciblés, avec les tests GTK de
+Studio, BlackBox V3, les chemins historiques de karaoké et de score, l’AEC,
+le témoin vocal, le cache Demucs et les protections nocturnes. Un calcul rap
+a déclenché la protection PSI avant l’isolation des allocations Demucs et
+Wav2Vec2 dans des processus successifs. Les deux titres rap ont ensuite
+terminé sous la protection. Le comparateur BlackBox a retrouvé les 31
+ancres entre les versions de 96,88 s et 134,18 s de *No Sympathy*.
+Le rejeu du même audio rap avec Huang a comparé 437 débuts de mots
+corroborés par les deux parcours sur une capture dont la référence était
+Wav2Vec2. L’empreinte du journal original est identique après le rejeu.
+
+Les captures de vérification utilisent des événements de joueur
+synthétiques. Une partie consentie avec un joueur reste nécessaire pour
+qualifier la capture microphone en conditions réelles, la justesse
+volontairement fausse et les écarts physiques de lecture ou d’affichage.
