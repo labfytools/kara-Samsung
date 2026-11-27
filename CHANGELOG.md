@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Capturer dans BlackBox la référence textuelle et temporelle du tour, avec lecture vérifiée dans Studio.
+
 - Réarmer la préparation nocturne sur secteur stable capot fermé et confirmer les coupures transitoires sans poursuivre les calculs sur batterie.
 - Autoriser une durée nocturne illimitée explicitement choisie (`0`), avec les protections énergétiques et matérielles conservées.
 - Permettre un plafond thermique nocturne explicite de 95 °C, sans relever les valeurs par défaut.

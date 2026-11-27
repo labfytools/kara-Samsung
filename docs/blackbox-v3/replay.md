@@ -93,3 +93,13 @@ bin/kara-blackbox compare-aec latest --cycle SESSION/TOUR \
 Les annotations d’intervalle conservent leur identifiant et leur version. Ajouter `--supersedes ID` pour publier une nouvelle version dans le même journal privé. Les marqueurs de partie, les annotations humaines, les paroles attendues et le score ont des provenances distinctes. L’annotation est une observation, utilisable comme vérité terrain si la procédure d’écoute la justifie.
 
 `simulate` rejoue des métadonnées de paquets avec graine, délais, pertes, dérive, coupure et époque de reconnexion explicites. L’ordre JSONL reste celui des paquets sources et les heures simulées permettent de trier les arrivées. `compare-aec --simulation` applique uniquement les perturbations d’amplitude, de saturation, d’écho et de réverbération à une copie PCM de travail. Le journal et les WAV d’origine conservent leurs empreintes.
+
+### Référence textuelle du tour
+
+`kara-blackbox lyrics-reference SESSION --turn TOUR` vérifie la session et
+recompose le document des paroles à partir des événements du tour. Le
+document associe l’empreinte du fichier musical, le texte source, les lignes
+effectivement affichées et la référence historique de notation lorsqu’elle
+existe. Studio expose la même lecture dans « Rapport et rejeu ». Le filtre
+de champs privés précède le découpage du document. Une perte dans le journal
+rend une référence incomplète détectable. L’export agrégé demeure expurgé.

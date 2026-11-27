@@ -17,6 +17,7 @@ import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from _kara_blackbox import BlackBox, atomic_json, cycle_id, digest, events, validate_recording
+from _kara_blackbox_lyrics import load as load_lyrics, record as record_lyrics
 from _kara_blackbox_clock import browser_anchor
 from _kara_blackbox_turbo import receive, submit
 from _kara_blackbox_trials import annotate, packet_simulation, simulate_pcm, simulation_options
@@ -58,6 +59,24 @@ class RecordingTests(unittest.TestCase):
         manifest["files"]["events.jsonl"] = {"bytes": log.stat().st_size, "sha256": digest(log)}
         with self.assertRaisesRegex(ValueError, "Identité du flux"):
             validate_recording(folder, manifest)
+
+    def test_multievent_lyrics_reference(self):
+        self.box.start(consent=True)
+        session = self.box.status()["session"]
+        original = "Ça me revient\n" * 2000
+        record_lyrics(self.box, session, self.turn, {"version": 1, "original": original,
+                                                     "password": "fixture-secret"})
+        self.box.stop(wait=True)
+        folder = self.box.root / session
+        validate_recording(folder, json.loads((folder / "manifest.json").read_text()))
+        self.assertEqual(load_lyrics(folder, self.turn["turn"])["reference"],
+                         {"version": 1, "original": original})
+        path = folder / "events.jsonl"
+        records = list(events(path))
+        path.write_text("".join(json.dumps(row) + "\n" for row in records
+                                if not (row["event"] == "reference-chunk" and row["data"]["index"] == 1)))
+        with self.assertRaisesRegex(ValueError, "incomplète"):
+            load_lyrics(folder, self.turn["turn"])
 
     def test_audio_admission_does_not_wait_for_manifest_sync(self):
         entered, release = Event(), Event()

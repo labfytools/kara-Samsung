@@ -356,7 +356,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
-                                          "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
+                                          "lyrics-reference", "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
                                           "extract-turbo", "replay-turbo", "compare-recognition",
                                           "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
                                           "annotate", "simulate", "diagnose", "delete", "prune"))
@@ -457,6 +457,15 @@ def main():
             output(validate_recording(folder, read(folder / "manifest.json")))
         elif args.action == "analyze":
             print((folder / "REPORT.md").read_text(), end="")
+        elif args.action == "lyrics-reference":
+            from _kara_blackbox_lyrics import load
+
+            manifest = read(folder / "manifest.json")
+            validate_recording(folder, manifest)
+            turn = manifest.get("cycles", {}).get(args.cycle, {}).get("turn") if args.cycle else args.turn
+            if not turn:
+                raise ValueError("Choisis un tour ou un cycle V3.")
+            output(load(folder, turn))
         elif args.action == "replay-round":
             validate_recording(folder, read(folder / "manifest.json"))
             replay_round(args, folder)

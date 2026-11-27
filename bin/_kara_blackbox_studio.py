@@ -266,7 +266,8 @@ class BlackBoxStudio(Gtk.Window):
         page = box()
         controls = box(Gtk.Orientation.HORIZONTAL)
         for action, label in (("report", "Rapport"), ("export", "Aperçu expurgé"), ("replay", "Rejouer le score"),
-                              ("compare", "Comparer ±0,75 et ±1,25 s"), ("compare-aec", "Comparer AEC")):
+                              ("compare", "Comparer ±0,75 et ±1,25 s"), ("compare-aec", "Comparer AEC"),
+                              ("lyrics-reference", "Référence des paroles")):
             controls.append(button(label, lambda *_args, kind=action: self.run_report(kind)))
         page.append(controls)
         scroll, self.report = text_panel()
@@ -279,8 +280,8 @@ class BlackBoxStudio(Gtk.Window):
             return
         selected = self.cycles.get_selected()
         turn = self.turns[selected - 1] if 0 < selected <= len(self.turns) else None
-        if action == "compare-aec" and turn is None:
-            fill(self.report, "Choisis un tour V3 dans la chronologie pour comparer les pistes.")
+        if action in ("compare-aec", "lyrics-reference") and turn is None:
+            fill(self.report, "Choisis un tour V3 dans la chronologie.")
             return
         fill(self.report, "Traitement…")
 
@@ -288,7 +289,7 @@ class BlackBoxStudio(Gtk.Window):
             args = [str(BIN / "kara-blackbox"), "--root", str(self.root), action, path.name, "--limit", "50"]
             if action == "compare":
                 args.extend(("--tolerance", ".75", "--tolerance", "1.25"))
-            if turn and action in ("compare", "replay", "compare-aec"):
+            if turn and action in ("compare", "replay", "compare-aec", "lyrics-reference"):
                 args.extend(("--cycle", f"{path.name}/{turn}"))
             command = subprocess.run(args, capture_output=True, text=True, timeout=120)
             if command.returncode:
