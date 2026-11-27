@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
-from datetime import date
+from datetime import date, datetime, timedelta
 import stat
 from time import perf_counter, time
 from urllib.parse import quote, unquote, urlsplit
@@ -99,6 +99,15 @@ LOCAL_PREPARATION_SCOPE = """
                    AND saved.subject=target.id AND saved.state='found' AND saved.checked>?)
     ) AND
 """
+
+# A present sidecar is left for manual review even when its timestamps are
+# invalid. Only the absent file token is eligible for a provider publication.
+NIGHT_LRC_MISSING = "coalesce(CASE WHEN json_valid(s.side) THEN json_extract(s.side,'$[0]') END,'')=''"
+NIGHT_LRC_STATE = """(candidate.state IN ('queued','suspended','temporary')
+    OR candidate.state='review' AND candidate.detail IN ('not_found','correspondance ambiguë'))"""
+NIGHT_LRC_TRACK = f""" AND candidate.kind='lrc' AND EXISTS(
+    SELECT 1 FROM songs s WHERE s.id=candidate.subject AND {NIGHT_LRC_MISSING}
+    AND NOT EXISTS(SELECT 1 FROM exclusions e WHERE e.kind='artist' AND e.subject=s.owner))"""
 
 
 def task_scope(local_reference, local_preparation, now):
@@ -498,6 +507,33 @@ class Index:
                                   AND (NOT ? OR json_extract(candidate.payload,'$.manual') IS NOT NULL) LIMIT 1""",
                               (*arguments, *kinds, now, manual_only)).fetchone() is not None
 
+    def night_lrc_due(self, db):
+        return db.execute(f"""SELECT min(candidate.due) FROM tasks AS candidate
+                               WHERE {NIGHT_LRC_STATE} {NIGHT_LRC_TRACK}""").fetchone()[0]
+
+    def night_lrc_status(self, *, now=None):
+        from _parole_sources import night_lrc_providers
+
+        now = time() if now is None else now
+        current = datetime.fromtimestamp(now)
+        noon = current.replace(hour=12, minute=0, second=0, microsecond=0)
+        if noon > current:
+            noon -= timedelta(days=1)
+        with self.db(wait=.15) as db:
+            total, missing = db.execute(f"""SELECT count(*), coalesce(sum({NIGHT_LRC_MISSING}),0)
+                                          FROM songs s""").fetchone()
+            retrieved, = db.execute("""SELECT coalesce(sum(CAST(value AS INTEGER)),0) FROM reviews
+                                      WHERE kind='activity_yield' AND state='night_lrc' AND checked>=?""",
+                                   (noon.timestamp(),)).fetchone()
+            due = self.night_lrc_due(db)
+            providers = night_lrc_providers(self, db=db, now=now)
+        ready = [row["id"] for row in providers if row["availability"] == "ready"]
+        waiting = [(row["id"], row["next_available"]) for row in providers if row["next_available"]]
+        source_due = now if ready else min((stamp for _, stamp in waiting), default=None)
+        resume = max(due, source_due) if due is not None and source_due is not None else None
+        return dict(total=total, missing=missing, present=total - missing, retrieved=retrieved,
+                    ready=ready, waiting=waiting, resume=resume)
+
     @staticmethod
     def read_closed_report(db):
         row = db.execute("SELECT value FROM settings WHERE key='night_lid_report'").fetchone()
@@ -622,7 +658,7 @@ class Index:
             return True
 
     def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None,
-              avoid=(), local_reference=False, local_preparation=None, manual_only=False):
+              avoid=(), local_reference=False, local_preparation=None, manual_only=False, night_lrc=False):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
@@ -638,9 +674,13 @@ class Index:
             AND (candidate.kind NOT IN ('lyrics','lrc') OR NOT EXISTS (
                 SELECT 1 FROM songs s JOIN tasks a ON a.kind='import_lyrics'
                 JOIN json_each(a.payload,'$.paths') j ON j.value=s.path
-                WHERE s.id=candidate.subject AND (a.state='running' OR
-                    (a.state IN ('queued','suspended','temporary') AND a.due<=candidate.due))))
+                WHERE s.id=candidate.subject AND (a.state='running' {pending_imports})))
         """ if {"lyrics", "lrc", "import_lyrics"}.intersection(kinds) else ""
+        pending_imports = ("" if night_lrc else
+                           "OR (a.state IN ('queued','suspended','temporary') AND a.due<=candidate.due)")
+        lyrics_guard = lyrics_guard.format(pending_imports=pending_imports)
+        state_guard = NIGHT_LRC_STATE if night_lrc else "candidate.state IN ('queued','suspended','temporary')"
+        track_guard = NIGHT_LRC_TRACK if night_lrc else ""
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             day = date.fromtimestamp(now).isoformat()
@@ -650,7 +690,8 @@ class Index:
                 UPDATE tasks SET state='running', updated=?, attempts=attempts+1
                 WHERE rowid=(SELECT candidate.rowid {scope} candidate.kind IN ({placeholders})
                     AND candidate.subject NOT IN ({excluded})
-                    AND candidate.state IN ('queued','suspended','temporary') AND candidate.due<=?
+                    AND {state_guard} AND candidate.due<=?
+                    {track_guard}
                     AND (NOT ? OR candidate.priority<=15)
                     AND (NOT ? OR json_extract(candidate.payload,'$.manual') IS NOT NULL)
                     {lyrics_guard}

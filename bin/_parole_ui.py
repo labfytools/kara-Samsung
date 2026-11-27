@@ -750,7 +750,7 @@ class ParoleView:
         self.night_summary_at = monotonic() + 3.
 
         def load():
-            return self.index.activity_progress(), self.index.closed_progress()
+            return self.index.night_lrc_status(), self.index.closed_progress()
 
         def finish(future):
             if not self.control.closed and self.night_summary is not None:
@@ -763,7 +763,7 @@ class ParoleView:
         self.control.tag_reader.submit(load).add_done_callback(lambda result: GLib.idle_add(finish, result))
 
     def refresh_night_summary(self, snapshot=None):
-        activity, closed = snapshot or (self.index.activity_progress(), self.index.closed_progress())
+        lrc, closed = snapshot or (self.index.night_lrc_status(), self.index.closed_progress())
         lines = []
         night = self.maintenance.night
         state = night.desktop
@@ -776,26 +776,22 @@ class ParoleView:
         lines.extend((f"{lid} · {power} · {screens} · {lock}", inhibitor))
         if night.reason:
             lines.append(night.reason)
-        hour, day, _ = activity
-        lines.extend((*self.activity_lines("Dernière heure révolue", hour),
-                      *self.activity_lines("Dernières 24 h révolues", day)))
+        progress = 100 * lrc["present"] / lrc["total"] if lrc["total"] else 0.
+        lines.extend((
+            f"{lrc['total']} morceaux · {lrc['present']} avec LRC · {lrc['missing']} sans LRC",
+            f"Progression {progress:.1f} % · {lrc['retrieved']} LRC récupérés cette nuit",
+            "Disponibles · " + (", ".join(lrc["ready"]) or "aucun"),
+            "Quotas en attente · " + (", ".join(
+                f"{name} ({datetime.fromtimestamp(stamp):%d/%m %H:%M})"
+                for name, stamp in lrc["waiting"]) or "aucun"),
+            "Prochaine reprise · " + (f"{datetime.fromtimestamp(lrc['resume']):%d/%m %H:%M}"
+                                      if lrc["resume"] is not None else "aucune échéance"),
+        ))
         if closed:
             stamp = datetime.fromtimestamp(closed["started"]).strftime("%d/%m à %H:%M")
-            completed = closed["completed"]
-            labels = {"lyrics": "paroles", "lrc": "LRC", "cover": "pochettes",
-                      "metadata": "métadonnées", "album": "albums", "discography": "discographies"}
-            counts = [f"{completed[kind]} {label}" for kind, label in labels.items() if kind in completed]
-            lines.append(f"Capot fermé le {stamp} · {sum(completed.values())} tâches réalisées · "
+            done = closed["completed"].get("lrc", 0)
+            lines.append(f"Capot fermé le {stamp} · {done} recherches LRC terminées · "
                          f"{closed['interrupted']} interruptions · {closed['deferred']} reports")
-            if counts:
-                lines.append(" · ".join(counts))
-            if "activity" in closed:
-                lines.extend(self.activity_lines("Résultats de la fermeture", closed["activity"]))
-            if closed["reason"]:
-                lines.append(f"Fin du bilan · {closed['reason']}")
-        storage = self.maintenance.resources.storage
-        if "shared_bytes" in storage:
-            lines.append(f"Espace mutualisé par liens · {display_size(storage['shared_bytes'])}")
         self.night_summary.set_text("\n".join(lines))
 
     def selected(self):
@@ -1287,8 +1283,6 @@ class ParoleView:
             general.append(button("Synchroniser la bibliothèque sur USB", self.control.music_sync.open_settings))
         stack.add_titled(scroller(general), "general", "Maintenance")
         resources = new()
-        resources.append(Gtk.Label(label="Les pistes Demucs sont préparées à la sélection des chansons.",
-                                   xalign=0, wrap=True, css_classes=["muted"]))
         for spec in (
             ("idle", "Inactivité Sway (secondes)", 30, 3600), ("cpu", "Charge CPU avant départ (%)", 1, 95),
             ("memory_mib", "Mémoire disponible au départ (Mio)", 512, 65536, 256),
@@ -1305,9 +1299,9 @@ class ParoleView:
         self.night_summary = Gtk.Label(xalign=0, wrap=True, selectable=True, css_classes=["muted"])
         night.append(self.night_summary)
         self.refresh_night_summary()
-        toggles(night, (("night_enabled", "Activer les recherches nocturnes de paroles"),
-                        ("night_screen_off", "Rechercher les références lorsque l’écran est éteint"),
-                        ("night_lid", "Rechercher les références lorsque le capot est fermé"),
+        toggles(night, (("night_enabled", "Activer la recherche nocturne des LRC manquants"),
+                        ("night_screen_off", "Rechercher les LRC lorsque l’écran est éteint"),
+                        ("night_lid", "Rechercher les LRC lorsque le capot est fermé"),
                         ("night_lid_qualified", "Refroidissement capot fermé vérifié sur cet ordinateur")))
         for spec in (
             ("night_idle", "Inactivité minimale (secondes)", 30, 3600),
@@ -1320,9 +1314,9 @@ class ParoleView:
             number(night, *spec)
         night.append(Gtk.Label(label="Secteur obligatoire. Attendez l’inhibiteur de capot actif avant de fermer.",
                                xalign=0, wrap=True, css_classes=["muted"]))
-        night.append(Gtk.Label(label="Paroles et LRC uniquement : aucun nouveau fichier instrumental ou vocal Demucs.",
+        night.append(Gtk.Label(label="Seuls les LRC d’origine fournis par les sources sont enregistrés.",
                                xalign=0, wrap=True, css_classes=["muted"]))
-        stack.add_titled(scroller(night), "night", "Paroles nocturnes")
+        stack.add_titled(scroller(night), "night", "LRC nocturnes")
         codex = new()
         toggles(codex, (("codex", "Autoriser l’authentification ChatGPT existante dans l’espace isolé"),
                         ("codex_auto", "Rechercher automatiquement en dernier recours")))

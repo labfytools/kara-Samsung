@@ -316,70 +316,66 @@ class NightTests(unittest.TestCase):
                 "SELECT kind,state,attempts FROM tasks ORDER BY kind")],
                 [("prepare", "queued", 0), ("transcription", "queued", 0)])
 
+    def missing_tracks(self, *names):
+        index = self.owner.index
+        paths = [index.root / (name + ".opus") for name in names]
+        for path in paths:
+            path.write_bytes(b"fixture")
+        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
+                  paths=paths, reader=lambda path: ({"title": path.stem, "artist": "Artiste",
+                                                       "duration_seconds": 5}, {}))
+        with index.db() as db:
+            return dict(db.execute("SELECT title,id FROM songs"))
+
     def test_closed_background_search_persists_completed_tasks(self):
         self.owner.foreground.clear()
-        self.owner.index.configure(night_lid=True, night_lid_qualified=True, network_workers=1)
-        self.settings = self.owner.index.settings()
+        index = self.owner.index
+        index.configure(night_lid=True, night_lid_qualified=True, network_workers=1)
+        self.settings = index.settings()
         self.night.refresh(self.settings)
         self.assertTrue(self.observe(lid=True))
-        results = iter((TimeoutError(), (0, b'{"state":"found"}'), (0, b'{"state":"found"}')))
-
-        def output(*_args, **_kwargs):
-            result = next(results)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        self.owner.output = Mock(side_effect=output)
-        for kind, subject in (("lrc", "slow"), ("lyrics", "lyric1"), ("lyrics", "lyric2"),
-                              ("cover", "cover"), ("prepare", "song"), ("transcription", "manual")):
-            payload = {"manual": True} if kind == "transcription" else None
-            self.owner.index.enqueue(kind, subject, "fixture", now=1, payload=payload)
+        tracks = self.missing_tracks("slow", "first", "second")
+        self.owner.output = Mock(side_effect=(TimeoutError(), *((
+            0, b'{"state":"found","source":"LRCLIB"}'),) * 2))
+        for i, subject in enumerate(("slow", "first", "second"), 1):
+            index.enqueue("lrc", tracks[subject], "fixture", now=i)
+        for kind in ("lyrics", "cover", "prepare", "transcription", "codex"):
+            index.enqueue(kind, tracks["slow"], "fixture", now=1)
         for _ in range(4):
             self.owner.tick()
-        report = self.owner.index.closed_progress()
-        self.assertEqual(report["completed"], {"lyrics": 2})
-        with self.owner.index.db() as db:
+        report = index.closed_progress()
+        self.assertEqual(report["completed"], {"lrc": 2})
+        self.assertEqual(index.night_lrc_status()["retrieved"], 2)
+        self.assertTrue(all("--original-lrc" in call.args[0] for call in self.owner.output.call_args_list))
+        with index.db() as db:
             pending = {row[0] for row in db.execute("SELECT kind FROM tasks WHERE state='queued'")}
-        self.assertTrue({"cover", "prepare", "transcription"} <= pending)
-        self.assertEqual(report["deferred"], 1)
+        self.assertTrue({"lyrics", "cover", "prepare", "transcription", "codex"} <= pending)
         self.assertIsNone(report["ended"])
         self.ac = False
         self.owner.tick()
-        self.assertIsNone(self.owner.index.closed_progress()["ended"])
+        self.assertIsNone(index.closed_progress()["ended"])
         self.night.power_loss_since -= POWER_LOSS_GRACE + 1
         self.owner.tick()
-        report = self.owner.index.closed_progress()
-        self.assertIsNotNone(report["ended"])
-        self.assertEqual(report["reason"], "secteur requis")
+        self.assertEqual(index.closed_progress()["reason"], "secteur requis")
         self.assertIsNone(self.night.lid_fd)
 
-    def test_closed_night_admits_a_local_prematch_without_provider_availability(self):
-        self.owner.foreground.clear()
+    def test_closed_night_waits_for_provider_then_caches_negative_result(self):
         index = self.owner.index
-        index.configure(night_lid=True, night_lid_qualified=True)
-        self.settings = self.owner.current_settings = index.settings()
-        self.night.refresh(self.settings)
-        self.assertTrue(self.observe(lid=True))
-        donor, target = (index.root / name for name in ("album.opus", "anthologie.opus"))
-        donor.write_bytes(b"fixture")
-        target.write_bytes(b"fixture")
-        donor.with_suffix(".lrc").write_text("[00:01.000]Texte local\n")
-        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
-                  paths=[donor, target], reader=lambda _: ({"title": "Titre", "artist": "Artiste",
-                                                          "duration_seconds": 5}, {}))
-        with index.db() as db:
-            db.execute("UPDATE songs SET audio=?", ("a" * 64,))
-            identity = db.execute("SELECT id FROM songs WHERE path=?", (str(target),)).fetchone()[0]
-        index.enqueue("lrc", identity, "fixture")
-        self.owner.output = Mock(return_value=(0, b'{"state":"local_miss"}'))
-        with patch("_parole_maintenance.ready_categories", return_value=set()):
-            self.assertTrue(self.owner.tick_night(self.settings, time()))
+        identity = self.missing_tracks("target")["target"]
+        now = time()
+        index.enqueue("lrc", identity, "fixture", now=now)
+        self.owner.output = Mock(return_value=(0, b'{"state":"not_found"}'))
+        with patch("_parole_maintenance.night_lrc_providers", return_value=[]):
+            self.assertFalse(self.owner.tick_night(self.settings, now))
+        self.owner.output.assert_not_called()
+        with patch("_parole_maintenance.night_lrc_providers", return_value=[{"availability": "ready"}]):
+            self.assertTrue(self.owner.tick_night(self.settings, now))
             self.assertFalse(self.owner.tick_night(self.settings, time()))
         self.owner.output.assert_called_once()
-        self.assertEqual(self.owner.output.call_args.args[0][-1], "--local-reference-only")
-        self.assertEqual(index.closed_progress()["deferred"], 1)
-        self.assertIsNotNone(self.night.lid_fd)
+        with index.db() as db:
+            row = db.execute("SELECT state,due FROM tasks WHERE subject=?", (identity,)).fetchone()
+        self.assertEqual(row["state"], "temporary")
+        self.assertGreater(row["due"], now + 60)
 
     def test_report_retains_validated_work_and_counts_a_crashed_claim_once(self):
         index = self.owner.index
@@ -415,33 +411,6 @@ class NightTests(unittest.TestCase):
         self.assertFalse(stage.exists())
         self.assertTrue(other.exists())
         self.assertTrue(ready.exists())
-
-    def test_waking_provider_search_leaves_legacy_alignment_queued(self):
-        index = self.owner.index
-        at = time()
-        for kind in ("prepare", "transcription", "lrc"):
-            index.enqueue(kind, "fixture", "version", now=at)
-        self.owner.transcribe_task = Mock()
-        self.owner.prepare = Mock()
-        self.owner.output = Mock(return_value=(0, b'{"state":"found"}'))
-        self.owner.do_song = Mock(return_value=("done", "LRC trouvé", 0))
-        with patch("_parole_maintenance.ready_categories", return_value={"lrc"}):
-            self.assertTrue(self.owner.tick_night(self.settings, at))
-            self.assertFalse(self.owner.tick_night(self.settings, time()))
-        self.owner.transcribe_task.assert_not_called()
-        self.owner.prepare.assert_not_called()
-        self.owner.output.assert_called_once()
-        with index.db() as db:
-            states = dict(db.execute("SELECT kind,state FROM tasks"))
-        self.assertEqual(states, {"prepare": "queued", "transcription": "queued", "lrc": "done"})
-
-    def test_night_codex_research_is_available_with_lyrics_policy(self):
-        self.owner.index.configure(codex=True, codex_auto=True, codex_categories=["lyrics", "lrc"])
-        with patch("_parole_maintenance.ready_categories", return_value={"lyrics","lrc","cover"}):
-            kinds = self.owner.network_kinds(self.owner.index.settings(), time(), nocturnal=True)
-        self.assertIn("codex", kinds)
-        self.assertIn("lrc", kinds)
-        self.assertNotIn("cover", kinds)
 
     def test_draft_filters_segments_without_corresponding_observed_words(self):
         heard = [ObservedWord("vrai", 1., 1.1, .9), ObservedWord("chant", 1.2, 1.4, .8)]
@@ -494,8 +463,8 @@ class NightTests(unittest.TestCase):
                 self.owner.resources.resumed = False
                 self.night.next_desktop = self.night.next_sleep = 0.
                 fds = self.open()
-                self.owner.index.enqueue("lyrics", phase, "fixture")
-                task = self.owner.index.claim(("lyrics",), time())
+                self.owner.index.enqueue("lrc", phase, "fixture")
+                task = self.owner.index.claim(("lrc",), time())
                 entered = Event()
 
                 def lookup(*_args, **_kwargs):

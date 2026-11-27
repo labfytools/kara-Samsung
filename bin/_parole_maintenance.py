@@ -36,7 +36,7 @@ from _parole_local_reference import SOURCE as LOCAL_SOURCE
 from _parole_night import Night
 from _parole_process import Interrupted, run
 from _parole_resources import Resources
-from _parole_sources import discover, seed, controls, ready_categories
+from _parole_sources import discover, seed, controls, ready_categories, night_lrc_providers
 from _paroles_lrc import MAX_LRC_BYTES
 
 CATEGORIES = ("SYSTEM", "SCAN", "INDEX", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
@@ -64,8 +64,7 @@ PHASES = {"cache": "Vérification du cache", "lyrics": "Paroles de référence",
 NIGHT_RESTART_SETTINGS = (
     "night_enabled", "night_lid", "night_lid_qualified", "night_screen_off", "night_idle",
     "night_minutes", "night_cpu_temperature", "night_gpu_temperature", "night_closed_temperature",
-    "cache_gib", "reserve_gib", "generate", "lyrics", "lrc", "albums", "discography", "cover", "metadata", "paused",
-    "night_transcribe",
+    "cache_gib", "reserve_gib", "paused",
 )
 
 
@@ -463,7 +462,8 @@ class Maintenance:
                 settings = self.index.settings(wait=.15)
 
                 def stopped():
-                    return self.shutdown.is_set() or settings["paused"] or bool(self.index_limit(settings))
+                    return (self.shutdown.is_set() or settings["paused"] or self.night_context(settings)
+                            or bool(self.index_limit(settings)))
 
                 if refresh_lexicon(self.index, time(), stopped):
                     continue
@@ -558,7 +558,8 @@ class Maintenance:
                 continue
             tags = json.loads(song["info"])["tags"]
             missing_tags = any(not tags.get(field) for field in ("title", "artist", "album"))
-            for kind, missing in (("lyrics", song["lyrics"] == "absent"), ("lrc", song["lrc"] in ("absent", "intégré")),
+            for kind, missing in (("lyrics", song["lyrics"] == "absent"), ("lrc", song["lrc"] in ("absent", "intégré")
+                                   or settings["night_enabled"] and not json.loads(song["side"] or "[null]")[0]),
                                   ("metadata", missing_tags)):
                 if not missing:
                     db.execute("UPDATE tasks SET state='done' WHERE kind=? AND subject=? "
@@ -569,7 +570,7 @@ class Maintenance:
                     priority = 20
                 if kind == "lrc":
                     priority -= 1
-                if settings.get(kind):
+                if settings.get(kind) or kind == "lrc" and settings["night_enabled"]:
                     self.index.enqueue(kind, subject, revision, priority, db=db)
 
     @staticmethod
@@ -838,7 +839,9 @@ class Maintenance:
     def network_output(self, task, settings, *, stop=None, local_reference_only=False):
         kind, subject = task["kind"], task["subject"]
         command = [sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject]
-        if local_reference_only:
+        if self.night_running:
+            command.append("--original-lrc")
+        elif local_reference_only:
             command.append("--local-reference-only")
         code, data = self.output(command,
                                  timeout=220 if kind == "source" else settings["network_timeout"], stop=stop)
@@ -1042,7 +1045,8 @@ class Maintenance:
     def tick_import_enrichment(self, settings, now, kind=IMPORT_LYRICS):
         enabled = (settings["lyrics"] or settings["lrc"]) if kind == IMPORT_LYRICS else settings["cover"]
         manual_only = kind == IMPORT_LYRICS and not enabled
-        if ((not enabled and not manual_only) or settings["paused"] or self.shutdown.is_set()
+        if ((not enabled and not manual_only) or settings["paused"] or self.night_context(settings)
+                or self.shutdown.is_set()
                 or (kind != IMPORT_LYRICS and self.priority)
                 or not self.index.work_due((kind,), now, manual_only=manual_only)):
             return False
@@ -1158,9 +1162,28 @@ class Maintenance:
                                   "Fournisseur proposé · validation nécessaire")
         return ("done" if result["status"] == "found" else "review", result["status"], 0)
 
+    def night_lrc_result(self, task, value):
+        outcome = value["state"]
+        if outcome in ("found", "present", "rescan", "excluded", "invalid"):
+            return self.do_song(task, value)
+        if outcome in ("not_found", "ambiguous", "instrumental"):
+            # Provider catalogue misses already have their own temporary
+            # negative entries. A track delay prevents traversal churn.
+            return "temporary", outcome, DAY
+        now = time()
+        reopening = [row["next_available"] for row in night_lrc_providers(self.index, now=now)
+                     if row["next_available"] and row["next_available"] > now]
+        # A quota expiry can make this recording searchable again earlier
+        # than the per-track retry. Other tracks can still use ready sources.
+        delay = min(reopening) - now if reopening else min(DAY, 120 * 2**min(task["attempts"], 9))
+        return "temporary", outcome, max(.05, delay)
+
     def execute(self, task, *, nocturnal=False, local_reference_only=False):
         started = monotonic()
         kind, subject = task["kind"], task["subject"]
+        if nocturnal and kind != "lrc":
+            self.index.finish(task, "suspended", "Hors file nocturne LRC", 0, refund_attempt=True)
+            return
         category = {"discography": "DISCOGRAPHIE", "prepare": "KARA", "source_probe": "SOURCE",
                     "cleanup": "CACHE"}.get(kind, kind.upper())
         network_found = False
@@ -1205,9 +1228,10 @@ class Maintenance:
                 result = ("done", "nettoyé", 0)
             else:
                 value = self.network_output(task, self.current_settings, local_reference_only=local_reference_only)
-                result = self.network_result(task, value)
+                result = self.night_lrc_result(task, value) if nocturnal else self.network_result(task, value)
                 network_found = value["state"] == "found" and value.get("source") not in (None, "Strawberry", LOCAL_SOURCE)
-                activity = self.reference_activity(task, value, result)
+                activity = (("night_lrc",) if nocturnal and network_found and result[0] == "done"
+                            else self.reference_activity(task, value, result))
         except Interrupted:
             result = ("suspended", "ressources libérées", 45)
             self.journal.emit(category, "Traitement interrompu · reprise différée")
@@ -1390,6 +1414,12 @@ class Maintenance:
             if removed:
                 self.journal.emit("CACHE", f"{removed} brouillons interrompus retirés")
 
+    def night_context(self, settings=None):
+        if settings is None:
+            settings = getattr(self, "current_settings", {})
+        state = self.night.desktop
+        return bool(settings.get("night_enabled") and state and (state.lid or state.locked))
+
     def tick(self):
         settings = self.current_settings = self.index.settings()
         now = time()
@@ -1409,6 +1439,15 @@ class Maintenance:
             if self.resources.resumed:
                 self.resources.resumed = False
                 self.night.activity()
+        if self.night_context(settings):
+            active_import = self.import_queue and self.import_queue.count().get("running", 0)
+            if desktop_ready and not self.priority and not active_import and not self.import_enrichment_count():
+                self.tick_night(settings, now)
+            else:
+                self.night.stop_work()
+            # An empty or throttled nighttime queue cannot fall through to
+            # unrelated daytime maintenance.
+            return
         imports_pending = self.import_enrichment_count() or self.import_queue and self.import_queue.pending()
         if imports_pending or self.priority:
             self.night.stop_work()
@@ -1433,13 +1472,6 @@ class Maintenance:
             return
         if self.import_diagnostics and not self.import_queue.pause_requested():
             self.import_diagnostics.tick(settings, now)
-        if settings["night_enabled"]:
-            if desktop_ready and not imports_pending and self.tick_night(settings, now):
-                return
-            if settings["night_lid"] and self.night.desktop and self.night.desktop.lid:
-                # The classical foreground path must not bypass a closed
-                # lid suspension or the nocturnal resource checks.
-                return
         if not self.foreground.is_set():
             return
         if not settings["night_enabled"]:
@@ -1460,9 +1492,9 @@ class Maintenance:
             return
         self.tick_network(settings, now, self.network_kinds(settings, now))
 
-    def network_kinds(self, settings, now, *, nocturnal=False):
+    def network_kinds(self, settings, now):
         ready = ready_categories(self.index, now)
-        return tuple(kind for kind in (("lyrics", "lrc", "codex", "source", "source_probe") if nocturnal else NETWORK)
+        return tuple(kind for kind in NETWORK
                      if (NETWORK_FLAGS.get(kind, kind) is None or settings[NETWORK_FLAGS.get(kind, kind)])
                      and (kind not in NETWORK_CATEGORY or NETWORK_CATEGORY[kind] in ready)
                      and (kind != "codex" or now >= settings.get("codex_suspended_until", 0)))
@@ -1527,16 +1559,22 @@ class Maintenance:
         return None
 
     def tick_night(self, settings, now):
-        kinds = self.network_kinds(settings, now, nocturnal=True)
-        due = (self.index.work_due(kinds, now) or
-               self.index.work_due(self.local_reference_kinds(settings), now, local_reference=True))
-        # The nighttime owner still serves the Parole provider tasks. Keep
-        # archived compute jobs in SQLite and outside the claim set.
+        with self.index.db(wait=.15) as db:
+            due = self.index.night_lrc_due(db)
+            providers = night_lrc_providers(self.index, now=now, db=db)
         try:
-            if due and self.night_allowed(settings, running=False, light=True) and self.night.open(settings):
-                return self.tick_network(settings, now, kinds, nocturnal=True)
-            if not due:
-                self.night.report("Mode nocturne en attente · file prête au prochain travail")
-            return False
+            if due is None:
+                return self.night.report("Aucun LRC à rechercher dans la file nocturne")
+            if not any(row["availability"] == "ready" for row in providers):
+                return self.night.report("En attente d’un fournisseur de LRC")
+            if due > now:
+                return self.night.report("Recherches LRC différées jusqu’à la prochaine échéance")
+            if not self.night_allowed(settings, running=False, light=True) or not self.night.open(settings):
+                return False
+            task = self.index.claim(("lrc",), now, night_lrc=True)
+            if task is None:
+                return False
+            self.execute(task, nocturnal=True)
+            return True
         finally:
             self.night.stop_work()

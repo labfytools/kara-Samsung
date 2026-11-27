@@ -153,13 +153,13 @@ class KeepAlive:
         self.connections.clear()
 
 
-def cache_identity(provider, signature, synced, local_text, strict, configuration):
+def cache_identity(provider, signature, synced, local_text, strict, configuration, *, original_lrc=False):
     # Keep the exact version/credits in the key. LyricDown aligns an existing
     # text, and its timing is only reusable with the same reference text.
     settings = json.loads(configuration)
     # Admission/order changes do not alter previously verified content.
     config = {name: settings.get(name) for name in ("host", "path")}
-    return encoded_key("lyrics-v4", provider, signature, synced,
+    return encoded_key("lyrics-original-lrc-v1" if original_lrc else "lyrics-v4", provider, signature, synced,
                        encoded_key(local_text) if synced else "", strict, config)
 
 

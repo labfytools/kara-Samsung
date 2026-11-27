@@ -37,7 +37,7 @@ def lyrics_engine():
     return module
 
 
-def lookup_song(index, identity, synced, *, read_only=False, local_reference_only=False):
+def lookup_song(index, identity, synced, *, read_only=False, local_reference_only=False, original_lrc=False):
     os.environ["KARA_IMPORT_PROCESSING"] = "1"
     engine = lyrics_engine()
     song = index.song(identity)
@@ -67,11 +67,11 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
     if not title or not artist or not math.isfinite(duration) or duration <= 0:
         return {"state": "invalid"}
     missing = "not_found"
-    if (synced and (rows := parse_lrc(text)) and rows[-1][0] <= duration + 3
+    if (not original_lrc and synced and (rows := parse_lrc(text)) and rows[-1][0] <= duration + 3
             and any(content for _, content in rows)):
         lyrics, provider = text, "Strawberry"
     else:
-        local = local_reference(index, song, synced=synced)
+        local = None if original_lrc else local_reference(index, song, synced=synced)
         if local:
             if read_only:
                 return {"state": "found", "source": LOCAL_SOURCE, "lyrics": local.text}
@@ -94,13 +94,14 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
             lyrics, provider = engine.LyricsSources().find(
                 title, artist, tags.get("album"), duration, tags.get("albumartist"),
                 synced=synced, local_text=local_text, registry=index, strict=True,
-                context=engine.contexts(tags), isrc=tags.get("isrc"), recording=(path, token))
+                context=engine.contexts(tags), isrc=tags.get("isrc"), recording=(path, token),
+                **({"original_lrc": True} if original_lrc else {}))
         except engine.AmbiguousLyrics:
             lyrics, missing = None, "ambiguous"
         except engine.ServiceUnavailable as error:
             lyrics, missing = None, error.reason
     if lyrics is None:
-        if not read_only:
+        if not read_only and not original_lrc:
             from _parole_unison import discover as unison
 
             unison(index, song, tags.get("isrc"), lambda data: (
@@ -119,7 +120,8 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
         # exclusive sidecar creation for the exact recording version.
         if file_token(path) != token or path.resolve() != path:
             return {"state": "rescan"}
-        if not engine.save_lrc(path.with_suffix(extension), lyrics):
+        save_options = {"original": True} if original_lrc else {}
+        if not engine.save_lrc(path.with_suffix(extension), lyrics, **save_options):
             return {"state": "present"}
         proof = reference_proof(path, extension, token, provider, external=synced and provider != "Strawberry")
     index.notify([path], SIDECAR, proofs={str(path): proof})
@@ -378,7 +380,8 @@ def main():
     index = Index(Path(sys.argv[3]) if kind == "lyrics_source_test" and len(sys.argv) == 4 else music_library())
     if kind in ("lyrics", "lrc"):
         result = lookup_song(index, subject, kind == "lrc",
-                             local_reference_only=sys.argv[3:] == ["--local-reference-only"])
+                             local_reference_only=sys.argv[3:] == ["--local-reference-only"],
+                             original_lrc=kind == "lrc" and sys.argv[3:] == ["--original-lrc"])
     elif kind in KINDS:
         # Library-lock progress and tool diagnostics must not contaminate the
         # machine-readable result expected by the maintenance supervisor.

@@ -213,6 +213,14 @@ def ready_sources(index, now):
             if row["used"] < provider_limits(json.loads(row["config"]))[0]}
 
 
+def night_lrc_providers(index, *, now=None, db=None):
+    """Providers with an approved adapter that can deliver native LRC."""
+    direct = {"LRCLIB", "NetEase", "QQ Music"}
+    return [row for row in lyrics_rows(index, db=db, now=now)
+            if row["state"] == "active" and "lrc" in row["category"].split(",")
+            and (row["id"] in direct or row["adapter"] == "lrclib" and row["decoded"].get("validated"))]
+
+
 def ready_categories(index, now):
     ready = set()
     available = ready_sources(index, now)

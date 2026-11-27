@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Limiter les tâches nocturnes à la récupération des LRC d’origine manquants. Conserver les quotas, les recherches sans résultat et la progression entre les redémarrages.
+
 - Revenir au karaoké classique avec le mix d’origine, le tour suivant automatique et l’écoute micro préalable. Retirer la notation, la reconnaissance vocale et la préparation acoustique du parcours. Conserver les fonctions de bibliothèque Parole.
 - Afficher la lecture Strawberry et sa pochette sur la TV avant et après la partie. Passer au jeu à l’ouverture du salon. Mettre à jour le client Samsung en version 2.1.0 et versionner les ressources JavaScript mobiles.
 

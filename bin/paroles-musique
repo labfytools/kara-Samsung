@@ -293,6 +293,7 @@ class LrcLib:
                     self.candidates.sort(key=lambda row: row["decision"] != "compatible")
 
         code = getattr(self, "isrc", "")
+        original_lrc = getattr(self, "original_lrc", False)
         signature = title, artist, album, duration, album_artist
         exact = dict(track_name=title, artist_name=artist, duration=duration)
         if album:
@@ -301,16 +302,17 @@ class LrcLib:
         scores = []
         def assess(record, *, exact=False):
             score = recording_score(record, *signature, isrc=code, synced=synced,
-                                    on_reject=lambda item, reason: observe(item, transcript(item, duration, synced), reason))
+                                    on_reject=lambda item, reason: observe(
+                                        item, transcript(item, duration, synced, original_lrc=original_lrc), reason))
             if score is None:
                 return None
-            text = transcript(record, duration, synced)
+            text = transcript(record, duration, synced, original_lrc=original_lrc)
             observe(record, text, "compatible" if text is not None else "format-indisponible")
             if text is not None:
                 scores.append((score, text, record))
                 # A plain match with looser evidence cannot seed the timed
                 # cache. Validate the reverse form independently.
-                if exact and recording_score(record, *signature, isrc=code, synced=True) is not None:
+                if not original_lrc and exact and recording_score(record, *signature, isrc=code, synced=True) is not None:
                     if companion := transcript(record, duration, not synced):
                         self.exact_complement = cache_value(companion, candidate_evidence(record, text, "")["metadata"])
             return text
@@ -477,7 +479,8 @@ class NetEase(PublicLyrics):
                 return None
             lrc = (response.get("lrc") or {}) if isinstance(response, dict) else {}
             raw = lrc.get("lyric") if isinstance(lrc, dict) else None
-            return catalog_transcript(raw, duration, synced=synced)
+            return catalog_transcript(raw, duration, synced=synced,
+                                      original_lrc=getattr(self, "original_lrc", False))
 
         return available_transcript(candidates, fetch, self)
 
@@ -545,7 +548,10 @@ class QQMusic(PublicLyrics):
                 self.failure = ServiceUnavailable("QQ Music a refusé l’accès au texte")
                 return None
             raw = response.get("lyric")
-            return catalog_transcript(unescape(raw) if isinstance(raw, str) else None, duration, synced=synced)
+            original_lrc = getattr(self, "original_lrc", False)
+            if isinstance(raw, str) and not original_lrc:
+                raw = unescape(raw)
+            return catalog_transcript(raw, duration, synced=synced, original_lrc=original_lrc)
 
         return available_transcript(candidates, fetch, self)
 
@@ -800,13 +806,14 @@ class LyricsSources:
 
     def find(self, title, artist, album, duration, album_artist, *, synced, local_text="",
              registry=None, strict=False, context=(), provider_only=None, isrc=None, recording=None,
-             refresh=False, audit=None):
+             refresh=False, audit=None, original_lrc=False):
         from _parole_import_metrics import LOOKUP, snapshot
         from _parole_sources import LYRICS_BROKER_UPSTREAMS, lyrics_rows, ready_sources
 
         signature = (title, artist, album, duration, album_artist)
         code = normalize_isrc(isrc)
-        if provider_only is None and (snapshot_path := os.environ.get("PAROLE_LRCLIB_SQLITE")):
+        self.original_lrc = original_lrc
+        if not original_lrc and provider_only is None and (snapshot_path := os.environ.get("PAROLE_LRCLIB_SQLITE")):
             from _parole_lrclib_local import candidates
 
             try:
@@ -836,7 +843,7 @@ class LyricsSources:
         }
         names = (["LRCLIB", "NetEase", "QQ Music", "LyricDown"] if synced
                  else ["LRCLIB", "NetEase", "QQ Music", "Genius", "lyrics.ovh"])
-        if not local_text and provider_only != "LyricDown" and "LyricDown" in names:
+        if "LyricDown" in names and (original_lrc or not local_text and provider_only != "LyricDown"):
             names.remove("LyricDown")
         providers, available, profiles, measured = {}, {}, {}, {}
         if registry:
@@ -886,7 +893,7 @@ class LyricsSources:
             row = providers.get(name)
             identity = cache_identity(name, (*signature, code), synced,
                                       local_text if name == "LyricDown" else "",
-                                      strict, row["config"]) if row is not None else None
+                                      strict, row["config"], original_lrc=original_lrc) if row is not None else None
             # LRCLIB transmits both forms together. They share the lookup
             # lease to let a concurrent text search reuse a verified LRC hit.
             lock_key = (cache_identity(name, (*signature, code), False, "", strict, row["config"])
@@ -995,7 +1002,9 @@ class LyricsSources:
         candidates = []
         error, conflict, value = None, False, None
         client, kwargs = clients.get(name, (None, None))
+        original_lrc = getattr(self, "original_lrc", False)
         if client:
+            client.original_lrc = original_lrc
             client.failure = None
             client.candidates = []
             client.isrc = code
@@ -1057,7 +1066,7 @@ class LyricsSources:
                     response = endpoint.search(label, credit, edition, registry=registry, provider=name,
                                                audit=transport_event)
                     value = best_transcript(
-                        response, *signature, synced=synced, strict=strict, isrc=code,
+                        response, *signature, synced=synced, strict=strict, isrc=code, original_lrc=original_lrc,
                         on_candidate=candidate, on_reject=lambda record, reason: candidate(record, None, reason),
                     )
                     if value is not None:
@@ -1276,14 +1285,18 @@ def usable_text(text, limit):
     return None
 
 
-def transcript(record, duration, synced):
+def transcript(record, duration, synced, *, original_lrc=False):
     if record.get("instrumental") is True:
         return ""
-    if synced and record.get("hasWordSync") is True:
+    if synced and not original_lrc and record.get("hasWordSync") is True:
         if text := enhanced(record.get("lyricsfile"), duration):
             return text
-    text = usable_text(record.get("syncedLyrics" if synced else "plainLyrics"),
-                       MAX_LRC_BYTES if synced else 32_000)
+    raw = record.get("syncedLyrics" if synced else "plainLyrics")
+    text = usable_text(raw, MAX_LRC_BYTES if synced else 32_000)
+    if synced and original_lrc and text is not None:
+        # Validate the original bytes' length too: stripping whitespace may
+        # have reduced the length of the string used for content validation.
+        text = raw if len(raw.encode("utf-8")) <= MAX_LRC_BYTES else None
     if not synced and text is None:
         timed = transcript(record, duration, True)
         if timed:
@@ -1295,8 +1308,8 @@ def transcript(record, duration, synced):
     return text
 
 
-def catalog_transcript(raw, duration, *, synced):
-    timed = transcript({"syncedLyrics": raw}, duration, True)
+def catalog_transcript(raw, duration, *, synced, original_lrc=False):
+    timed = transcript({"syncedLyrics": raw}, duration, True, original_lrc=original_lrc)
     if timed and not synced:
         return usable_text("\n".join(line for _, line in parse_lrc(timed) if line), 32_000)
     return timed
@@ -1326,7 +1339,7 @@ def verified_lyrics(record, title, artist, album, duration, album_artist, *, syn
 
 
 def best_transcript(records, title, artist, album, duration, album_artist, *, synced, strict=False,
-                    on_edition=None, on_candidate=None, isrc="", on_reject=None):
+                    on_edition=None, on_candidate=None, isrc="", on_reject=None, original_lrc=False):
     if not isinstance(records, list):
         return None
     candidates = []
@@ -1334,7 +1347,7 @@ def best_transcript(records, title, artist, album, duration, album_artist, *, sy
         score = recording_score(record, title, artist, album, duration, album_artist,
                                 on_edition=on_edition, isrc=isrc, synced=synced, on_reject=on_reject)
         if score is not None:
-            text = transcript(record, duration, synced)
+            text = transcript(record, duration, synced, original_lrc=original_lrc)
             if text is not None:
                 candidates.append((score, text, record))
             elif on_candidate:
@@ -1410,9 +1423,11 @@ def save_lyrics(path, version, tags, lyrics, publication_root=None, *, published
         return current
 
 
-def save_lrc(path, lyrics):
-    with NamedTemporaryFile(dir=path.parent, prefix=".paroles-", mode="w", encoding="utf-8") as draft:
-        draft.write(lyrics + "\n")
+def save_lrc(path, lyrics, *, original=False):
+    # The final create remains exclusive. In original mode the UTF-8
+    # provider payload is the sidecar, including its existing newline bytes.
+    with NamedTemporaryFile(dir=path.parent, prefix=".paroles-", mode="wb") as draft:
+        draft.write((lyrics if original else lyrics + "\n").encode("utf-8"))
         draft.flush()
         os.fsync(draft.fileno())
         share_file(draft.name, path)

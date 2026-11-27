@@ -59,6 +59,19 @@ class LyricsTests(unittest.TestCase):
             db.execute("UPDATE sources SET state='disabled'")
             db.executemany("UPDATE sources SET state='active' WHERE id=?", [(name,) for name in providers])
 
+    def test_native_lrc_preserves_original_payload_and_existing_file(self):
+        self.only("LRCLIB")
+        original = "\ufeff[00:01.00]<00:01.00>Mot  \r\n[00:02.25]Suite"
+        client = self.engine.LyricsSources()
+        with patch.object(client.lrc, "find", return_value=original):
+            found = client.find(*SONG, synced=True, original_lrc=True, registry=self.index)
+        self.assertEqual(found, (original, "LRCLIB"))
+        destination = self.library / "track.lrc"
+        self.engine.save_lrc(destination, original, original=True)
+        self.assertEqual(destination.read_bytes(), original.encode("utf-8"))
+        self.engine.save_lrc(destination, TIMED, original=True)
+        self.assertEqual(destination.read_bytes(), original.encode("utf-8"))
+
     def test_two_independent_429_fallback_and_no_false_negative(self):
         self.only("LRCLIB", "NetEase", "QQ Music", "lyrics.ovh")
         client = self.engine.LyricsSources()
