@@ -23,19 +23,24 @@ Les paramètres et protections de la [file Parole](parole-imports.md) s’appliq
 aussi aux demandes mobiles. ArchASP utilise la surveillance de collection de
 Strawberry pour indexer les fichiers publiés.
 
-Valider un choix planifie sa préparation immédiatement. Le contrôleur partage
-le traitement par chemin audio et réutilise les reçus Turbo et les pistes
-Demucs vérifiés. Les LRC sources et les seuils existants restent les références.
-La préparation anticipée tourne à priorité CPU réduite et laisse passer un
-tour prêt. Une préparation interrompue peut repartir depuis ses caches.
-Les imports déjà admis poursuivent leur travail avec les limites de la file.
+Confirmer une chanson conserve le choix sans lancer de calcul. Le fichier
+audio local suffit pour ouvrir le salon. La recherche multisource de paroles
+et de LRC continue dans Parole et après les imports. Les fichiers LRC existants
+restent en lecture seule pendant la partie. Le PC et la TV suivent leurs
+timestamps de ligne et leurs repères Enhanced LRC quand ils sont présents.
+Le décalage manuel par morceau s’applique aux deux affichages.
+
+L’action **Préparer les instrumentaux** dans Paroles Strawberry lance
+uniquement la séparation des pistes audio choisies. Avec un LRC et un
+instrumental en cache, Kara peut noter la voix du joueur avec Turbo. Les
+repères au mot permettent une mesure du timing. Les lignes seules permettent
+une comparaison lexicale. Si un prérequis de la note manque, le morceau reste
+jouable en chant libre, avec le mix original si nécessaire.
 
 ## Tour et organisation
 
-Le premier morceau prêt permet d’ouvrir le salon. Les suivants attendent leur
-préparation. L’organisateur peut changer l’ordre, reporter puis replacer un
-joueur, relancer un traitement et autoriser un tour sans note quand le mix
-est disponible. La télévision présente les joueurs, le départ et les paroles.
+L’organisateur peut changer l’ordre, reporter puis replacer un joueur.
+La télévision présente les joueurs, le départ et les paroles.
 **Nouvelle partie** revient aux inscriptions.
 
 Le compte à rebours est piloté par le serveur. Le joueur actif et

@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Ouvrir le salon avec le fichier audio sélectionné, afficher le LRC original et réserver Turbo à la reconnaissance du chanteur. Archiver les traitements de minutage IA et conserver les recherches multisources.
+
 - Compléter les débuts de ligne CHRONOS manquants avec ceux du LRC lorsque le texte correspond.
 - Consigner les erreurs et protections de la préparation CHRONOS, Turbo et Demucs dans BlackBox, avec leurs étapes et codes de sortie disponibles.
 - Préparer le minutage CHRONOS d’une partie pendant la lecture, réutiliser le LRC et proposer le chant sans note lorsque seule la synchronisation est disponible.

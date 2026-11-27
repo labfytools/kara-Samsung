@@ -33,9 +33,6 @@ class RemoteParty:
         self.eligible = set()
         self.completed_paths = defaultdict(set)
         self.unscored_turns = set()
-        self.retries = set()
-        self.background_path = None
-        self.managed_stems = set()
         self.defaults = {"music": 100, "original": 0, "voice": None}
         self.last_result = None
 
@@ -99,11 +96,11 @@ class RemoteParty:
         elif action == "blackbox-stop":
             control.stop_blackbox()
         elif action == "prepare":
-            self.prepare(data.get("retry") is True)
+            self.prepare()
         elif action == "open" and self.phase in ("lobby", "ready"):
             turns = self.selected_turns()
             if not turns or not self.can_offer(*turns[0]):
-                raise RoomError("Le premier morceau doit être prêt pour ouvrir le salon.", 409)
+                raise RoomError("Choisis un premier morceau audio disponible pour ouvrir le salon.", 409)
             self.opened_early = True
             self.plan = turns
             self.queue = deque(turns)
@@ -272,9 +269,7 @@ class RemoteParty:
                 for player, songs in choices if index < len(songs)]
 
     def can_offer(self, player, song):
-        if player.training:
-            return self.control.song_available(song, unscored=True, training=True)
-        return self.control.song_available(song, unscored=self.unscored_for(player, song))
+        return self.control.song_available(song)
 
     def unscored_for(self, player, song):
         return player.training or (player, song.path) in self.unscored_turns
@@ -319,27 +314,13 @@ class RemoteParty:
             raise RoomError("Aucune préparation en échec pour ce morceau.", 409)
         player, match = selected
         if action == "allow-unscored":
-            if not self.control.song_available(match, unscored=True):
+            if not self.control.song_available(match):
                 raise RoomError("Les pistes du morceau sont indisponibles.", 409)
             self.unscored_turns.add((player, match.path))
         else:
-            self.retries.add(match.path)
-
-    def background(self, candidates):
-        control = self.control
-        if control.validating or control.party.active is not None or control.game_score.requested:
-            return
-        for _, song in candidates:
-            force = song.path in self.retries
-            if not force and (song.path in control.failed_alignments or control.song_available(song)):
-                continue
-            self.background_path = song.path
-            if control.begin_preparation([song], for_party=False, force=force):
-                self.retries.discard(song.path)
-                self.managed_stems.add(song.path)
-            else:
-                self.background_path = None
-            break
+            if not self.control.song_available(match):
+                raise RoomError("Le fichier audio est toujours indisponible.", 409)
+            self.control.failed_alignments.pop(match.path)
 
     def set_player_mix(self, name, data):
         control = self.control
@@ -373,11 +354,6 @@ class RemoteParty:
             if player is control.party.active:
                 control.apply_player_mix(player, music_changed=music_changed, original_changed=original_changed)
 
-    def training_paths(self):
-        training = {song.path for player, song in self.plan if player.training}
-        scored = {song.path for player, song in self.plan if not player.training}
-        return training, training - scored
-
     def reorder_players(self, names):
         players = {player.name: player for player in self.control.party.players}
         if (not isinstance(names, list) or len(names) != len(players)
@@ -393,12 +369,10 @@ class RemoteParty:
         if self.control.players_window:
             self.control.players_window.refresh()
 
-    def prepare(self, retry=False):
+    def prepare(self):
         control = self.control
         if self.phase not in ("lobby", "ready") or control.validating or control.party.active:
             raise RoomError("Une préparation ou un tour est en cours.", 409)
-        if control.album_import.running or control.mobile_imports.pending():
-            raise RoomError("Attends la fin des demandes d’importation.", 409)
         selections = control.receiver.room.selections()
         choices = []
         for player in control.party.players:
@@ -423,8 +397,7 @@ class RemoteParty:
         self.phase = "preparing"
         self.notice = ""
         control.receiver.room.set_mode(locked=True, game_mode=True, current="")
-        options = {"force_paths": self.control.failed_alignments.keys()} if retry else {}
-        if not control.begin_preparation([song for _, song in self.plan], for_party=True, **options):
+        if not control.begin_preparation([song for _, song in self.plan], for_party=True):
             self.phase = "lobby"
             raise RoomError("La préparation n’a pas démarré.", 409)
 
@@ -434,15 +407,6 @@ class RemoteParty:
             self.revision += 1
 
     def tick(self, now):
-        if self.phase in ("lobby", "ready"):
-            candidates = self.selected_turns(confirmed_only=False)
-            paths = {song.path for _, song in candidates}
-            if self.background_path is not None and self.background_path not in paths:
-                self.control.interrupt_preload()
-            discarded = self.managed_stems - paths
-            if discarded and not self.control.validating and self.control.party.active is None:
-                self.managed_stems -= self.control.release_prepared_stems(discarded)
-            self.background(candidates)
         if (self.phase != "running" or self.control.party.active is not None or self.current is not None
                 or now < self.next_at):
             return
@@ -453,14 +417,12 @@ class RemoteParty:
         if self.opened_early:
             player, song = self.queue[0]
             if not self.can_offer(player, song):
-                self.background(self.queue)
+                self.notice = f"Fichier audio indisponible · {song.title}"
                 return
             if player.mobile_id and not self.control.receiver.room.is_online(player.mobile_id):
                 self.notice = f"En attente de {player.name}."
                 return
             if self.control.validating:
-                if self.background_path is not None:
-                    self.control.interrupt_preload()
                 return
             if player.mobile_id and not self.control.receiver.room.reserve_turn(player.mobile_id, song):
                 # A choice changed between heartbeat and handoff. Reconcile on the
@@ -530,7 +492,6 @@ class RemoteParty:
         self.completed_paths.clear()
         self.unscored_turns.clear()
         self.opened_early = False
-        self.retries.clear()
         self.last_result = None
         self.notice = ""
         self.control.party_ready = False

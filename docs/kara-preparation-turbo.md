@@ -1,5 +1,7 @@
 # Préparation des chansons et score Kara
 
+> Archive de la préparation des références avec Turbo. Le parcours de jeu actuel suit le LRC original et utilise Turbo pour reconnaître le chanteur. Voir [Kara V2](kara-v2.md).
+
 ## Préparer une partie
 
 Dans **Joueurs**, chaque joueur choisit un fichier du catalogue Strawberry, puis **Préparer la partie** lance le traitement du lot. Un morceau sélectionné par plusieurs joueurs ne passe qu’une fois dans ce lot. Les tours restent désactivés pendant la préparation. Parole affiche la part des mots évaluables sur les titres prêts à noter et la couverture des titres dont la référence reste insuffisante. Après un échec, on peut relancer, changer de morceau, écarter les titres en échec ou autoriser explicitement le chant sans note pour les fichiers toujours accessibles. Un tour sans note utilise la lecture ordinaire et n’ouvre pas le moteur de capture.

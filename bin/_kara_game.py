@@ -11,6 +11,7 @@ import time
 from gi.repository import Gio, GLib
 
 from _kara_blackbox_turbo import CHUNK, receive
+from _kara_lrc_game import score_clock
 from _kara_scoring import (AudioWindow, MAX_PREPARED_WINDOW, SCORE_TOLERANCE,
                            prepared_window, score_breakdown, score_reference_line)
 from _kara_words import LyricVocabulary, words
@@ -50,6 +51,7 @@ class GameScore:
         self.echo = False
         self.round_total = None
         self.reference = None
+        self.reference_clock = (), (), ()
         self.tolerance = timing_tolerance()
         self.vocabulary = LyricVocabulary(())
         self.language = ""
@@ -67,6 +69,7 @@ class GameScore:
 
     def set_round(self, lyrics=None, vocabulary=None, *, reference=None):
         self.reference = reference
+        self.reference_clock = score_clock(reference)
         if lyrics is not None:
             self.configure_voice(lyrics, vocabulary)
         self.round_total = sum(len(words(line)) for line in lyrics) if lyrics is not None else None
@@ -319,6 +322,8 @@ class GameScore:
         index = window.line
         lines = self.reference["lines"]
         source = event.get("source", "unverified")
+        original_lrc = self.reference.get("method") == "lrc-original"
+        line = lines[index]
         recognized = []
         if source == "voice":
             # Adjacent windows overlap. Assign a matching occurrence to the
@@ -332,15 +337,18 @@ class GameScore:
                              if word["start"] is not None and word["normalized"] == item["word"]]
                 if distances and min(distances)[0] <= self.tolerance and min(distances)[1] != index:
                     continue
-                if not distances and not lines[index]["display_start"] <= point < (
-                        lines[index + 1]["display_start"] if index + 1 < len(lines) else self.reference["duration"]):
+                stop = (lines[index + 1]["display_start"] if index + 1 < len(lines)
+                        else self.reference["duration"] or window.stop)
+                in_line = line["display_start"] <= point < stop
+                if (not distances or original_lrc and min(distances)[0] > self.tolerance) and not in_line:
                     continue
                 end = item.get("end")
                 recognized.append({**item, "start": point,
                                    "end": window.start + end * window.rate if end is not None else None})
         audit = {} if self.diagnostics and self.diagnostics.active() else None
         self.line_results[index] = score_reference_line(lines[index], recognized, self.tolerance,
-                                                        source=source, audit=audit)
+                                                        source=source, audit=audit,
+                                                        lexical_only_allowed=original_lrc)
         if audit is not None:
             self.diagnostics.emit("scoring", "line-decision", **self.diagnostic_turn,
                                   position=window.start, line=index, window=event.get("id"),
@@ -416,6 +424,13 @@ class GameScore:
                 # Include measured words even if display uses a fallback line
                 # onset, or the last syllable was held beyond a short line.
                 window = prepared_window(index, start, end, duration, rate, calibrated, self.tolerance)
+                if (window is None and self.reference.get("method") == "lrc-original"
+                        and end > max(0., start)):
+                    # A written line still bounds a lexical window. It does
+                    # not imply individual word timestamps.
+                    head = max(0., start - self.tolerance)
+                    tail = min(duration, end + self.tolerance) if duration else end + self.tolerance
+                    window = AudioWindow(index, head, tail, rate, calibrated)
                 if window is None:
                     self.cursor += 1
                     continue
@@ -437,7 +452,7 @@ class GameScore:
             if tail <= head or (end_of_song and head >= position):
                 continue
             if self.reference:
-                earliest_word = max(0., next(x for x in calibrated if x is not None) - self.tolerance)
+                earliest_word = max(0., next((x for x in calibrated if x is not None), start) - self.tolerance)
                 if earliest_word < self.epoch - .02 or tail > head + MAX_PREPARED_WINDOW:
                     self.match_reference(AudioWindow(index, head, tail, rate), {"source": "unverified"})
                     continue

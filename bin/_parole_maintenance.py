@@ -149,7 +149,6 @@ class Maintenance:
         self.night = Night(self.index, self.journal)
         self.night_running = False
         self.night_network_next = True
-        self.transcription_next = True
         self.night_settings_at = 0.
         self.next_night_watch = 0.
         self.night_policy = None
@@ -593,8 +592,7 @@ class Maintenance:
             tags = json.loads(song["info"])["tags"]
             missing_tags = any(not tags.get(field) for field in ("title", "artist", "album"))
             for kind, missing in (("lyrics", song["lyrics"] == "absent"), ("lrc", song["lrc"] in ("absent", "intégré")),
-                                  ("metadata", missing_tags),
-                                  ("prepare", song["kara"] != "prêt" and song["lyrics"] != "instrumental")):
+                                  ("metadata", missing_tags)):
                 if not missing:
                     db.execute("UPDATE tasks SET state='done' WHERE kind=? AND subject=? "
                                "AND state IN ('queued','temporary','suspended')", (kind, subject))
@@ -604,18 +602,7 @@ class Maintenance:
                     priority = 20
                 if kind == "lrc":
                     priority -= 1
-                if kind == "prepare":
-                    priority += 30 if song["lrc"] == "absent" else 20
-                draft_due = (song["lrc"] == "absent" and song["lyrics"] not in ("absent", "instrumental", "inconnu")
-                             and settings["generate"] and settings["lrc"])
-                if kind == "prepare" and (settings["night_enabled"] or draft_due):
-                    if song["kara"] == "prêt" or json.loads(song["info"]).get("report", {}).get("reference_validated"):
-                        db.execute("UPDATE tasks SET state='done' WHERE kind=? AND subject=? "
-                                   "AND state IN ('queued','temporary','suspended')", (kind, subject))
-                        continue
-                    night_revision = encoded_key(revision, "night-lyrics-v1", settings["generate"], settings["lrc"], settings["lyrics"])
-                    self.index.enqueue(kind, subject, night_revision, priority, db=db)
-                elif kind != "prepare" and settings.get(kind):
+                if settings.get(kind):
                     self.index.enqueue(kind, subject, revision, priority, db=db)
 
     @staticmethod
@@ -832,8 +819,6 @@ class Maintenance:
         elif outcome == "local_miss":
             return "temporary", LOCAL_REFERENCE_MISS, 0
         elif outcome in ("temporary", "network", "unavailable", "limited"):
-            if kind == "lyrics" and outcome in ("network", "unavailable", "limited") and self.current_settings["night_transcribe"]:
-                self.index.queue_transcription(song)
             msg = {"temporary": "Publication ou moteur temporairement indisponible",
                    "network": "Erreur réseau", "unavailable": "Fournisseur indisponible",
                    "limited": "Limitation du fournisseur"}[outcome]
@@ -851,13 +836,9 @@ class Maintenance:
                 self.provider_notices = notices
             return "temporary", msg, min(DAY, 120 * 2**min(task["attempts"], 9))
         elif outcome == "ambiguous":
-            if kind == "lyrics" and self.current_settings["night_transcribe"]:
-                self.index.queue_transcription(song)
             self.queue_codex(kind, identity, "correspondances classiques ambiguës")
             return "review", "correspondance ambiguë", 0
         elif outcome == "not_found":
-            if kind == "lyrics" and self.current_settings["night_transcribe"]:
-                self.index.queue_transcription(song)
             self.journal.emit(kind.upper(), f"Aucune correspondance vérifiée · {song['title']}")
             self.queue_codex(kind, identity, "sources classiques épuisées")
             return "review", outcome, 7 * DAY
@@ -1051,17 +1032,6 @@ class Maintenance:
             if "tracks_seconds" in value:
                 self.import_lyrics_stats = value
                 self.index.review("import_lyrics_metrics", subject, "measured", value)
-                if self.index.settings()["night_transcribe"]:
-                    unfinished = {"missing", "review", "limited", "temporary"}
-                    # No publication was made for these paths. The heavy
-                    # worker still checks current files before decoding.
-                    pending = [path for path, track in value["tracks"].items()
-                               if track["lyrics"] in unfinished and track["lrc"] in unfinished]
-                    if pending:
-                        with self.index.db() as db:
-                            db.execute("BEGIN IMMEDIATE")
-                            for song in path_rows(db, pending).values():
-                                self.index.queue_transcription(song, db=db)
                 self.journal.emit("LYRICS", f"{value['lyrics'].get('found', 0)} textes · "
                                   f"{value['lrc'].get('found', 0)} LRC · {value['seconds']:.2f} s · "
                                   f"{value['requests']} requêtes · {value['cache_hits']} recherches évitées")
@@ -1511,7 +1481,7 @@ class Maintenance:
             return "temporary", "brouillon indisponible", 6 * HOUR
         detail = "brouillon à vérifier" if receipt["lines"] else "transcription incertaine"
         self.journal.emit("TRANSCRIPTION", f"{receipt['lines']} lignes proposées · {receipt['omitted']} incertaines · "
-                          f"CHRONOS {receipt.get('chronos', 'indisponible')}")
+                          "brouillon texte")
         return "review", detail, 0
 
     def execute(self, task, *, nocturnal=False, local_reference_only=False):
@@ -1552,7 +1522,7 @@ class Maintenance:
             if nocturnal and self.stopped():
                 raise Interrupted
             if kind == "prepare":
-                result = self.prepare(task, nocturnal=True) if nocturnal else self.prepare(task)
+                result = ("suspended", "Minutage IA archivé", DAY)
             elif kind == "transcription":
                 result = self.transcribe_task(task)
             elif kind == "codex":
@@ -1893,21 +1863,15 @@ class Maintenance:
         kinds = self.network_kinds(settings, now, nocturnal=True)
         network_due = (self.index.work_due(kinds, now) or
                        self.index.work_due(self.local_reference_kinds(settings), now, local_reference=True))
-        manual_transcription = not settings["night_transcribe"]
-        transcription_due = self.index.work_due(("transcription",), now, manual_only=manual_transcription)
-        reference_provider_ready = "lrc" in kinds or (settings["generate"] and "lyrics" in kinds)
-        local_preparation = None if reference_provider_ready else (settings["lrc"], settings["generate"])
-        prepare_due = self.index.preparation_due(now, local_preparation=local_preparation)
-        if (not prepare_due and not transcription_due and local_preparation is not None
-                and settings["night_transcribe"]):
-            transcription_due = self.index.queue_offline_transcription(now)
-            if transcription_due:
-                self.journal.emit("TRANSCRIPTION", "Fournisseurs en attente · brouillon local planifié")
+        # Old automatic jobs remain intact for diagnosis and can still be
+        # promoted by an explicit review request. The scheduler claims only
+        # manually requested drafts and never claims legacy alignment work.
+        transcription_due = self.index.work_due(("transcription",), now, manual_only=True)
         # Offer the other class the next turn. A bounded network batch
         # alternates with one song, so neither class can starve the other.
         order = (True, False) if self.night_network_next else (False, True)
         for light in order:
-            if not (network_due if light else (prepare_due or transcription_due)):
+            if not (network_due if light else transcription_due):
                 continue
             if not self.night_allowed(settings, running=False, light=light) or not self.night.open(settings):
                 continue
@@ -1916,25 +1880,14 @@ class Maintenance:
                     self.night.report("Recherches nocturnes en attente · aucune tâche disponible")
                     continue
             else:
-                task = None
-                if transcription_due and (not prepare_due or self.transcription_next):
-                    task = self.index.claim(("transcription",), now, manual_only=manual_transcription)
-                if task is None and prepare_due:
-                    task = self.index.claim(("prepare",), now,
-                                            night=(self.night.budget, self.resources.storage.get("bytes", 0)),
-                                            local_preparation=local_preparation)
+                task = self.index.claim(("transcription",), now, manual_only=True)
                 if task is None:
                     continue
                 self.execute(task, nocturnal=True)
-                self.transcription_next = task["kind"] == "prepare"
             self.night_network_next = not light
-            if self.night.window is not None or not self.index.preparation_due(time(), local_preparation=local_preparation):
-                self.night.stop_work()
+            self.night.stop_work()
             return True
         self.night.stop_work()
-        if not (network_due or prepare_due or transcription_due):
-            if local_preparation is not None and self.index.preparation_due(now):
-                self.night.report("Préparation en attente d’un fournisseur de référence")
-            else:
-                self.night.report("Mode nocturne en attente · file prête au prochain travail")
+        if not (network_due or transcription_due):
+            self.night.report("Mode nocturne en attente · file prête au prochain travail")
         return False

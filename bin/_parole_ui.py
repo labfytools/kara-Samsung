@@ -1441,7 +1441,7 @@ class ParoleView:
         general = new()
         general.append(button("Ouvrir BlackBox Studio", self.control.show_blackbox_studio))
         toggles(general, (("startup", "Inventaire automatique au lancement"), ("lyrics", "Rechercher les paroles manquantes"),
-                          ("lrc", "Rechercher les LRC"), ("generate", "Générer un LRC depuis les paroles"),
+                          ("lrc", "Rechercher les LRC"),
                           ("albums", "Vérifier les albums"), ("discography", "Vérifier les discographies"),
                           ("cover", "Rechercher progressivement les pochettes"), ("metadata", "Vérifier les métadonnées manquantes"),
                           ("import_tracks", "Importer les pistes des éditions vérifiées autorisées"),
@@ -1507,8 +1507,7 @@ class ParoleView:
         self.night_summary = Gtk.Label(xalign=0, wrap=True, selectable=True, css_classes=["muted"])
         night.append(self.night_summary)
         self.refresh_night_summary()
-        toggles(night, (("night_enabled", "Activer les recherches et minutages nocturnes des paroles"),
-                        ("night_transcribe", "Proposer des transcriptions quand aucune source ne répond"),
+        toggles(night, (("night_enabled", "Activer les recherches nocturnes de paroles"),
                         ("night_screen_off", "Préparer lorsque l’écran est éteint"),
                         ("night_lid", "Préparer lorsque le capot est fermé"),
                         ("night_lid_qualified", "Refroidissement capot fermé vérifié sur cet ordinateur")))

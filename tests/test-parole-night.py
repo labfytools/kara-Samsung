@@ -302,23 +302,19 @@ class NightTests(unittest.TestCase):
         self.assertIsNone(self.owner.index.night_budget())
         self.assertTrue(self.night.open(self.settings))
 
-    def test_serial_claim_passes_legacy_daily_limit_and_releases_at_end(self):
-        self.owner.index.configure(heavy_daily=1)
-        for subject in ("a", "b", "c", "d", "e"):
-            self.owner.index.enqueue("prepare", subject, "fixture", now=1)
-        self.owner.prepare = Mock(return_value=("done", "prêt", 0))
-        for _ in range(5):
-            self.assertTrue(self.owner.tick_night(self.settings, time()))
-        self.assertEqual(self.owner.prepare.call_count, 5)
-        self.assertIsNone(self.night.fd)
-        self.assertEqual(len(self.login.inhibit.call_args_list), 2)
-        with self.owner.index.db() as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM daily_usage").fetchone()[0], 0)
-            self.assertEqual(db.execute("SELECT count(*) FROM tasks WHERE state='done'").fetchone()[0], 5)
-        _, _, _, report = self.owner.index.night_progress()
-        self.assertEqual(report["ready"], 5)
-        self.assertEqual(report["cache_bytes"], 100)
-        self.assertIsNone(report["pending"])
+    def test_night_never_claims_legacy_alignment_or_automatic_drafts(self):
+        index = self.owner.index
+        for kind in ("prepare", "transcription"):
+            index.enqueue(kind, kind, "fixture", now=1)
+        self.owner.prepare = Mock()
+        self.owner.transcribe_task = Mock()
+        self.assertFalse(self.owner.tick_night(self.settings, time()))
+        self.owner.prepare.assert_not_called()
+        self.owner.transcribe_task.assert_not_called()
+        with index.db() as db:
+            self.assertEqual([tuple(row) for row in db.execute(
+                "SELECT kind,state,attempts FROM tasks ORDER BY kind")],
+                [("prepare", "queued", 0), ("transcription", "queued", 0)])
 
     def test_closed_background_alternates_work_and_persists_completed_tasks(self):
         self.owner.foreground.clear()
@@ -336,25 +332,26 @@ class NightTests(unittest.TestCase):
 
         order = []
 
-        def prepare(*_args, **_kwargs):
-            order.append("prepare")
-            return "done", "prêt", 0
+        def transcribe(*_args, **_kwargs):
+            order.append("transcription")
+            return "done", "brouillon de test", 0
 
         self.owner.output = Mock(side_effect=output)
-        self.owner.prepare = prepare
+        self.owner.transcribe_task = transcribe
         for kind, subject in (("lrc", "slow"), ("lyrics", "lyric1"), ("lyrics", "lyric2"),
-                              ("cover", "cover"), ("prepare", "song")):
-            self.owner.index.enqueue(kind, subject, "fixture", now=1)
+                              ("cover", "cover"), ("prepare", "song"), ("transcription", "manual")):
+            payload = {"manual": True} if kind == "transcription" else None
+            self.owner.index.enqueue(kind, subject, "fixture", now=1, payload=payload)
         for _ in range(4):
             self.owner.tick()
         report = self.owner.index.closed_progress()
-        self.assertEqual(order, ["prepare"])
-        self.assertEqual(report["completed"], {"lyrics": 2, "prepare": 1})
+        self.assertEqual(order, ["transcription"])
+        self.assertEqual(report["completed"], {"lyrics": 2, "transcription": 1})
         with self.owner.index.db() as db:
-            self.assertEqual(db.execute("SELECT state FROM tasks WHERE kind='cover'").fetchone()[0], "queued")
+            pending = {row[0] for row in db.execute("SELECT kind FROM tasks WHERE state='queued'")}
+        self.assertTrue({"cover", "prepare"} <= pending)
         self.assertEqual(report["deferred"], 1)
         self.assertIsNone(report["ended"])
-        self.assertEqual(self.owner.index.night_progress()[3]["ready"], 1)
         self.ac = False
         self.owner.tick()
         self.assertIsNone(self.owner.index.closed_progress()["ended"])
@@ -485,59 +482,24 @@ class NightTests(unittest.TestCase):
         self.owner.output.assert_called_once()
         self.assertEqual(self.owner.output.call_args.args[0][-1], "--local-reference-only")
 
-    def test_offline_preparation_spends_its_turn_on_local_text(self):
+    def test_waking_provider_search_leaves_legacy_alignment_queued(self):
         index = self.owner.index
-        index.configure(night_transcribe=False)
-        self.settings = self.owner.current_settings = index.settings()
-        missing, local = (index.root / name for name in ("inconnue.opus", "texte.opus"))
-        for path in (missing, local):
-            path.write_bytes(b"fixture")
-        local.with_suffix(".txt").write_text("Texte déjà disponible\n")
-        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
-                  paths=[missing, local], reader=lambda path: ({"title": path.stem, "artist": "Artiste",
-                                                                "duration_seconds": 5}, {}))
         at = time()
-        with index.db() as db:
-            identities = dict(db.execute("SELECT path,id FROM songs"))
-        unknown, known = (identities[str(path)] for path in (missing, local))
-        index.enqueue("prepare", unknown, "fixture", priority=10, now=at - 10)
-        index.enqueue("prepare", known, "fixture", priority=40, now=at)
-        prepare = self.owner.prepare = Mock(return_value=("done", "prêt", 0))
-
-        with patch("_parole_maintenance.ready_categories", return_value=set()):
-            self.assertTrue(self.owner.tick_night(self.settings, at))
-            self.assertEqual(prepare.call_args.args[0]["subject"], known)
-            self.assertFalse(self.owner.tick_night(self.settings, time()))
-            self.assertEqual(self.night.reason, "Préparation en attente d’un fournisseur de référence")
-        with index.db() as db:
-            deferred = db.execute("SELECT state,due,attempts FROM tasks WHERE subject=?", (unknown,)).fetchone()
-            self.assertEqual(tuple(deferred), ("queued", at - 10, 0))
-
+        for kind in ("prepare", "transcription", "lrc"):
+            index.enqueue(kind, "fixture", "version", now=at)
+        self.owner.transcribe_task = Mock()
+        self.owner.prepare = Mock()
+        self.owner.output = Mock(return_value=(0, b'{"state":"found"}'))
+        self.owner.do_song = Mock(return_value=("done", "LRC trouvé", 0))
         with patch("_parole_maintenance.ready_categories", return_value={"lrc"}):
-            self.assertTrue(self.owner.tick_night(self.settings, time()))
-            self.assertEqual(prepare.call_args.args[0]["subject"], unknown)
-
-    def test_offline_transcription_keeps_original_search_and_preparation_tasks(self):
-        index = self.owner.index
-        path = index.root / "inconnue.opus"
-        path.write_bytes(b"fixture")
-        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
-                  paths=[path], reader=lambda p: ({"title": p.stem, "artist": "Artiste", "duration_seconds": 5}, {}))
-        with index.db() as db:
-            song = db.execute("SELECT id FROM songs").fetchone()[0]
-        at = time()
-        index.enqueue("prepare", song, "fixture", now=at)
-        index.enqueue("lyrics", song, "fixture", now=at)
-        self.owner.transcribe_task = Mock(return_value=("review", "brouillon à vérifier", 0))
-        with patch("_parole_maintenance.ready_categories", return_value=set()):
             self.assertTrue(self.owner.tick_night(self.settings, at))
-            self.owner.transcribe_task.assert_called_once()
             self.assertFalse(self.owner.tick_night(self.settings, time()))
+        self.owner.transcribe_task.assert_not_called()
+        self.owner.prepare.assert_not_called()
+        self.owner.output.assert_called_once()
         with index.db() as db:
             states = dict(db.execute("SELECT kind,state FROM tasks"))
-        self.assertEqual(states["prepare"], "queued")
-        self.assertEqual(states["lyrics"], "queued")
-        self.assertEqual(states["transcription"], "review")
+        self.assertEqual(states, {"prepare": "queued", "transcription": "queued", "lrc": "done"})
 
     def test_artist_transcription_reuses_queue_and_manual_jobs_run_at_night(self):
         index = self.owner.index
@@ -564,7 +526,7 @@ class NightTests(unittest.TestCase):
         self.assertEqual(index.queue_artist_transcriptions("Artiste"), (1, 0))
         self.assertFalse(missing.with_suffix(".txt").exists())
 
-    def test_missing_references_enqueue_a_resumable_review_without_publication(self):
+    def test_manual_transcription_runs_without_publication_or_alignment(self):
         path = self.owner.index.root / "song.opus"
         path.write_bytes(b"fixture")
         song = {"id": "fixture", "path": str(path), "token": document(file_token(path)), "title": "Chanson",
@@ -572,12 +534,8 @@ class NightTests(unittest.TestCase):
                 "lrc": "absent", "lyrics": "absent", "duration": 24, "plays": 5,
                 "info": document({"plain": ""})}
         self.owner.index.song = Mock(return_value=song)
-        self.owner.cache.cached = Mock(return_value=None)
-        self.owner.night_reference = Mock(return_value={"state": "not_found"})
         self.owner.resources.allowed_storage = Mock(return_value=True)
-        self.assertEqual(self.owner.prepare({"subject": "fixture"}, nocturnal=True)[0], "review")
-        self.assertIsNotNone(self.owner.index.claim(("transcription",), time()))
-        self.owner.index.recover()
+        self.assertTrue(self.owner.index.queue_transcription(song, manual=True))
         self.owner.output = Mock(return_value=(0, b'{"event":"draft","lines":2,"omitted":1}'))
         with patch("_parole_maintenance.cached_stems", return_value=None) as stems:
             self.assertTrue(self.owner.tick_night(self.settings, time()))
@@ -688,7 +646,7 @@ class NightTests(unittest.TestCase):
         self.assertEqual(path.with_suffix(".lrc").read_text(), "[00:04.000]Refrain")
 
     def test_real_subprocess_stops_on_power_loss_sleep_heat_space_and_kara(self):
-        cases = ("Demucs", "Turbo", "veille", "température", "stockage", "Kara", "activité", "désactivation")
+        cases = ("secteur", "veille", "température", "stockage", "Kara", "activité", "désactivation")
         for phase in cases:
             with self.subTest(phase=phase):
                 self.ac = True
@@ -700,21 +658,21 @@ class NightTests(unittest.TestCase):
                 self.owner.resources.resumed = False
                 self.night.next_desktop = self.night.next_sleep = 0.
                 fds = self.open()
-                self.owner.index.enqueue("prepare", phase, "fixture")
-                task = self.owner.index.claim(("prepare",), time())
+                self.owner.index.enqueue("transcription", phase, "fixture", payload={"manual": True})
+                task = self.owner.index.claim(("transcription",), time())
                 entered = Event()
 
-                def prepare(*_args, **_kwargs):
+                def transcribe(*_args, **_kwargs):
                     self.owner.output([sys.executable, "-c", "import time; print('{}',flush=True); time.sleep(30)"],
                                       timeout=10, observer=lambda _event: entered.set())
                     return "done", "inattendu", 0
 
-                self.owner.prepare = prepare
+                self.owner.transcribe_task = transcribe
                 thread = Thread(target=self.owner.execute, args=(task,), kwargs={"nocturnal": True})
                 thread.start()
                 try:
                     self.assertTrue(entered.wait(2))
-                    if phase in ("Demucs", "Turbo"):
+                    if phase == "secteur":
                         self.ac = False
                     elif phase == "veille":
                         self.state = replace(self.state, sleeping=True)

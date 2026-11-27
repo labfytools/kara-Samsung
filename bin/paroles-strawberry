@@ -20,24 +20,20 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 
-from _kara_game import GameScore, LyricVocabulary, words
+from _kara_game import GameScore, LyricVocabulary
 from _kara_acoustic_capture import AcousticCapture
 from _kara_blackbox import BlackBox, digest
 from _kara_blackbox_lyrics import record as record_lyrics, snapshot as lyrics_snapshot
-from _kara_chronos import ENGINES as CHRONOS_ENGINES, cache_path as chronos_path
-from _kara_chronos import display_index as chronos_index
-from _kara_chronos import displayable, playback_experiment, playback_lines
+from _kara_lrc_game import read_source, score_source
 from _kara_preparation_error import error_details
-from _parole_transcribe import NAME as DRAFT_FILE
 from _kara_remote_party import RemoteParty
 from _kara_room_audio import RoomAudio
 from _kara_mobile_imports import MobileImports
 from _kara_mobile_room import RoomError
-from _kara_prepare import PreparedCache, file_token, lrc_token
-from _kara_reference import display_marks
+from _kara_prepare import PreparedCache, lrc_token
 from _kara_stem_playback import StemPlayback, STRENGTHS
-from _kara_stems import cached_stems, prune_stems
-from _kara_timing import LyricTiming, highlighted_characters
+from _kara_stems import cached_stems
+from _kara_timing import LyricTiming
 from _kara_party import Party, PlayersWindow, Singer, Song, catalogue, score_color, search_key
 from _kara_preparation_ui import PreparationWindow
 from _kara_library import MusicLibraryWindow
@@ -46,7 +42,6 @@ from _kara_paths import BIN, music_library
 from _labfy_sync import MusicSync
 from _kara_tv import https_configured, start_receiver
 from _musique_oz import AUDIO, probe
-from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _parole_index import PREPARATION, path_rows, sidecar_token
 from _parole_maintenance import Maintenance
 from _parole_ui import ParoleView
@@ -83,12 +78,6 @@ def local_track(url):
     return path if path.is_relative_to(LIBRARY.resolve()) and path.is_file() else None
 
 
-def lyric_progress(position, start, end):
-    # Les LRC usuels ont un repère par ligne, sans temps par mot.
-    duration = max(0.3, min(8.0, end - start))
-    return min(1.0, max(0.0, (position - start) / duration))
-
-
 def embedded_lyrics(track):
     try:
         from _parole_index import sidecar
@@ -99,12 +88,6 @@ def embedded_lyrics(track):
     except (OSError, ValueError, subprocess.SubprocessError):
         return ""
     return next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
-
-
-def read_lrc(path):
-    with path.open("rb") as source:
-        raw = source.read(MAX_LRC_BYTES + 1)
-    return parse_lrc(raw.decode("utf-8-sig")) if len(raw) <= MAX_LRC_BYTES else []
 
 
 def faded_scroll(scroll, *, top_share=0.18, bottom_share=0.30, height_limit=FADE_HEIGHT):
@@ -157,17 +140,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.rows = []
         self.lyrics = []
         self.view_lyrics = []
-        self.chronos_reference = None
-        self.chronos_turn = None
-        self.chronos_reports = {}
-        self.experimental_songs = set()
-        self.chronos_times, self.chronos_indices = [], []
-        self.chronos_mode = os.environ.get("KARA_CHRONOS_MODE", "")
-        if self.chronos_mode not in CHRONOS_ENGINES:
-            self.chronos_mode = ""
+        self.lyric_source = None
         self.times = []
         self.raw_lines = []
-        self.word_marks = self.word_times = self.word_ends = ()
+        self.word_marks = ()
         self.timing_offset = 0.0
         self.active = -1
         self.highlight = -1
@@ -210,25 +186,17 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.media_updated = 0.0
         self.preparation_only = False
         self.active_plan = {}
-        self.training_only = set()
         self.preload_cancelled = False
         self.timing = LyricTiming(state_dir / "lyric-timing.json")
         self.references = PreparedCache(state_dir / "prepared")
         self.active_reference = None
-        self.align_job = None
-        self.align_finished = set()
-        self.batch_ready = {}
-        self.batch_failed = {}
-        self.batch_reports = {}
-        self.preparation_reports = {}
         self.align_status = ""
         self.align_fraction = 0.0
         self.failed_alignments = {}
         self.party_selection = ()
+        self.party_available = set()
         self.validating = False
         self.party_ready = False
-        self.validated_songs = {}
-        self.prepared_stems = {}
         self.syncing_offset = False
         self.turn_tail = None
         self.record_turn = False
@@ -506,7 +474,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         elif effect.stems:
             self.effect_state.set_text("Instrumental IA prêt · lecture normale")
         else:
-            self.effect_state.set_text("Valide la partie pour préparer l'instrumental")
+            self.effect_state.set_text("Prépare l’instrumental si tu veux séparer la voix et la musique.")
             if self.effect_toggle.get_active():
                 self.effect_changing = True
                 self.effect_toggle.set_active(False)
@@ -619,7 +587,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         mobile = self.room_audio.status()["available"]
         received = self.room_audio.receiving(recent=True)
         sink = self.room_audio.selected_sink()
-        references = bool(self.active_reference or self.prepared_stems)
+        references = bool(self.lyric_source)
         tv = self.receiver and time.monotonic() - self.receiver.tv_seen < 4
         return {
             "Espace disque": ("À vérifier" if free is None else "Prêt" if free >= MIN_FREE + 65536 else "Bloquant"),
@@ -661,9 +629,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             raise ValueError("Volume musical invalide.")
         if self.turn_music_restore is not None:
             self.turn_music_restore = percent / 100
-            if self.turn_original_mix:
-                self.write_music_volume(percent / 100)
-            elif self.party.active is not None:
+            if self.party.active is not None:
                 self.apply_player_mix(self.party.active)
         else:
             self.write_music_volume(percent / 100)
@@ -678,11 +644,16 @@ class LyricsWindow(Gtk.ApplicationWindow):
                       None, Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
 
     def apply_player_mix(self, player, *, music_changed=True, original_changed=True):
-        if (self.turn_original_mix or self.turn_music_restore is None
-                or self.turn_phase not in ("opening", "playing")):
+        if self.turn_music_restore is None or self.turn_phase not in ("opening", "playing"):
             return
         ceiling = round(100 * min(1., self.turn_music_restore))
         music = player.music_volume if player.music_volume is not None else 100
+        if self.turn_original_mix:
+            if music_changed:
+                self.write_music_volume(min(music, ceiling) / 100)
+                self.blackbox.emit("audio", "original-mix", turn=self.bb_turn, player=player.name,
+                                   music_requested=music, music_applied=min(music, ceiling))
+            return
         self.vocal_effect.set_turn_mix(music, player.original_voice, ceiling)
         if original_changed:
             position = max(0., self.base_position + (time.monotonic() - self.updated) * self.rate)
@@ -891,7 +862,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def can_skip_failed(self):
         return (not self.validating and not self.party_ready and bool(self.failed_alignments)
-                and bool(self.validated_songs) and self.party_choice() == self.party_selection)
+                and bool(self.party_available) and self.party_choice() == self.party_selection)
 
     def skip_failed(self, _button):
         if self.can_skip_failed():
@@ -917,224 +888,78 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.players_window.refresh()
 
     def preparation_status(self, path):
-        report = self.preparation_reports.get(path)
-        if path in self.validated_songs and report:
-            return f"Prêt à noter · {report['word_coverage']:.0%} de mots évaluables"
-        if path in self.experimental_songs:
-            return "Minutage prêt · chant sans note"
         if path in self.failed_alignments:
-            return (f"Référence insuffisante · {report['word_coverage']:.0%} de mots repérés"
-                    if report and "word_coverage" in report else "Préparation indisponible")
-        return ""
+            return self.failed_alignments[path]
+        return "Instrumental disponible" if cached_stems(path) else ""
 
-    def preload_songs(self, songs, *, force=False):
-        """Prépare des chansons de la bibliothèque sans créer de partie."""
-        if self.validating or self.party.active is not None or self.game_toggle.get_active():
-            if self.preparation_window is not None:
-                self.preparation_window.message.set_text("Termine la partie ou le traitement en cours.")
+    def preload_songs(self, songs):
+        """Generate only backing stems, on explicit selection."""
+        if self.closed or self.validating or self.party.active is not None or self.game_toggle.get_active():
+            self.preparation_window.message.set_text("Termine la partie ou le traitement en cours.")
             return False
-        return self.begin_preparation(songs, for_party=False, force=force)
+        if self.maintenance and not self.maintenance.yield_heavy():
+            self.preparation_window.message.set_text("Un autre traitement audio est en cours.")
+            return False
+        self.active_plan = {song.path: song.title for song in songs}
+        self.stem_queue = {path: title for path, title in self.active_plan.items()
+                           if local_track(path.as_uri()) == path}
+        self.stem_failed = self.active_plan.keys() - self.stem_queue.keys()
+        self.stem_completed = len(self.stem_failed)
+        self.preparation_only = self.validating = True
+        self.preparation_window.set_busy(True)
+        self.start_stem_generation()
+        return True
 
     def cancel_preparation(self):
-        self.interrupt_preload()
-
-    def interrupt_preload(self):
         if not self.validating or not self.preparation_only or self.preload_cancelled:
             return
         self.preload_cancelled = True
         self.stem_queue.clear()
-        if self.preparation_window is not None:
-            self.preparation_window.message.set_text("Annulation en cours…")
-            self.preparation_window.update_controls()
-        processes = (self.align_job, self.stem_job[1] if self.stem_job else None)
-        for process in processes:
-            if process is not None:
-                try:
-                    process.send_signal(signal.SIGTERM)
-                except GLib.Error:
-                    pass
-        if all(process is None for process in processes):
-            self.complete_party_validation()
-
-    def release_prepared_stems(self, paths):
-        if self.validating or self.party.active is not None:
-            return set()
-        # A manual Strawberry playback may still have the current stems open.
-        released = set(paths) - {self.track}
-        if not released:
-            return set()
-        try:
-            removed, _ = prune_stems(only=released)
-        except (OSError, ValueError, RuntimeError):
-            return set()
-        for path in released:
-            self.prepared_stems.pop(path, None)
-            self.failed_alignments.pop(path, None)
-        if self.maintenance and removed:
+        self.preparation_window.message.set_text("Annulation en cours…")
+        self.preparation_window.update_controls()
+        if self.stem_job:
             try:
-                self.maintenance.index.notify(removed, PREPARATION)
-                self.maintenance.index_wake.set()
-            except (OSError, ValueError, sqlite3.Error):
+                self.stem_job[1].send_signal(signal.SIGTERM)
+            except GLib.Error:
                 pass
-        return released
+        else:
+            self.complete_stem_preparation()
 
-    def begin_preparation(self, songs, *, for_party, force=False, force_paths=()):
-        if self.closed or self.validating or self.party.active is not None:
+    def begin_preparation(self, songs, *, for_party):
+        # A playable local audio file is the only admission requirement.
+        # Searching providers and building an instrumental are independent.
+        if self.closed or self.party.active is not None or not for_party:
             return False
-        if getattr(self, "maintenance", None) and not self.maintenance.yield_heavy():
-            return False
-        plan = {song.path: song.title for song in songs}
-        if not plan:
-            return False
-        self.preparation_only = not for_party
-        self.preload_cancelled = False
-        self.active_plan = plan
-        if for_party:
-            self.remote_party.managed_stems.update(plan)
-        self.training_songs, self.training_only = (
-            self.remote_party.training_paths() if for_party and self.remote_party.phase == "preparing" else
-            ({player.song.path for player in self.party.players if player.training and player.song}, set())
-            if for_party else (set(), set()))
-        self.align_finished.clear()
-        self.batch_failed = {}
-        self.batch_reports = {}
-        self.chronos_reports = {}
-        self.batch_experimental = set()
-        self.batch_playable = set()
-        self.batch_protected = {}
-        self.align_diagnostics = ""
-        self.batch_ready = {}
-        if for_party:
-            self.party_selection = self.party_choice()
-            self.party_ready = False
-            self.party.excluded.clear()
-            self.party.unscored.clear()
-            self.experimental_songs.clear()
-        self.game_toggle.set_active(False)
-        self.validating = True
-        retried = [str(path) for path in plan if path in force_paths]
-        self.blackbox.emit("turbo", "preparation-start", count=len(plan), force=force,
-                           retried=len(retried), for_party=for_party)
-        self.stem_queue = {}
-        self.stem_completed = 0
-        self.stem_failed.clear()
-        for path in plan:
-            if local_track(path.as_uri()) != path:
-                message = "Fichier audio local introuvable."
-                self.batch_failed[path] = message
-                self.log_preparation_error("turbo", plan[path], {"phase": "input", "message": message})
-                self.align_finished.add(path)
-        if self.preparation_window is not None and self.preparation_only:
-            self.preparation_window.set_busy(True)
+        paths = {song.path for song in songs}
+        available = {path for path in paths if local_track(path.as_uri()) == path}
+        self.party_selection = self.party_choice()
+        self.party_available = available
+        self.failed_alignments = dict.fromkeys(paths - available, "Fichier audio local introuvable.")
+        self.party.excluded.clear()
+        self.party.unscored.clear()
+        self.party_ready = bool(available) and not self.failed_alignments
+        if self.receiver is not None:
+            self.receiver.room.set_prepared(available, failures=self.failed_alignments)
+        detail = (f"Partie prête · {len(available)} morceau(x)." if self.party_ready else
+                  f"{len(paths - available)} fichier(s) audio local(aux) indisponible(s).")
         if self.players_window is not None:
+            self.players_window.message.set_text(detail)
             self.players_window.refresh()
-        paths = [str(path) for path in plan if path not in self.batch_failed]
-        if paths:
-            command = ["nice", "-n", "8", sys.executable, "-B", str(BIN / "_kara_prepare.py"),
-                       "--cache", str(self.references.root), "--separate-if-needed",
-                       *(["--chronos", self.chronos_mode] if self.chronos_mode else []),
-                       *(["--for-party"] if for_party and self.chronos_mode else []),
-                       *(["--force"] if force else []),
-                       *(["--trace"] if self.blackbox.status()["active"] else []),
-                       *(arg for path in retried for arg in ("--force-path", path)), *paths]
-            try:
-                process = Gio.Subprocess.new(command, Gio.SubprocessFlags.STDOUT_PIPE |
-                                             Gio.SubprocessFlags.STDERR_MERGE)
-            except GLib.Error as error:
-                for path in paths:
-                    self.batch_failed[Path(path)] = str(error)
-                    self.log_preparation_error("turbo", plan[Path(path)], error_details(error, "spawn"))
-            else:
-                self.align_job = process
-                self.show_align_status("Vérification de la préparation Turbo…", 0)
-                stream = Gio.DataInputStream.new(process.get_stdout_pipe())
-                stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
-                return True
-        self.complete_party_validation()
+        self.remote_party.prepared()
         return True
 
-    def complete_party_validation(self):
-        preload = self.preparation_only
+    def complete_stem_preparation(self):
         self.validating = False
-        selected = self.party_choice() == self.party_selection
-        if not preload:
-            # Training needs the source audio and stems. A lyric-reference
-            # failure still blocks paths used by at least one scored turn.
-            for path in self.training_only & self.batch_failed.keys():
-                if path not in self.stem_failed and local_track(path.as_uri()) == path and cached_stems(path):
-                    self.batch_failed.pop(path)
-            for path in self.stem_failed:
-                self.batch_ready.pop(path, None)
-                self.batch_failed.setdefault(path, "Pistes séparées indisponibles pour le mixage.")
-                if path in self.batch_playable:
-                    self.batch_experimental.add(path)
-            self.failed_alignments = self.batch_failed
-            self.experimental_songs = self.batch_experimental
-            self.preparation_reports = self.batch_reports
-            self.validated_songs = self.batch_ready
-            self.party_ready = selected and not self.failed_alignments and bool(self.validated_songs or self.training_only)
-            if self.receiver is not None:
-                self.receiver.room.set_prepared(self.validated_songs)
-        elif any(path in self.validated_songs and current != self.validated_songs[path]
-                 for path, current in self.batch_ready.items()) or self.batch_failed.keys() & self.validated_songs.keys():
-            self.party_ready = False
-        if preload and self.remote_party.background_path is not None:
-            # One preparation owns the GPU at a time. A preempted generation
-            # stays eligible for retry and never publishes a failure from SIGTERM.
-            path = self.remote_party.background_path
-            self.remote_party.background_path = None
-            if not self.preload_cancelled:
-                self.experimental_songs.discard(path)
-                self.experimental_songs.update(self.batch_experimental)
-                if path in self.stem_failed:
-                    self.batch_failed.setdefault(path, "Pistes séparées indisponibles pour le mixage.")
-                    if path in self.batch_playable:
-                        self.experimental_songs.add(path)
-                    self.prepared_stems.pop(path, None)
-                elif path not in self.batch_experimental:
-                    try:
-                        self.prepared_stems[path] = file_token(path)
-                    except (OSError, ValueError):
-                        self.batch_failed[path] = "Le fichier audio est indisponible."
-                self.preparation_reports.update(self.batch_reports)
-                if path in self.batch_failed:
-                    self.failed_alignments[path] = self.batch_failed[path]
-                    self.validated_songs.pop(path, None)
-                elif path in self.batch_ready:
-                    self.failed_alignments.pop(path, None)
-                    self.validated_songs.update(self.batch_ready)
-            if self.receiver is not None:
-                self.receiver.room.set_prepared(self.validated_songs, failures=self.failed_alignments)
-        ready = len(self.batch_ready.keys() | (self.training_only - self.batch_failed.keys()))
-        without_score = len(self.batch_experimental & self.batch_failed.keys())
         if self.preload_cancelled:
-            detail = "Préparation annulée. Les morceaux terminés restent en cache."
-        elif self.batch_failed:
-            total = len(self.active_plan)
-            errors = [f"{self.active_plan[path]} · {error}" for path, error in self.batch_failed.items()]
-            detail = f"{ready}/{total} morceau(x) prêt(s) à noter."
-            if without_score:
-                detail += f" {without_score} disponible(s) sans note."
-            detail += " " + " / ".join(errors)
-        elif not preload and self.party_ready:
-            detail = f"Partie prête · {ready} morceau(x)."
-        elif not preload:
-            detail = "La sélection des joueurs a changé. Relance la préparation."
+            detail = "Préparation annulée. Les pistes terminées restent en cache."
         else:
-            detail = f"{ready} morceau(x) prêt(s) dans le cache Turbo."
-        if self.stem_failed:
-            detail += f" Instrumental indisponible pour {len(self.stem_failed)} morceau(x)."
-        self.show_align_status(detail, round(self.align_fraction * 100) if self.preload_cancelled else 100)
-        if self.preparation_window is not None and preload:
-            self.preparation_window.set_busy(False)
-        self.preparation_only = False
-        self.preload_cancelled = False
+            detail = f"{len(self.active_plan) - len(self.stem_failed)} instrumental(aux) disponible(s)."
+            if self.stem_failed:
+                detail += f" Séparation en échec pour {len(self.stem_failed)} morceau(x)."
+        self.show_align_status(detail, 100)
+        self.preparation_window.set_busy(False)
+        self.preparation_only = self.preload_cancelled = False
         self.active_plan = {}
-        self.blackbox.emit("turbo", "preparation-end", ready=ready, without_score=without_score,
-                           failed=len(self.batch_failed) - without_score)
-        self.remote_party.prepared()
-        if self.players_window is not None:
-            self.players_window.refresh()
         GLib.timeout_add(650, self.hide_alignment_bars)
 
     def log_preparation_error(self, engine, title, details):
@@ -1178,7 +1003,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             stream = Gio.DataInputStream.new(process.get_stdout_pipe())
             stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_stem_event, process)
             return
-        self.complete_party_validation()
+        self.complete_stem_preparation()
 
     def read_stem_event(self, stream, result, process):
         if self.closed or not self.stem_job or self.stem_job[1] is not process:
@@ -1240,7 +1065,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def show_align_status(self, detail, progress):
         total = max(1, len(self.active_plan))
         if self.stem_job:
-            total_progress = .85 + .15 * (self.stem_completed + progress / 100) / total
+            total_progress = (self.stem_completed + progress / 100) / total
         else:
             total_progress = progress / 100
         self.align_fraction = max(0.0, min(1.0, total_progress))
@@ -1255,126 +1080,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
             bar.set_visible(True)
             bar.set_fraction(self.align_fraction)
             bar.set_text(f"{round(self.align_fraction * 100)} %")
-
-    def read_alignment(self, stream, result, process):
-        if self.closed or self.align_job is not process:
-            return
-        try:
-            line, _ = stream.read_line_finish_utf8(result)
-        except GLib.Error as error:
-            self.align_diagnostics += str(error)
-            line = None
-        if line is None:
-            process.wait_async(None, self.alignment_exit)
-            return
-        try:
-            event = json.loads(line)
-        except ValueError:
-            event = None
-        if not isinstance(event, dict):
-            self.align_diagnostics = (self.align_diagnostics + line + "\n")[-24_000:]
-            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
-            return
-        path = Path(event.get("path", ""))
-        if path in self.active_plan:
-            kind = event.get("event")
-            title = self.active_plan[path]
-            count = len(self.active_plan)
-            done = len(self.align_finished)
-            if kind == "chronos":
-                self.chronos_reports[path] = event["status"]
-                self.blackbox.emit("chronos", "preparation", song=title, engine=event["engine"],
-                                   status=event["status"], reason=(event.get("message") or "")[:4000] or None,
-                                   phase=event.get("phase"), exit_code=event.get("exit_code"),
-                                   protection=event.get("protection"))
-                if event.get("message"):
-                    self.log_preparation_error("chronos", title, event)
-                protection = event.get("protection")
-                if protection and not protection.startswith("Lecture en cours"):
-                    self.batch_protected[path] = protection
-                if path == self.track:
-                    self.file_token = None
-                    self.load_lines()
-            elif kind == "evidence":
-                self.blackbox.emit("turbo", event["kind"], song=title, evidence=event["evidence"])
-            elif kind in ("error", "diagnostic"):
-                engine = event.get("engine", "turbo")
-                component = "chronos" if engine in CHRONOS_ENGINES else engine
-                self.log_preparation_error(component, title, event)
-                if engine == "demucs":
-                    self.stem_failed.add(path)
-            elif kind in ("progress", "result"):
-                self.blackbox.emit("turbo", kind, song=title,
-                                   phase=event.get("phase"), progress=event.get("percent"),
-                                   ready=event.get("ready"), report=event.get("report"),
-                                   duration=event.get("duration"), cached=event.get("cached"))
-            if kind == "progress":
-                stages = {"cache": "Vérification du cache", "lyrics": "Récupération des paroles",
-                          "model": "Chargement du modèle", "transcription": "Analyse audio par Turbo",
-                          "chronos": "Minutage CHRONOS expérimental",
-                          "comparison": "Comparaison des paroles", "correction": "Correction des timestamps",
-                          "words": "Synchronisation mot par mot", "separation": "Séparation de la voix",
-                          "refinement": "Analyse locale des passages incertains",
-                          "vocal_refinement": "Vérification locale sur la piste vocale",
-                          "saving": "Enregistrement", "cached_insufficient": "Référence insuffisante · cache",
-                          "ready": "Morceau prêt", "cached": "Morceau prêt · cache"}
-                stage = stages.get(event.get("phase"), "Préparation")
-                progress = round(85 * (done + event.get("percent", 0) / 100) / count)
-                self.show_align_status(f"Morceau {min(count, done + 1)}/{count} · {title} · {stage}", progress)
-            elif kind in ("result", "error"):
-                self.align_finished.add(path)
-                if event.get("experimental"):
-                    self.batch_experimental.add(path)
-                if event.get("timing_playable"):
-                    self.batch_playable.add(path)
-                self.batch_reports[path] = event.get("report", {})
-                item = self.references.cached(path, verify=False) if event.get("ready") else None
-                if item is not None:
-                    self.batch_ready[path] = (item["prepared_at"], item["lrc_sha256"])
-                else:
-                    report = event.get("report", {})
-                    message = event.get("message") or report.get("message", "Préparation Turbo indisponible.")
-                    if "word_coverage" in report:
-                        message += (f" {report['word_coverage']:.0%} des mots et "
-                                    f"{report['line_coverage']:.0%} des débuts de ligne repérés.")
-                    self.batch_failed[path] = message
-                if path == self.track:
-                    self.file_token = None
-                    self.load_lines()
-        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
-
-    def alignment_exit(self, process, result):
-        if self.closed or self.align_job is not process:
-            return
-        self.align_job = None
-        try:
-            code = self.preparation_status_code(process, result)
-        except GLib.Error as error:
-            code = None
-            self.align_diagnostics += str(error)
-        self.blackbox.emit("turbo", "worker-exit", phase="preparation", exit_code=code)
-        if self.align_diagnostics:
-            self.log_preparation_error("turbo", None, {"phase": "worker", "message": self.align_diagnostics,
-                                                       "exit_code": code})
-        if not self.preload_cancelled:
-            for path in self.active_plan.keys() - self.align_finished:
-                message = self.align_diagnostics or "La préparation Turbo a été interrompue."
-                self.batch_failed[path] = message
-                self.log_preparation_error("turbo", self.active_plan[path], {"phase": "worker",
-                                           "message": message, "exit_code": code})
-            # Active resource guards also defer new heavy stem work. Receive
-            # fresh stems only for scoring or the dedicated training mix.
-            for path, title in self.active_plan.items():
-                if (path in self.batch_experimental and path not in self.training_songs or path in self.stem_failed
-                        or local_track(path.as_uri()) != path or cached_stems(path)):
-                    continue
-                if path in self.batch_protected:
-                    self.stem_failed.add(path)
-                    self.batch_failed.setdefault(path, self.batch_protected[path])
-                else:
-                    self.stem_queue[path] = title
-            self.stem_completed = len(self.active_plan) - len(self.stem_queue)
-        self.start_stem_generation()
 
     def build_timing_controls(self):
         self.timing_menu = Gtk.MenuButton(label="Minutage", tooltip_text="Ajuster le défilement PC et TV")
@@ -1399,75 +1104,31 @@ class LyricsWindow(Gtk.ApplicationWindow):
         reset = Gtk.Button(label="Remettre le décalage à zéro")
         reset.connect("clicked", lambda *_: self.timing_spin.set_value(0))
         content.append(reset)
-        self.original_timing = Gtk.CheckButton(label="Afficher le LRC d’origine")
-        self.original_timing.connect("toggled", lambda *_: self.load_lines() if self.track else None)
-        content.append(self.original_timing)
-        self.chronos_choice = Gtk.DropDown(model=Gtk.StringList.new(
-            ["Minutage historique", "CHRONOS · Huang", "CHRONOS · Wav2Vec2", "CHRONOS · Huang / HTDemucs-FT"]))
-        self.chronos_choice.set_selected(1 + CHRONOS_ENGINES.index(self.chronos_mode) if self.chronos_mode else 0)
-        self.chronos_choice.connect("notify::selected", self.choose_chronos)
-        content.append(self.chronos_choice)
         self.timing_message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
         content.append(self.timing_message)
         return self.timing_menu
 
-    def choose_chronos(self, widget, _property):
-        if self.validating or self.party.active:
-            widget.handler_block_by_func(self.choose_chronos)
-            widget.set_selected(1 + CHRONOS_ENGINES.index(self.chronos_mode) if self.chronos_mode else 0)
-            widget.handler_unblock_by_func(self.choose_chronos)
-            return
-        selected = widget.get_selected()
-        if selected > len(CHRONOS_ENGINES):
-            return
-        self.chronos_mode = ("", *CHRONOS_ENGINES)[selected]
-        self.file_token = None
-        if self.track:
-            self.load_lines()
-
     def view_anchor(self, position):
-        if self.chronos_reference is None:
-            return bisect_right(self.times, position) - 1
-        index = bisect_right(self.chronos_times, position) - 1
-        return self.chronos_indices[index] if index >= 0 else -1
+        return bisect_right(self.times, position) - 1
 
     def apply_timing(self):
-        scoring = self.game_toggle.get_active() or self.party.active is not None
-        show_original = self.original_timing.get_active() and not scoring
-        self.timing_offset = 0. if scoring else self.timing.offset(self.track)
-        if self.active_reference and not show_original:
-            lines = self.active_reference["lines"]
-            self.times = [line["display_start"] + self.timing_offset for line in lines]
-            self.word_marks = tuple(display_marks(line) for line in lines)
-            self.word_times = tuple(tuple(word["start"] for word in line["words"]) for line in lines)
-            self.word_ends = tuple(line["end"] for line in lines)
-        elif show_original:
-            self.times = [stamp + self.timing_offset for stamp, _ in self.raw_lines]
-            self.word_marks = self.word_times = self.word_ends = ()
-        else:
-            self.times = self.timing.times(self.track, self.raw_lines)
-            self.word_marks = self.timing.marks(self.track, self.raw_lines)
-            self.word_times = self.word_ends = ()
+        # The adjustment is a display offset. Original per-line and per-word
+        # clocks are retained and the score keeps its own frozen LRC clock.
+        self.timing_offset = self.timing.offset(self.track)
+        self.times = [stamp + self.timing_offset for stamp, _, _ in self.raw_lines]
+        self.word_marks = tuple(marks for _, _, marks in self.raw_lines)
         self.highlight = -1
         self.next_tv_update = 0
-        self.timing_menu.set_sensitive(not scoring)
         self.timing_spin.set_sensitive(bool(self.track and self.raw_lines))
         self.syncing_offset = True
-        self.timing_spin.set_value(self.timing.offset(self.track))
+        self.timing_spin.set_value(self.timing_offset)
         self.syncing_offset = False
-        calibrated = bool(self.active_reference) and not show_original
         marked = sum(bool(marks) for marks in self.word_marks)
-        lyric_lines = sum(bool(words(text)) for _, text in self.raw_lines)
-        if marked:
-            detail = f"Repères par mot sur {marked}/{lyric_lines} lignes."
-            if marked < lyric_lines:
-                detail += " Les autres lignes suivent le minutage par ligne."
-        else:
-            detail = "Réglage par rapport au calage Turbo." if calibrated else "Réglage par rapport au fichier LRC."
+        detail = f"Repères LRC par mot sur {marked} ligne(s)." if marked else "Minutage du fichier LRC."
         self.timing_message.set_text(detail)
 
     def change_timing(self, spin):
-        if self.syncing_offset or self.track is None or not self.raw_lines or self.game_toggle.get_active():
+        if self.syncing_offset or self.track is None or not self.raw_lines:
             return
         try:
             self.timing.set_offset(self.track, spin.get_value())
@@ -1476,29 +1137,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         self.apply_timing()
 
-    def original_mix_reference(self, path):
-        # This independent playback path requires a fresh display receipt,
-        # then freezes that receipt when the turn starts.
-        if path in self.experimental_songs:
-            experiment = playback_experiment(path, self.references, self.chronos_mode)
-            if displayable(experiment):
-                return experiment
-        return None
-
-    def song_available(self, song, *, unscored=False, training=False):
-        # The worker validated the stems and reference. The real turn repeats
-        # the full check before opening audio to catch replacement in the interim.
-        path = song.path
-        try:
-            token = file_token(path)
-            stems = self.prepared_stems.get(path) == token
-        except (OSError, ValueError):
-            return False
-        if unscored and self.turn_original_mix and self.chronos_turn and self.chronos_turn[0] == path:
-            return self.chronos_turn[1]["tokens"][0] == token
-        if unscored and not training and self.original_mix_reference(path):
-            return True
-        return stems and (unscored or path in self.validated_songs)
+    def song_available(self, song):
+        return local_track(song.path.as_uri()) == song.path
 
     def start_turn(self, player, *, independent=False):
         if getattr(self, "maintenance", None):
@@ -1511,41 +1151,21 @@ class LyricsWindow(Gtk.ApplicationWindow):
         path = player.song.path
         if path in self.party.excluded:
             return
-        scored = (not self.remote_party.unscored_for(player, player.song) if independent else
-                  path not in self.party.unscored and not player.training)
-        reference = self.references.cached(path, verify=False) if scored else None
-        if scored and (reference is None or self.validated_songs.get(path) != (
-                reference["prepared_at"], reference["lrc_sha256"])):
-            self.party_ready = False
-            self.validated_songs.pop(path, None)
-            self.failed_alignments[path] = "Le morceau ou sa référence a changé."
-            self.players_window.message.set_text("Le morceau a changé. Valide à nouveau la partie.")
-            self.players_window.refresh()
-            return
-        if not scored and local_track(path.as_uri()) != path:
+        if not self.song_available(player.song):
             self.party_ready = False
             self.players_window.message.set_text("Le fichier du morceau est indisponible.")
             self.players_window.refresh()
             return
-        experiment = playback_experiment(path, self.references, self.chronos_mode)
-        generated = bool(experiment and experiment.get("source", {}).get("kind") == "generated-transcription")
-        if generated and scored:
-            experiment, generated = None, False
-        sing_only = (self.remote_party.unscored_for(player, player.song) and not player.training
-                     if independent else path in self.party.unscored)
-        original_mix = sing_only and path in self.experimental_songs and displayable(experiment)
-        if not original_mix and not cached_stems(path):
-            self.party_ready = False
-            self.prepared_stems.pop(path, None)
-            self.failed_alignments[path] = "Les pistes du mixage ne sont plus disponibles."
-            self.players_window.message.set_text("Les pistes du mixage ont changé. Prépare à nouveau la partie.")
-            self.players_window.refresh()
-            return
+        wants_score = not (self.remote_party.unscored_for(player, player.song) or path in self.party.unscored)
+        original_mix = cached_stems(path) is None
+        reference = (score_source(read_source(path), player.song.duration or 0.)
+                     if wants_score and not original_mix else None)
+        scored = reference is not None
         if self.parole_ui is not None:
             self.parole_ui.draft_audition.stop()
         self.game_toggle.set_active(False)
         self.bb_turn = self.remote_party.turn_id or token_hex(8)
-        if self.remote_party.current and player.mobile_id:
+        if player.mobile_id:
             try:
                 self.game_score.network_socket = self.room_audio.open_turn(
                     player.mobile_id, player.name, self.bb_turn, player.song.title, scoring=scored,
@@ -1559,15 +1179,11 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.previous_result = player.score, player.done, player.result
         player.score, player.done, player.result = None, False, None
         self.party.active = player
-        self.chronos_turn = (path, experiment)
         self.game_score.diagnostic_turn = {"turn": self.bb_turn, "player": player.name, "song": player.song.title}
         self.blackbox.emit("party", "turn-start", **self.game_score.diagnostic_turn, scored=scored, training=player.training,
                            identity={"room": self.bb_room, "party": self.remote_party.identity},
-                           experimental_lyrics=generated, original_mix=original_mix,
-                           reference={**{key: reference.get(key) for key in ("song_id", "prepared_at", "lrc_sha256",
-                                       "language", "duration", "settings", "model")},
-                                      "audio_sha256": reference["audio"]["sha256"],
-                                      "audio_pcm_sha256": reference["audio"].get("pcm_sha256")} if reference else None)
+                           original_mix=original_mix, reference={key: reference[key] for key in (
+                               "method", "lrc_sha256", "language", "duration")} if reference else None)
         self.turn_scored = scored
         self.turn_original_mix = original_mix
         self.game_toggle.set_sensitive(scored)
@@ -1582,7 +1198,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.game_score.set_round(vocabulary.lines, vocabulary, reference=reference)
         else:
             self.game_score.set_round()
-        self.players_window.message.set_text("")
+        self.players_window.message.set_text("Chant sans note · instrumental ou LRC indisponible."
+                                             if wants_score and not scored else "")
         self.players_window.refresh()
         self.update_vocal_effect()
         if scored:
@@ -1609,7 +1226,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if time.monotonic() - self.receiver.secure_tv_seen >= 4:
             raise RoomError("La télévision Kara est déconnectée.", 409)
         player = self.party.active
-        if not self.song_available(player.song, unscored=not self.turn_scored):
+        if not self.song_available(player.song):
             raise RoomError("La chanson doit être préparée de nouveau.", 409)
         self.turn_phase = "countdown"
         self.countdown_end = time.monotonic() + 3.
@@ -1682,12 +1299,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
                     self.turn_phase = "playing"
                     self.log_playback_reference(player.song.path)
                     return
-                if not self.times:
-                    self.finish_turn(pause=True, error="Les paroles minutées ne sont plus disponibles.")
-                    return
-                if not self.active_reference or self.game_score.reference["prepared_at"] != self.active_reference["prepared_at"]:
-                    self.finish_turn(pause=True, error="La préparation du morceau a changé.")
-                    return
                 if self.record_turn:
                     start = self.updated - self.base_position / self.rate
                     self.record_turn = self.game_score.record_turn(start, player.song.title)
@@ -1707,8 +1318,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 self.finish_turn()
             return
         if self.track == song and playback != "Stopped":
-            if not self.active_reference or self.game_score.reference["prepared_at"] != self.active_reference["prepared_at"]:
-                self.finish_turn(pause=True, error="La préparation a changé pendant le tour.")
             return
         if self.record_turn:
             self.game_score.record_turn()
@@ -1746,29 +1355,43 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 else:
                     self.begin_playback(player)
             elif game.process is None or now >= self.turn_deadline:
-                self.finish_turn(error=game.message or "Le micro ne s’est pas préparé.")
+                self.drop_turn_score(game.message or "Turbo indisponible")
+                if player.mobile_id:
+                    self.turn_phase = "awaiting-mic"
+                    self.turn_deadline = now + 75.
+                else:
+                    self.begin_playback(player)
         elif self.turn_phase == "opening" and now >= self.turn_deadline:
             self.finish_turn(error="Strawberry n’a pas démarré la chanson sélectionnée.")
         elif self.turn_phase == "awaiting-mic":
             if not self.remote_party.opened_early and self.room_audio.receiving():
                 self.begin_playback(player)
-            elif ((not self.remote_party.opened_early and now >= self.turn_deadline)
-                  or self.turn_scored and game.process is None):
+            elif self.turn_scored and game.process is None:
+                self.drop_turn_score(game.message or "Turbo indisponible")
+            elif not self.remote_party.opened_early and now >= self.turn_deadline:
                 self.finish_turn(error="Le microphone du joueur n’a pas démarré.")
         elif self.turn_phase == "countdown":
             if (not self.room_audio.receiving(recent=True) or now - self.receiver.secure_tv_seen >= 4
-                    or now - self.player_seen > 2 or not self.song_available(player.song, unscored=not self.turn_scored)):
+                    or now - self.player_seen > 2 or not self.song_available(player.song)):
                 self.turn_phase = "awaiting-mic"
                 self.turn_deadline = now + 75.
             elif now >= self.countdown_end:
                 self.begin_playback(player)
         elif self.turn_phase == "playing" and game.requested and game.process is None:
-            self.finish_turn(pause=True, error=game.message or "Le moteur de score s’est arrêté.")
+            self.drop_turn_score(game.message or "Le moteur de score s’est arrêté")
         elif self.turn_phase == "finishing":
             if self.turn_tail is not None:
                 game.flush_round(*self.turn_tail)
             if not game.pending or now >= self.turn_deadline:
                 self.finish_turn()
+
+    def drop_turn_score(self, detail):
+        # A decoder failure must leave the live return and playback owned by
+        # the turn. Discard scoring work without closing its audio route.
+        self.turn_scored = False
+        self.game_score.stop()
+        self.blackbox.emit("party", "score-unavailable", **self.game_score.diagnostic_turn)
+        self.players_window.message.set_text(f"{detail} · chant sans note.")
 
     def finish_turn(self, *, pause=False, error=""):
         player = self.party.active
@@ -1814,7 +1437,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.game_score.network_socket.close()
             self.game_score.network_socket = None
         self.party.active = None
-        self.chronos_turn = None
         self.vocal_effect.output_override = None
         if self.turn_mix_strength is not None:
             self.effect_toggle.set_active(False)
@@ -1852,17 +1474,17 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if not button.get_active():
             self.finish_turn()
             self.game_score.stop()
-        if self.track:
-            self.load_lines()
-        self.apply_timing()
         self.sync_game()
 
     def sync_game(self):
         if os.environ.get("KARA_SILENT") == "1":
             return
         if self.party.active is None:
+            can_score = bool(self.game_toggle.get_active() and self.lyric_source and self.scoring_source())
+            if can_score and self.active_reference is None:
+                self.active_reference = score_source(self.lyric_source, self.duration)
             source = self.active_reference
-            can_score = bool(source and self.track and self.scoring_source())
+            can_score = bool(can_score and source)
         else:
             source = self.game_score.reference
             can_score = self.turn_scored and bool(source) and (
@@ -1899,8 +1521,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             status = "Calcul du score final…"
         elif game.message:
             status = game.message
-        elif not self.active_reference:
-            status = "Préparation Turbo nécessaire"
+        elif not game.reference:
+            status = "Fichier LRC indisponible"
         elif self.rate > 0 and not self.scoring_source():
             status = "Instrumental requis pour noter la voix"
         elif not self.rate:
@@ -2105,7 +1727,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         active = self.view_anchor(position)
         lines = [self.view_lyrics[i] if 0 <= i < len(self.view_lyrics) else "" for i in range(active - 1, active + 3)]
         fraction = self.display_progress(position, active, utf16=True) if active >= 0 else 0.0
-        engine = self.chronos_reference["engine"] if self.chronos_reference else "historical"
+        engine = "lrc-original"
         if (self.track, active, self.playback_state, engine) != self.bb_line:
             self.bb_line = self.track, active, self.playback_state, engine
             self.tv_line_revision += 1
@@ -2113,7 +1735,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                revision=self.tv_line_revision, line=active, lines=lines, playback=self.playback_state,
                                timing_engine=engine)
         if self.title.get_label():
-            notice = self.view_notice() or ("Paroles minutées indisponibles" if not self.times else " ")
+            notice = "Paroles minutées indisponibles" if not self.times else " "
         else:
             notice = "En attente de Strawberry…"
         self.receiver.update({
@@ -2145,8 +1767,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.vocal_effect.disable()
         self.game_toggle.set_active(False)
         self.tv_toggle.set_active(False)
-        if not self.validating and self.party.active is None:
-            self.release_prepared_stems(self.remote_party.managed_stems)
         # Managed workers own their leases and write their own result. Closing
         # the window stops scheduling and leaves any admitted import recoverable.
         if self.maintenance:
@@ -2156,8 +1776,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.music_sync.close()
         self.stop_blackbox("window-close", wait=wait)
         self.closed = True
-        if self.align_job is not None:
-            self.align_job.send_signal(signal.SIGTERM)
         if self.stem_job is not None:
             self.stem_job[1].send_signal(signal.SIGTERM)
         for timer in self.timers:
@@ -2183,8 +1801,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         self.track = track
         self.active_reference = None
-        self.chronos_reference = None
-        self.chronos_times, self.chronos_indices = [], []
+        self.lyric_source = None
         self.vocal_effect.set_song(track)
         self.update_vocal_effect()
         self.file_token = None
@@ -2219,8 +1836,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         now = time.monotonic()
         self.player_seen = now
-        previous_track, previous_duration, previous_times = self.track, self.duration, self.times
-        previous_word_times, previous_word_ends, previous_rate = self.word_times, self.word_ends, self.rate
+        previous_track, previous_duration, previous_rate = self.track, self.duration, self.rate
+        previous_times, previous_word_times, previous_word_ends = self.game_score.reference_clock
         previous_source = self.scoring_source()
         previous_position = self.base_position + (now - self.updated) * self.rate
         metadata = properties.get("Metadata", {})
@@ -2262,65 +1879,20 @@ class LyricsWindow(Gtk.ApplicationWindow):
         path = self.track.with_suffix(".lrc")
         try:
             source_token = lrc_token(path)
-            audio_token = file_token(self.track)
-            try:
-                cache_token = (file_token(self.references.folder(self.track) / "prepared.json"),
-                               file_token(self.references.model))
-            except FileNotFoundError:
-                cache_token = None
         except (OSError, ValueError):
-            self.show_lrc_error("Le morceau ou son fichier LRC est illisible.")
-            return
-        show_original = (self.original_timing.get_active() and self.party.active is None
-                         and not self.game_toggle.get_active())
-        mode = self.chronos_mode if not show_original else ""
-        experiment = None
-        if mode:
-            tokens = []
-            for candidate in (chronos_path(self.track, mode), chronos_path(self.track, "huang"),
-                              self.references.folder(self.track) / DRAFT_FILE):
-                try:
-                    tokens.append(file_token(candidate))
-                except (OSError, ValueError):
-                    tokens.append(None)
-            experiment = (*tokens, lrc_token(self.track.with_suffix(".txt")))
-        token = (source_token, audio_token, cache_token, show_original, self.party.active is not None,
-                 mode, experiment)
-        if token != self.file_token:
-            if self.chronos_turn and self.chronos_turn[0] == self.track:
-                # A turn snapshots its display evidence. Editor changes and
-                # cache eviction affect the next turn on the same recording.
-                current = self.chronos_turn[1]
-                self.chronos_reference = current if current and current["tokens"][0] == audio_token else None
-            else:
-                self.chronos_reference = (playback_experiment(self.track, self.references, mode,
-                                          before=[audio_token, source_token, experiment[-1]]) if experiment else None)
-            self.file_token = token
-            self.active_reference = self.references.cached(self.track, verify=False) if cache_token else None
-            if self.active_reference:
-                lines = (parse_lrc(self.active_reference["source_lrc"]) if show_original else
-                         [(line["source_start"], line["text"]) for line in self.active_reference["lines"]])
-                self.set_lines(lines)
-            elif source_token is not None:
-                try:
-                    lines = read_lrc(path)
-                except (OSError, ValueError):
-                    lines = []
-                self.set_lines(lines if any(text for _, text in lines) else [])
+            source_token = None
+        if (self.track, source_token) != self.file_token:
+            self.file_token = self.track, source_token
+            self.lyric_source = read_source(self.track) if source_token is not None else None
+            self.active_reference = None
+            if self.lyric_source:
+                self.set_lines(self.lyric_source[2])
             else:
                 self.set_lines([])
         if not self.rows:
             notice = ("Recherche des paroles minutées…" if self.fetching == self.track else
-                      self.fetch_message or "Les paroles minutées de ce morceau sont absentes.")
+                      self.fetch_message or "Les paroles minutées de ce morceau sont indisponibles.")
             self.show_fallback(notice, fetch=source_token is None)
-
-    def show_lrc_error(self, message):
-        self.file_token = None
-        self.active_reference = None
-        self.chronos_reference = None
-        if self.rows:
-            self.set_lines([])
-        self.show_fallback(message, fetch=False)
 
     def load_embedded(self):
         try:
@@ -2408,7 +1980,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.rows = []
         self.raw_lines = lines
         self.apply_timing()
-        self.lyrics = [text for _, text in lines]
+        self.lyrics = [text for _, text, _ in lines]
         if self.party.active is None:
             if self.lyrics:
                 self.game_score.configure_voice(self.lyrics)
@@ -2416,38 +1988,17 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.refresh_game()
         self.active = -1
         self.highlight = -1
-        experimental = playback_lines(self.chronos_reference) if self.chronos_reference else None
-        self.chronos_times, self.chronos_indices = chronos_index(experimental or ())
-        self.view_lyrics = [line["text"] for line in experimental] if experimental else self.lyrics
-        for index, text in enumerate(self.view_lyrics):
+        self.view_lyrics = self.lyrics
+        for text in self.view_lyrics:
             label = Gtk.Label(label=text, xalign=0.5, justify=Gtk.Justification.CENTER, wrap=True,
                               css_classes=["lyric"])
-            if experimental and experimental[index]["start"] is None:
-                label.set_tooltip_text("Aucun début de ligne corroboré")
             self.box.append(label)
             self.rows.append(label)
         self.scroll.get_vadjustment().set_value(0)
         if self.rows:
             self.style_lines()
-            self.set_footer(self.view_notice(), False)
+            self.set_footer("", False)
             self.stack.set_visible_child_name("lyrics")
-
-    def view_notice(self):
-        if self.chronos_reference is None:
-            if self.chronos_mode and self.chronos_reports.get(self.track) == "unavailable":
-                return "Minutage historique · CHRONOS indisponible"
-            return ""
-        count = len(self.chronos_indices)
-        if self.chronos_reference.get("source", {}).get("kind") == "generated-transcription":
-            engine = self.chronos_reference["engine"]
-            return f"Paroles générées · expérimentales · {count}/{len(self.view_lyrics)} lignes repérées ({engine})"
-        if self.chronos_reference["engine"] == "LRC":
-            return f"Minutage LRC · {count}/{len(self.view_lyrics)} lignes"
-        if "display_lines" in self.chronos_reference:
-            observed = sum(line["status"] == "experimental" for line in playback_lines(self.chronos_reference))
-            return f"Minutage CHRONOS et LRC · {observed}/{count} débuts de ligne CHRONOS"
-        return (f"Minutage CHRONOS expérimental · {count}/{len(self.view_lyrics)} lignes repérées"
-                if count else "CHRONOS · aucun début de ligne corroboré")
 
     def style_lines(self):
         anchor = max(0, self.active)
@@ -2470,10 +2021,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         backing = Path(scoring[0]) if scoring else None
         # Take GTK-owned values before the I/O worker runs. A later seek or
         # song selection cannot change the display evidence for this turn.
-        reference = self.active_reference
-        experiment = self.chronos_reference
-        displayed = ([[line["start"], line["text"]] for line in playback_lines(experiment)] if experiment
-                     else list(zip(self.times, self.lyrics)))
+        reference = self.game_score.reference if self.turn_scored else None
+        source = self.lyric_source
+        displayed = list(zip(self.times, self.lyrics))
         plain = self.tag_text
 
         def identify():
@@ -2493,38 +2043,19 @@ class LyricsWindow(Gtk.ApplicationWindow):
                         self.blackbox.emit("audio", "error", **context, recording_session=session,
                                            operation="stem-reference-identification")
                 self.blackbox.emit("audio", "reference", **context, recording_session=session, files=files)
-                original_text, source = plain, "embedded" if plain else "unavailable"
-                if reference:
-                    original_text, source = reference["source_lrc"], reference["source"].get("provider") or "prepared-lrc"
-                else:
-                    for suffix, kind in ((".lrc", "sidecar-lrc"), (".txt", "sidecar-text")):
-                        try:
-                            with original.with_suffix(suffix).open("rb") as lyrics:
-                                raw = lyrics.read(MAX_LRC_BYTES + 1)
-                            if len(raw) <= MAX_LRC_BYTES:
-                                original_text, source = raw.decode("utf-8"), kind
-                                break
-                        except (OSError, UnicodeError):
-                            continue
+                original_text = source[0] if source else plain
+                source_kind = "sidecar-lrc" if source else "embedded" if plain else "unavailable"
                 try:
-                    generated = (experiment.get("source", {}) if experiment
-                                 and experiment["audio_sha256"] == files["original"]["sha256"] else {})
-                    if generated.get("original") and not reference:
-                        original_text = generated["original"]
-                        kind = generated["kind"]
-                        source = kind if kind == "generated-transcription" else generated.get("provider") or kind
-                    document = lyrics_snapshot(files, source, original_text, displayed, reference)
-                    if generated.get("transcription"):
-                        document["transcription"] = generated["transcription"]
-                    document["chronos"] = ({key: value for key, value in experiment.items() if key != "display_lines"}
-                                           if experiment and experiment["engine"] in CHRONOS_ENGINES else None)
+                    document = lyrics_snapshot(files, source_kind, original_text, displayed)
+                    if source:
+                        document["lrc_word_marks"] = [marks for _, _, marks in source[2]]
+                        document["display_offset_s"] = displayed[0][0] - source[2][0][0]
+                    if reference:
+                        document["original_lrc_score"] = reference
                     from _parole_lyrics_lookup import playback_candidates
 
                     if candidates := playback_candidates(original, LIBRARY):
                         document["lyrics_candidates"] = candidates
-                    if experiment and experiment["audio_sha256"] != files["original"]["sha256"]:
-                        document["chronos"] = None
-                        document["chronos_state"] = "audio-identity-mismatch"
                     record_lyrics(self.blackbox, session, context, document)
                 except (KeyError, TypeError, ValueError):
                     self.blackbox.emit("lyrics", "reference-unavailable", **context,
@@ -2567,8 +2098,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.acoustic.update()
             self.capture_output()
         if self.game_toggle.get_active() and self.turn_phase in ("", "playing"):
-            self.game_score.tick(self.times, self.duration, position, self.rate, now,
-                                 self.word_times, self.word_ends, source=self.scoring_source())
+            times, word_times, word_ends = self.game_score.reference_clock
+            self.game_score.tick(times, self.duration, position, self.rate, now,
+                                 word_times, word_ends, source=self.scoring_source())
         self.update_tv(position, now)
         if not self.rows or not self.scroll.get_mapped():
             return GLib.SOURCE_CONTINUE
@@ -2580,7 +2112,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.highlight = -1
             self.style_lines()
             self.blackbox.emit("lyrics", "pc-line", **context, position=position, line=active,
-                               timing_engine=self.chronos_reference["engine"] if self.chronos_reference else "historical")
+                               timing_engine="lrc-original")
 
         if active >= 0:
             self.progress_line(position, active)
@@ -2594,25 +2126,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
         text = self.view_lyrics[active]
         if not text:
             return 0.0
-        if self.chronos_reference is not None:
-            # Highlight a contiguous prefix of observed onsets only. Ends
-            # are diagnostic and a refused word cannot advance the highlight.
-            from re import finditer
-            prefix = 0
-            line = playback_lines(self.chronos_reference)[active]
-            for match, word in zip(finditer(r"\S+", text), line["words"]):
-                if word["start"] is None or word["start"] > position:
-                    break
-                prefix = match.end()
-            if utf16:
-                return len(text[:prefix].encode("utf-16-le")) / len(text.encode("utf-16-le"))
-            return prefix / len(text)
-        marks = self.word_marks[active] if self.word_marks else None
+        marks = self.word_marks[active]
         if not marks:
-            start = self.times[active]
-            end = self.times[active + 1] if active + 1 < len(self.times) else max(start + 1.0, self.duration)
-            return lyric_progress(position, start, end)
-        shown = max(0.0, min(len(text), highlighted_characters(marks, position - self.timing_offset)))
+            # Line LRC has no trustworthy word timings. Hold the current row
+            # highlighted for its actual interval.
+            return 1.
+        source_position = position - self.timing_offset
+        shown = max((end for stamp, _, end in marks if stamp <= source_position), default=0)
         if utf16:
             prefix = int(shown)
             units = len(text[:prefix].encode("utf-16-le")) / 2

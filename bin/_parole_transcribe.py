@@ -212,20 +212,10 @@ def main():
     song = Path(sys.argv[2]).resolve(strict=True)
     data = transcribe(cache, song, lambda phase, percent: print(
         json.dumps({"event": "progress", "phase": phase, "percent": percent}), flush=True))
-    chronos = "unavailable"
-    if (source := draft_source(cache, song, data)) and data["duration"] < 600:
-        from _kara_chronos import prepare
-        from _parole_process import Interrupted
-
-        print(json.dumps({"event": "progress", "phase": "chronos", "percent": 90}), flush=True)
-        try:
-            chronos = prepare(song, cache, "huang", supplied=source, allow_demucs=False)
-        except (OSError, ValueError, RuntimeError, KeyError, Interrupted):
-            # The signed draft was published before alignment and remains
-            # usable when CHRONOS abstains or its resource guard declines.
-            pass
+    # A Parole draft contains text for review. Kara displays the library
+    # LRC and never starts an alignment when a draft is made.
     print(json.dumps({"event": "draft", "lines": len(data["plain"].splitlines()),
-                      "omitted": data["omitted"], "chronos": chronos}), flush=True)
+                      "omitted": data["omitted"]}), flush=True)
 
 
 if __name__ == "__main__":

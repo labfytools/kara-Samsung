@@ -99,14 +99,14 @@ def outside_tolerance(delta, tolerance):
     return abs(delta) > tolerance + TIMING_EPSILON
 
 
-def score_reference_line(reference, observed, tolerance=SCORE_TOLERANCE, *, source="voice", audit=None):
+def score_reference_line(reference, observed, tolerance=SCORE_TOLERANCE, *, source="voice", audit=None, lexical_only_allowed=False):
     """Align one independently decoded line and retain lexical/timing evidence."""
     words = reference["words"]
     if source != "voice":
         return [{"id": word["id"], "expected": word["text"],
                  "expected_start": word["start"],
-                 "status": "missing" if source == "silence" and word["start"] is not None else "uncertain",
-                 "reason": "reference" if word["start"] is None else source}
+                 "status": "missing" if source == "silence" and (lexical_only_allowed or word["start"] is not None) else "uncertain",
+                 "reason": "reference" if word["start"] is None and not lexical_only_allowed else source}
                 for word in words]
     # Minimize lexical edits first. For repeated words, prefer in-tolerance
     # matches, then the nearest occurrence on the common musical clock.
@@ -169,8 +169,12 @@ def score_reference_line(reference, observed, tolerance=SCORE_TOLERANCE, *, sour
             start = word["start"]
             result["expected_start"] = start
             if start is None:
-                result["status"] = "uncertain"
-                result["reason"] = "reference"
+                if lexical_only_allowed:
+                    if action == "match" and result["status"] != "uncertain":
+                        result["status"] = "correct"
+                else:
+                    result["status"] = "uncertain"
+                    result["reason"] = "reference"
             elif item is not None:
                 delay = item["start"] - start
                 result["delay"] = round(delay, 4)
@@ -183,8 +187,11 @@ def score_reference_line(reference, observed, tolerance=SCORE_TOLERANCE, *, sour
 
 def score_breakdown(reference, results):
     total = sum(len(line["words"]) for line in reference["lines"])
-    eligible = sum(word["start"] is not None for line in reference["lines"] for word in line["words"])
+    original_lrc = reference.get("method") == "lrc-original"
+    eligible = total if original_lrc else sum(
+        word["start"] is not None for line in reference["lines"] for word in line["words"])
     verified, uncertain, correct, lexical, extras = 0, 0, 0, 0, 0
+    timed, in_time = 0, 0
     for index, line in results.items():
         words = reference["lines"][index]["words"]
         for result in line:
@@ -192,13 +199,20 @@ def score_breakdown(reference, results):
             if result["id"] is None:
                 extras += status == "extra"
                 continue
-            if words[result["id"]]["start"] is None:
+            has_onset = words[result["id"]]["start"] is not None
+            if not has_onset and not original_lrc:
                 continue
+            timed += has_onset and status in ("correct", "early", "late")
+            in_time += has_onset and status == "correct"
             uncertain += status == "uncertain"
             verified += status != "uncertain"
             correct += status == "correct"
             lexical += status in ("correct", "early", "late")
-    return score_summary(total, eligible, verified, uncertain, correct, lexical, extras)
+    summary = score_summary(total, eligible, verified, uncertain, correct, lexical, extras)
+    if original_lrc:
+        # Line-only words can earn lexical credit but provide no timing evidence.
+        summary["timing"] = round(100 * in_time / timed) if timed else None
+    return summary
 
 
 def score_summary(total, eligible, verified, uncertain, correct, lexical, extras):

@@ -219,7 +219,7 @@ class FakeController:
         self.game_score = SimpleNamespace(breakdown=None, requested=False)
 
     def song_available(self, song, *, unscored=False, training=False):
-        return song.path in self.available
+        return song.path.is_file()
 
     def countdown(self):
         return 0
@@ -293,7 +293,7 @@ class RoomTests(unittest.TestCase):
             receipt, = ImportQueue(path / "state", path).requests()
             self.assertEqual(len(receipt["requests"]), 2)
 
-    def test_preparation_runs_once_for_shared_choice_and_first_turn_can_open(self):
+    def test_room_opens_without_preparation_and_reserves_one_turn(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
             control = FakeController(path)
@@ -311,18 +311,13 @@ class RoomTests(unittest.TestCase):
             self.idle_until(lambda: len(control.party.players) == 3)
             remote = control.remote_party
             remote.tick(time.monotonic())
-            self.assertEqual(control.batch, songs[:1])
-            remote.tick(time.monotonic())
-            self.assertEqual(control.calls, ["prepare"])
-            control.available.add(songs[0].path)
-            control.validating = False
-            remote.background_path = None
+            self.assertEqual(control.calls, [])
             self.assertTrue(remote.can_open())
             remote.command("open", "Alex", {"request": "0" * 24, "revision": remote.revision})
             remote.tick(time.monotonic())
             self.assertEqual(control.party.active.name, "Alex")
             self.assertEqual(control.turn_phase, "awaiting-mic")
-            self.assertNotIn(songs[1].path, control.available)
+            self.assertFalse(songs[1].path.with_suffix(".lrc").exists())
             with self.assertRaises(RoomError):
                 remote.command("player-start", "Jo", {"request": "1" * 24, "turn": remote.turn_id})
             control.request_turn_start = lambda: control.calls.append("countdown")
@@ -331,38 +326,23 @@ class RoomTests(unittest.TestCase):
             remote.command("player-start", "Alex", data)
             self.assertEqual(control.calls.count("countdown"), 1)
 
-    def test_prepare_before_confirmation_and_release_unselected_song(self):
+    def test_unconfirmed_selection_does_not_schedule_preparation(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
             control = FakeController(path)
             control.receiver = receiver = Receiver("127.0.0.1", b"", on_mobile=control.mobile_event)
             self.addCleanup(receiver.close)
             room = receiver.room
-            first = Song(path / "A", "Premier", "Artiste", "Album")
-            second = Song(path / "B", "Second", "Artiste", "Album")
-            first.path.touch(); second.path.touch()
-            room.update_catalogue([(song, search_key(song.title)) for song in (first, second)])
+            song = Song(path / "A", "Premier", "Artiste", "Album")
+            song.path.touch()
+            room.update_catalogue([(song, search_key(song.title))])
             token = room.join("Alex")["token"]
-            room.choose(token, room.search(token, first.title)["results"][0]["id"], confirm=False)
+            room.choose(token, room.search(token, song.title)["results"][0]["id"], confirm=False)
             self.idle_until(lambda: len(control.party.players) == 1)
             remote = control.remote_party
-            self.assertEqual(remote.selected_turns(), [])
             remote.tick(time.monotonic())
-            self.assertEqual(control.batch, [first])
-            control.interrupt_preload = lambda: control.calls.append("cancel")
-            room.choose(token, room.search(token, second.title)["results"][0]["id"], confirm=False, replace=True)
-            remote.tick(time.monotonic())
-            self.assertIn("cancel", control.calls)
-            control.validating = False
-            remote.background_path = None
-            released = []
-            def release(paths):
-                released.extend(paths)
-                return set(paths)
-            control.release_prepared_stems = release
-            remote.tick(time.monotonic())
-            self.assertEqual(released, [first.path])
-            self.assertEqual(control.batch, [second])
+            self.assertFalse(remote.can_open())
+            self.assertEqual(control.calls, [])
 
     def test_tv_display_reopens_once_after_start_or_manual_close(self):
         receiver = Receiver("127.0.0.1", b"TV")
@@ -603,7 +583,7 @@ class RoomTests(unittest.TestCase):
                     command(pool, a, "blackbox-start", "b", consent=True)
                     command(pool, a, "prepare", "c")
                     self.assertEqual([song.title for song in control.batch], ["Second", "Second", "Premier"])
-                    self.assertEqual(control.remote_party.training_paths(), ({path / "Second"}, set()))
+                    self.assertEqual([player.name for player, _ in control.remote_party.plan if player.training], ["Morgan"])
                     control.validating = False
                     control.party_ready = True
                     control.remote_party.prepared()

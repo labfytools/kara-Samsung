@@ -234,20 +234,13 @@
     const song = (index >= 0 && songs.find(item => item.title === next[index].song)) || songs[0];
     const unscored = state.me.unscored?.includes(song?.title);
     const failed = song?.preparation === "failed" && !unscored;
-    const ready = song?.preparation === "ready" || unscored;
     const running = party.phase === "running";
     const waiting = running ? "En attente de ton tour" : "En attente de l’ouverture du salon";
-    $("waiting-title").textContent = failed ? "Préparation indisponible" : ready || !song ? waiting : "Chargement de ta chanson en cours…";
-    if (song && !ready && !failed) {
-      const spinner = element("span", undefined, "spinner");
-      spinner.setAttribute("aria-hidden", "true");
-      $("waiting-title").prepend(spinner, " ");
-    }
+    $("waiting-title").textContent = failed ? "Fichier audio indisponible" : waiting;
     $("waiting-song").textContent = song ? [song.title, song.artist].filter(Boolean).join(" · ") : "";
     const before = index < 0 ? "" : index + (party.player ? 1 : 0) + " passage(s) avant toi";
     $("waiting-detail").textContent = [
-      ready ? (unscored ? "Ta chanson est prête pour un tour sans note." : "Ta chanson est prête !") : "",
-      ready || !song ? "" : waiting,
+      unscored ? "Tour sans note." : "",
       before,
       party.player ? party.player + " chante " + party.song : "",
       party.notice
@@ -639,7 +632,7 @@
         for (const song of participant.songs) {
           const line = element("div", undefined, "track");
           const preparation = song.preparation === "ready" ? "Prêt" :
-            song.preparation === "failed" ? "Préparation en échec" : "En attente de préparation";
+            song.preparation === "failed" ? "Fichier audio indisponible" : "Sélectionné";
           line.append(element("span", song.title + " · " + preparation, "track-info"));
           if (song.preparation === "failed") {
             const selection = {player: player.name, song: song.title};
@@ -700,7 +693,7 @@
     if (document.activeElement !== $("music-volume")) $("music-volume").value = party.audio?.music_ceiling ?? 100;
     displayAdminPlayers(party);
     $("admin-status").textContent = party.notice || (party.phase === "lobby" && !party.can_open ?
-      "Le salon pourra ouvrir dès que le premier morceau sera prêt." : "");
+      "Confirme un premier morceau pour ouvrir le salon." : "");
     const disk = party.blackbox?.free_bytes;
     $("bb-disk").textContent = Number.isFinite(disk) ? (disk / 1e9).toFixed(1) + " Go disponibles" : "";
     if (party.blackbox?.unavailable?.length) $("bb-disk").textContent += " · " + party.blackbox.unavailable.join(", ");

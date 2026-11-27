@@ -1,5 +1,7 @@
 # CHRONOS dans Kara
 
+> Archive du parcours CHRONOS. Kara joue le LRC original. Les implémentations, les captures existantes et les versions de qualification sont conservées, notamment sur les branches locales `experiment/chronos` (`b4cbb40`) et `feat/chronos-integration-v1` (`efc4b69`). Les procédures ci-dessous décrivent la version expérimentale.
+
 ## Pendant une partie
 
 Choisir un parcours dans **Minutage** avant de préparer la sélection. Huang
