@@ -725,6 +725,78 @@ class Preparer:
         item["source"].update(kind="local", file=lrc_token(lrc))
 
 
+PREPARATION_ERRORS = (EOFError, OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError)
+
+
+def prepare_chronos_track(song, preparer, engine, *, for_party, force, progress, send):
+    from _kara_chronos import (cached, displayable, local_tokens, playback_experiment,
+                               prepare as align, source_for, timed_lines)
+    from _kara_stems import duration as probe_duration
+
+    begun = monotonic()
+    progress("lyrics", 8)
+    before = local_tokens(song)
+    # A retrieved LRC remains private and bound to this audio and its
+    # sidecars. Reuse it before consulting any network provider again.
+    receipt = cached(song, engine, cache=preparer.cache)
+    source = (receipt["source"] if receipt and receipt["source"]["timed"]
+              else source_for(song, preparer.cache, include_draft=True, prefer_timed=True))
+    lookup_error = None
+    draft = source["kind"] == "generated-transcription"
+    if not source["timed"] and not draft and before[1] is None:
+        try:
+            raw, provider = preparer.reader(song)
+            source = {"kind": "retrieved", "original": raw.decode("utf-8-sig"),
+                      "provider": provider, "timed": True}
+        except PREPARATION_ERRORS as error:
+            lookup_error = str(error)
+            send("diagnostic", song, engine=engine, phase="lyrics", message=lookup_error)
+    if local_tokens(song) != before:
+        raise ValueError("Le morceau ou les paroles ont changé pendant la recherche.")
+    seconds = receipt["duration"] if receipt else probe_duration(song)
+    lines = timed_lines(source, seconds)
+    if preparer.trace and source["timed"] and not draft:
+        preparer.trace_text(song, "source-lrc", source["original"],
+                            provider=source.get("provider"), sha256=fingerprint(source["original"].encode()))
+
+    # The display has its own admission, input and result. A separate
+    # historical scoring attempt can neither authorize nor revoke it.
+    progress("chronos", 15)
+    preparer.close()
+    selected = "huang" if draft else engine
+    try:
+        status = align(song, preparer.cache, selected, supplied=source, allow_demucs=not draft,
+                       for_party=for_party, source_clock=(seconds, lines) if lines else None,
+                       expected_tokens=before)
+    except PREPARATION_ERRORS as error:
+        status = "unavailable"
+        send("chronos", song, engine=selected, status=status, message=str(error))
+    else:
+        send("chronos", song, engine=selected, status=status)
+    playable = displayable(playback_experiment(song, preparer.cache, engine))
+    score = None if draft else preparer.cache.cached(song, verify=False)
+    cached_score = bool(score and not force)
+    if cached_score:
+        ready, report = True, score["report"]
+    elif draft or (lines and playable and not force) or (lookup_error and before[1] is None):
+        ready = False
+        report = {"message": ("Minutage disponible · chant sans note. Relance l’analyse Turbo pour préparer la notation."
+                              if playable else lookup_error or "Minutage indisponible.")}
+    else:
+        timed = source["original"].encode() if source["timed"] and before[1] is None else None
+        try:
+            ready, report, _, seconds = preparer.prepare(
+                song, force=force, progress=progress, timed=timed,
+                provider=source.get("provider") or "Strawberry")
+        except PREPARATION_ERRORS as error:
+            preparer.close()
+            ready, report = False, {"message": str(error)}
+            send("diagnostic", song, engine="turbo", message=str(error))
+    send("result", song, ready=ready, experimental=playable and not ready, cached=cached_score,
+         report=report, seconds=round(monotonic() - begun, 3), duration=round(seconds, 3))
+    return ready, playable
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("songs", nargs="+", type=Path)
@@ -749,6 +821,8 @@ def main():
                         help="Conserver le calage CHRONOS du texte en brouillon privé sans Demucs.")
     parser.add_argument("--chronos", choices=("huang", "wav2vec2", "huang-ft"),
                         help="Préparer aussi un défilement expérimental pour cette sélection.")
+    parser.add_argument("--for-party", action="store_true",
+                        help="Demande explicite de partie. Autorise CHRONOS pendant la lecture.")
     args = parser.parse_args()
     if args.require_vulkan and args.device != "gpu":
         parser.error("La préparation Vulkan requiert --device gpu.")
@@ -778,6 +852,8 @@ def main():
         parser.error("Version du LRC à conserver invalide")
     failed = False
     force_paths = {path.resolve() for path in args.force_path}
+    if args.for_party and (not args.chronos or plain is not None or timed is not None):
+        parser.error("La priorité de partie concerne uniquement CHRONOS.")
     try:
         for song in dict.fromkeys(path.resolve() for path in args.songs):
             phase = ""
@@ -800,30 +876,17 @@ def main():
                 else:
                     send("chronos", song, engine="huang", status=status)
             if args.chronos and plain is None and timed is None:
-                from _kara_chronos import prepare as prepare_chronos, source_for
-                from _parole_process import Interrupted
-                from _parole_transcribe import draft_source
-
                 try:
-                    draft = draft_source(preparer.cache, song)
-                    use_draft = draft and source_for(song, preparer.cache, include_draft=True) == draft
-                except (OSError, ValueError):
-                    use_draft = False
-                if use_draft:
-                    # Draft text must never become a historical/scoring
-                    # reference. Admit only the bounded Huang path here.
+                    ready, playable = prepare_chronos_track(
+                        song, preparer, args.chronos, for_party=args.for_party,
+                        force=args.force or song in force_paths, progress=progress, send=send)
+                except PREPARATION_ERRORS as error:
                     preparer.close()
-                    progress("chronos", 95)
-                    try:
-                        status = prepare_chronos(song, preparer.cache, "huang", supplied=draft, allow_demucs=False)
-                    except (OSError, ValueError, RuntimeError, KeyError, Interrupted, subprocess.SubprocessError):
-                        status = "unavailable"
-                    send("chronos", song, engine="huang", status=status)
-                    send("result", song, ready=False, experimental=True,
-                         report={"message": "Paroles générées expérimentalement · chant sans note"},
-                         duration=0., seconds=0.)
+                    send("error", song, phase=phase, message=str(error))
                     failed = True
-                    continue
+                else:
+                    failed |= not (ready or playable)
+                continue
             result_available = False
             try:
                 ready, report, elapsed, duration = preparer.prepare(

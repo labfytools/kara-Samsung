@@ -272,6 +272,8 @@ class RemoteParty:
                 for player, songs in choices if index < len(songs)]
 
     def can_offer(self, player, song):
+        if player.training:
+            return self.control.song_available(song, unscored=True, training=True)
         return self.control.song_available(song, unscored=self.unscored_for(player, song))
 
     def unscored_for(self, player, song):

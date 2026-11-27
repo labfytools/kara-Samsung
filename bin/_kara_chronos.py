@@ -44,14 +44,16 @@ def local_tokens(song):
     return [file_token(song), lrc_token(song.with_suffix(".lrc")), lrc_token(song.with_suffix(".txt"))]
 
 
-def source_for(song, cache, *, fallback=None, include_draft=False):
+def source_for(song, cache, *, fallback=None, include_draft=False, prefer_timed=False):
     # The exact editor/source text and order remain available when no time
     # survives alignment. A validated legacy receipt supplies its own order.
     before = local_tokens(song)
-    reference = cache.cached(song, verify=False)
-    if not reference and not include_draft:
-        reference = cache.cached(song, verify=False, insufficient=True)
     lrc, plain = song.with_suffix(".lrc"), song.with_suffix(".txt")
+    if prefer_timed and before[1]:
+        return {"kind": "sidecar-lrc", "original": read_source(lrc).decode("utf-8"), "timed": True}
+    reference = cache.cached(song, verify=False)
+    if not reference and (not include_draft or prefer_timed):
+        reference = cache.cached(song, verify=False, insufficient=True)
     if before[2]:
         raw = read_source(plain).decode("utf-8")
         if raw.strip():
@@ -84,6 +86,29 @@ def reference_lines(source):
     return [row.strip() for row in text.splitlines() if row.strip()]
 
 
+def timed_lines(source, duration):
+    """Accept supplied line onsets on the file clock for display only."""
+    if not source["timed"] or not isfinite(duration) or duration <= 0:
+        return []
+    rows = [(stamp, text) for stamp, text in parse_lrc(source["original"]) if text]
+    if not rows or any(not 0 <= stamp < duration for stamp, _ in rows):
+        return []
+    return [{"text": text, "start": stamp, "words": [], "status": "source-timing",
+             "reason": "lrc-line-onset"} for stamp, text in rows]
+
+
+def displayable(experiment):
+    return bool(experiment and display_index(experiment["lines"])[0])
+
+
+def display_receipt(result):
+    if result and result["status"] in ("abstained", "source-timing"):
+        lines = timed_lines(result["source"], result["duration"])
+        if lines:
+            return dict(result, engine="LRC", status="source-timing", lines=lines)
+    return result
+
+
 def cache_path(song, engine):
     return ROOT / (path_id(song) + "-" + engine + ".json")
 
@@ -111,7 +136,7 @@ def display_index(lines):
 def cached(song, engine, *, cache=None):
     try:
         result = load_json(cache_path(song, engine))
-        if (result["version"] == 1 and result["status"] in ("experimental", "abstained")
+        if (result["version"] == 1 and result["status"] in ("experimental", "abstained", "source-timing")
                 and result["engine"] == engine and result["tokens"] == local_tokens(song)
                 and result["implementation"] == implementation()):
             if result.get("source", {}).get("kind") == "generated-transcription":
@@ -133,12 +158,14 @@ def playback_experiment(song, cache, engine, *, before=None):
     except (OSError, ValueError):
         return None
     experiment = cached(song, engine, cache=cache)
-    if experiment or before[1] or before[2]:
-        return experiment
+    if experiment:
+        return display_receipt(experiment)
+    if before[1] or before[2]:
+        return None
     if engine != "huang":
         candidate = cached(song, "huang", cache=cache)
         if candidate and candidate.get("source", {}).get("kind") == "generated-transcription":
-            return candidate
+            return display_receipt(candidate)
     from _parole_transcribe import draft_display
 
     return draft_display(cache, song, before)
@@ -177,7 +204,7 @@ def guard(directory, *, require_quiet=True):
         return "Lecture en cours. Kara garde la priorité."
 
 
-def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True):
+def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True, for_party=False):
     """Run one explicit alignment under the existing Parole process supervisor."""
     if engine not in (*ENGINES, "edition") or not allow_demucs and engine != "huang":
         raise ValueError("Moteur CHRONOS inconnu.")
@@ -197,7 +224,7 @@ def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True):
             if monotonic() >= last_check + 1:
                 last_check = monotonic()
                 try:
-                    reason = guard(scratch)
+                    reason = guard(scratch, require_quiet=not for_party)
                 except (OSError, ValueError, TypeError, subprocess.SubprocessError):
                     reason = "Mesures système CHRONOS indisponibles"
             return reason is not None
@@ -210,6 +237,7 @@ def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True):
             code, output = run(args, stop=stop, timeout=365, maximum=32_768,
                                env=dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="2",
                                         MKL_NUM_THREADS="2", PYTHONNOUSERSITE="1",
+                                        KARA_CHRONOS_TIMED_PARTY="1" if for_party else "0",
                                         KARA_CHRONOS_ALLOW_DEMUCS="1" if allow_demucs else "0"))
         except Interrupted:
             raise RuntimeError(reason) from None
@@ -219,17 +247,34 @@ def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True):
         return load_json(scratch / "result.json")
 
 
-def prepare(song, cache, engine, *, supplied=None, allow_demucs=True):
+def prepare(song, cache, engine, *, supplied=None, allow_demucs=True, for_party=False, source_clock=None,
+            expected_tokens=None):
     before = local_tokens(song)
+    if expected_tokens is not None and expected_tokens != before:
+        raise ValueError("Le morceau ou les paroles ont changé avant la préparation CHRONOS.")
     source = supplied if supplied is not None else source_for(song, cache)
     if not reference_lines(source):
         raise ValueError("Aucune parole de référence disponible pour cet enregistrement.")
     key = sha256(json.dumps(source, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     previous = cached(song, engine, cache=cache)
-    if (previous and previous["source_sha256"] == key
+    same_source = previous and previous["source_sha256"] == key
+    if (same_source and previous["status"] != "source-timing"
             and (not allow_demucs or previous.get("separation_allowed", True))):
         return previous["status"]
-    result = calculate(song, source, engine, allow_demucs=allow_demucs)
+    admission = {"for_party": True} if for_party else {}
+    failure = None
+    try:
+        result = calculate(song, source, engine, allow_demucs=allow_demucs, **admission)
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
+        # Keep a privately retrieved LRC playable even when admission fails.
+        # Its line times have source provenance and never qualify for scoring.
+        if not source_clock or same_source:
+            raise
+        failure = error
+        seconds, lines = source_clock
+        result = {"version": 1, "implementation": implementation(), "engine": engine,
+                  "status": "source-timing", "source": source, "duration": seconds,
+                  "lines": lines, "audio_sha256": digest(song)}
     if (local_tokens(song) != before or supplied is None and source_for(song, cache) != source
             or source["kind"] == "generated-transcription"
             and source_for(song, cache, include_draft=True) != source):
@@ -256,4 +301,6 @@ def prepare(song, cache, engine, *, supplied=None, allow_demucs=True):
             size -= old.stat().st_size
             old.unlink()
         atomic(cache_path(song, engine), raw)
+    if failure is not None:
+        raise failure
     return result["status"]

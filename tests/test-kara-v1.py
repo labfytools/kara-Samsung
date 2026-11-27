@@ -218,7 +218,7 @@ class FakeController:
         self.available = set()
         self.game_score = SimpleNamespace(breakdown=None, requested=False)
 
-    def song_available(self, song, *, unscored=False):
+    def song_available(self, song, *, unscored=False, training=False):
         return song.path in self.available
 
     def countdown(self):

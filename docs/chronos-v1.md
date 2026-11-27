@@ -8,22 +8,34 @@ signalent un passage difficile. Wav2Vec2 reprend le chemin phonétique du rap
 avec une voix HTDemucs. L’option Huang / HTDemucs-FT demande cette vue
 explicitement. La sélection est indépendante du genre déclaré.
 
-Le moteur local utilise le texte présent dans le fichier voisin, la référence
-historique récupérée ou les tags. Il garde le texte source et associe les
-résultats à l’empreinte SHA-256 du fichier et à celle du PCM. L’accord avec Turbo
-et le contraste phonétique sont des indices. Les mots ou lignes sans repère
-corroboré restent visibles avec un temps absent. Une avance du surlignage par
-mot exige un préfixe de repères observés. Le bouton **Minutage historique**
-rétablit l’affichage historique pour les prochaines sélections. La notation de
-partie continue d’utiliser la référence historique et ses seuils. La justesse
-mélodique n’entre pas dans le calcul CHRONOS. Si la référence historique
-est insuffisante, choisir le parcours de chant sans note proposé par Kara.
-Une protection déclenchée pendant le calcul signale le repli dans le
-lecteur et conserve son motif dans la capture ouverte.
+La préparation utilise le LRC voisin ou une référence déjà obtenue pour
+l’enregistrement. En leur absence, elle peut rechercher un LRC ou exploiter
+un texte local, un tag ou un brouillon Turbo privé. Le résultat garde le
+texte source et est associé au fichier et à ses fichiers voisins. Les
+résultats acoustiques conservent aussi l’empreinte du PCM. Huang peut
+s’appuyer sur son contraste phonétique lorsqu’une demande de partie
+dispose d’un LRC exploitable. Les repères du LRC sont réservés à
+l’affichage. Les mots et lignes sans repère acoustique corroboré gardent
+un temps absent dans le résultat CHRONOS. Quand CHRONOS ne fournit aucun
+début de ligne exploitable, Kara utilise les débuts du LRC ou du brouillon
+timé et indique cette provenance dans le lecteur.
 
-Les calculs CHRONOS réutilisent le superviseur Parole et le verrou local du moteur. Les protections secteur, température, PSI, RAM et disque peuvent suspendre le calcul. Le groupe de calcul est limité à 8 Gio et à deux cœurs. Les vues vocales temporaires sont supprimées à la fin du travail, y compris sur sortie contrôlée. Les reçus de minutage privés occupent au maximum 128 Mio.
+Une préparation avec un LRC exploitable réutilise une référence de
+notation Turbo valide si elle existe. **Relancer l’analyse Turbo** ou
+réessayer la préparation force son calcul. Le score conserve ses seuils et
+sa référence historique. Si seul le minutage est disponible, choisir
+**Autoriser le chant sans note**, puis **Chanter sans note**. Le morceau
+peut alors utiliser le mix original et la partie n’engage aucun calcul de
+score. Le menu **Minutage historique** sélectionne le défilement historique.
 
-Une piste qui dispose seulement d’un brouillon Turbo peut être préparée dans un mode **Minutage CHRONOS**. Après la préparation, choisir **Autoriser le chant sans note**, puis **Chanter sans note** pour utiliser le brouillon et le mix original dans une partie locale. Cette préparation n’engage ni le calcul d’un score ni la séparation des pistes. CHRONOS Huang peut proposer un calage privé sous les protections existantes. Le lecteur indique que les paroles sont générées et affiche les débuts observés. Si CHRONOS est indisponible, les débuts de ligne du brouillon Turbo servent au défilement expérimental. Une référence publiée garde la priorité à la préparation suivante.
+Les calculs CHRONOS réutilisent le superviseur Parole et le verrou local du
+moteur. Une validation explicite de la partie autorise CHRONOS avec
+Strawberry en lecture. La préparation hors partie reste soumise à la
+priorité du lecteur. Les protections secteur, température, PSI, RAM et
+disque s’appliquent à l’admission et pendant le calcul. Le groupe de
+calcul est limité à 8 Gio et à deux cœurs. Les vues vocales temporaires
+sont supprimées à la fin du travail. Les reçus privés de minutage
+partagent un plafond de 128 Mio.
 
 ## BlackBox Studio
 

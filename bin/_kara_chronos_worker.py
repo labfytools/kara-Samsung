@@ -12,7 +12,7 @@ import wave
 
 from _kara_audio_identity import pcm_digest
 from _kara_chronos import (ASSETS, SETTINGS, atomic, audio_duration, implementation,
-                           load_json, reference_lines)
+                           load_json, reference_lines, timed_lines)
 from _kara_chronos_policy import decide, difficult, support
 from _kara_import_resources import lease
 from _kara_stems import ROOT as STEM_ROOT
@@ -181,7 +181,13 @@ def work(song, scratch, engine, expected):
         unmix(verify(configured("UMX"), models, "open-unmix-hq"), song, seconds, voice)
         record_view(result, voice, "umx")
         base, contrast = evaluate(voice)
-        heard = observations(voice, language, models)
+        # Timed sources already provide a display clock. In party
+        # preparation, Huang can corroborate new onsets acoustically without
+        # a second, full-song transcription. Replays keep their lexical audit.
+        phonetic_only = (os.environ.get("KARA_CHRONOS_TIMED_PARTY") == "1"
+                         and bool(timed_lines(source, seconds)))
+        heard = [] if phonetic_only else observations(voice, language, models)
+        result["lexical_evidence"] = "not-requested" if phonetic_only else "turbo"
         deep, deep_contrast = None, None
         if allow_demucs and (engine == "huang-ft" or difficult(base)):
             try:

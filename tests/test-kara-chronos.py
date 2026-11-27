@@ -116,6 +116,65 @@ class ChronosTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 calculate(song, source, "wav2vec2", allow_demucs=False)
 
+    def test_party_relaxes_only_the_playback_gate(self):
+        from _parole_process import Interrupted
+
+        def guarded_run(_args, *, stop, **_kwargs):
+            if stop():
+                raise Interrupted
+            return 17, b"failure"
+
+        with TemporaryDirectory() as directory, patch("_kara_chronos.ROOT", Path(directory)), patch.dict(
+                os.environ, {"KARA_CHRONOS_PYTHON": sys.executable}), patch(
+                "_kara_chronos.run", side_effect=guarded_run), patch("_kara_chronos.guard") as guard:
+            guard.side_effect = lambda _path, require_quiet: "Lecture en cours" if require_quiet else "Réserve mémoire"
+            with self.assertRaisesRegex(RuntimeError, "Lecture en cours"):
+                calculate("audio", {}, "huang")
+            with self.assertRaisesRegex(RuntimeError, "Réserve mémoire"):
+                calculate("audio", {}, "huang", for_party=True)
+            self.assertEqual([call.kwargs for call in guard.call_args_list],
+                             [{"require_quiet": True}, {"require_quiet": False}])
+
+    def test_timed_source_survives_engine_and_score_failures_without_duplicate_work(self):
+        from _kara_chronos import playback_experiment
+        from _kara_prepare import PreparedCache, Preparer, prepare_chronos_track
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            song = root / "audio.flac"
+            song.write_bytes(b"audio fixture")
+            preparer = Preparer(PreparedCache(root / "prepared"))
+            events = []
+            def send(event, _song, **data):
+                events.append((event, data))
+
+            # The Enhanced LRC is retained even if the guarded model never starts.
+            lrc = b"[00:01.00]<00:01.00>Hello <00:01.40>night\n[00:03.00]Again"
+            options = dict(for_party=True, progress=lambda *_: None, send=send)
+            with patch("_kara_chronos.ROOT", root / "chronos"), patch(
+                    "_kara_stems.duration", return_value=5.) as probe, patch(
+                    "_musique_oz.probe", return_value=({}, [])), patch(
+                    "_parole_lyrics_lookup.playback_candidates", return_value=[]), patch.object(
+                    preparer, "reader", return_value=(lrc, "LRCLIB")) as reader, patch(
+                    "_kara_chronos.calculate", side_effect=RuntimeError("Protection mémoire")) as engine, patch.object(
+                    preparer, "prepare", side_effect=RuntimeError("Erreur exacte de référence")) as score:
+                self.assertEqual(prepare_chronos_track(song, preparer, "huang", force=False, **options), (False, True))
+                score.assert_not_called()
+                self.assertEqual(prepare_chronos_track(song, preparer, "huang", force=True, **options), (False, True))
+                score.assert_called_once()
+                reader.assert_called_once_with(song)
+                probe.assert_called_once_with(song)
+                self.assertEqual(engine.call_count, 2)
+                self.assertEqual(events[-1][1]["report"]["message"], "Erreur exacte de référence")
+                playback = playback_experiment(song, preparer.cache, "huang")
+                self.assertEqual(playback["engine"], "LRC")
+                self.assertEqual(playback["source"]["provider"], "LRCLIB")
+                self.assertEqual(display_index(playback["lines"]), ([1., 3.], [0, 1]))
+                self.assertEqual([line["text"] for line in playback["lines"]], ["Hello night", "Again"])
+                song.with_suffix(".lrc").write_text("[00:02]An edition from a human")
+                self.assertIsNone(playback_experiment(song, preparer.cache, "huang"))
+            self.assertFalse(preparer.cache.folder(song).exists())
+
     def test_generated_draft_uses_private_reference_and_stays_outside_score(self):
         from _kara_chronos import playback_experiment, source_for
         from _kara_prepare import PreparedCache, file_token
