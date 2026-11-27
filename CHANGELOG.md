@@ -2,6 +2,9 @@
 
 ## En développement
 
+- Proposer le défilement expérimental CHRONOS sur la sélection, avec les paroles complètes et l’abstention pour les repères incertains.
+- Rejouer des alignements et les comparer sur une capture BlackBox V3, sur la même chronologie que la musique, le microphone et le score.
+
 - Capturer dans BlackBox la référence textuelle et temporelle du tour, avec lecture vérifiée dans Studio.
 
 - Réarmer la préparation nocturne sur secteur stable capot fermé et confirmer les coupures transitoires sans poursuivre les calculs sur batterie.

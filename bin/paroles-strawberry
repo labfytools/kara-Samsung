@@ -24,6 +24,8 @@ from _kara_game import GameScore, LyricVocabulary, words
 from _kara_acoustic_capture import AcousticCapture
 from _kara_blackbox import BlackBox, digest
 from _kara_blackbox_lyrics import record as record_lyrics, snapshot as lyrics_snapshot
+from _kara_chronos import ENGINES as CHRONOS_ENGINES, cached as cached_chronos, cache_path as chronos_path
+from _kara_chronos import display_index as chronos_index
 from _kara_remote_party import RemoteParty
 from _kara_room_audio import RoomAudio
 from _kara_mobile_imports import MobileImports
@@ -147,6 +149,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.tag_reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paroles")
         self.rows = []
         self.lyrics = []
+        self.view_lyrics = []
+        self.chronos_reference = None
+        self.chronos_turn = None
+        self.chronos_times, self.chronos_indices = [], []
+        self.chronos_mode = os.environ.get("KARA_CHRONOS_MODE", "")
+        if self.chronos_mode not in CHRONOS_ENGINES:
+            self.chronos_mode = ""
         self.times = []
         self.raw_lines = []
         self.word_marks = self.word_times = self.word_ends = ()
@@ -319,7 +328,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.tv_toggle = Gtk.ToggleButton(label="Salle / TV", tooltip_text="Activer la salle mobile et l'écran TV sur le réseau local")
         self.tv_toggle.connect("toggled", self.toggle_tv)
         controls.append(self.tv_toggle)
-        self.build_timing_controls()  # Minutage manuel masqué, état interne maintenu.
+        self.build_timing_controls()
         self.score_label = Gtk.Label(xalign=1.0, hexpand=True, wrap=True, css_classes=["game-score"])
         controls.append(self.score_label)
         self.kara_expander.set_child(controls)
@@ -424,7 +433,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.start_maintenance()
         if not self.parole_ui:
             self.parole_ui = ParoleView(self, self.maintenance)
-            self.set_titlebar(self.parole_ui.header())
+            header = self.parole_ui.header()
+            header.pack_start(self.timing_menu)
+            header.pack_start(self.blackbox_button)
+            self.set_titlebar(header)
             self.set_child(self.parole_ui.root)
             self.timers.append(GLib.timeout_add(350, self.parole_ui.refresh))
         self.present()
@@ -527,6 +539,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         }, identity={"room": self.bb_room, "party": self.remote_party.identity}, mode=mode)
         self.bb_line = None
         self.blackbox.emit("party", "recording-start", mode=self.blackbox.status(storage=True)["mode"])
+        if self.party.active and self.turn_phase == "playing":
+            self.log_playback_reference(self.party.active.song.path)
 
     def stop_blackbox(self, reason="manual", *, wait=False):
         self.acoustic.update()
@@ -991,6 +1005,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if paths:
             command = ["nice", "-n", "8", sys.executable, "-B", str(BIN / "_kara_prepare.py"),
                        "--cache", str(self.references.root), "--separate-if-needed",
+                       *(["--chronos", self.chronos_mode] if self.chronos_mode else []),
                        *(["--force"] if force else []),
                        *(["--trace"] if self.blackbox.status()["active"] else []),
                        *(arg for path in retried for arg in ("--force-path", path)), *paths]
@@ -1189,7 +1204,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
             title = self.active_plan[path]
             count = len(self.active_plan)
             done = len(self.align_finished)
-            if kind == "evidence":
+            if kind == "chronos":
+                self.blackbox.emit("chronos", "preparation", song=title, engine=event["engine"],
+                                   status=event["status"], reason=event.get("message"))
+                if path == self.track:
+                    self.file_token = None
+                    self.load_lines()
+            elif kind == "evidence":
                 self.blackbox.emit("turbo", event["kind"], song=title, evidence=event["evidence"])
             elif kind in ("error", "progress", "result"):
                 self.blackbox.emit("turbo", kind, song=title,
@@ -1199,6 +1220,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             if kind == "progress":
                 stages = {"cache": "Vérification du cache", "lyrics": "Récupération des paroles",
                           "model": "Chargement du modèle", "transcription": "Analyse audio par Turbo",
+                          "chronos": "Minutage CHRONOS expérimental",
                           "comparison": "Comparaison des paroles", "correction": "Correction des timestamps",
                           "words": "Synchronisation mot par mot", "separation": "Séparation de la voix",
                           "refinement": "Analyse locale des passages incertains",
@@ -1252,9 +1274,34 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.original_timing = Gtk.CheckButton(label="Afficher le LRC d’origine")
         self.original_timing.connect("toggled", lambda *_: self.load_lines() if self.track else None)
         content.append(self.original_timing)
+        self.chronos_choice = Gtk.DropDown(model=Gtk.StringList.new(
+            ["Minutage historique", "CHRONOS · Huang", "CHRONOS · Wav2Vec2", "CHRONOS · Huang / HTDemucs-FT"]))
+        self.chronos_choice.set_selected(1 + CHRONOS_ENGINES.index(self.chronos_mode) if self.chronos_mode else 0)
+        self.chronos_choice.connect("notify::selected", self.choose_chronos)
+        content.append(self.chronos_choice)
         self.timing_message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
         content.append(self.timing_message)
         return self.timing_menu
+
+    def choose_chronos(self, widget, _property):
+        if self.validating or self.party.active:
+            widget.handler_block_by_func(self.choose_chronos)
+            widget.set_selected(1 + CHRONOS_ENGINES.index(self.chronos_mode) if self.chronos_mode else 0)
+            widget.handler_unblock_by_func(self.choose_chronos)
+            return
+        selected = widget.get_selected()
+        if selected > len(CHRONOS_ENGINES):
+            return
+        self.chronos_mode = ("", *CHRONOS_ENGINES)[selected]
+        self.file_token = None
+        if self.track:
+            self.load_lines()
+
+    def view_anchor(self, position):
+        if self.chronos_reference is None:
+            return bisect_right(self.times, position) - 1
+        index = bisect_right(self.chronos_times, position) - 1
+        return self.chronos_indices[index] if index >= 0 else -1
 
     def apply_timing(self):
         scoring = self.game_toggle.get_active() or self.party.active is not None
@@ -1275,7 +1322,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.word_times = self.word_ends = ()
         self.highlight = -1
         self.next_tv_update = 0
-        self.timing_menu.set_sensitive(bool(self.track and self.raw_lines and not scoring))
+        self.timing_menu.set_sensitive(not scoring)
+        self.timing_spin.set_sensitive(bool(self.track and self.raw_lines))
         self.syncing_offset = True
         self.timing_spin.set_value(self.timing.offset(self.track))
         self.syncing_offset = False
@@ -1362,6 +1410,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.previous_result = player.score, player.done, player.result
         player.score, player.done, player.result = None, False, None
         self.party.active = player
+        self.chronos_turn = (path, cached_chronos(path, self.chronos_mode) if self.chronos_mode else None)
         self.game_score.diagnostic_turn = {"turn": self.bb_turn, "player": player.name, "song": player.song.title}
         self.blackbox.emit("party", "turn-start", **self.game_score.diagnostic_turn, scored=scored, training=player.training,
                            identity={"room": self.bb_room, "party": self.remote_party.identity},
@@ -1609,6 +1658,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.game_score.network_socket.close()
             self.game_score.network_socket = None
         self.party.active = None
+        self.chronos_turn = None
         self.vocal_effect.output_override = None
         if self.turn_mix_strength is not None:
             self.effect_toggle.set_active(False)
@@ -1894,16 +1944,19 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 "party_phase": self.remote_party.phase,
             })
             return
-        active = bisect_right(self.times, position) - 1
-        lines = [self.lyrics[i] if 0 <= i < len(self.lyrics) else "" for i in range(active - 1, active + 3)]
+        active = self.view_anchor(position)
+        lines = [self.view_lyrics[i] if 0 <= i < len(self.view_lyrics) else "" for i in range(active - 1, active + 3)]
         fraction = self.display_progress(position, active, utf16=True) if active >= 0 else 0.0
-        if (self.track, active, self.playback_state) != self.bb_line:
-            self.bb_line = self.track, active, self.playback_state
+        engine = self.chronos_reference["engine"] if self.chronos_reference else "historical"
+        if (self.track, active, self.playback_state, engine) != self.bb_line:
+            self.bb_line = self.track, active, self.playback_state, engine
             self.tv_line_revision += 1
             self.blackbox.emit("lyrics", "tv-line", turn=self.bb_turn, position=position,
-                               revision=self.tv_line_revision, line=active, lines=lines, playback=self.playback_state)
+                               revision=self.tv_line_revision, line=active, lines=lines, playback=self.playback_state,
+                               timing_engine=engine)
         if self.title.get_label():
-            notice = "Paroles minutées indisponibles" if not self.times else " "
+            notice = (self.chronos_notice() if self.chronos_reference else
+                      "Paroles minutées indisponibles" if not self.times else " ")
         else:
             notice = "En attente de Strawberry…"
         self.receiver.update({
@@ -1973,6 +2026,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         self.track = track
         self.active_reference = None
+        self.chronos_reference = None
+        self.chronos_times, self.chronos_indices = [], []
         self.vocal_effect.set_song(track)
         self.update_vocal_effect()
         self.file_token = None
@@ -2061,8 +2116,23 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         show_original = (self.original_timing.get_active() and self.party.active is None
                          and not self.game_toggle.get_active())
-        token = (source_token, audio_token, cache_token, show_original, self.party.active is not None)
+        experiment = None
+        if self.chronos_mode and not show_original:
+            try:
+                experiment = (file_token(chronos_path(self.track, self.chronos_mode)),
+                              lrc_token(self.track.with_suffix(".txt")))
+            except (OSError, ValueError):
+                pass
+        token = (source_token, audio_token, cache_token, show_original, self.party.active is not None,
+                 self.chronos_mode, experiment)
         if token != self.file_token:
+            if self.chronos_turn and self.chronos_turn[0] == self.track:
+                # A turn snapshots its display evidence. Editor changes and
+                # cache eviction affect the next turn on the same recording.
+                current = self.chronos_turn[1]
+                self.chronos_reference = current if current and current["tokens"][0] == audio_token else None
+            else:
+                self.chronos_reference = cached_chronos(self.track, self.chronos_mode) if experiment else None
             self.file_token = token
             self.active_reference = self.references.cached(self.track, verify=False) if cache_token else None
             if self.active_reference:
@@ -2085,6 +2155,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def show_lrc_error(self, message):
         self.file_token = None
         self.active_reference = None
+        self.chronos_reference = None
         if self.rows:
             self.set_lines([])
         self.show_fallback(message, fetch=False)
@@ -2182,16 +2253,26 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.refresh_game()
         self.active = -1
         self.highlight = -1
-        for text in self.lyrics:
+        experimental = self.chronos_reference["lines"] if self.chronos_reference else None
+        self.chronos_times, self.chronos_indices = chronos_index(experimental or ())
+        self.view_lyrics = [line["text"] for line in experimental] if experimental else self.lyrics
+        for index, text in enumerate(self.view_lyrics):
             label = Gtk.Label(label=text, xalign=0.5, justify=Gtk.Justification.CENTER, wrap=True,
                               css_classes=["lyric"])
+            if experimental and experimental[index]["start"] is None:
+                label.set_tooltip_text("Aucun début de ligne corroboré")
             self.box.append(label)
             self.rows.append(label)
         self.scroll.get_vadjustment().set_value(0)
         if self.rows:
             self.style_lines()
-            self.set_footer("", False)
+            self.set_footer(self.chronos_notice() if experimental else "", False)
             self.stack.set_visible_child_name("lyrics")
+
+    def chronos_notice(self):
+        count = len(self.chronos_indices)
+        return (f"Minutage CHRONOS expérimental · {count}/{len(self.view_lyrics)} lignes repérées"
+                if count else "CHRONOS · aucun début de ligne corroboré")
 
     def style_lines(self):
         anchor = max(0, self.active)
@@ -2215,36 +2296,48 @@ class LyricsWindow(Gtk.ApplicationWindow):
         # Take GTK-owned values before the I/O worker runs. A later seek or
         # song selection cannot change the display evidence for this turn.
         reference = self.active_reference
-        displayed = list(zip(self.times, self.lyrics))
+        experiment = self.chronos_reference
+        displayed = ([[line["start"], line["text"]] for line in experiment["lines"]] if experiment
+                     else list(zip(self.times, self.lyrics)))
         plain = self.tag_text
 
         def identify():
             try:
                 files = {"original": {"library_path": str(original.relative_to(LIBRARY.resolve())),
                                       "sha256": digest(original)}}
-                if backing is not None:
-                    files["instrumental"] = {"cache_generation": backing.parent.name, "sha256": digest(backing)}
-                    guide = backing.with_name("vocals.flac")
-                    files["original_voice"] = {"cache_generation": guide.parent.name, "sha256": digest(guide)}
             except (OSError, ValueError):
                 self.blackbox.emit("audio", "error", **context, recording_session=session,
                                    operation="reference-identification")
             else:
+                if backing is not None:
+                    try:
+                        files["instrumental"] = {"cache_generation": backing.parent.name, "sha256": digest(backing)}
+                        guide = backing.with_name("vocals.flac")
+                        files["original_voice"] = {"cache_generation": guide.parent.name, "sha256": digest(guide)}
+                    except OSError:
+                        self.blackbox.emit("audio", "error", **context, recording_session=session,
+                                           operation="stem-reference-identification")
                 self.blackbox.emit("audio", "reference", **context, recording_session=session, files=files)
                 original_text, source = plain, "embedded" if plain else "unavailable"
                 if reference:
-                    original_text, source = reference["source_lrc"], reference.get("source_provider", "prepared-lrc")
+                    original_text, source = reference["source_lrc"], reference["source"].get("provider") or "prepared-lrc"
                 else:
-                    try:
-                        with original.with_suffix(".lrc").open("rb") as lyrics:
-                            raw = lyrics.read(MAX_LRC_BYTES + 1)
-                        if len(raw) <= MAX_LRC_BYTES:
-                            original_text, source = raw.decode("utf-8-sig"), "sidecar-lrc"
-                    except (OSError, UnicodeError):
-                        pass
+                    for suffix, kind in ((".lrc", "sidecar-lrc"), (".txt", "sidecar-text")):
+                        try:
+                            with original.with_suffix(suffix).open("rb") as lyrics:
+                                raw = lyrics.read(MAX_LRC_BYTES + 1)
+                            if len(raw) <= MAX_LRC_BYTES:
+                                original_text, source = raw.decode("utf-8"), kind
+                                break
+                        except (OSError, UnicodeError):
+                            continue
                 try:
-                    record_lyrics(self.blackbox, session, context,
-                                  lyrics_snapshot(files, source, original_text, displayed, reference))
+                    document = lyrics_snapshot(files, source, original_text, displayed, reference)
+                    document["chronos"] = experiment
+                    if experiment and experiment["audio_sha256"] != files["original"]["sha256"]:
+                        document["chronos"] = None
+                        document["chronos_state"] = "audio-identity-mismatch"
+                    record_lyrics(self.blackbox, session, context, document)
                 except (KeyError, TypeError, ValueError):
                     self.blackbox.emit("lyrics", "reference-unavailable", **context,
                                        recording_session=session, reason="snapshot-invalid")
@@ -2291,13 +2384,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.update_tv(position, now)
         if not self.rows or not self.scroll.get_mapped():
             return GLib.SOURCE_CONTINUE
-        active = bisect_right(self.times, position) - 1
+        active = self.view_anchor(position)
         if active != self.active:
             if self.active >= 0:
-                self.rows[self.active].set_text(self.lyrics[self.active])
+                self.rows[self.active].set_text(self.view_lyrics[self.active])
             self.active = active
             self.highlight = -1
             self.style_lines()
+            self.blackbox.emit("lyrics", "pc-line", **context, position=position, line=active,
+                               timing_engine=self.chronos_reference["engine"] if self.chronos_reference else "historical")
 
         if active >= 0:
             self.progress_line(position, active)
@@ -2308,9 +2403,22 @@ class LyricsWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_CONTINUE
 
     def display_progress(self, position, active, *, utf16=False):
-        text = self.lyrics[active]
+        text = self.view_lyrics[active]
         if not text:
             return 0.0
+        if self.chronos_reference is not None:
+            # Highlight a contiguous prefix of observed onsets only. Ends
+            # are diagnostic and a refused word cannot advance the highlight.
+            from re import finditer
+            prefix = 0
+            line = self.chronos_reference["lines"][active]
+            for match, word in zip(finditer(r"\S+", text), line["words"]):
+                if word["start"] is None or word["start"] > position:
+                    break
+                prefix = match.end()
+            if utf16:
+                return len(text[:prefix].encode("utf-16-le")) / len(text.encode("utf-16-le"))
+            return prefix / len(text)
         marks = self.word_marks[active] if self.word_marks else None
         if not marks:
             start = self.times[active]
@@ -2325,7 +2433,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         return shown / len(text)
 
     def progress_line(self, position, active):
-        text = self.lyrics[active]
+        text = self.view_lyrics[active]
         count = int(self.display_progress(position, active) * len(text) + 1e-8)
         if count != self.highlight:
             done = GLib.markup_escape_text(text[:count])

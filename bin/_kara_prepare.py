@@ -744,6 +744,8 @@ def main():
     parser.add_argument("--threads", type=int, choices=range(1, 33))
     parser.add_argument("--backend-logs", action="store_true")
     parser.add_argument("--separate-if-needed", action="store_true")
+    parser.add_argument("--chronos", choices=("huang", "wav2vec2", "huang-ft"),
+                        help="Préparer aussi un défilement expérimental pour cette sélection.")
     args = parser.parse_args()
     if args.require_vulkan and args.device != "gpu":
         parser.error("La préparation Vulkan requiert --device gpu.")
@@ -780,6 +782,7 @@ def main():
                 phase = stage
                 send("progress", song, phase=stage, percent=percent)
 
+            result_available = False
             try:
                 ready, report, elapsed, duration = preparer.prepare(
                     song, force=args.force or song in force_paths, progress=progress, plain=plain,
@@ -790,9 +793,25 @@ def main():
                 send("error", song, message=str(error))
                 failed = True
             else:
-                send("result", song, ready=ready, cached=phase in ("cached", "cached_insufficient"), report=report,
-                     seconds=round(elapsed, 3), duration=round(duration, 3))
+                result_available = True
+                cache_hit = phase in ("cached", "cached_insufficient")
                 failed |= not ready
+            if args.chronos:
+                from _kara_chronos import prepare as prepare_chronos
+
+                # Release Turbo before entering the independently admitted
+                # CHRONOS scope. Its result never changes the score reference.
+                preparer.close()
+                progress("chronos", 95)
+                try:
+                    status = prepare_chronos(song, preparer.cache, args.chronos)
+                except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
+                    send("chronos", song, engine=args.chronos, status="unavailable", message=str(error))
+                else:
+                    send("chronos", song, engine=args.chronos, status=status)
+            if result_available:
+                send("result", song, ready=ready, cached=cache_hit, report=report,
+                     seconds=round(elapsed, 3), duration=round(duration, 3))
     except KeyboardInterrupt:
         return 130
     finally:

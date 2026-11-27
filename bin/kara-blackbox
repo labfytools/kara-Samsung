@@ -356,7 +356,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
-                                          "lyrics-reference", "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
+                                          "lyrics-reference", "chronos-replay", "chronos-edition", "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
                                           "extract-turbo", "replay-turbo", "compare-recognition",
                                           "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
                                           "annotate", "simulate", "diagnose", "delete", "prune"))
@@ -398,6 +398,8 @@ def main():
     parser.add_argument("--budget-bytes", type=int, help="plafond de capture envisagé lors du diagnostic")
     parser.add_argument("--backing", type=Path)
     parser.add_argument("--original", type=Path)
+    parser.add_argument("--chronos-engine", choices=("huang", "wav2vec2", "huang-ft"), default="huang")
+    parser.add_argument("--alternate-audio", type=Path)
     args = parser.parse_args()
     try:
         if args.action == "diagnose":
@@ -466,6 +468,16 @@ def main():
             if not turn:
                 raise ValueError("Choisis un tour ou un cycle V3.")
             output(load(folder, turn))
+        elif args.action in ("chronos-replay", "chronos-edition"):
+            from _kara_blackbox_chronos import replay
+
+            if args.cycle and not args.cycle.startswith(folder.name + "/"):
+                raise ValueError("Cycle hors de la session sélectionnée.")
+            turn = args.cycle.split("/", 1)[1] if args.cycle else args.turn
+            if not turn or (args.action == "chronos-edition") != (args.alternate_audio is not None):
+                raise ValueError("Choisis un tour et, pour une comparaison d’éditions, un autre fichier audio.")
+            output(replay(folder, turn, args.chronos_engine, explicit=args.original,
+                          output=args.output, alternate=args.alternate_audio))
         elif args.action == "replay-round":
             validate_recording(folder, read(folder / "manifest.json"))
             replay_round(args, folder)

@@ -45,6 +45,7 @@ class BlackBoxStudio(Gtk.Window):
         self.paths = []
         self.turns = []
         self.preview = None
+        self.recalculated = None
         self.serial = 0
         self.catalogue_serial = 0
         self.timer = 0
@@ -235,7 +236,9 @@ class BlackBoxStudio(Gtk.Window):
                 for row in rows]))
             self.event_selected()
 
-        self.submit(lambda: tiles(path, turn, origin, start, width), show, self.timeline_state.set_text)
+        recalculated = (self.recalculated["alignment"] if self.recalculated
+                        and self.recalculated["cycle"] == f"{path.name}/{turn}" else None)
+        self.submit(lambda: tiles(path, turn, origin, start, width, recalculated), show, self.timeline_state.set_text)
 
     def event_selected(self, *_):
         index = self.event_picker.get_selected()
@@ -245,9 +248,15 @@ class BlackBoxStudio(Gtk.Window):
     def draw(self, _widget, ctx, width, height):
         ctx.set_source_rgb(.094, .094, .145)
         ctx.paint()
-        if not self.preview or not self.preview["peaks"]:
+        if not self.preview:
             return
-        tracks = self.preview["peaks"]
+        tracks = {**self.preview["peaks"]}
+        markers = self.preview["markers"]
+        for row in markers:
+            tier = row["data"]["tier"]
+            tracks.setdefault(tier, [])
+        if not tracks:
+            return
         top = height / len(tracks)
         for number, (track, peaks) in enumerate(tracks.items()):
             center = (number + .55) * top
@@ -261,6 +270,19 @@ class BlackBoxStudio(Gtk.Window):
                 ctx.move_to(x, center - max(-1, min(1, low)) * top / 2)
                 ctx.line_to(x, center - max(-1, min(1, high)) * top / 2)
             ctx.stroke()
+            for row in markers:
+                if row["data"]["tier"] != track:
+                    continue
+                fraction = (row["monotonic_ns"] - self.preview["begin"]) / (self.preview["end"] - self.preview["begin"])
+                x = 85 + fraction * max(1, width - 85)
+                kind = row["event"]
+                size = {"line": .46, "word-start": .33, "word-end": .21, "abstention": .26, "phone": .1,
+                        "score-decision": .35}[kind]
+                ctx.set_source_rgb(*((1., .58, .59) if kind == "abstention" else
+                                    (.59, .87, .73) if kind == "word-end" else (.71, .75, 1.)))
+                ctx.move_to(x, center - size * top)
+                ctx.line_to(x, center + size * top)
+                ctx.stroke()
 
     def report_page(self):
         page = box()
@@ -270,6 +292,11 @@ class BlackBoxStudio(Gtk.Window):
                               ("lyrics-reference", "Référence des paroles")):
             controls.append(button(label, lambda *_args, kind=action: self.run_report(kind)))
         page.append(controls)
+        replay_controls = box(Gtk.Orientation.HORIZONTAL)
+        self.replay_engine = Gtk.DropDown(model=Gtk.StringList.new(["Huang", "Wav2Vec2", "Huang / HTDemucs-FT"]))
+        replay_controls.append(self.replay_engine)
+        replay_controls.append(button("Recalculer CHRONOS hors ligne", lambda *_: self.run_report("chronos-replay")))
+        page.append(replay_controls)
         scroll, self.report = text_panel()
         page.append(scroll)
         self.pages.append_page(page, Gtk.Label(label="Rapport et rejeu"))
@@ -280,22 +307,32 @@ class BlackBoxStudio(Gtk.Window):
             return
         selected = self.cycles.get_selected()
         turn = self.turns[selected - 1] if 0 < selected <= len(self.turns) else None
-        if action in ("compare-aec", "lyrics-reference") and turn is None:
+        if action in ("compare-aec", "lyrics-reference", "chronos-replay") and turn is None:
             fill(self.report, "Choisis un tour V3 dans la chronologie.")
             return
         fill(self.report, "Traitement…")
+        engine = ("huang", "wav2vec2", "huang-ft")[self.replay_engine.get_selected()]
 
         def run():
             args = [str(BIN / "kara-blackbox"), "--root", str(self.root), action, path.name, "--limit", "50"]
             if action == "compare":
                 args.extend(("--tolerance", ".75", "--tolerance", "1.25"))
-            if turn and action in ("compare", "replay", "compare-aec", "lyrics-reference"):
+            if action == "chronos-replay":
+                args.extend(("--chronos-engine", engine))
+            if turn and action in ("compare", "replay", "compare-aec", "lyrics-reference", "chronos-replay"):
                 args.extend(("--cycle", f"{path.name}/{turn}"))
-            command = subprocess.run(args, capture_output=True, text=True, timeout=120)
+            command = subprocess.run(args, capture_output=True, text=True,
+                                     timeout=390 if action == "chronos-replay" else 120)
             if command.returncode:
                 raise ValueError(command.stderr.strip())
-            return "\n\n".join(json.dumps(json.loads(line), indent=2, ensure_ascii=False)
-                                 for line in command.stdout.splitlines())
+            return [json.loads(line) for line in command.stdout.splitlines()]
 
-        self.submit(run, lambda result: fill(self.report, result) if self.path == path else None,
-                    lambda message: fill(self.report, message))
+        def show(results):
+            if self.path != path:
+                return
+            fill(self.report, "\n\n".join(json.dumps(result, indent=2, ensure_ascii=False) for result in results))
+            if action == "chronos-replay" and results:
+                self.recalculated = results[0]
+                self.refresh_timeline()
+
+        self.submit(run, show, lambda message: fill(self.report, message))

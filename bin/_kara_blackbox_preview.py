@@ -16,7 +16,7 @@ def read_json(path):
         return json.load(source)
 
 
-def tiles(folder, turn, origin, start, seconds):
+def tiles(folder, turn, origin, start, seconds, recalculated=None):
     """Summarize publication time; raw source clocks remain in event detail."""
     elapsed = round(start * SECOND)
     begin = origin + elapsed
@@ -24,6 +24,7 @@ def tiles(folder, turn, origin, start, seconds):
     lo, hi = {}, {}
     listed, layouts = [], {}
     total = 0
+    score_marks = []
     for row in events(folder / "events.jsonl"):
         stamp = row["monotonic_ns"]
         if stamp < begin:
@@ -37,6 +38,10 @@ def tiles(folder, turn, origin, start, seconds):
             total += 1
             if len(listed) < MAX_EVENTS:
                 listed.append(row)
+            if row["event"] == "line-decision" and len(score_marks) < MAX_EVENTS:
+                score_marks.append({"component": row["component"], "event": "score-decision",
+                                    "monotonic_ns": stamp,
+                                    "data": {"tier": "notation historique", "line": data.get("line")}})
             continue
         track = data["track"]
         if track not in TRACKS:
@@ -66,5 +71,12 @@ def tiles(folder, turn, origin, start, seconds):
         low, high = float(sample.min()) / scale, float(sample.max()) / scale
         lo[track][idx] = low if lo[track][idx] is None else min(lo[track][idx], low)
         hi[track][idx] = high if hi[track][idx] is None else max(hi[track][idx], high)
-    return {"peaks": {name: list(zip(lo[name], hi[name])) for name in TRACKS if name in lo},
-            "events": listed, "total": total, "begin": begin, "end": end, "origin": origin}
+    from _kara_blackbox_lyric_clock import project
+
+    markers, references = project(folder, turn, begin, end, BINS, recalculated)
+    peaks = {**references, **{name: list(zip(lo[name], hi[name])) for name in TRACKS if name in lo}}
+    return {"peaks": peaks, "markers": markers + score_marks,
+            "events": sorted(listed + [row for row in markers if row["event"] != "phone"][:MAX_EVENTS],
+                             key=lambda row: row["monotonic_ns"]),
+            "total": total + sum(row["event"] != "phone" for row in markers),
+            "begin": begin, "end": end, "origin": origin}

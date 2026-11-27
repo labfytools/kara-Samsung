@@ -32,7 +32,7 @@ def record(box, session, context, document):
     identity = sha256(raw).hexdigest()
     count = (len(raw) + CHUNK_BYTES - 1) // CHUNK_BYTES
     for index in range(count):
-        encoded = b64encode(raw[index * CHUNK_BYTES:(index + 1) * CHUNK_BYTES]).decode("ascii")
+        encoded = b64encode(raw[index * CHUNK_BYTES:(index + 1) * CHUNK_BYTES]).decode("ascii").rstrip("=")
         box.emit("lyrics", "reference-chunk", **context, recording_session=session,
                  snapshot_sha256=identity, index=index, count=count, payload=encoded)
 
@@ -60,7 +60,7 @@ def load(folder, turn):
         payload = data.get("payload")
         if not isinstance(payload, str) or len(payload) > 4 * ((CHUNK_BYTES + 2) // 3):
             raise ValueError("Fragment de référence BlackBox invalide.")
-        part = b64decode(payload, validate=True)
+        part = b64decode(payload + "=" * (-len(payload) % 4), validate=True)
         if not (0 < len(part) <= CHUNK_BYTES) or index + 1 < total and len(part) != CHUNK_BYTES:
             raise ValueError("Taille de fragment BlackBox invalide.")
         parts.append(part)
