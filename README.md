@@ -22,3 +22,5 @@ Parole gère les imports, la recherche multisource, les albums, les métadonnée
 Le poste utilise Strawberry, MPRIS, Python avec GTK 4 et PyGObject, et les utilitaires d’import spécifiques aux sources utilisées. Le service utilisateur [kara.service](contrib/systemd/user/kara.service) démarre avec la session graphique. Le lanceur Parole ouvre la bibliothèque depuis le menu des applications. L’utilitaire `bin/kara-tv-package` prépare le paquet à signer dans un dossier privé.
 
 Les anciens parcours sont conservés dans les branches locales `archive/kara-avant-back-to-basics-20261127` et `archive/kara-multijoueur-2.1.0`. Les données privées et les captures restent dans l’espace utilisateur.
+
+Pour revenir à une version précédente, restaurer le raccourci, l’unité utilisateur et ses paramètres de lancement depuis la sauvegarde de déploiement, puis redémarrer le service. La télévision accepte le paquet précédent signé avec le même certificat auteur. La restauration de la version s’effectue sur les données présentes afin de garder les imports et LRC acquis depuis la mise à jour.

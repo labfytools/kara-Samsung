@@ -2,7 +2,7 @@
 
 ## Réconciliation de la bibliothèque
 
-L’index Parole reste dans `maintenance.sqlite3`, en WAL. Strawberry fournit des données de collection en lecture seule. Le tri indexé d’OMEGA I et les preuves de provenance d’OMEGA II sont conservés. OMEGA I · OMEGA II
+L’index Parole reste dans `maintenance.sqlite3`, en WAL. Strawberry fournit des données de collection en lecture seule. Le tri indexé d’OMEGA I et les preuves de provenance d’OMEGA II sont conservés. Les rapports de qualification sont conservés dans la branche locale `archive/kara-multijoueur-2.1.0`.
 
 La réconciliation compare les versions du fichier audio, des fichiers associés et du cache Kara. Un fichier associé est relu lorsque sa version change. La lecture bornée vérifie la version avant et après. Le cache de lecture distingue le dernier repère LRC non vide et la présence de texte. La durée du morceau reste un critère de validation du repère. L’index conserve ses pistes inchangées sans écriture et vérifie les disparitions sur un parcours complet. L’identité du répertoire racine et le périphérique des fichiers historiques protègent contre un point de montage indisponible. Les erreurs de parcours suspendent la suppression.
 
