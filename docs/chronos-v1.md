@@ -16,7 +16,10 @@ corroboré restent visibles avec un temps absent. Une avance du surlignage par
 mot exige un préfixe de repères observés. Le bouton **Minutage historique**
 rétablit l’affichage historique pour les prochaines sélections. La notation de
 partie continue d’utiliser la référence historique et ses seuils. La justesse
-mélodique n’entre pas dans le calcul CHRONOS.
+mélodique n’entre pas dans le calcul CHRONOS. Si la référence historique
+est insuffisante, choisir le parcours de chant sans note proposé par Kara.
+Une protection déclenchée pendant le calcul signale le repli dans le
+lecteur et conserve son motif dans la capture ouverte.
 
 Les calculs CHRONOS sont limités à la préparation interactive et aux
 recalculs explicites. Ils réutilisent le superviseur Parole et le verrou
@@ -58,7 +61,13 @@ historique séparément. Les fenêtres restent celles du tour enregistré.
 Un texte différent ou une fenêtre absente peuvent limiter la comparaison.
 Les observations du joueur gardent leur statut de reconnaissance machine.
 
+Pour les commandes locales, charger au préalable l’environnement du service.
+
 ```sh
+set -a
+. .runtime/chronos-local.env
+set +a
+
 bin/kara-blackbox lyrics-reference SESSION --turn TOUR
 bin/kara-blackbox chronos-replay SESSION --turn TOUR --chronos-engine wav2vec2 --output ./comparaison.json
 bin/kara-blackbox chronos-edition SESSION --turn TOUR --alternate-audio /chemin/autre-version.flac --output ./edition.json
@@ -78,9 +87,15 @@ Son fichier d’environnement pointe vers les poids CHRONOS préexistants,
 le Python du runtime Demucs et les dépendances locales Python 3.12.
 Les poids et les dépendances tierces ne font pas partie de ce lot Git.
 Pour revenir à la version précédente, pendant que la salle est inactive,
-retirer uniquement le drop-in CHRONOS, recharger systemd utilisateur puis
-redémarrer Kara. Le lanceur historique et les dossiers des captures et
-résultats restent utilisables.
+désactiver uniquement le drop-in CHRONOS et redémarrer Kara. Le lanceur
+historique et les dossiers des captures et résultats restent utilisables.
+
+```sh
+chronos_dropin="$HOME/.config/systemd/user/kara.service.d/90-chronos-v1.conf"
+mv -- "$chronos_dropin" "$chronos_dropin.disabled"
+systemctl --user daemon-reload
+systemctl --user restart kara
+```
 
 Le dépôt amont de Huang affiche MIT pour le code. Le checkpoint est
 proposé par lien externe dans le README. La documentation consultée

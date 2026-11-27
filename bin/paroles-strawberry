@@ -152,6 +152,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.view_lyrics = []
         self.chronos_reference = None
         self.chronos_turn = None
+        self.chronos_reports = {}
         self.chronos_times, self.chronos_indices = [], []
         self.chronos_mode = os.environ.get("KARA_CHRONOS_MODE", "")
         if self.chronos_mode not in CHRONOS_ENGINES:
@@ -979,6 +980,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.align_finished.clear()
         self.batch_failed = {}
         self.batch_reports = {}
+        self.chronos_reports = {}
         self.batch_ready = {}
         if for_party:
             self.party_selection = self.party_choice()
@@ -1205,6 +1207,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             count = len(self.active_plan)
             done = len(self.align_finished)
             if kind == "chronos":
+                self.chronos_reports[path] = event["status"]
                 self.blackbox.emit("chronos", "preparation", song=title, engine=event["engine"],
                                    status=event["status"], reason=event.get("message"))
                 if path == self.track:
@@ -1955,8 +1958,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                revision=self.tv_line_revision, line=active, lines=lines, playback=self.playback_state,
                                timing_engine=engine)
         if self.title.get_label():
-            notice = (self.chronos_notice() if self.chronos_reference else
-                      "Paroles minutées indisponibles" if not self.times else " ")
+            notice = self.view_notice() or ("Paroles minutées indisponibles" if not self.times else " ")
         else:
             notice = "En attente de Strawberry…"
         self.receiver.update({
@@ -2266,10 +2268,14 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.scroll.get_vadjustment().set_value(0)
         if self.rows:
             self.style_lines()
-            self.set_footer(self.chronos_notice() if experimental else "", False)
+            self.set_footer(self.view_notice(), False)
             self.stack.set_visible_child_name("lyrics")
 
-    def chronos_notice(self):
+    def view_notice(self):
+        if self.chronos_reference is None:
+            if self.chronos_mode and self.chronos_reports.get(self.track) == "unavailable":
+                return "Minutage historique · CHRONOS indisponible"
+            return ""
         count = len(self.chronos_indices)
         return (f"Minutage CHRONOS expérimental · {count}/{len(self.view_lyrics)} lignes repérées"
                 if count else "CHRONOS · aucun début de ligne corroboré")
