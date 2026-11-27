@@ -191,6 +191,27 @@ class InventoryTests(Fixture):
             self.assertEqual(db.execute("SELECT state FROM tasks WHERE kind=? AND subject=?",
                                         (LYRICS, subject)).fetchone()[0], "queued")
 
+    def test_album_replays_a_settled_track_only_for_a_new_audio_revision(self):
+        from _parole_import_enrichment import COVER, LYRICS, schedule
+
+        first = self.audio()
+        second = self.audio("02 Autre.flac", title="Autre")
+        early = schedule(self.index, [first], lyrics_only=True)
+        self.assertEqual(early[COVER], [])
+        subject, = early[LYRICS]
+        old = self.index.claim((LYRICS,), time())
+        self.assertEqual(old["subject"], subject)
+        self.index.finish(old, "review")
+
+        first.unlink()
+        self.assertEqual(self.audio(), first)
+        album = schedule(self.index, [first, second])
+        self.assertEqual(len(album[COVER]), 1)
+        replacement = self.index.claim((LYRICS,), time())
+        self.assertEqual(album[LYRICS], [replacement["subject"]])
+        self.assertNotEqual(replacement["subject"], subject)
+        self.assertEqual(json.loads(replacement["payload"])["paths"], sorted(map(str, (first, second))))
+
     def test_manual_correction_in_lexicon_is_bound_to_sidecar_and_audio(self):
         from _parole_lexicon import records
 

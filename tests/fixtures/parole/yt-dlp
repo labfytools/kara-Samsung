@@ -44,7 +44,7 @@ url = arguments[-1]
 info = {
     "id": video, "title": track["title"], "artist": config["artist"], "duration": 4,
     "webpage_url": url, "original_url": url, "extractor": "youtube", "extractor_key": "Youtube",
-    "formats": [{"url": config["media"], "format_id": "fixture", "ext": "opus",
+    "formats": [{"url": track.get("media", config["media"]), "format_id": "fixture", "ext": "opus",
                  "acodec": "opus", "vcodec": "none", "protocol": "http"}],
 }
 if album.get("source_album"):

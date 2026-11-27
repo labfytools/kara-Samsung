@@ -320,7 +320,7 @@ class AlbumImportTests(unittest.TestCase):
     def update_config(self):
         self.manifest.write_text(json.dumps(self.config), encoding="utf-8")
 
-    def hold_media_bodies(self):
+    def hold_media_bodies(self, *, timeout=18, started=None):
         # Keep real response bodies open while observing leases. Delaying
         # extractor startup would exercise the resolution phase instead.
         audio, release = self.signal, Event()
@@ -332,7 +332,9 @@ class AlbumImportTests(unittest.TestCase):
                 self.end_headers()
                 try:
                     self.wfile.write(audio[:8192])
-                    release.wait(18)
+                    if started is not None:
+                        started.set()
+                    release.wait(timeout)
                     self.wfile.write(audio[8192:])
                 except OSError:
                     pass
@@ -1301,21 +1303,7 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
         self.assertTrue(track.with_suffix(".lrc").is_file())
         self.assertEqual(pcm_digest(track), pcm)
 
-    def test_downloaded_album_enriches_during_strawberry_playback(self):
-        from _parole_import_enrichment import LYRICS
-
-        queue = ImportQueue(self.temp / "state", self.library)
-        url = playlist("PLENRICH")
-        identity = queue.enqueue([("Enrich", url)])
-        worker = self.launch_managed(queue, identity)
-        stdout, stderr = worker.communicate(timeout=35)
-        self.assertEqual(worker.returncode, 0, (stdout, stderr))
-        album = queue.outcomes(identity)[url]
-        self.assertTrue(album["audio_complete"])
-        track, = map(Path, album["tracks"])
-        subject, = album["enrichment"][LYRICS]
-        audio = track.read_bytes()
-        self.assertFalse(track.with_suffix(".lrc").exists())
+    def enrich_one_during_playback(self):
         script = """
 from time import time
 from types import SimpleNamespace
@@ -1336,11 +1324,80 @@ finally:
                                 env=dict(self.env, PYTHONPATH=str(BIN) + os.pathsep + str(FIXTURES)),
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+
+    def test_downloaded_album_enriches_during_strawberry_playback(self):
+        from _parole_import_enrichment import LYRICS
+
+        queue = ImportQueue(self.temp / "state", self.library)
+        url = playlist("PLENRICH")
+        identity = queue.enqueue([("Enrich", url)])
+        worker = self.launch_managed(queue, identity)
+        stdout, stderr = worker.communicate(timeout=35)
+        self.assertEqual(worker.returncode, 0, (stdout, stderr))
+        album = queue.outcomes(identity)[url]
+        self.assertTrue(album["audio_complete"])
+        track, = map(Path, album["tracks"])
+        subject, = album["enrichment"][LYRICS]
+        audio = track.read_bytes()
+        self.assertFalse(track.with_suffix(".lrc").exists())
+        self.enrich_one_during_playback()
         self.assertTrue(track.with_suffix(".lrc").is_file())
         self.assertEqual(track.read_bytes(), audio)
         with Index(self.library, self.temp / "state").db() as db:
             self.assertEqual(db.execute("SELECT state FROM tasks WHERE kind=? AND subject=?",
                                         (LYRICS, subject)).fetchone()[0], "done")
+
+    def test_first_track_enriches_while_next_track_is_downloading(self):
+        from _parole_import_enrichment import COVER, LYRICS
+
+        media = self.config["media"]
+        second_started = Event()
+        release = self.hold_media_bodies(timeout=35, started=second_started)
+        self.config["transfer_failures"].clear()
+        self.config["playlists"]["PLPART"]["tracks"][1]["media"] = self.config["media"]
+        self.config["media"] = media
+        self.update_config()
+        queue = ImportQueue(self.temp / "state", self.library)
+        index = Index(self.library, self.temp / "state")
+        url = playlist("PLPART")
+        identity = queue.enqueue([("Deux pistes", url)])
+        worker = self.launch_managed(queue, identity)
+
+        def tasks(kind):
+            with index.db() as db:
+                return {row["subject"]: row for row in db.execute("SELECT * FROM tasks WHERE kind=?", (kind,))}
+
+        try:
+            self.assertTrue(second_started.wait(15))
+            self.until(lambda: tasks(LYRICS), seconds=15)
+            (subject, task), = tasks(LYRICS).items()
+            track, = map(Path, json.loads(task["payload"])["paths"])
+            self.assertIn("Piste un", track.name)
+            audio = track.read_bytes()
+            lrc = track.with_suffix(".lrc")
+            self.assertFalse(lrc.exists())
+            self.assertEqual(tasks(COVER), {})
+            self.enrich_one_during_playback()
+            self.assertIsNone(worker.poll())
+            self.assertEqual(queue.outcomes(identity), {})
+            self.assertEqual(list(self.library.rglob("*.opus")), [track])
+            self.assertEqual(lrc.read_bytes(), "[00:00.20]Son créé pour le test.".encode())
+            self.assertEqual(track.read_bytes(), audio)
+        finally:
+            release.set()
+        stdout, stderr = worker.communicate(timeout=35)
+        self.assertEqual(worker.returncode, 0, (stdout, stderr))
+        album = queue.outcomes(identity)[url]
+        self.assertTrue(album["audio_complete"])
+        self.assertEqual(set(album["enrichment"][LYRICS]), set(tasks(LYRICS)))
+        self.assertEqual(len(tasks(LYRICS)), 2)
+        self.assertEqual(tuple(tasks(LYRICS)[subject][name] for name in ("state", "attempts")), ("done", 1))
+        self.assertEqual(len(album["enrichment"][COVER]), 1)
+        second, = (Path(value) for value in album["tracks"] if Path(value) != track)
+        self.assertFalse(second.with_suffix(".lrc").exists())
+        self.enrich_one_during_playback()
+        self.assertTrue(second.with_suffix(".lrc").is_file())
+        self.assertEqual(lrc.read_bytes(), "[00:00.20]Son créé pour le test.".encode())
 
     def test_cancel_artist_during_http_wait_while_strawberry_has_priority(self):
         marker = self.temp / "manual-http"

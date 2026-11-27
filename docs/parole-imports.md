@@ -6,7 +6,9 @@ Le tableau de bord et la maintenance sont documentés dans [Parole V3](parole-v3
 
 ## Publication audio et enrichissement
 
-Un résultat « Audio complet » confirme que les pistes de l’édition sont disponibles. Les imports de la file enregistrent séparément les recherches de paroles et de pochettes dans les tâches persistantes de Parole. Le reçu audio permet de rejouer l’admission après une interruption. Les tâches ont des identifiants stables dérivés des chemins publiés. Les sorties audio partielles suivent la même procédure pour les pistes déjà classées.
+Un résultat « Audio complet » confirme que les pistes de l’édition sont disponibles. Dès qu’une piste est vérifiée et classée dans la bibliothèque, la file d’import enregistre sa recherche de LRC et de paroles. La maintenance peut la lancer pendant le téléchargement des autres pistes. Si la source fournit un LRC, celui-ci est copié avant l’admission de la recherche. La recherche de pochette est enregistrée au bilan de l’album.
+
+Le reçu audio permet de rejouer l’admission après une interruption. Le bilan reprend aussi les pistes déjà classées lors d’un import partiel. Les tâches ont des identifiants stables dérivés des chemins publiés. Une recherche déjà terminée pour la même version audio est réutilisée au bilan de l’album.
 
 Kara intègre les pistes publiées par petits lots pendant l’import. La vérification globale avec la collection Strawberry intervient à la fin du lot. Les recherches repassent en maintenance classique quand le traitement initial laisse des éléments manquants. Les recherches de paroles et de LRC continuent pendant la lecture. Les pochettes conservent leur priorité antérieure. Les imports en attente ont priorité sur la préparation lourde, qui retrouve ses tâches après la libération des ressources.
 

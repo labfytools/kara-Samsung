@@ -765,8 +765,23 @@ def download_track(source, folder, progress):
     return result
 
 
+def queue_published_lyrics(progress, track):
+    if not progress.defer_enrichment or progress.measure_index is None:
+        return False
+    paths = available_tracks([str(track)], SHARED_LIBRARY)
+    if not paths:
+        return False
+    try:
+        schedule_enrichment(progress.measure_index, paths, lyrics_only=True)
+    except (OSError, sqlite3.Error) as error:
+        # Album settlement replays this admission from the confirmed paths.
+        progress.log("Paroles", f"Admission à reprendre : {type(error).__name__}")
+        return False
+    return True
+
+
 def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, folder_hint=None, filing_artist=None,
-               selected=None, partial_credits=False, staged_proof=None):
+               selected=None, partial_credits=False, staged_proof=None, early_lyrics=False):
     if not selected and not any(audio_files(batch)):
         return 0, [], {}
     with TemporaryDirectory(prefix="kara-rapport-") as temporary:
@@ -781,10 +796,17 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
             paths.write_text(json.dumps(proofs), encoding="utf-8")
             selection = ["--liste-import", str(paths)]
         delivered = set()
+        admitted = set()
 
         def notify(line):
             try:
                 path, proof = json.loads(line)
+                if not isinstance(path, str):
+                    raise ValueError("Chemin publié invalide.")
+            except (TypeError, ValueError):
+                progress.log("Index", "Publication à rapprocher de l’index")
+                return
+            try:
                 progress.measure_index.notify([path], proofs={path: proof} if proof else None)
                 delivered.add(path)
                 if proof:
@@ -793,6 +815,8 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
                 # Retry with the complete report. The on-disk receipt and V2
                 # watcher also cover a process exit before delivery.
                 progress.log("Index", "Publication à rapprocher de l’index")
+            if early_lyrics and path not in admitted and queue_published_lyrics(progress, path):
+                admitted.add(path)
 
         code = run("Tri dans l’audiothèque",
                    [str(BIN / "musique-tri"), "--bibliotheque", str(SHARED_LIBRARY),
@@ -820,6 +844,11 @@ def sort_audio(batch, progress, album_artist, receipt, *, preserve_tags=False, f
                 # The durable import receipts still describe the published
                 # subset. Album settlement can send the same paths again.
                 progress.log("Index", "Publication à rapprocher de l’index")
+        if early_lyrics:
+            # Large proofs can bypass the publication line and appear here.
+            for path in tracks:
+                if path not in admitted:
+                    queue_published_lyrics(progress, path)
     return data["added"], tracks, data.get("sources", {})
 
 
@@ -1260,8 +1289,12 @@ def import_entries(item, root, inbox, previous, stop, seen, reader, source, refe
                             record_error(progress, "Registre canonique", error)
                         finally:
                             progress.guard = previous_guard
-                    local_sidecars({name: targets[name] for name in names if name in targets},
-                                   entries, root, progress, covers=False)
+                    classified = {name: targets[name] for name in names if name in targets}
+                    # A supplied LRC has first use of the exclusive sidecar
+                    # path, before the network search can publish there.
+                    local_sidecars(classified, entries, root, progress, covers=False)
+                    for track in sorted(set(classified.values())):
+                        queue_published_lyrics(progress, track)
 
                 def pending_entries():
                     for number, name in enumerate(audio, 1):
@@ -1731,7 +1764,7 @@ def import_album(item, root, inbox, previous, stop, seen):
                 def publish_youtube(*, selected=None, partial_credits=False):
                     check_space(folder, extra=MAX_MEDIA * PROCESSING)
                     added, tracks, _ = sort_audio(folder, progress, item.artist, receipt, filing_artist=filing_artist,
-                                                  selected=selected, partial_credits=partial_credits)
+                                                  selected=selected, partial_credits=partial_credits, early_lyrics=True)
                     item.added += added
                     item.tracks = sorted(set(item.tracks).union(tracks))
 

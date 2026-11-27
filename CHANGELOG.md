@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Rechercher les LRC d’origine piste par piste dès leur classement, pendant le téléchargement du reste de l’album. Préserver les LRC fournis et reprendre les recherches interrompues depuis la file persistante.
+
 - Élargir le budget journalier local de LRCLIB, distinguer les envois des reports de quota et remettre en file les LRC reportés après une recherche manuelle.
 
 - Ajouter LRC Lyrics Library, Myaanee et le cache public KuGou à la recherche de LRC. Proposer une vérification manuelle pour les réponses KuGou dont l’édition est incertaine et consulter les variantes LRC d’Unison.

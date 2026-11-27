@@ -36,6 +36,17 @@ def queue_lyrics(index, db, paths, *, manual=None, versions=None):
                           WHERE kind=? AND subject=?""", (time(), document(data), LYRICS, subject))
     remaining = [path for path in paths if path not in active]
     result = {path: choice[0] for path, choice in active.items()}
+    if manual is None and versions is not None and remaining:
+        # Track publication and album settlement share a receipt. The latter
+        # must reuse a settled singleton only for the same audio revision.
+        singletons = {encoded_key(LYRICS, [path]): path for path in remaining if path in versions}
+        for row in db.execute("""SELECT subject,revision FROM tasks WHERE kind=? AND state IN ('done','review')
+            AND subject IN (SELECT value FROM json_each(?))""", (LYRICS, document(list(singletons)))):
+            subject = row["subject"]
+            path = singletons[subject]
+            if row["revision"] == encoded_key(subject, [versions[path]]):
+                result[path] = subject
+        remaining = [path for path in remaining if path not in result]
     for offset in range(0, len(remaining), BATCH_SIZE):
         batch = remaining[offset:offset + BATCH_SIZE]
         subject = encoded_key(LYRICS, batch)
@@ -54,9 +65,8 @@ def queue_lyrics(index, db, paths, *, manual=None, versions=None):
     return result
 
 
-def schedule(index, tracks):
+def schedule(index, tracks, *, lyrics_only=False):
     paths = sorted({str(path) for path in tracks})
-    albums = sorted({str(Path(path).parent) for path in paths})
     subjects = {kind: [] for kind in KINDS}
     if not paths:
         return subjects
@@ -66,6 +76,11 @@ def schedule(index, tracks):
             versions[value] = revision(Path(value).lstat())
         except FileNotFoundError:
             continue
+    if lyrics_only:
+        paths = sorted(versions)
+    if not paths:
+        return subjects
+    albums = [] if lyrics_only else sorted({str(Path(path).parent) for path in paths})
     with index.db(wait=.15) as db:
         db.execute("BEGIN IMMEDIATE")
         # An existing index event owns delivery and its retry cadence.
