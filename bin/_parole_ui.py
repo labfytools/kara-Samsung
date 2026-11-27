@@ -1121,7 +1121,7 @@ class ParoleView:
             cancel.set_sensitive(False)
             current.set_text("")
 
-        cancel = button("Annuler la recherche", stop, sensitive=False)
+        cancel = button("Annuler la recherche", stop)
         for widget in (status, progress, counters, current, errors, cancel):
             content.append(widget)
         window.set_child(content)
@@ -1156,9 +1156,7 @@ class ParoleView:
             if completed == total:
                 finish("Recherche terminée.")
             else:
-                status.set_text("Recherche en cours" if running else
-                                "En attente de la fin de la lecture" if self.maintenance.priority else
-                                "En attente d’un créneau de recherche Parole")
+                status.set_text("Recherche en cours" if running else "En attente d’un créneau de recherche Parole")
             return GLib.SOURCE_REMOVE
 
         def inspect():
@@ -1182,8 +1180,9 @@ class ParoleView:
             except (OSError, ValueError, sqlite3.Error):
                 finish("L’inventaire ou la file Parole est indisponible.")
                 return GLib.SOURCE_REMOVE
-            cancel.set_sensitive(True)
-            self.maintenance.wake.set()
+            if state["done"] or state["cancelling"]:
+                return GLib.SOURCE_REMOVE
+            self.maintenance.prioritize_artist_lyrics(set(state["paths"].values()))
             poll()
             GLib.timeout_add(700, poll)
             return GLib.SOURCE_REMOVE

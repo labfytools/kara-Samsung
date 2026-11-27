@@ -1297,6 +1297,8 @@ from _kara_import_queue import ImportQueue
 from _parole_maintenance import Maintenance
 maintenance = Maintenance(music_library(), Path('collection-fixture'), state=STATE, import_queue=ImportQueue())
 maintenance.current_settings = maintenance.index.settings()
+# Strawberry playback stays in priority throughout the automatic search.
+maintenance.set_priority(True, kara=False)
 with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=50 * 1024 ** 3)):
     assert maintenance.tick_import_enrichment(maintenance.current_settings, time())
 """
@@ -1325,6 +1327,101 @@ with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=5
             self.assertEqual(db.execute("SELECT state FROM tasks WHERE subject=?", (subject,)).fetchone()[0], "done")
         self.assertTrue(track.with_suffix(".lrc").is_file())
         self.assertEqual(pcm_digest(track), pcm)
+
+    def test_downloaded_album_enriches_during_strawberry_playback(self):
+        from _parole_import_enrichment import LYRICS
+
+        queue = ImportQueue(self.temp / "state", self.library)
+        url = playlist("PLENRICH")
+        identity = queue.enqueue([("Enrich", url)])
+        worker = self.launch_managed(queue, identity)
+        stdout, stderr = worker.communicate(timeout=35)
+        self.assertEqual(worker.returncode, 0, (stdout, stderr))
+        album = queue.outcomes(identity)[url]
+        self.assertTrue(album["audio_complete"])
+        track, = map(Path, album["tracks"])
+        subject, = album["enrichment"][LYRICS]
+        audio = track.read_bytes()
+        self.assertFalse(track.with_suffix(".lrc").exists())
+        script = """
+from time import time
+from types import SimpleNamespace
+from unittest.mock import patch
+from _kara_paths import STATE, music_library
+from _kara_import_queue import ImportQueue
+from _parole_maintenance import Maintenance
+
+owner = Maintenance(music_library(), None, state=STATE, import_queue=ImportQueue())
+owner.set_priority(True, kara=False)
+try:
+    with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=50 * 1024 ** 3)):
+        assert owner.tick_import_enrichment(owner.index.settings(), time())
+finally:
+    owner.close()
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", script], cwd=self.temp,
+                                env=dict(self.env, PYTHONPATH=str(BIN) + os.pathsep + str(FIXTURES)),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertTrue(track.with_suffix(".lrc").is_file())
+        self.assertEqual(track.read_bytes(), audio)
+        with Index(self.library, self.temp / "state").db() as db:
+            self.assertEqual(db.execute("SELECT state FROM tasks WHERE kind=? AND subject=?",
+                                        (LYRICS, subject)).fetchone()[0], "done")
+
+    def test_cancel_artist_during_http_wait_while_strawberry_has_priority(self):
+        marker = self.temp / "manual-http"
+        song = self.library / self.config["artist"] / "Recherche bloquée" / "01.flac"
+        self.make_local_track(song, 1)
+        original = song.read_bytes()
+        self.config["lyric_wait"] = str(marker)
+        self.update_config()
+        script = """
+from pathlib import Path
+from threading import Thread
+from time import monotonic, sleep, time
+from types import SimpleNamespace
+from unittest.mock import patch
+import sys
+
+from _kara_paths import STATE, music_library
+from _parole_import_enrichment import LYRICS, queue_artist
+from _parole_maintenance import Maintenance
+
+marker = Path(sys.argv[1])
+with patch('_parole_maintenance.disk_usage', return_value=SimpleNamespace(free=50 * 1024 ** 3)):
+    owner = Maintenance(music_library(), None, state=STATE)
+    owner.set_priority(True, kara=False)
+    queued = queue_artist(owner.index, "Atelier test", "fixture")
+    assert len(queued) == 1
+    result = []
+    job = Thread(target=lambda: result.append(owner.tick_import_enrichment(owner.index.settings(), time())))
+    job.start()
+    try:
+        deadline = monotonic() + 5
+        while not marker.exists() and job.is_alive() and monotonic() < deadline:
+            sleep(.015)
+        assert marker.exists(), "La requête bloquée n'a pas démarré pendant la lecture"
+        owner.set_priority(True, kara=False)
+        assert job.is_alive(), "Le passage en lecture a interrompu la requête"
+        start = monotonic()
+        owner.cancel_artist_lyrics("fixture")
+        job.join(3)
+        assert result == [True] and monotonic() - start < 3, "La réponse réseau retarde l'annulation"
+        with owner.index.db() as db:
+            assert db.execute("select state from tasks where kind=?", (LYRICS,)).fetchone()[0] == "excluded"
+        print("Annulation HTTP :", round(monotonic() - start, 3), "s")
+    finally:
+        owner.close()
+        job.join(4)
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", script, str(marker)], cwd=self.temp,
+                                env=dict(self.env, PYTHONPATH=str(BIN) + os.pathsep + str(FIXTURES)),
+                                capture_output=True, text=True, timeout=14)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        print(result.stdout.strip(), flush=True)
+        self.assertFalse(song.with_suffix(".lrc").exists())
+        self.assertEqual(song.read_bytes(), original)
 
     def test_lost_worker_after_sort_starts_reuses_publication_receipt(self):
         self.config["transfer_failures"].clear()

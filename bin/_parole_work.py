@@ -14,13 +14,11 @@ import sys
 from threading import Lock, local
 from time import monotonic
 
-from _kara_audio_identity import pcm_digest
-from _kara_import_resources import PROCESSING, resource_slot
 from _kara_paths import BIN, DATA, music_library
 from _kara_prepare import file_token
-from _musique_oz import INBOX, shared_mutation
+from _musique_oz import shared_mutation
 from _parole_catalogue import check_album, check_discography, check_recording, request, MBID
-from _parole_index import MEDIA, SIDECAR, Index, collection_reader, document, key, reference_proof, sidecar
+from _parole_index import SIDECAR, Index, collection_reader, document, key, reference_proof, sidecar
 from _parole_import_enrichment import COVER, KINDS, LYRICS, paths_for
 from _parole_import_metrics import snapshot
 from _parole_local_reference import SOURCE as LOCAL_SOURCE, local_reference
@@ -114,29 +112,16 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
         if len(lyrics.encode()) > MAX_LRC_BYTES:
             return {"state": "invalid"}
         return {"state": "found", "source": provider, "lyrics": lyrics}
-    root = index.root
-    if synced:
-        with shared_mutation(root):
-            if file_token(path) != token or path.resolve() != path:
-                return {"state": "rescan"}
-            if not engine.save_lrc(path.with_suffix(".lrc"), lyrics):
-                return {"state": "present"}
-            proof = reference_proof(path, ".lrc", token, provider, external=provider != "Strawberry")
-        index.notify([path], SIDECAR, proofs={str(path): proof})
-    elif path.suffix.lower() in engine.STREAM_TAGS | engine.FILE_TAGS:
-        # The existing engine compares tags and the original audio/image
-        # streams before replacing the container, with stream copy only.
-        def published(current, saved_tags, previous):
-            proof = {"token": document(current), "tags": saved_tags, "same_streams_as": document(previous),
-                     "lyrics_provider": provider, "pcm": audio}
-            index.notify([path], MEDIA, proofs={str(path): proof})
-
-        with resource_slot(root / INBOX / ".kara-traitements", PROCESSING, timeout=12):
-            audio = pcm_digest(path)
-            current = engine.save_lyrics(path, version, tags, lyrics, root, published=published)
-        return {"state": "found", "source": provider, "token": current, "audio": audio}
-    else:
-        return {"state": "invalid"}
+    extension = ".lrc" if synced else ".txt"
+    with shared_mutation(index.root):
+        # The reader may already have the audio open. Publication is an
+        # exclusive sidecar creation for the exact recording version.
+        if file_token(path) != token or path.resolve() != path:
+            return {"state": "rescan"}
+        if not engine.save_lrc(path.with_suffix(extension), lyrics):
+            return {"state": "present"}
+        proof = reference_proof(path, extension, token, provider, external=synced and provider != "Strawberry")
+    index.notify([path], SIDECAR, proofs={str(path): proof})
     return {"state": "found", "source": provider}
 
 

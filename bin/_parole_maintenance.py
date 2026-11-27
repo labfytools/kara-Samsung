@@ -164,6 +164,7 @@ class Maintenance:
         self.interrupt = Event()
         self.scan_now = Event()
         self.index_wake = Event()
+        self.lyrics_wake = Event()
         self.index_progress = None
         self.priority = False
         self.index_priority = False
@@ -186,6 +187,8 @@ class Maintenance:
         self.next_enrichment_delivery = 0.
         self.import_lyrics_stats = None
         self.import_lyrics_live = {}
+        self.import_lyrics_automatic = True
+        self.import_lyrics_preempted = False
         self.next_import_probe = 0.
         self.revision = 0
         self.sampling = 0
@@ -202,6 +205,7 @@ class Maintenance:
         self.shutdown.set()
         self.wake.set()
         self.index_wake.set()
+        self.lyrics_wake.set()
         if self.thread is None:
             self.journal.close()
 
@@ -212,8 +216,11 @@ class Maintenance:
             if busy and self.active and self.active[0] in HEAVY:
                 self.interrupt.set()
             if busy:
-                for cancel in self.import_enrichment_active.values():
-                    cancel.set()
+                # Only artwork retains the playback policy in these lanes.
+                # Lyric workers publish sidecars and never replace the audio.
+                for (kind, _), cancel in self.import_enrichment_active.items():
+                    if kind != IMPORT_LYRICS:
+                        cancel.set()
         if busy and self.active:
             self.wake.set()
 
@@ -266,6 +273,16 @@ class Maintenance:
                 if active:
                     active.set()
         self.wake.set()
+
+    def prioritize_artist_lyrics(self, subjects):
+        # An artist request may reuse the active import. Otherwise yield
+        # the same lane after terminating its existing provider process.
+        with self.lock:
+            for (kind, subject), cancel in self.import_enrichment_active.items():
+                if kind == IMPORT_LYRICS and subject not in subjects and self.import_lyrics_automatic:
+                    self.import_lyrics_preempted = True
+                    cancel.set()
+        self.lyrics_wake.set()
 
     def artist_lyrics_live(self, subjects):
         with self.lock:
@@ -1053,7 +1070,10 @@ class Maintenance:
             os.setpriority(os.PRIO_PROCESS, 0, max(5, os.getpriority(os.PRIO_PROCESS, 0)))
         except OSError:
             pass
+        wake = self.lyrics_wake if kind == IMPORT_LYRICS else self.shutdown
         while not self.shutdown.is_set():
+            if kind == IMPORT_LYRICS:
+                wake.clear()
             try:
                 if kind == IMPORT_LYRICS:
                     self.retry_enrichment_delivery()
@@ -1062,12 +1082,13 @@ class Maintenance:
             except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
                 self.journal.emit("ERROR", "File d’enrichissement temporairement indisponible", "WARNING")
                 self.shutdown.wait(5)
-            self.shutdown.wait(.5)
+            wake.wait(.5)
 
     def tick_import_enrichment(self, settings, now, kind=IMPORT_LYRICS):
         enabled = (settings["lyrics"] or settings["lrc"]) if kind == IMPORT_LYRICS else settings["cover"]
         manual_only = kind == IMPORT_LYRICS and not enabled
-        if ((not enabled and not manual_only) or settings["paused"] or self.priority or self.shutdown.is_set()
+        if ((not enabled and not manual_only) or settings["paused"] or self.shutdown.is_set()
+                or (kind != IMPORT_LYRICS and self.priority)
                 or not self.index.work_due((kind,), now, manual_only=manual_only)):
             return False
         if ((self.import_queue is not None and self.import_queue.pause_requested())
@@ -1076,13 +1097,18 @@ class Maintenance:
         with (self.import_queue.activity() if self.import_queue is not None else nullcontext()) as owner:
             if owner is not None and self.import_queue.pause_requested():
                 return False
-            task = self.index.claim((kind,), now, manual_only=manual_only)
+            task = self.index.claim((kind,), now, manual_only=True) if kind == IMPORT_LYRICS else None
+            if task is None and not manual_only:
+                task = self.index.claim((kind,), now)
             if task is None:
                 return False
             identity = kind, task["subject"]
             cancel = Event()
             with self.lock:
                 self.import_enrichment_active[identity] = cancel
+                if kind == IMPORT_LYRICS:
+                    payload = json.loads(task["payload"])
+                    self.import_lyrics_automatic = not payload.get("manual") or bool(payload.get("automatic"))
             try:
                 self.run_import_enrichment(task, owner, cancel)
             finally:
@@ -1090,6 +1116,8 @@ class Maintenance:
                     self.import_enrichment_active.pop(identity, None)
                     if kind == IMPORT_LYRICS:
                         self.import_lyrics_live.pop(task["subject"], None)
+                        self.import_lyrics_automatic = True
+                        self.import_lyrics_preempted = False
         return True
 
     def run_import_enrichment(self, task, owner, cancel):
@@ -1100,7 +1128,7 @@ class Maintenance:
 
         def stopped():
             nonlocal next_check
-            if self.shutdown.is_set() or self.priority or cancel.is_set():
+            if self.shutdown.is_set() or cancel.is_set() or (kind != IMPORT_LYRICS and self.priority):
                 return True
             now = monotonic()
             if now >= next_check:
@@ -1110,15 +1138,16 @@ class Maintenance:
                     return True
             return False
 
-        self.journal.emit(category, "Paroles et LRC des imports" if kind == IMPORT_LYRICS else "Pochette d’un import")
-        paused = False
+        self.journal.emit(category, "Recherche de paroles et de LRC" if kind == IMPORT_LYRICS else "Pochette d’un import")
+        paused = preempted = False
         try:
             # Import pause drains the child and the claim before the activity
             # lease is released. Other network work has separate cancellation.
             result = self.enrich_import(task, owner, stopped)
         except Interrupted:
             paused = owner is not None and self.import_queue.pause_requested()
-            result = "suspended", "ressources libérées", 0 if paused else 45
+            preempted = kind == IMPORT_LYRICS and self.import_lyrics_preempted
+            result = "suspended", "ressources libérées", 0 if paused or preempted else 45
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
             payload = json.loads(task["payload"])
@@ -1126,7 +1155,7 @@ class Maintenance:
             result = (("temporary", "opération indisponible", 300 * min(72, 2 ** min(7, task["attempts"] - 1)))
                       if automatic_lyrics or task["attempts"] < 2 else
                       ("review", "enrichissement partiel · maintenance complémentaire", 0))
-        self.index.finish(task, *result, refund_attempt=paused)
+        self.index.finish(task, *result, refund_attempt=paused or preempted)
         if paused:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
@@ -1307,17 +1336,8 @@ class Maintenance:
                                                    and seconds >= 0)
             return receive
 
-        # Nocturnal work is exclusively lyrical. Demucs is reserved for an explicit preparation.
-        if not nocturnal and not cached_stems(path):
-            began = monotonic()
-            self.journal.emit("DEMUCS", f"Séparation voix / accompagnement · {song['title']}")
-            rc, _ = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path)],
-                                1800, status("DEMUCS"))
-            self.metrics["demucs_seconds"] = monotonic() - began
-            if rc:
-                return "temporary", "séparation indisponible", 6 * HOUR
-            if nocturnal:
-                self.night_measures["demucs"] = self.metrics["demucs_seconds"]
+        # Full-library preparation can reuse an existing voice reference.
+        # Only Kara's explicit selection path may create a Demucs stem pair.
         analyzed = not saved or saved.get("refinement", {}).get("version") != REFINEMENT_VERSION
         if analyzed:
             self.journal.emit("TURBO", f"Analyse Turbo{' Vulkan' if nocturnal else ''} · {song['title']}")
@@ -1343,7 +1363,7 @@ class Maintenance:
         reference = self.cache.cached(path, verify=False)
         valid_reference = reference and reference.get("refinement", {}).get("version") == REFINEMENT_VERSION
         prepared_stems = cached_stems(path) if valid_reference and not nocturnal else None
-        if valid_reference and (nocturnal or prepared_stems):
+        if valid_reference:
             if nocturnal:
                 folder = self.cache.folder(path)
                 try:
@@ -1354,7 +1374,7 @@ class Maintenance:
                 except OSError:
                     pass
             updated = {"audio": reference["audio"].get("pcm_sha256", "")}
-            if not nocturnal:
+            if prepared_stems:
                 updated["kara"] = "prêt"
             origin = reference["source"]
             generated = bool(origin.get("plain_sha256") and reference_option == "--plain-reference")
@@ -1368,7 +1388,7 @@ class Maintenance:
                 self.journal.emit("LRC", f"Minutage corrigé dans Kara · {song['title']}")
             self.refresh_song(song, **updated)
             self.night_lrc = (corrected, generated)
-            if nocturnal:
+            if not prepared_stems:
                 self.journal.emit("LRC", f"Référence temporelle validée · {song['title']}")
                 return "done", "référence prête", 0
             self.journal.emit("KARA", f"Chanson prête · {song['title']}")
@@ -1713,6 +1733,19 @@ class Maintenance:
         if not self.foreground.is_set() and not settings["night_enabled"] and not imports_pending:
             return
         if self.priority:
+            # During ordinary playback, allow one conventional lyric task
+            # at a time and give the combined artist/import lane precedence.
+            # The playback branch deliberately skips the compute governor.
+            if not self.foreground.is_set() or self.index_priority:
+                return
+            due = self.index.work_due((IMPORT_LYRICS,), now)
+            with self.lock:
+                active_lyrics = any(kind == IMPORT_LYRICS for kind, _ in self.import_enrichment_active)
+            if not due and not active_lyrics and disk_usage(self.index.root).free > settings["reserve_gib"] * 1024**3:
+                kinds = tuple(kind for kind in self.network_kinds(settings, now) if kind in ("lyrics", "lrc"))
+                task = self.claim_network(settings, now, kinds)
+                if task is not None:
+                    self.execute(task)
             return
         if self.import_diagnostics and not self.import_queue.pause_requested():
             self.import_diagnostics.tick(settings, now)

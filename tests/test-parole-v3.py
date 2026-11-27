@@ -405,6 +405,27 @@ class QueueTests(Fixture):
         self.assertEqual(owner.network_width, 3)
         self.assertFalse(owner.network_active)
 
+    def test_manual_request_wakes_lane_and_only_yields_unrelated_automatic_search(self):
+        owner = Maintenance(self.root, None, state=self.base / "state")
+        self.addCleanup(owner.close)
+        cover, lyrics = Event(), Event()
+        owner.import_enrichment_active = {("import_lyrics", "album"): lyrics, ("import_cover", "album"): cover}
+        owner.active = ("prepare", "song")
+        owner.set_priority(True, kara=False)
+        self.assertTrue(owner.interrupt.is_set())
+        self.assertTrue(cover.is_set())
+        self.assertFalse(lyrics.is_set())
+        owner.prioritize_artist_lyrics({"album"})
+        self.assertFalse(lyrics.is_set())
+        owner.import_lyrics_automatic = False
+        owner.prioritize_artist_lyrics({"artist"})
+        self.assertFalse(lyrics.is_set())
+        owner.import_lyrics_automatic = True
+        owner.prioritize_artist_lyrics({"artist"})
+        self.assertTrue(lyrics.is_set())
+        self.assertTrue(owner.lyrics_wake.is_set())
+        self.assertTrue(owner.import_lyrics_preempted)
+
     def test_import_cover_settles_while_lyrics_worker_waits(self):
         owner = Maintenance(self.root, None, state=self.base / "state", background=True)
         owner.index.configure(startup=False, night_enabled=False)
