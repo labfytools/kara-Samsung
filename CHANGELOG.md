@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Ajouter LRC Lyrics Library, Myaanee et le cache public KuGou à la recherche de LRC. Proposer une vérification manuelle pour les réponses KuGou dont l’édition est incertaine et consulter les variantes LRC d’Unison.
+
 - Rétablir les suggestions d’albums pendant une suspension des téléchargements pour réponses vidéo ambiguës. Afficher le motif quand les suggestions échouent.
 
 - Suspendre l’économiseur d’écran Samsung tant que Kara TV 2.2.3 est au premier plan et le rétablir à la sortie.

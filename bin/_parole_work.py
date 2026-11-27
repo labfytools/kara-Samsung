@@ -360,10 +360,17 @@ def test_lyrics_source(index, identity):
     engine = lyrics_engine()
     client = engine.LyricsSources()
     from _parole_lrc_credit import RED
+    from _parole_sources import COMMUNITY_LRC, KUGOU
 
     if identity == RED:
         signature = ("Bohemian Rhapsody (Remastered 2011)", "Queen", "A Night at the Opera", 356.52, "Queen")
         code = "GBUM71029604"
+    elif identity == "LRC Lyrics Library":
+        signature = ("到底發生過什麼事", "Dear Jane", "到底發生過什麼事", 259.375, "Dear Jane")
+        code = None
+    elif identity == "Myaanee":
+        signature = ("Shoujo Rei (少女レイ)", "Miyashita Yuu (宮下遊)", "Ao ni Aruku (2018)", 289, "Miyashita Yuu (宮下遊)")
+        code = None
     else:
         signature = ("Yellow", "Coldplay", "Parachutes", 269, "Coldplay")
         code = None
@@ -371,13 +378,16 @@ def test_lyrics_source(index, identity):
     try:
         for synced in forms:
             text, _ = client.find(*signature, synced=synced, registry=index, isrc=code,
-                                  strict=True, provider_only=identity, refresh=True, original_lrc=identity == RED)
+                                  strict=True, provider_only=identity, refresh=True,
+                                  original_lrc=identity in (RED, KUGOU, *COMMUNITY_LRC))
             if text:
                 return {"state": "found", "format": "mot" if synced and engine.WORD_STAMP.search(text)
                         else "ligne" if synced else "texte"}
     except engine.ServiceUnavailable as error:
         return {"state": "temporary", "detail": str(error)}
     except engine.AmbiguousLyrics as error:
+        if identity == KUGOU:
+            return {"state": "review", "detail": "LRC reçu · édition à confirmer"}
         return {"state": "ambiguous", "detail": str(error)}
     return {"state": "not_found"}
 
@@ -450,6 +460,37 @@ def main():
                    else "absent", monotonic() - began)
             result = {"state": state, "value": value}
     print(document(result))
+
+
+def import_lrc_candidate(index, identity, digest, expected_audio):
+    """Publie le candidat KuGou choisi, pour la version audio consultée."""
+    from hashlib import sha256
+    from _parole_lyrics_lookup import recording_candidates
+    from _parole_sources import KUGOU
+
+    song = index.song(identity)
+    if not song or song["token"] != expected_audio:
+        raise ValueError("Le morceau a changé. Rouvre ses détails.")
+    audio = Path(song["path"])
+    if not audio.is_relative_to(index.root) or audio.resolve(strict=True) != audio:
+        raise ValueError("Morceau hors bibliothèque")
+    engine = lyrics_engine()
+    with shared_mutation(index.root):
+        # The selection identifies the exact cached bytes for this exact
+        # audio version. Publication is exclusive even after user approval.
+        token = file_token(audio)
+        if document(token) != expected_audio or audio.resolve(strict=True) != audio:
+            raise ValueError("Le morceau a changé. Rouvre ses détails.")
+        entries = recording_candidates(index.path, audio, include_text=True).get("synced", [])
+        raw = next((item["text"] for item in entries if item["decision"] == "unverified"
+                    and item["provider"] == KUGOU and item["sha256"] == digest), None)
+        if (not isinstance(raw, str) or sha256(raw.encode()).hexdigest() != digest
+                or not engine.catalog_transcript(raw, song["duration"], synced=True, original_lrc=True)):
+            raise ValueError("Ce candidat a expiré ou contient un minutage invalide.")
+        if not engine.save_lrc(audio.with_suffix(".lrc"), raw, original=True):
+            raise ValueError("Un LRC existe déjà pour ce morceau.")
+        proof = reference_proof(audio, ".lrc", token, KUGOU, external=True)
+    index.notify([audio], SIDECAR, proofs={str(audio): proof})
 
 
 def save_correction(index, identity, suffix, original_version, text, *, expected_audio=None, draft=False):

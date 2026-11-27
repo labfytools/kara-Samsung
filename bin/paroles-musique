@@ -814,7 +814,7 @@ class LyricsSources:
              refresh=False, audit=None, original_lrc=False):
         from _parole_import_metrics import LOOKUP, snapshot
         from _parole_lrc_credit import CREDITED, RED, UNISON, save_links
-        from _parole_sources import LYRICS_BROKER_UPSTREAMS, lyrics_rows, ready_sources
+        from _parole_sources import COMMUNITY_LRC, KUGOU, LYRICS_BROKER_UPSTREAMS, lyrics_rows, ready_sources
 
         signature = (title, artist, album, duration, album_artist)
         code = normalize_isrc(isrc)
@@ -862,6 +862,8 @@ class LyricsSources:
                     names.insert(1, RED)
                 if code:
                     names.append(UNISON)
+                names.extend(COMMUNITY_LRC)
+                names.append(KUGOU)
             if audit:
                 for row in rows:
                     if row["id"] in names and row["state"] != "active":
@@ -904,6 +906,7 @@ class LyricsSources:
             if registry and name not in providers:
                 continue
             row = providers.get(name)
+            search_version = LRC_SEARCH_VERSION + int(name == UNISON)
             identity = cache_identity(name, (*signature, code), synced,
                                       local_text if name == "LyricDown" else "",
                                       strict, row["config"], original_lrc=original_lrc) if row is not None else None
@@ -915,7 +918,7 @@ class LyricsSources:
                 with lookup_slot(registry, lock_key) if lock_key else nullcontext():
                     hit, result = cached(registry, identity) if identity and not refresh else (False, None)
                     if (hit and synced and original_lrc and result["text"] is None
-                            and result.get("metadata", {}).get("search_version") != LRC_SEARCH_VERSION):
+                            and result.get("metadata", {}).get("search_version") != search_version):
                         hit = False
 
                     def note(event):
@@ -924,7 +927,11 @@ class LyricsSources:
 
                     if hit:
                         self.cache_hits += 1
-                        note({"type": "provider", "outcome": "cache-hit" if result["text"] is not None else "cache-miss"})
+                        review = result.get("metadata", {}).get("unverified")
+                        if review:
+                            entries.append(dict(review, provider=name))
+                        note({"type": "provider", "outcome": "cache-review" if review else
+                              "cache-hit" if result["text"] is not None else "cache-miss"})
                     elif registry and (name not in available or "limited_until" in measured.get(name, {})
                                        or name == "lyrics.ovh" and not set(LYRICS_BROKER_UPSTREAMS).issubset(
                                            ready_sources(registry, time.time()))):
@@ -957,7 +964,7 @@ class LyricsSources:
                         if identity:
                             if not error and not conflict:
                                 if synced and original_lrc and result["text"] is None:
-                                    result["metadata"]["search_version"] = LRC_SEARCH_VERSION
+                                    result["metadata"]["search_version"] = search_version
                                 remember(registry, identity, result)
                             elif error:
                                 temporary(registry, identity, name, str(error))
@@ -1017,13 +1024,18 @@ class LyricsSources:
             if isinstance(failed, ServiceUnavailable):
                 raise failed
             raise ServiceUnavailable("Au moins un fournisseur est indisponible")
+        if strict and any(item["decision"] == "unverified" for item in entries):
+            # The candidate is already available in the track details.
+            # A provider's earlier retry horizon still wins over review.
+            raise AmbiguousLyrics("Correspondance ambiguë")
         return None, None
 
     def query(self, name, clients, row, signature, local_text, synced, registry, strict, context, code, *, audit):
         from _parole_import_metrics import LOOKUP, SUCCEEDED, observe
-        from _parole_lrc_catalogues import lookup
+        from _parole_lrc_catalogues import community_lookup, kugou_lookup, lookup
         from _parole_lrc_credit import CREDITED
-        from _parole_sources import LyricsEndpoint, ProviderUnavailable, lyrics_rows, record, record_lyrics
+        from _parole_sources import (COMMUNITY_LRC, KUGOU, LyricsEndpoint, ProviderUnavailable,
+                                     lyrics_rows, record, record_lyrics)
 
         started = time.monotonic()
         candidates = []
@@ -1088,19 +1100,35 @@ class LyricsSources:
             try:
                 title, artist, album, duration, album_artist = signature
                 variants = lyric_queries(title, artist, album, album_artist, timed=synced)
+                def score(item):
+                    return recording_score(item, *signature, isrc=code,
+                                           on_reject=lambda row, reason: candidate(row, None, reason))
+
+                def native(raw):
+                    return catalog_transcript(raw, duration, synced=True, original_lrc=True)
+
                 if name in CREDITED:
                     label, credit, _ = next(iter(variants), (title, artist, album))
                     result = lookup(
                         name, signature, code, registry, transport_event,
-                        score=lambda item: recording_score(item, *signature, isrc=code,
-                                                           on_reject=lambda row, reason: candidate(row, None, reason)),
-                        validate=lambda raw: catalog_transcript(raw, duration, synced=True, original_lrc=True),
+                        score=score, validate=native,
                         search_text=f"{label} {credit}",
                     )
                     if result:
                         item, value, attribution = result
                         candidate(item, value, "compatible")
                         candidates[-1]["metadata"]["attribution"] = attribution
+                elif name == KUGOU:
+                    if result := kugou_lookup(signature, registry, transport_event, score=score, validate=native):
+                        item, raw, verified = result
+                        candidate(item, raw, "compatible" if verified else "unverified")
+                        if verified:
+                            value = raw
+                elif name in COMMUNITY_LRC:
+                    if result := community_lookup(name, signature, registry, transport_event,
+                                                  score=score, validate=native, title_key=title_key):
+                        item, value = result
+                        candidate(item, value, "compatible")
                 else:
                     variants = list(dict.fromkeys([(title, artist, album), *variants]))
                     endpoint = LyricsEndpoint(conf["host"], conf["path"])
@@ -1117,7 +1145,7 @@ class LyricsSources:
                 conflict = True
             except (ProviderUnavailable, ValueError) as failure:
                 error = failure
-                if name in CREDITED:
+                if name in CREDITED or name == KUGOU or name in COMMUNITY_LRC:
                     current = next(row for row in lyrics_rows(registry) if row["id"] == name)
                     if current["last_http"] == 429 or current["remaining"] == 0:
                         error = ServiceUnavailable(str(failure), "limited")
@@ -1136,6 +1164,8 @@ class LyricsSources:
             observe(registry, name, {LOOKUP: elapsed, SUCCEEDED: int(value is not None)})
             record_profile(registry, name, synced, context, elapsed, value is not None)
         metadata = next((item["metadata"] for item in candidates if item["text"] == value), {})
+        if unverified := next((item for item in candidates if item["decision"] == "unverified"), None):
+            metadata = {"unverified": unverified}
         return cache_value(value, metadata), error, conflict, candidates
 
 

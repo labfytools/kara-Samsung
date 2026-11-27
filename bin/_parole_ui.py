@@ -23,9 +23,9 @@ from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL
 from _parole_lrc_credit import UNISON, load_links
 from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_music_registry import set_alias
-from _parole_sources import configure_limits, controls, lyrics_rows, move_lyrics_source, night_lrc_providers, provider_limits
+from _parole_sources import KUGOU, configure_limits, controls, lyrics_rows, move_lyrics_source, night_lrc_providers, provider_limits
 from _parole_resources import GIB
-from _parole_work import save_correction
+from _parole_work import import_lrc_candidate, save_correction
 
 PAGE = 80
 STATES = {"absent": "Absent", "prêt": "Prêt", "partiel": "Partiel", "externe": "Externe",
@@ -925,6 +925,42 @@ class ParoleView:
         editbar.append(edit)
         editbar.append(save)
         editbar.append(cancel)
+        ku = next((item for item in candidates.get("synced", [])
+                   if item["provider"] == KUGOU and item["decision"] == "unverified"), None)
+        if ku and lrc_token(path.with_suffix(".lrc")) is None:
+            def inspect_kugou(_):
+                dialog = Gtk.Window(title="Vérifier le LRC KuGou", transient_for=window,
+                                    destroy_with_parent=True, default_width=660, default_height=470)
+                content = box(css_classes=["panel-content"])
+                dialog.set_child(content)
+                content.append(Gtk.Label(label=f"{row['title']} · {row['artist']} · {row['album']}",
+                                         wrap=True, xalign=0))
+                content.append(Gtk.Label(label="Écoute le morceau et vérifie que les repères correspondent à cette édition.",
+                                         wrap=True, xalign=0))
+                preview = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+                preview.get_buffer().set_text(ku["text"])
+                content.append(scroller(preview, vexpand=True))
+                message = Gtk.Label(xalign=0, wrap=True)
+
+                def confirm(_):
+                    try:
+                        import_lrc_candidate(self.index, identity, ku["sha256"], row["token"])
+                    except (OSError, ValueError, sqlite3.Error) as error:
+                        message.set_text(str(error))
+                        return
+                    self.maintenance.index_wake.set()
+                    review.set_sensitive(False)
+                    forms.set_selected(1)
+                    reload_text()
+                    status.set_text("LRC d’origine importé")
+                    dialog.close()
+
+                content.append(message)
+                content.append(button("Confirmer et importer le LRC", confirm))
+                dialog.present()
+
+            review = button("Vérifier le LRC KuGou", inspect_kugou)
+            panel.append(review)
         if identification:
             found = json.loads(identification[0])
             if found.pop("token", None) == row["token"]:
@@ -1694,7 +1730,8 @@ class ParoleView:
                         value = json.loads(stdout)
                         labels = {"found": "Correspondance vérifiée", "candidate": "Lien attribué",
                                   "not_found": "Enregistrement de test introuvable", "reachable": "Service joignable",
-                                  "temporary": "Échec temporaire", "ambiguous": "Correspondance ambiguë"}
+                                  "temporary": "Échec temporaire", "ambiguous": "Correspondance ambiguë",
+                                  "review": "Correspondance à vérifier"}
                         detail = labels.get(value["state"], states.get(value["state"], value["state"]))
                         if format_name := value.get("format"):
                             detail += f" ({format_name})"

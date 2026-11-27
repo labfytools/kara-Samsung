@@ -1057,6 +1057,13 @@ class GtkTests(Fixture):
         wait_library()
         self.assertEqual(modifications, [True])
         self.assertEqual(view.song_selection.get_selected_item().data["id"], visible.data["id"])
+        from _kara_files import file_token
+        from _parole_lyrics_lookup import cache_value, save_candidates
+        from _parole_sources import KUGOU
+
+        offered_lrc = "\ufeff[00:00.20]Paroles à confirmer  \r\n"
+        entry = dict(cache_value(offered_lrc), provider=KUGOU, decision="unverified")
+        save_candidates(window.maintenance.index, (path, file_token(path)), [entry], synced=True)
         view.details(view.songs.get_item(0).data)
         detail = next(w for w in Gtk.Window.get_toplevels() if w.get_transient_for() is window
                       and w.get_title() == visible.data["title"])
@@ -1102,6 +1109,13 @@ class GtkTests(Fixture):
         editor_buttons["Annuler la correction"].emit("clicked")
         self.assertTrue(formats.get_sensitive())
         self.assertFalse(path.with_suffix(".lrc").exists())
+        editor_buttons["Vérifier le LRC KuGou"].emit("clicked")
+        review = next(w for w in Gtk.Window.get_toplevels() if w.get_title() == "Vérifier le LRC KuGou")
+        self.assertFalse(path.with_suffix(".lrc").exists())
+        confirm = next(widget for widget in descendants(review) if isinstance(widget, Gtk.Button)
+                       and widget.get_label() == "Confirmer et importer le LRC")
+        confirm.emit("clicked")
+        self.assertEqual(path.with_suffix(".lrc").read_bytes(), offered_lrc.encode())
 
         view.tree_selection.set_selected(0)
         self.assertTrue(view.import_artist.get_sensitive())

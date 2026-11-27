@@ -2,7 +2,7 @@
 """Qualification hors réseau des admissions et de la provenance V3."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, nullcontext
-from hashlib import sha256
+from hashlib import sha1, sha256
 import json
 import os
 from pathlib import Path
@@ -20,13 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 
 from _kara_files import file_token
-from _parole_index import Index
+from _parole_index import Index, document
 from _parole_lrc_credit import RED, UNISON, load_links
-from _parole_lyrics_lookup import CACHE_KIND, EVIDENCE_KIND, TEMPORARY_KIND, playback_candidates
+from _parole_lyrics_lookup import CACHE_KIND, EVIDENCE_KIND, TEMPORARY_KIND, playback_candidates, recording_candidates
 from _parole_lrclib_local import candidates
-from _parole_sources import (configure_limits, lyrics_rows, move_lyrics_source, night_lrc_providers, ready_sources,
+from _parole_sources import (KUGOU, configure_limits, lyrics_rows, move_lyrics_source, night_lrc_providers, ready_sources,
                              record_quota, seed)
-from _parole_work import lyrics_engine
+from _parole_work import import_lrc_candidate, lyrics_engine
 
 SONG = ("Chanson", "Groupe", "Album", 30, "Groupe")
 TIMED = "[00:01.00]Premier mot"
@@ -147,6 +147,95 @@ class LyricsTests(unittest.TestCase):
         self.assertEqual((row["category"], row["state"], row["remaining"], row["interval"]),
                          ("lyrics_candidate,lrc", "disabled", 19, 3))
         self.assertNotIn(UNISON, {row["id"] for row in night_lrc_providers(self.index)})
+
+    def test_unison_checks_a_native_variant_when_the_default_is_ttml(self):
+        self.only(UNISON)
+        code, video = "FR8EU2300090", "Ugr4KKK_SqY"
+        contributor = {"displayName": "Contributrice", "keyId": "native"}
+        item = dict(id=12, lyrics="<tt>TTML</tt>", isrc=code, format="ttml", song=SONG[0],
+                    artist=SONG[1], album=SONG[2], videoId=video, submitter=contributor)
+        default = {"success": True, "data": item}
+        listing = {"success": True, "data": [{"id": 12, "format": "ttml"}, {"id": 13, "format": "lrc"}]}
+        native = dict(item, id=13, format="lrc", lyrics=TIMED)
+        for value, wanted in ((native, (TIMED, UNISON)), (dict(native, isrc="FR8EU2300091"), (None, None))):
+            with patch("_parole_lrc_catalogues.fetch", side_effect=[
+                default, listing, {"success": True, "data": value}
+            ]) as request:
+                self.assertEqual(self.engine.LyricsSources().find(*SONG, synced=True, original_lrc=True,
+                                 strict=True, registry=self.index, isrc=code, refresh=True), wanted)
+                self.assertEqual(request.call_args.args[0], "https://unison.betterlyrics.org/lyrics/13")
+
+    def test_community_directory_is_shared_and_download_checks_blob_and_native_metadata(self):
+        name = "LRC Lyrics Library"
+        self.only(name)
+        raw = b"\xef\xbb\xbf[ti:Chanson]\r\n[ar:Groupe]\r\n[al:Album]\r\n[length:00:30]\r\n[00:01.00]Original \r\n"
+        path = "lrc/Groupe/Album/01. Chanson.lrc"
+        blob = sha1(f"blob {len(raw)}\0".encode() + raw, usedforsecurity=False).hexdigest()
+        tree = {"truncated": False, "tree": [
+            dict(path=path, size=len(raw), mode="100644", type="blob", sha=blob),
+            dict(path="../01. Autre.lrc", size=len(raw), mode="100644", type="blob", sha=blob)]}
+        options = dict(synced=True, original_lrc=True, strict=True, registry=self.index)
+        with patch("_parole_lrc_catalogues.fetch", side_effect=[tree, raw]) as request:
+            self.assertEqual(self.engine.LyricsSources().find(*SONG, **options), (raw.decode(), name))
+            self.assertEqual(request.call_count, 2)
+        with patch("_parole_lrc_catalogues.fetch", side_effect=AssertionError("absence dans le dépôt local")):
+            self.assertEqual(self.engine.LyricsSources().find("Autre", *SONG[1:], **options), (None, None))
+        with patch("_parole_lrc_catalogues.fetch", return_value=b"fichier remplace"):
+            with self.assertRaises(self.engine.ServiceUnavailable):
+                self.engine.LyricsSources().find(*SONG, **options, refresh=True)
+
+    def test_kugou_unknown_edition_stays_in_review_until_exclusive_native_import(self):
+        self.only(KUGOU)
+        raw = "\ufeff[00:01.00]Premier mot  \r\n[00:04.00]Suite\r\n"
+        audio = self.library / "track.flac"
+        audio.write_bytes(b"audio fixture")
+        token = file_token(audio)
+        options = dict(synced=True, original_lrc=True, strict=True, registry=self.index,
+                       recording=(audio, token))
+        with patch("_parole_lrc_catalogues.fetch", return_value={"provider": "kugou", "lyrics": raw}) as request:
+            with self.assertRaises(self.engine.AmbiguousLyrics):
+                self.engine.LyricsSources().find(*SONG, **options)
+            self.assertIn("/kugou/getLyrics?s=Chanson&a=Groupe&al=Album&d=30", request.call_args.args[0])
+        with patch("_parole_lrc_catalogues.fetch", side_effect=AssertionError("candidat en cache")):
+            with self.assertRaises(self.engine.AmbiguousLyrics):
+                self.engine.LyricsSources().find(*SONG, **options)
+        target = audio.with_suffix(".lrc")
+        self.assertFalse(target.exists())
+        entry, = recording_candidates(self.index.path, audio, include_text=True)["synced"]
+        self.assertEqual((entry["decision"], entry["text"]), ("unverified", raw))
+        song = dict(token=document(token), path=str(audio), duration=30)
+        with patch.object(self.index, "song", return_value=song):
+            import_lrc_candidate(self.index, "track", entry["sha256"], song["token"])
+            self.assertEqual(target.read_bytes(), raw.encode())
+            with self.assertRaisesRegex(ValueError, "existe déjà"):
+                import_lrc_candidate(self.index, "track", entry["sha256"], song["token"])
+            audio.write_bytes(b"different audio")
+            with self.assertRaisesRegex(ValueError, "a changé"):
+                import_lrc_candidate(self.index, "track", entry["sha256"], song["token"])
+
+    def test_kugou_accepts_native_identity_and_rejects_a_conflicting_album(self):
+        self.only(KUGOU)
+        raw = "[ti:Chanson]\n[ar:Groupe]\n[al:Album]\n[length:00:30.00]\n" + TIMED
+        options = dict(synced=True, original_lrc=True, strict=True, registry=self.index, refresh=True)
+        with patch("_parole_lrc_catalogues.fetch", return_value={"provider": "kugou", "lyrics": raw}):
+            self.assertEqual(self.engine.LyricsSources().find(*SONG, **options), (raw, KUGOU))
+        with patch("_parole_lrc_catalogues.fetch", return_value={
+            "provider": "kugou", "lyrics": raw.replace("[al:Album]", "[al:Autre]")
+        }):
+            self.assertEqual(self.engine.LyricsSources().find(*SONG, **options), (None, None))
+
+    def test_kugou_miss_in_anonymous_cache_does_not_suspend_other_songs(self):
+        self.only(KUGOU)
+        headers = {"X-Provider": "kugou", "X-Auth-Mode": "cache", "X-Cache-Status": "MISS",
+                   "X-RateLimit-Type": "normal"}
+        response = SimpleNamespace(status=401, headers=headers, getheader=headers.get)
+        connection = SimpleNamespace(request=lambda *args, **kwargs: None, getresponse=lambda: response)
+        with patch("_parole_sources.wait_service"), patch(
+            "_parole_sources.https_connection", return_value=nullcontext(connection)):
+            self.assertEqual(self.engine.LyricsSources().find(*SONG, registry=self.index,
+                             synced=True, original_lrc=True, strict=True), (None, None))
+            row = next(row for row in lyrics_rows(self.index) if row["id"] == KUGOU)
+            self.assertEqual((row["availability"], row["used_today"]), ("ready", 1))
 
     def test_lrc_red_429_keeps_retry_after_and_falls_back_without_caching_a_miss(self):
         self.only(RED, "NetEase")

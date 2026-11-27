@@ -176,7 +176,7 @@ def cached(index, identity):
         with index.db(wait=.2) as db:
             row = db.execute("SELECT checked,state,value FROM reviews WHERE kind=? AND subject=?",
                              (CACHE_KIND, identity)).fetchone()
-        if row and time() - row["checked"] < (MAX_ABSENCE_AGE if row["state"] == "absent" else MAX_AGE):
+        if row and time() - row["checked"] < (MAX_AGE if row["state"] == "verified" else MAX_ABSENCE_AGE):
             value = json.loads(row["value"])
             if isinstance(value, dict) and isinstance(value.get("text"), (str, type(None))):
                 text = value["text"]
@@ -195,11 +195,11 @@ def cache_value(text, metadata=None):
 
 
 def remember(index, identity, value):
+    state = "review" if value["metadata"].get("unverified") else "absent" if value["text"] is None else "verified"
     try:
         with index.db(wait=.2) as db:
             db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",
-                       (CACHE_KIND, identity, "absent" if value["text"] is None else "verified",
-                        time(), document(value)))
+                       (CACHE_KIND, identity, state, time(), document(value)))
             db.execute("DELETE FROM reviews WHERE kind=? AND subject=?", (TEMPORARY_KIND, identity))
     except sqlite3.Error:
         pass
@@ -236,7 +236,7 @@ def save_candidates(index, recording, entries, *, synced):
             previous = value.get(form, [])
             entries = list({(item["provider"], item["sha256"], item["decision"]): item
                             for item in [*previous, *entries]}.values())
-            order = {"selected": 0, "ambiguous": 1, "compatible": 2, "alternative": 3}
+            order = {"selected": 0, "ambiguous": 1, "unverified": 2, "compatible": 3, "alternative": 4}
             entries = sorted(entries, key=lambda item: order.get(item["decision"], 4))[:MAX_CANDIDATES]
             value[form] = entries
             db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",

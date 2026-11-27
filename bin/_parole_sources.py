@@ -23,6 +23,12 @@ from _parole_import_metrics import Transfer, limited, observe
 from _parole_lrc_credit import RED, UNISON, red_contact
 from _parole_lyrics_lookup import backoff
 
+KUGOU = "KuGou (Better Lyrics)"
+COMMUNITY_LRC = {
+    "LRC Lyrics Library": ("sonikkk-526/lrc-lyrics-library", "main"),
+    "Myaanee": ("Myaanee/lyrics", "master"),
+}
+
 BUILTINS = {
     "LRCLIB": ("lrclib.net", "lyrics,lrc", "https://lrclib.net/docs"),
     "lyrics.ovh": ("api.lyrics.ovh", "lyrics", "https://lyricsovh.docs.apiary.io/"),
@@ -32,6 +38,9 @@ BUILTINS = {
     "LyricDown": ("lyricdown.com", "lrc", ""),
     RED: ("lrc.red", "lrc", "https://lrc.red/api"),
     UNISON: ("unison.betterlyrics.org", "lyrics_candidate,lrc", "https://docs.betterlyrics.org/unison"),
+    KUGOU: ("api.betterlyrics.org", "lrc", "https://docs.betterlyrics.org/reference/get-lyrics"),
+    **{name: ("api.github.com", "lrc", f"https://github.com/{repo}")
+       for name, (repo, _) in COMMUNITY_LRC.items()},
     "YouTube Music": ("music.youtube.com", "catalogue,cover,import", ""),
     ARCHIVE: ("archive.org", "catalogue,import", "https://archive.org/developers/md-read.html"),
     JAMENDO: ("api.jamendo.com", "catalogue,import", "https://developer.jamendo.com/v3.0/authentication"),
@@ -50,7 +59,8 @@ RECENT_SOURCE_KIND = "source_latency_samples"
 LYRICS_STATS = "lyrics_source_statistics"
 LYRICS_RATE = "lyrics_source_remote_quota"
 LYRICS_BROKER_UPSTREAMS = ("LRCLIB", "NetEase")
-LYRICS_DEFAULT_ORDER = ("LRCLIB", RED, "NetEase", "QQ Music", UNISON, "Genius", "LyricDown", "lyrics.ovh")
+LYRICS_DEFAULT_ORDER = ("LRCLIB", RED, "NetEase", "QQ Music", UNISON, *COMMUNITY_LRC, KUGOU,
+                        "Genius", "LyricDown", "lyrics.ovh")
 
 SOURCE_OUTCOMES = frozenset(("found", "absent", "error", "ambiguous", "different_edition"))
 COVER_PROVIDERS = {host: identity for identity, (host, category, _) in BUILTINS.items()
@@ -222,7 +232,7 @@ def night_lrc_providers(index, *, now=None, db=None):
     """Providers with an approved adapter that can deliver native LRC."""
     from _parole_lrclib_local import configured_snapshot
 
-    direct = {"LRCLIB", RED, UNISON, "NetEase", "QQ Music"}
+    direct = {"LRCLIB", RED, UNISON, KUGOU, "NetEase", "QQ Music", *COMMUNITY_LRC}
     providers = [row for row in lyrics_rows(index, db=db, now=now)
                  if row["state"] == "active" and "lrc" in row["category"].split(",")
                  and (row["id"] in direct or row["adapter"] == "lrclib" and row["decoded"].get("validated"))]
@@ -403,6 +413,11 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
 def fetch_response(parts, interval, accept, registry, provider, validation, event, user_agent):
     service = parts.hostname if registry is not None or parts.hostname == "lrclib.net" else "parole-" + parts.hostname
     if registry is not None:
+        if parts.hostname == "api.github.com":
+            try:
+                wait_service(service, .5, max_wait=5)
+            except ImportIssue as error:
+                raise ProviderUnavailable("Quota GitHub en attente") from error
         wait_provider(registry, provider, service, interval, validation=validation,
                       lyrics=provider == "Unison" or event is not None)
     else:
@@ -426,10 +441,25 @@ def fetch_response(parts, interval, accept, registry, provider, validation, even
                 record_quota(registry, provider, getattr(response, "headers", {}))
             if response.status == 404:
                 return None
+            if (response.status == 401 and provider == KUGOU
+                    and response.getheader("X-Provider") == "kugou" and response.getheader("X-Auth-Mode") == "cache"
+                    and response.getheader("X-Cache-Status") == "MISS"
+                    and response.getheader("X-RateLimit-Type") in ("normal", "cached")
+                    and not response.getheader("Retry-After")):
+                # This recording needs a key. Cache the anonymous miss,
+                # without delaying other recordings in the public cache.
+                if event is not None:
+                    event["reason"] = "hors cache public"
+                return None
             if response.status in (401, 403, 429, 451) or response.status >= 500:
                 retry = response.getheader("Retry-After", "")
                 denied = response.status in (401, 403, 451)
-                delay = provider_backoff(registry, provider, service, max(300 if denied else 0, retry_delay(retry)),
+                minimum = max(300 if denied else 0, retry_delay(retry))
+                if parts.hostname == "api.github.com" and response.getheader("X-RateLimit-Remaining") == "0":
+                    reset = response.getheader("X-RateLimit-Reset", "")
+                    if re.fullmatch(r"[0-9]{1,10}", reset):
+                        minimum = max(minimum, int(reset) - time())
+                delay = provider_backoff(registry, provider, service, minimum,
                                          response.status, lookup_access=denied)
                 defer_service(service, delay)
                 raise ProviderUnavailable(f"Fournisseur HTTP {response.status}")
