@@ -111,6 +111,10 @@ def encoded_key(*parts):
     return sha256(document(parts).encode()).hexdigest()
 
 
+def track_plan_revision(song):
+    return encoded_key(song["token"], song["side"], song["title"], song["artist"], song["edition"])
+
+
 def queue_lexicon(db, identity, now):
     # A newer receipt supersedes even a claim already computing forms. The
     # worker can settle only the exact revision it claimed.

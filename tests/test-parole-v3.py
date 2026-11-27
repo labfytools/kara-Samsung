@@ -337,6 +337,38 @@ class InventoryTests(Fixture):
 
 
 class QueueTests(Fixture):
+    def test_manual_lrc_quota_uses_existing_night_lane_and_keeps_published_lrc(self):
+        from _parole_import_enrichment import LRC_QUOTA_RETRY, defer_artist_lrc
+        from _parole_index import track_plan_revision
+
+        target = self.audio("01 À reprendre.flac")
+        complete = self.audio("02 Présent.flac")
+        complete.with_suffix(".lrc").write_text("[00:01.00]Déjà présent")
+        self.scan()
+        rows = {row["path"]: row for row in self.songs()}
+        wanted = rows[str(target)]
+        now = time()
+        self.index.enqueue("lrc", wanted["id"], track_plan_revision(wanted), 35, now=now - 1)
+        result = {"lrc": "limited", "audit": [
+            {"provider": "LRCLIB", "outcome": "limited", "form": "lrc"},
+            {"provider": "QQ Music", "outcome": "limited", "form": "lyrics"}]}
+        available = [dict(id="LRCLIB", availability="limited", next_available=now + 90),
+                     dict(id="QQ Music", availability="limited", next_available=now + 30)]
+        with patch("_parole_sources.night_lrc_providers", return_value=available):
+            self.assertEqual(defer_artist_lrc(self.index, {str(target): result, str(complete): result}, now=now),
+                             {str(target): now + 90})
+        with self.index.db() as db:
+            task = db.execute("SELECT * FROM tasks WHERE kind='lrc'").fetchone()
+        self.assertEqual((task["state"], task["detail"], task["priority"], task["due"]),
+                         ("temporary", LRC_QUOTA_RETRY, 12, now + 90))
+        self.assertEqual(task["revision"], track_plan_revision(wanted))
+        self.assertIsNone(self.index.claim(("lrc",), now + 89, night_lrc=True))
+        claimed = self.index.claim(("lrc",), now + 90, night_lrc=True)
+        self.assertEqual(claimed["subject"], wanted["id"])
+        with patch("_parole_sources.night_lrc_providers", return_value=available):
+            self.assertFalse(defer_artist_lrc(self.index, {str(target): result}, now=now + 90))
+        self.assertEqual(complete.with_suffix(".lrc").read_text(), "[00:01.00]Déjà présent")
+
     def test_classic_queue_ignores_legacy_global_quota_and_counts_external_publications(self):
         owner = Maintenance(self.root, None, state=self.base / "state")
         self.addCleanup(owner.close)
@@ -629,7 +661,7 @@ class SourceTests(Fixture):
         owner.output = Mock(wraps=owner.output)
         with self.index.db() as db:
             db.execute("""INSERT INTO daily_usage(bucket,day,used)
-                          SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 2000 ELSE 200 END FROM sources""")
+                          SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 6000 ELSE 200 END FROM sources""")
         settings = owner.current_settings = self.index.settings()
         self.index.enqueue("lrc", second["id"], "fixture")
         kinds = owner.network_kinds(settings, time())
@@ -708,7 +740,7 @@ class SourceTests(Fixture):
                 if not available:
                     with self.index.db() as db:
                         db.execute("""INSERT INTO daily_usage(bucket,day,used)
-                                      SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 2000 ELSE 200 END FROM sources""")
+                                      SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 6000 ELSE 200 END FROM sources""")
                 settings = owner.current_settings = self.index.settings()
                 kinds = owner.network_kinds(settings, time())
                 self.assertEqual("lrc" in kinds, available)
@@ -808,7 +840,7 @@ class SourceTests(Fixture):
     def test_lyrics_quota_skips_network_but_keeps_local_text_provider_distinct(self):
         from _parole_sources import configure_limits, provider_limits, ready_categories
         seed(self.index)
-        self.assertEqual(provider_limits({"host": "lrclib.net"}), (2000, 2))
+        self.assertEqual(provider_limits({"host": "lrclib.net"}), (6000, 2))
         self.assertEqual(provider_limits({"host": "musicbrainz.org"}), (200, 0))
         with self.index.db() as db:
             db.execute("UPDATE sources SET state='disabled' WHERE id NOT IN ('LRCLIB','LyricDown')")

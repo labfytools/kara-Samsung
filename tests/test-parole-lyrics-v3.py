@@ -489,11 +489,16 @@ class LyricsTests(unittest.TestCase):
                  ("missing", "missing"), ("missing", "limited"), ("temporary", "missing"))
         audit = [{"type": "request", "provider": "LRCLIB", "sent": True},
                  {"type": "provider", "provider": "LRCLIB", "outcome": "found"},
-                 {"type": "publication", "provider": "LRCLIB", "form": "lrc"}]
+                 {"type": "publication", "provider": "LRCLIB", "form": "lrc"},
+                 {"type": "request", "provider": KUGOU, "sent": True, "http": 401, "reason": "hors cache public"},
+                 {"type": "provider", "provider": "Myaanee", "outcome": "absent", "contacted": False},
+                 {"type": "provider", "provider": "LRCLIB", "outcome": "limited"}]
         rows = {i: {"lyrics": plain, "lrc": timed} for i, (plain, timed) in enumerate(cases)}
         rows[2]["audit"] = audit
         self.assertEqual(artist_summary(rows), (dict.fromkeys(ARTIST_OUTCOMES, 1),
-                         {"LRCLIB": {"requests": 1, "found": 1, "published_lrc": 1}}))
+                         {"LRCLIB": {"requests": 1, "found": 1, "published_lrc": 1, "limited": 1},
+                          KUGOU: {"requests": 1, "public_cache_miss": 1},
+                          "Myaanee": {"absent": 1, "local_miss": 1}}))
         self.assertEqual(artist_lrc_summary(rows),
                          {"present": 1, "limited": 2, "found": 1, "review": 1, "missing": 2})
 

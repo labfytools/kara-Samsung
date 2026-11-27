@@ -23,7 +23,8 @@ from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL
 from _parole_lrc_credit import UNISON, load_links
 from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_music_registry import set_alias
-from _parole_sources import KUGOU, configure_limits, controls, lyrics_rows, move_lyrics_source, night_lrc_providers, provider_limits
+from _parole_sources import (KUGOU, configure_limits, controls, lyrics_rows, max_daily_requests,
+                             move_lyrics_source, night_lrc_providers, provider_limits)
 from _parole_resources import GIB
 from _parole_work import import_lrc_candidate, save_correction
 
@@ -1081,14 +1082,24 @@ class ParoleView:
                                                        for key, label in LRC_OUTCOMES.items()
                                                        if key in ("found", "present") or timed.get(key))
             lines = [lrc_line, f"Textes simples récupérés · {counts.get('lyrics', 0)}"]
-            if resumes is not None:
-                lines.append(f"Prochain quota LRC · {datetime.fromtimestamp(resumes):%d/%m à %H:%M}")
+            requeued = sum("lrc_retry_at" in row for row in values.values())
+            if requeued:
+                lines.append(f"{requeued} LRC en file pour reprise automatique")
+            if resumes is not None and resumes > time():
+                lines.append(f"Prochaine disponibilité LRC · {datetime.fromtimestamp(resumes):%d/%m à %H:%M}")
             counters.set_text("\n".join(lines))
             if sources:
-                errors.set_text("\n".join(f"{name} · {data.get('requests', 0)} requêtes · "
-                                          f"{data.get('found', 0)} correspondances · "
-                                          f"{data.get('published_lyrics', 0) + data.get('published_lrc', 0)} publications"
-                                          for name, data in sources.items()))
+                rows = []
+                for name, data in sources.items():
+                    detail = [f"{data.get('requests', 0)} envoyées"]
+                    for key, label in (("limited", "reports pour quota"), ("public_cache_miss", "hors cache public"),
+                                       ("local_miss", "absences vérifiées localement"), ("cache-miss", "absences en cache"),
+                                       ("http_429", "HTTP 429"), ("found", "correspondances"),
+                                       ("published_lrc", "LRC publiés"), ("published_lyrics", "textes publiés")):
+                        if amount := data.get(key):
+                            detail.append(f"{amount} {label}")
+                    rows.append(" · ".join([name, *detail]))
+                errors.set_text("\n".join(rows))
             progress.set_fraction(completed / total if total else 1.)
             progress.set_text(f"{completed}/{total} morceaux analysés")
             current.set_text("Recherche en cours · " + ", ".join(Path(path).stem for path in running[:4])
@@ -1112,8 +1123,9 @@ class ParoleView:
             running = [path for path in live if path in paths and path not in durable]
             next_quota = None
             if any(row["lrc"] == "limited" for row in results.values()):
-                next_quota = min((row["next_available"] for row in night_lrc_providers(self.index)
-                                  if row["next_available"] is not None), default=None)
+                dates = [row["lrc_retry_at"] for row in results.values() if "lrc_retry_at" in row]
+                next_quota = min(dates or [row["next_available"] for row in night_lrc_providers(self.index)
+                                           if row["next_available"] is not None], default=None)
             return results, running, next_quota
 
         def poll():
@@ -1857,7 +1869,7 @@ class ParoleView:
         window = Gtk.Window(title=f"Limites · {source['name']}", transient_for=self.settings_dialog,
                             modal=True, destroy_with_parent=True, default_width=520)
         panel = box(css_classes=["panel-content"])
-        daily_spin = Gtk.SpinButton.new_with_range(0, 2000, 1)
+        daily_spin = Gtk.SpinButton.new_with_range(0, max_daily_requests(config), 1)
         seconds_spin = Gtk.SpinButton.new_with_range(0, 300, 1)
         for label, spin, value in (("Requêtes HTTP de maintenance par jour", daily_spin, daily),
                                    ("Intervalle minimal (secondes)", seconds_spin, seconds)):

@@ -54,6 +54,7 @@ HOST = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z
 PATH = re.compile(r"/[a-zA-Z0-9_/-]{0,200}")
 MAX_RESPONSE = 1_000_000
 DEFAULT_REQUESTS = 200
+LRCLIB_DAILY_REQUESTS = 6000
 RECENT_SOURCE_LIMIT = 128
 RECENT_SOURCE_KIND = "source_latency_samples"
 LYRICS_STATS = "lyrics_source_statistics"
@@ -85,29 +86,33 @@ def request_slot(host, timeout):
         yield
 
 
+def max_daily_requests(config):
+    return LRCLIB_DAILY_REQUESTS if config.get("host") == "lrclib.net" else 2000
+
+
 def provider_limits(config):
     limits = config.get("rate", {})
     # LRCLIB documents per-minute, not daily, allowances. Give its anonymous
     # client a bounded local budget and a conservative 30-request/min pace.
     # Explicit user settings and the transport's Retry-After still win.
     lrclib = config.get("host") == "lrclib.net"
-    daily = limits.get("daily", 2000 if lrclib else DEFAULT_REQUESTS)
+    daily = limits.get("daily", LRCLIB_DAILY_REQUESTS if lrclib else DEFAULT_REQUESTS)
     seconds = limits.get("seconds", 2 if lrclib else 0)
-    if type(daily) is not int or not 0 <= daily <= 2000 or type(seconds) is not int or not 0 <= seconds <= 300:
+    if (type(daily) is not int or not 0 <= daily <= max_daily_requests(config)
+            or type(seconds) is not int or not 0 <= seconds <= 300):
         raise ValueError("Limites de recherche fournisseur invalides")
     return daily, seconds
 
 
 def configure_limits(index, identity, daily, seconds):
-    limits = {"daily": daily, "seconds": seconds}
-    provider_limits({"rate": limits})
     with index.db() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT config FROM sources WHERE id=?", (identity,)).fetchone()
         if not row:
             raise ValueError("Fournisseur inconnu")
         config = json.loads(row[0])
-        config["rate"] = limits
+        config["rate"] = {"daily": daily, "seconds": seconds}
+        provider_limits(config)
         db.execute("UPDATE sources SET config=? WHERE id=?", (document(config), identity))
 
 

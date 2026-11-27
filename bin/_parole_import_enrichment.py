@@ -5,12 +5,13 @@ from pathlib import Path
 from time import time
 
 from _musique_oz import audio_files, grouped_path
-from _parole_index import document, encoded_key, index_path, path_rows, revision
+from _parole_index import NIGHT_LRC_MISSING, document, encoded_key, index_path, path_rows, revision, track_plan_revision
 
 LYRICS = "import_lyrics"
 COVER = "import_cover"
 KINDS = (LYRICS, COVER)
 BATCH_SIZE = 16
+LRC_QUOTA_RETRY = "quota LRC · reprise automatique"
 
 
 def queue_lyrics(index, db, paths, *, manual=None, versions=None):
@@ -170,6 +171,44 @@ def artist_lrc_summary(results):
     return Counter(row["lrc"] if row["lrc"] in LRC_OUTCOMES else "error" for row in results.values())
 
 
+def defer_artist_lrc(index, results, *, now=None):
+    """Transfer manual quota misses to the persistent LRC lane."""
+    from _parole_sources import night_lrc_providers
+
+    limited = {path: row for path, row in results.items() if row.get("lrc") == "limited"}
+    if not limited:
+        return {}
+    now = time() if now is None else now
+    requeued = {}
+    with index.db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        sources = {row["id"]: row for row in night_lrc_providers(index, db=db, now=now)}
+        fallback = [row["next_available"] for row in sources.values() if row["next_available"]]
+        # Use the same revision and task as the regular planner. A later
+        # scan must not discard this retry, and an active claim keeps ownership.
+        for song in db.execute(f"""SELECT s.* FROM songs s
+            WHERE s.path IN (SELECT value FROM json_each(?)) AND {NIGHT_LRC_MISSING}
+            AND NOT EXISTS (SELECT 1 FROM exclusions e WHERE e.kind='artist' AND e.subject=s.owner)
+            ORDER BY s.id""", (document(list(limited)),)).fetchall():
+            path = song["path"]
+            affected = {event.get("provider") for event in limited[path].get("audit", ()) if event.get("form") == "lrc"
+                        and (event.get("outcome") == "limited" or event.get("http") == 429)}
+            dates = [row["next_available"] or now for name in affected if (row := sources.get(name))
+                     and row["availability"] in ("limited", "ready")]
+            if not (dates or fallback):
+                continue
+            due = max(now, min(dates or fallback))
+            generation = track_plan_revision(song)
+            index.enqueue("lrc", song["id"], generation, 12, now=now, db=db)
+            changed = db.execute("""UPDATE tasks SET state='temporary', due=?, updated=?, detail=?,
+                priority=min(priority,12) WHERE kind='lrc' AND subject=? AND revision=?
+                AND state IN ('queued','temporary','suspended','review')""",
+                (due, now, LRC_QUOTA_RETRY, song["id"], generation)).rowcount
+            if changed:
+                requeued[path] = due
+    return requeued
+
+
 def artist_summary(results):
     outcomes = Counter(track_outcome(row) for row in results.values())
     sources = defaultdict(Counter)
@@ -180,8 +219,12 @@ def artist_summary(results):
                     sources[name]["requests"] += 1
                     if event.get("http") == 429:
                         sources[name]["http_429"] += 1
+                    if event.get("reason") == "hors cache public":
+                        sources[name]["public_cache_miss"] += 1
                 elif event["type"] == "provider":
                     sources[name][event["outcome"]] += 1
+                    if event["outcome"] == "absent" and event.get("contacted") is False:
+                        sources[name]["local_miss"] += 1
                 elif event["type"] == "publication":
                     sources[name]["published_" + event["form"]] += 1
     return dict(outcomes), {name: dict(stats) for name, stats in sorted(sources.items())}

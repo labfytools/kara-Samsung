@@ -24,11 +24,11 @@ from _kara_files import file_token
 from _parole_codex import KINDS, research
 from _parole_artist_groups import recover as recover_artist_groups
 from _parole_index import (ARTWORK, LOCAL_REFERENCE_MISS, Index, affected_tracks,
-                           document, encoded_key, inventory, path_rows, sidecar)
+                           document, encoded_key, inventory, path_rows, sidecar, track_plan_revision)
 from _parole_index_watch import Watch
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
-from _parole_import_enrichment import cancel_artist, paths_for as enrichment_paths
+from _parole_import_enrichment import cancel_artist, defer_artist_lrc, paths_for as enrichment_paths
 from _parole_import_enrichment import schedule as schedule_enrichment
 from _parole_lexicon import refresh_one as refresh_lexicon
 from _parole_local_reference import SOURCE as LOCAL_SOURCE
@@ -510,7 +510,7 @@ class Maintenance:
         # from filter, pagination and GTK selection.
         blocked = {row[0] for row in db.execute("SELECT subject FROM exclusions WHERE kind='artist'")}
         for song in songs:
-            revision = encoded_key(song["token"], song["side"], song["title"], song["artist"], song["edition"])
+            revision = track_plan_revision(song)
             subject = song["id"]
             if song["owner"] in blocked:
                 db.execute("UPDATE tasks SET state='excluded' WHERE subject=? AND state!='running'", (subject,))
@@ -946,6 +946,12 @@ class Maintenance:
         value = json.loads(data.splitlines()[-1]) if not code else {"state": "temporary"}
         if kind == IMPORT_LYRICS and paths:
             if "tracks_seconds" in value:
+                if value["lrc"].get("limited") and json.loads(task["payload"]).get("manual") and not stop():
+                    requeued = defer_artist_lrc(self.index, value["tracks"])
+                    for path, due in requeued.items():
+                        value["tracks"][path]["lrc_retry_at"] = due
+                    if requeued:
+                        self.wake.set()
                 self.import_lyrics_stats = value
                 self.index.review("import_lyrics_metrics", subject, "measured", value)
                 self.journal.emit("LYRICS", f"{value['lyrics'].get('found', 0)} textes · "
