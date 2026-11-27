@@ -145,9 +145,9 @@ def guard(directory, *, require_quiet=True):
         return "Lecture en cours. Kara garde la priorité."
 
 
-def calculate(song, source, engine, *, expected_audio=None):
+def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True):
     """Run one explicit alignment under the existing Parole process supervisor."""
-    if engine not in (*ENGINES, "edition"):
+    if engine not in (*ENGINES, "edition") or not allow_demucs and engine != "huang":
         raise ValueError("Moteur CHRONOS inconnu.")
     python = Path(os.environ.get("KARA_CHRONOS_PYTHON", ""))
     if not python.is_absolute() or not python.is_file():
@@ -177,7 +177,8 @@ def calculate(song, source, engine, *, expected_audio=None):
         try:
             code, output = run(args, stop=stop, timeout=365, maximum=32_768,
                                env=dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="2",
-                                        MKL_NUM_THREADS="2", PYTHONNOUSERSITE="1"))
+                                        MKL_NUM_THREADS="2", PYTHONNOUSERSITE="1",
+                                        KARA_CHRONOS_ALLOW_DEMUCS="1" if allow_demucs else "0"))
         except Interrupted:
             raise RuntimeError(reason) from None
         if code:
@@ -186,19 +187,20 @@ def calculate(song, source, engine, *, expected_audio=None):
         return load_json(scratch / "result.json")
 
 
-def prepare(song, cache, engine):
+def prepare(song, cache, engine, *, supplied=None, allow_demucs=True):
     before = local_tokens(song)
-    source = source_for(song, cache)
+    source = supplied if supplied is not None else source_for(song, cache)
     if not reference_lines(source):
         raise ValueError("Aucune parole de référence disponible pour cet enregistrement.")
     key = sha256(json.dumps(source, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     previous = cached(song, engine)
-    if previous and previous["source_sha256"] == key:
+    if (previous and previous["source_sha256"] == key
+            and (not allow_demucs or previous.get("separation_allowed", True))):
         return previous["status"]
-    result = calculate(song, source, engine)
-    if local_tokens(song) != before or source_for(song, cache) != source:
+    result = calculate(song, source, engine, allow_demucs=allow_demucs)
+    if local_tokens(song) != before or supplied is None and source_for(song, cache) != source:
         raise ValueError("Le morceau ou les paroles ont changé pendant la préparation CHRONOS.")
-    result.update(tokens=before, source_sha256=key)
+    result.update(tokens=before, source_sha256=key, separation_allowed=allow_demucs)
     raw = json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     if len(raw) > MAX_RESULT:
         raise ValueError("Résultat trop volumineux pour le cache CHRONOS.")

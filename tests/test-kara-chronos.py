@@ -14,7 +14,7 @@ from _kara_blackbox import BlackBox, digest
 from _kara_blackbox_chronos import differences, replay
 from _kara_blackbox_lyrics import record, snapshot
 from _kara_blackbox_lyric_clock import SECOND, anchors, chapter_markers
-from _kara_chronos import cached, display_index, implementation, prepare, reference_lines
+from _kara_chronos import cached, calculate, display_index, implementation, prepare, reference_lines
 from _kara_chronos_policy import support
 from _kara_chronos_worker import rows_for, window_words
 
@@ -96,6 +96,25 @@ class ChronosTests(unittest.TestCase):
                     original.write_text("Editor changed the words")
                     self.assertIsNone(cached(song, "huang"))
             self.assertFalse(song.with_suffix(".lrc").exists())
+
+    def test_night_request_caches_private_text_and_cannot_enable_demucs_engine(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            song = root / "sound.flac"
+            song.write_bytes(b"fixture")
+            source = {"kind": "night-plain", "provider": "fixture", "original": "Hello night", "timed": False}
+            result = {**alignment(), "engine": "huang", "version": 1,
+                      "status": "experimental", "implementation": implementation()}
+            with patch("_kara_chronos.ROOT", root / "cache"):
+                with patch("_kara_chronos.calculate", return_value=result) as execution:
+                    prepare(song, None, "huang", supplied=source, allow_demucs=False)
+                    execution.assert_called_once_with(song, source, "huang", allow_demucs=False)
+                    self.assertFalse(cached(song, "huang")["separation_allowed"])
+                    prepare(song, None, "huang", supplied=source)
+                    self.assertEqual(execution.call_count, 2)
+            self.assertFalse(song.with_suffix(".lrc").exists())
+            with self.assertRaises(ValueError):
+                calculate(song, source, "wav2vec2", allow_demucs=False)
 
     @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK") == "1", "requires GTK")
     def test_actual_kara_display_preserves_score_clock_and_uses_only_observed_onsets(self):

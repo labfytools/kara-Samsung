@@ -238,7 +238,11 @@ def import_enrichment(index, kind, subject, report):
     engine = lyrics_engine()
     settings = index.settings()
     with index.db() as db:
-        excluded = {row[0] for row in db.execute("SELECT subject FROM exclusions WHERE kind='artist'")}
+        task = db.execute("SELECT payload FROM tasks WHERE kind=? AND subject=?", (kind, subject)).fetchone()
+        manual = task and json.loads(task["payload"]).get("manual")
+        excluded = set() if manual else {row[0] for row in db.execute("SELECT subject FROM exclusions WHERE kind='artist'")}
+    if manual:
+        settings = {**settings, "lyrics": True, "lrc": True}
     try:
         with collection_reader(DATA / "strawberry/strawberry/strawberry.db", index.root, targeted=True) as read_batch:
             strawberry = read_batch(paths)
@@ -250,7 +254,11 @@ def import_enrichment(index, kind, subject, report):
         worker_count = 4
     # The batch belongs to one maintenance owner for the whole collection.
     # HTTP gates and FFmpeg slots remain shared with other import processes.
-    if any(d.get("last_http") == 429 for d in limits.values()):
+    from _parole_sources import ready_sources
+    from time import time
+    ready = ready_sources(index, time())
+    if (any(d.get("last_http") == 429 for d in limits.values())
+            or sum(bool({"lyrics", "lrc"} & set(row["category"].split(","))) for row in ready.values()) <= 2):
         worker_count = min(worker_count, 2)
     try:
         available = next(int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
@@ -281,12 +289,17 @@ def import_enrichment(index, kind, subject, report):
 
     def work(path):
         began = monotonic()
+        errors = []
+        report({"event": "track-start", "path": str(path)})
         try:
             result = engine.process_import_track(path, storage.source, index, settings, excluded, locks, activity,
-                                                 strawberry.get(str(path)), notify=notify)
-        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+                                                 strawberry.get(str(path)), notify=notify, diagnostic=errors.append)
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
             result = "temporary", "temporary"
-        return result, monotonic() - began
+            errors.append(type(error).__name__)
+        detail = {"lyrics": result[0], "lrc": result[1], "errors": sorted(set(errors))}
+        report({"event": "track-result", "path": str(path), "result": detail})
+        return result, monotonic() - began, detail
 
     started = monotonic()
     try:
@@ -296,13 +309,15 @@ def import_enrichment(index, kind, subject, report):
         for source in clients:
             source.close()
     prune(index)
-    plain = Counter(result[0] for result, _ in processed)
-    timed = Counter(result[1] for result, _ in processed)
+    plain = Counter(result[0] for result, _, _ in processed)
+    timed = Counter(result[1] for result, _, _ in processed)
     missing = {"missing", "review"}
     state = ("temporary" if plain["temporary"] or timed["temporary"] else
              "not_found" if missing & (plain.keys() | timed.keys()) else "complete")
     return {"state": state, "lyrics": dict(plain), "lrc": dict(timed), "seconds": monotonic() - started,
-            "tracks_seconds": [seconds for _, seconds in processed], "workers": min(worker_count, len(paths)),
+            "tracks_seconds": [seconds for _, seconds, _ in processed],
+            "tracks": {str(path): row[2] for path, row in zip(paths, processed, strict=True)},
+            "workers": min(worker_count, len(paths)),
             "requests": sum(c.gate.requests for source in clients for c in source.clients),
             "cache_hits": sum(c.cache_hits for c in clients),
             "providers": sorted({provider for c in clients for provider in c.providers})}

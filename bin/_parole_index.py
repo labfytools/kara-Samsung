@@ -456,15 +456,16 @@ class Index:
     def preparation_due(self, now, *, local_preparation=None):
         return self.work_due(("prepare",), now, local_preparation=local_preparation)
 
-    def work_due(self, kinds, now, *, local_reference=False, local_preparation=None):
+    def work_due(self, kinds, now, *, local_reference=False, local_preparation=None, manual_only=False):
         if not kinds:
             return False
         placeholders = ",".join("?" for _ in kinds)
         scope, arguments = task_scope(local_reference, local_preparation, now)
         with self.db(wait=.15) as db:
             return db.execute(f"""SELECT 1 {scope} candidate.kind IN ({placeholders}) AND candidate.due<=?
-                                  AND candidate.state IN ('queued','suspended','temporary') LIMIT 1""",
-                              (*arguments, *kinds, now)).fetchone() is not None
+                                  AND candidate.state IN ('queued','suspended','temporary')
+                                  AND (NOT ? OR json_extract(candidate.payload,'$.manual') IS NOT NULL) LIMIT 1""",
+                              (*arguments, *kinds, now, manual_only)).fetchone() is not None
 
     @staticmethod
     def read_closed_report(db):
@@ -590,12 +591,25 @@ class Index:
             return True
 
     def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None,
-              avoid=(), local_reference=False, local_preparation=None):
+              avoid=(), local_reference=False, local_preparation=None, manual_only=False):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
         excluded = ",".join("?" for _ in avoid)
         scope, arguments = task_scope(local_reference, local_preparation, now)
+        # The import lane and classical network lane share the claim
+        # transaction. A pending batch owns its tracks until this pass ends.
+        lyrics_guard = """
+            AND (candidate.kind!='import_lyrics' OR NOT EXISTS (
+                SELECT 1 FROM json_each(candidate.payload,'$.paths') j
+                JOIN songs s ON s.path=j.value JOIN tasks a ON a.subject=s.id
+                WHERE a.kind IN ('lyrics','lrc') AND a.state='running'))
+            AND (candidate.kind NOT IN ('lyrics','lrc') OR NOT EXISTS (
+                SELECT 1 FROM songs s JOIN tasks a ON a.kind='import_lyrics'
+                JOIN json_each(a.payload,'$.paths') j ON j.value=s.path
+                WHERE s.id=candidate.subject AND (a.state='running' OR
+                    (a.state IN ('queued','suspended','temporary') AND a.due<=candidate.due))))
+        """ if {"lyrics", "lrc", "import_lyrics"}.intersection(kinds) else ""
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             day = date.fromtimestamp(now).isoformat()
@@ -607,12 +621,14 @@ class Index:
                     AND candidate.subject NOT IN ({excluded})
                     AND candidate.state IN ('queued','suspended','temporary') AND candidate.due<=?
                     AND (NOT ? OR candidate.priority<=15)
+                    AND (NOT ? OR json_extract(candidate.payload,'$.manual') IS NOT NULL)
+                    {lyrics_guard}
                     AND (? OR candidate.kind!='codex' OR json_extract(candidate.payload,'$.manual')=1
                          OR json_extract(candidate.payload,'$.kind') IN ('adapter','import_patch'))
                     ORDER BY max(10,candidate.priority-cast((?-candidate.due)/86400 AS INTEGER)),
                              candidate.due,candidate.subject LIMIT 1)
                 RETURNING *
-            """, (now, *arguments, *kinds, *avoid, now, high, codex_auto, now)).fetchone()
+            """, (now, *arguments, *kinds, *avoid, now, high, manual_only, codex_auto, now)).fetchone()
             if bucket and task is not None:
                 self.reserve(db, bucket, day, now, gap)
             if night is not None and task is not None:

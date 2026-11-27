@@ -30,7 +30,8 @@ from _parole_index import (ARTWORK, LOCAL_REFERENCE_MISS, REFERENCE_REUSE_SECOND
 from _parole_index_watch import Watch
 from _parole_import_diagnostics import ImportDiagnostics
 from _parole_import_enrichment import COVER as IMPORT_COVER, KINDS as IMPORT_ENRICHMENT, LYRICS as IMPORT_LYRICS
-from _parole_import_enrichment import paths_for as enrichment_paths
+from _parole_import_enrichment import cancel_artist, paths_for as enrichment_paths
+from _parole_import_enrichment import schedule as schedule_enrichment
 from _parole_lexicon import refresh_one as refresh_lexicon
 from _parole_local_reference import SOURCE as LOCAL_SOURCE
 from _parole_night import Night
@@ -182,7 +183,9 @@ class Maintenance:
         self.network_active = {}
         self.import_enrichment_active = {}
         self.import_activity = (0, 0)
+        self.next_enrichment_delivery = 0.
         self.import_lyrics_stats = None
+        self.import_lyrics_live = {}
         self.next_import_probe = 0.
         self.revision = 0
         self.sampling = 0
@@ -254,6 +257,20 @@ class Maintenance:
                 self.cancelled = self.active
                 self.interrupt.set()
         self.wake.set()
+
+    def cancel_artist_lyrics(self, request):
+        subjects = cancel_artist(self.index, request)
+        with self.lock:
+            for subject in subjects:
+                active = self.import_enrichment_active.get((IMPORT_LYRICS, subject))
+                if active:
+                    active.set()
+        self.wake.set()
+
+    def artist_lyrics_live(self, subjects):
+        with self.lock:
+            return {path: detail for subject in subjects
+                    for path, detail in self.import_lyrics_live.get(subject, {}).items()}
 
     def inspect_cache(self, path, old, token, side):
         def available(candidate):
@@ -572,7 +589,9 @@ class Maintenance:
                     priority -= 1
                 if kind == "prepare":
                     priority += 30 if song["lrc"] == "absent" else 20
-                if kind == "prepare" and settings["night_enabled"]:
+                draft_due = (song["lrc"] == "absent" and song["lyrics"] not in ("absent", "instrumental", "inconnu")
+                             and settings["generate"] and settings["lrc"])
+                if kind == "prepare" and (settings["night_enabled"] or draft_due):
                     if song["kara"] == "prêt" or json.loads(song["info"]).get("report", {}).get("reference_validated"):
                         db.execute("UPDATE tasks SET state='done' WHERE kind=? AND subject=? "
                                    "AND state IN ('queued','temporary','suspended')", (kind, subject))
@@ -974,9 +993,14 @@ class Maintenance:
         def update(event):
             if event.get("event") == "activity":
                 self.import_activity = event["lyrics"], event["lrc"]
+            elif event.get("event") in ("track-start", "track-result"):
+                with self.lock:
+                    self.import_lyrics_live.setdefault(subject, {})[event["path"]] = event.get("result")
+
         try:
             code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
-                                     timeout=180, observer=update if kind == IMPORT_LYRICS else None,
+                                     timeout=180 + 105 * ((len(paths) + 1) // 2) if kind == IMPORT_LYRICS else 180,
+                                     observer=update if kind == IMPORT_LYRICS else None,
                                      extra_env={"KARA_ENRICHMENT_EVENTS": "1"}, stop=stop, import_owner=owner)
         finally:
             if kind == IMPORT_LYRICS:
@@ -997,13 +1021,30 @@ class Maintenance:
             raise Interrupted
         if value["state"] == "complete":
             return "done", "enrichissement vérifié", 0
-        if value["state"] == "temporary" and task["attempts"] < 2:
-            return "temporary", "recherche différée", 300
+        if value["state"] == "temporary":
+            payload = json.loads(task["payload"])
+            if kind == IMPORT_LYRICS and (not payload.get("manual") or payload.get("automatic")):
+                # Provider outages and quotas convey no absence. Preserve
+                # the exact album receipt across retry and restart.
+                return "temporary", "fournisseur ou lecture temporairement indisponible", 300 * min(72, 2 ** min(7, task["attempts"] - 1))
+            if kind != IMPORT_LYRICS and task["attempts"] < 2:
+                return "temporary", "recherche différée", 300
         return "review", "enrichissement partiel · maintenance complémentaire", 0
 
     def import_enrichment_count(self):
         with self.lock:
             return len(self.import_enrichment_active)
+
+    def retry_enrichment_delivery(self):
+        if (self.import_queue is None or self.import_queue.pause_requested()
+                or monotonic() < self.next_enrichment_delivery):
+            return
+        self.next_enrichment_delivery = monotonic() + 10
+        for job, url, payload in self.import_queue.enrichment_pending():
+            outcome = json.loads(payload)
+            scheduled = schedule_enrichment(self.index, outcome.get("tracks", ()))
+            if self.import_queue.acknowledge_enrichment(job, url, payload, scheduled):
+                self.index_wake.set()
 
     def import_enrichment_loop(self, kind):
         # Two bounded lanes under the same maintenance owner. Text and LRC
@@ -1014,6 +1055,8 @@ class Maintenance:
             pass
         while not self.shutdown.is_set():
             try:
+                if kind == IMPORT_LYRICS:
+                    self.retry_enrichment_delivery()
                 if self.tick_import_enrichment(self.index.settings(wait=.15), time(), kind):
                     continue
             except (OSError, ValueError, TypeError, KeyError, sqlite3.Error):
@@ -1023,8 +1066,9 @@ class Maintenance:
 
     def tick_import_enrichment(self, settings, now, kind=IMPORT_LYRICS):
         enabled = (settings["lyrics"] or settings["lrc"]) if kind == IMPORT_LYRICS else settings["cover"]
-        if (not enabled or settings["paused"] or self.priority or self.shutdown.is_set()
-                or not self.index.work_due((kind,), now)):
+        manual_only = kind == IMPORT_LYRICS and not enabled
+        if ((not enabled and not manual_only) or settings["paused"] or self.priority or self.shutdown.is_set()
+                or not self.index.work_due((kind,), now, manual_only=manual_only)):
             return False
         if ((self.import_queue is not None and self.import_queue.pause_requested())
                 or disk_usage(self.index.root).free <= settings["reserve_gib"] * 1024**3):
@@ -1032,7 +1076,7 @@ class Maintenance:
         with (self.import_queue.activity() if self.import_queue is not None else nullcontext()) as owner:
             if owner is not None and self.import_queue.pause_requested():
                 return False
-            task = self.index.claim((kind,), now)
+            task = self.index.claim((kind,), now, manual_only=manual_only)
             if task is None:
                 return False
             identity = kind, task["subject"]
@@ -1044,6 +1088,8 @@ class Maintenance:
             finally:
                 with self.lock:
                     self.import_enrichment_active.pop(identity, None)
+                    if kind == IMPORT_LYRICS:
+                        self.import_lyrics_live.pop(task["subject"], None)
         return True
 
     def run_import_enrichment(self, task, owner, cancel):
@@ -1075,8 +1121,11 @@ class Maintenance:
             result = "suspended", "ressources libérées", 0 if paused else 45
         except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             self.journal.emit(category, "Moteur indisponible ou réponse invalide", "WARNING")
-            result = (("review", "enrichissement partiel · maintenance complémentaire", 0)
-                      if task["attempts"] >= 2 else ("temporary", "opération indisponible", 600))
+            payload = json.loads(task["payload"])
+            automatic_lyrics = kind == IMPORT_LYRICS and (not payload.get("manual") or payload.get("automatic"))
+            result = (("temporary", "opération indisponible", 300 * min(72, 2 ** min(7, task["attempts"] - 1)))
+                      if automatic_lyrics or task["attempts"] < 2 else
+                      ("review", "enrichissement partiel · maintenance complémentaire", 0))
         self.index.finish(task, *result, refund_attempt=paused)
         if paused:
             self.journal.emit(category, "Enrichissement suspendu · état sauvegardé · ressources libérées")
@@ -1087,7 +1136,8 @@ class Maintenance:
         settings = self.current_settings
         # Retain a verified provider response across Demucs/Turbo cancellation.
         # Audio/sidecar edits and changed enabled sources invalidate that reply.
-        local_text = sidecar(path, ".txt")[1] or json.loads(song["info"]).get("plain", "")
+        local = json.loads(song["info"])
+        local_text = sidecar(path, ".txt")[1] or local.get("plain", "")
         available = ready_categories(self.index, time()) & {"lyrics", "lrc", "lrc_text"}
         timed_ready = "lrc" in available or ("lrc_text" in available and bool(local_text.strip()))
         with self.index.db() as db:
@@ -1132,7 +1182,8 @@ class Maintenance:
             # lyric text. The completed lookup attempt may therefore fall
             # back to acoustically observed timestamps from that text.
             if local_text.strip() and len(local_text.encode()) <= MAX_LRC_BYTES:
-                result = {"state": "found", "lyrics": local_text, "source": "bibliothèque"}
+                result = {"state": "found", "lyrics": local_text,
+                          "source": local.get("text_provider") or local.get("lyrics_provider") or "bibliothèque"}
             elif settings["lyrics"]:
                 if "lyrics" in available or song["audio"]:
                     result = lookup("prepare_plain", local_only="lyrics" not in available)
@@ -1234,6 +1285,9 @@ class Maintenance:
                 if event.get("event") == "progress" and type(event.get("percent")) in (int, float):
                     phase = PHASES.get(event.get("phase"), "Séparation voix / musique" if category == "DEMUCS" else "Préparation")
                     self.progress = (category, f"{song['title']} · {phase}", max(0, min(100, event["percent"])) / 100)
+                elif event.get("event") == "chronos":
+                    self.journal.emit("LRC", f"CHRONOS · {song['title']} · {event['status']}"
+                                      + (f" · {event['message']}" if event.get("message") else ""))
                 elif event.get("event") == "result":
                     seconds = event.get("seconds")
                     if type(seconds) in (int, float):
@@ -1279,6 +1333,8 @@ class Maintenance:
                     reference = Path(workspace) / "reference.txt"
                     reference.write_text(plain, encoding="utf-8")
                     command.extend((reference_option, str(reference), "--reference-provider", provider))
+                    if nocturnal and reference_option == "--plain-reference" and os.environ.get("KARA_CHRONOS_PYTHON"):
+                        command.append("--chronos-night-draft")
                     if rejected:
                         command.extend(("--rejected-lrc", document(rejected)))
                 rc, _ = self.output([*command, "--", str(path)], 1800, status("TURBO"))

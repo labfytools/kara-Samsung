@@ -6,7 +6,8 @@ import json
 from math import ceil
 from pathlib import Path
 import sqlite3
-from time import monotonic
+from time import monotonic, time
+from uuid import uuid4
 
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
@@ -16,6 +17,7 @@ from _kara_paths import STATE
 from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, rebind_preparations, undo as undo_group
 from _parole_audition import DraftAudition, vocal_file
 from _parole_index import key, document, encoded_key, sidecar
+from _parole_import_enrichment import artist_results, queue_artist
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_music_registry import set_alias
@@ -306,6 +308,7 @@ class ParoleView:
         self.tv_requested = 0.
         self.settings_dialog = None
         self.night_summary = None
+        self.artist_search = None
         self.stats_at = 0.
         self.library_generation = 0
         self.library_pending = False
@@ -363,7 +366,11 @@ class ParoleView:
             context.popup()
         click.connect("pressed", show_context)
         tree_view.add_controller(click)
-        panes.set_start_child(scroller(tree_view, min_content_width=160))
+        artist_pane = box(vexpand=True)
+        artist_pane.append(scroller(tree_view, min_content_width=160, vexpand=True))
+        self.search_lyrics = button("Rechercher les paroles", self.search_artist_lyrics, sensitive=False)
+        artist_pane.append(self.search_lyrics)
+        panes.set_start_child(artist_pane)
         panes.set_shrink_start_child(False)
         self.songs = Gio.ListStore(item_type=Row)
         self.song_selection = Gtk.SingleSelection(model=self.songs, autoselect=False, can_unselect=True)
@@ -516,6 +523,7 @@ class ParoleView:
     def select_tree(self, *_):
         selected = self.tree_selection.get_selected_item()
         self.scope = selected.get_item().data if selected else ()
+        self.search_lyrics.set_sensitive(bool(self.scope))
         self.reset()
 
     def open_tree(self, _, pos):
@@ -1068,6 +1076,121 @@ class ParoleView:
     def research_scope(self, kind):
         if self.scope and (kind != "album" or len(self.scope) >= 3):
             self.manual_codex(kind, self.scope[1] if kind == "album" else self.scope[0])
+
+    def search_artist_lyrics(self, _widget):
+        if not self.scope:
+            return
+        if self.artist_search and not self.artist_search["done"]:
+            self.artist_search["window"].present()
+            return
+        if self.artist_search:
+            self.artist_search["window"].destroy()
+        artist, request, started = self.scope[0], uuid4().hex, time()
+        window = Gtk.Window(title=f"Recherche de paroles · {artist}", transient_for=self.control,
+                            destroy_with_parent=True, hide_on_close=True, default_width=520)
+        content = box(spacing=12, margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+        status = Gtk.Label(label="Inventaire des morceaux locaux…", xalign=0, wrap=True)
+        counters = Gtk.Label(xalign=0, wrap=True)
+        current = Gtk.Label(xalign=0, wrap=True)
+        errors = Gtk.Label(xalign=0, wrap=True)
+        progress = Gtk.ProgressBar(show_text=True)
+        state = self.artist_search = {"window": window, "done": False, "paths": None,
+                                      "results": {}, "polling": False, "cancelling": False}
+        pool = self.control.tag_reader
+
+        def stop(_button):
+            state["cancelling"] = True
+            cancel.set_sensitive(False)
+            status.set_text("Annulation de la recherche…")
+            pool.submit(self.maintenance.cancel_artist_lyrics, request).add_done_callback(
+                lambda future: GLib.idle_add(stopped, future))
+
+        def stopped(future):
+            try:
+                future.result()
+            except (OSError, ValueError, sqlite3.Error):
+                state["cancelling"] = False
+                status.set_text("Annulation momentanément indisponible.")
+                cancel.set_sensitive(True)
+            else:
+                finish("Recherche annulée. Les paroles enregistrées sont disponibles.")
+
+        def finish(message):
+            state["done"] = True
+            status.set_text(message)
+            cancel.set_sensitive(False)
+            current.set_text("")
+
+        cancel = button("Annuler la recherche", stop, sensitive=False)
+        for widget in (status, progress, counters, current, errors, cancel):
+            content.append(widget)
+        window.set_child(content)
+
+        def draw(future):
+            state["polling"] = False
+            if state["done"] or state["cancelling"]:
+                return GLib.SOURCE_REMOVE
+            try:
+                results, running = future.result()
+            except (OSError, ValueError, sqlite3.Error):
+                status.set_text("État de la file momentanément indisponible.")
+                return GLib.SOURCE_REMOVE
+            state["results"].update(results)
+            values = state["results"]
+            total, completed = len(state["paths"]), len(values)
+            found = sum(row["lyrics"] == "found" for row in values.values())
+            timed = sum(row["lrc"] == "found" for row in values.values())
+            absent = sum(row["lyrics"] in ("missing", "review", "temporary", "unknown") for row in values.values())
+            topics = [(Path(path).stem, row["errors"]) for path, row in values.items() if row["errors"]]
+            counters.set_text(f"{total} morceaux à analyser · {found} paroles trouvées · {timed} LRC trouvés\n"
+                              f"{absent} morceaux traités sans paroles confirmées · {len(topics)} avec erreur")
+            if topics:
+                translations = {"limited": "quota ou délai fournisseur", "network": "réseau",
+                                "unavailable": "fournisseur indisponible"}
+                errors.set_text("\n".join(f"{name} · {', '.join(translations.get(p, p) for p in reasons)}"
+                                         for name, reasons in topics[-3:]))
+            progress.set_fraction(completed / total if total else 1.)
+            progress.set_text(f"{completed}/{total} morceaux analysés")
+            current.set_text("Recherche en cours · " + ", ".join(Path(path).stem for path in running[:4])
+                             if running else "")
+            if completed == total:
+                finish("Recherche terminée.")
+            else:
+                status.set_text("Recherche en cours" if running else
+                                "En attente de la fin de la lecture" if self.maintenance.priority else
+                                "En attente d’un créneau de recherche Parole")
+            return GLib.SOURCE_REMOVE
+
+        def inspect():
+            paths = state["paths"]
+            live = self.maintenance.artist_lyrics_live(set(paths.values()))
+            results = artist_results(self.index, paths, started)
+            results.update({path: result for path, result in live.items() if path in paths and result is not None})
+            return results, [path for path, result in live.items() if path in paths and result is None]
+
+        def poll():
+            if state["done"] or self.control.closed:
+                return GLib.SOURCE_REMOVE
+            if not state["polling"] and not state["cancelling"] and state["paths"] is not None:
+                state["polling"] = True
+                pool.submit(inspect).add_done_callback(lambda future: GLib.idle_add(draw, future))
+            return GLib.SOURCE_CONTINUE
+
+        def admitted(future):
+            try:
+                state["paths"] = future.result()
+            except (OSError, ValueError, sqlite3.Error):
+                finish("L’inventaire ou la file Parole est indisponible.")
+                return GLib.SOURCE_REMOVE
+            cancel.set_sensitive(True)
+            self.maintenance.wake.set()
+            poll()
+            GLib.timeout_add(700, poll)
+            return GLib.SOURCE_REMOVE
+
+        window.present()
+        pool.submit(queue_artist, self.index, artist, request).add_done_callback(
+            lambda future: GLib.idle_add(admitted, future))
 
     def exclude_artist(self, widget):
         if not self.scope:

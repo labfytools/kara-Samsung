@@ -511,7 +511,7 @@ class AlbumImportTests(unittest.TestCase):
         cached = json.loads(subprocess.check_output([sys.executable, "-B", str(BIN / "_parole_work.py"),
                                                     "import_lyrics", task["subject"]], env=self.env, timeout=20))
         self.assertEqual(cached["requests"], 0)
-        self.assertGreaterEqual(cached["cache_hits"], 2)
+        self.assertGreaterEqual(cached["cache_hits"], 1)
         self.assertTrue(published.with_suffix(".lrc").is_file())
         queue.refreshed([(identity, queue.job(identity)["refresh"])])
         self.assertEqual(queue.delete_history(successful=True), 1)

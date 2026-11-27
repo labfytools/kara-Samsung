@@ -453,6 +453,23 @@ class ImportQueue:
         with self.connect() as db:
             db.execute("UPDATE jobs SET journal=? WHERE id=?", (str(path), identity))
 
+    def enrichment_pending(self):
+        with self.connect() as db:
+            # The outcome owns retry until the separate Parole database has
+            # committed the tasks. Read a small page, outside a write lock.
+            return [(row["job"], row["url"], row["payload"]) for row in db.execute("""
+                SELECT job,url,payload FROM outcomes WHERE json_extract(payload,'$.enrichment_pending')=1
+                ORDER BY rowid LIMIT 16
+            """)]
+
+    def acknowledge_enrichment(self, job, url, payload, scheduled):
+        with self.connect(write=True) as db:
+            # A newer audio attempt owns later receipts for the same album.
+            return db.execute("""UPDATE outcomes SET payload=json_remove(
+                json_set(payload,'$.enrichment',json(?)),'$.enrichment_pending')
+                WHERE job=? AND url=? AND payload=?""",
+                (json.dumps(scheduled), job, url, payload)).rowcount == 1
+
     def album(self, identity, outcome):
         with self.connect() as db:
             db.execute("INSERT OR REPLACE INTO outcomes VALUES (?, ?, ?)",

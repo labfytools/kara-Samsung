@@ -44,7 +44,7 @@ from _labfy_sync import MusicSync
 from _kara_tv import https_configured, start_receiver
 from _musique_oz import AUDIO, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
-from _parole_index import PREPARATION, path_rows
+from _parole_index import PREPARATION, path_rows, sidecar_token
 from _parole_maintenance import Maintenance
 from _parole_ui import ParoleView
 
@@ -88,6 +88,10 @@ def lyric_progress(position, start, end):
 
 def embedded_lyrics(track):
     try:
+        from _parole_index import sidecar
+
+        if local := sidecar(track, ".txt")[1].strip():
+            return local
         tags, _ = probe(track)
     except (OSError, ValueError, subprocess.SubprocessError):
         return ""
@@ -2167,7 +2171,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
             info = self.track.stat()
         except OSError:
             return ""
-        token = (self.track, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+        token = (self.track, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size,
+                 sidecar_token(self.track.with_suffix(".txt")))
         if self.tag_job is not None:
             pending, future = self.tag_job
             if future.done():

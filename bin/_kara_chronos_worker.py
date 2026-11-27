@@ -134,8 +134,9 @@ def work(song, scratch, engine, expected):
         raise ValueError("L’empreinte audio diffère de celle de la capture.")
     language = detect_language(words(" ".join(tokens)))
     models = {}
+    allow_demucs = os.environ.get("KARA_CHRONOS_ALLOW_DEMUCS", "1") == "1"
     result = {"version": 1, "implementation": implementation(), "engine": engine, "models": models,
-              "settings": SETTINGS, "source": source, "duration": seconds, "language": language,
+              "settings": {**SETTINGS, "allow_demucs": allow_demucs}, "source": source, "duration": seconds, "language": language,
               "audio_sha256": original, "audio_pcm_sha256": pcm_digest(song), "views": {}}
     if language not in ("en", "fr"):
         result.update(status="abstained", reason="language-unsupported-or-uncertain",
@@ -182,7 +183,7 @@ def work(song, scratch, engine, expected):
         base, contrast = evaluate(voice)
         heard = observations(voice, language, models)
         deep, deep_contrast = None, None
-        if engine == "huang-ft" or difficult(base):
+        if allow_demucs and (engine == "huang-ft" or difficult(base)):
             try:
                 weights = verify(configured("DEMUCS_FT"), models, "htdemucs-ft-vocals")
                 with lease(STEM_ROOT / "demucs.lock", wait=False) as slot:

@@ -2,6 +2,10 @@
 
 ## En développement
 
+- Rechercher les paroles et les LRC de tous les albums locaux d’un artiste, avec suivi et annulation depuis Parole.
+- Reprendre les recherches différées des albums importés, privilégier les LRC vérifiés et conserver le texte simple dans un fichier séparé.
+- Préparer les brouillons CHRONOS des nouveaux textes dans le parcours nocturne, sans lancer Demucs.
+
 - Proposer le défilement expérimental CHRONOS sur la sélection, avec les paroles complètes et l’abstention pour les repères incertains.
 - Rejouer des alignements et les comparer sur une capture BlackBox V3, sur la même chronologie que la musique, le microphone et le score.
 

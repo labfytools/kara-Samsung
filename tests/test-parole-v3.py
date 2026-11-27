@@ -120,28 +120,76 @@ class InventoryTests(Fixture):
             self.assertEqual(tuple(db.execute("SELECT * FROM reviews WHERE kind='lexicon' AND subject=?",
                                               (other_id,)).fetchone()), unchanged)
 
-    def test_import_text_is_published_before_timed_lookup(self):
+    def test_import_prefers_verified_lrc_and_writes_plain_only_as_fallback(self):
         from threading import Lock
 
         path = self.audio()
         engine = lyrics_engine()
         plain = "Un refrain assez long pour la vérification"
-        published = []
+        published, requested = [], []
 
-        def lookup(*_signature, synced, local_text, **_options):
-            if synced:
-                self.assertEqual(local_text, plain)
-                self.assertEqual(len(published), 1)
-                self.assertEqual(engine.probe(path)[0]["lyrics"], plain)
-                return "[00:01.00]Le refrain", "fixture"
-            return plain, "fixture"
+        def lookup(*_signature, synced, **_options):
+            requested.append(synced)
+            return ("[00:01.00]Le refrain", "fixture") if synced else (plain, "fixture")
 
-        client = SimpleNamespace(new_track=lambda: None, find=lookup)
-        result = engine.process_import_track(path, client, self.index, self.index.settings(), set(),
-                                             (Lock(),), lambda *_: None, None,
-                                             notify=lambda *event: published.append(event))
+        client = SimpleNamespace(new_track=lambda: None, start_form=lambda: None, find=lookup)
+        args = (path, client, self.index, self.index.settings(), set(), (Lock(),), lambda *_: None, None)
+        result = engine.process_import_track(*args, notify=lambda *event: published.append(event))
         self.assertEqual(result, ("found", "found"))
-        self.assertEqual(len(published), 2)
+        self.assertEqual(requested, [True])
+        self.assertEqual(len(published), 1)
+        self.assertFalse(path.with_suffix(".txt").exists())
+        path.with_suffix(".lrc").unlink()
+        original = path.read_bytes()
+
+        def simple(*_signature, synced, **_options):
+            requested.append(synced)
+            return (None, None) if synced else (plain, "fixture")
+
+        client.find = simple
+        self.assertEqual(engine.process_import_track(*args, notify=lambda *_: None), ("found", "missing"))
+        self.assertEqual(requested, [True, True, False])
+        self.assertEqual(path.with_suffix(".txt").read_text().strip(), plain)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_artist_search_adopts_existing_batch_and_cancels_only_its_own(self):
+        from _parole_import_enrichment import LYRICS, cancel_artist, queue_artist, schedule
+
+        imported = self.audio()
+        unindexed = self.audio("02 Autre.flac", title="Autre")
+        importer = schedule(self.index, [imported])[LYRICS][0]
+        result = queue_artist(self.index, "Groupe", "request")
+        self.assertEqual(set(result), {str(imported), str(unindexed)})
+        self.assertEqual(result[str(imported)], importer)
+        self.assertEqual(cancel_artist(self.index, "request"), [result[str(unindexed)]])
+        with self.index.db() as db:
+            statuses = dict(db.execute("SELECT subject,state FROM tasks WHERE kind=?", (LYRICS,)))
+        self.assertEqual(statuses, {importer: "queued", result[str(unindexed)]: "excluded"})
+        self.assertEqual(schedule(self.index, [unindexed])[LYRICS], [result[str(unindexed)]])
+        with self.index.db() as db:
+            self.assertEqual(db.execute("SELECT state FROM tasks WHERE subject=?",
+                                        (result[str(unindexed)],)).fetchone()[0], "queued")
+
+    def test_deferred_album_delivery_replays_without_download(self):
+        from _kara_import_queue import ImportQueue
+        from _parole_import_enrichment import LYRICS
+
+        audio = self.audio()
+        queue = ImportQueue(self.base / "state", self.root)
+        url = "https://example.invalid/album-fixture"
+        identity = queue.enqueue([("Fixture", url)])
+        queue.album(identity, {"url": url, "status": "success", "audio_complete": True,
+                               "tracks": [str(audio)], "enrichment_pending": True})
+        owner = Maintenance(self.root, None, state=self.base / "state", import_queue=queue)
+        self.addCleanup(owner.close)
+        owner.retry_enrichment_delivery()
+        receipt = queue.outcomes(identity)[url]
+        self.assertTrue(receipt["audio_complete"])
+        self.assertNotIn("enrichment_pending", receipt)
+        subject, = receipt["enrichment"][LYRICS]
+        with self.index.db() as db:
+            self.assertEqual(db.execute("SELECT state FROM tasks WHERE kind=? AND subject=?",
+                                        (LYRICS, subject)).fetchone()[0], "queued")
 
     def test_manual_correction_in_lexicon_is_bound_to_sidecar_and_audio(self):
         from _parole_lexicon import records
@@ -906,7 +954,10 @@ class GtkTests(Fixture):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), style,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         path = self.audio()
-        with patch.object(app_module, "https_configured", return_value=False), patch.object(
+        from _kara_import_queue import ImportQueue
+        fixture_queue = ImportQueue(self.base / "state", self.root)
+        with patch.object(app_module, "https_configured", return_value=False), patch(
+                "_kara_import.ImportQueue", return_value=fixture_queue), patch.object(
                 app_module, "Maintenance", side_effect=lambda root, collection, **kwargs: Maintenance(
                     root, None, state=self.base / "state", **kwargs)):
             window = app_module.LyricsWindow(app)
@@ -937,6 +988,33 @@ class GtkTests(Fixture):
         wait_library()
         self.assertEqual(view.cards["total"].get_label(), "1")
         self.assertEqual(view.songs.get_n_items(), 1)
+        view.tree_selection.set_selected(0)
+        self.assertTrue(view.search_lyrics.get_sensitive())
+        view.search_lyrics.emit("clicked")
+        search = view.artist_search
+        self.addCleanup(search["window"].destroy)
+        context = GLib.MainContext.default()
+        deadline = monotonic() + 4
+        while search["paths"] is None and monotonic() < deadline:
+            while context.pending():
+                context.iteration(False)
+            sleep(.01)
+        self.assertEqual(set(search["paths"]), {str(path)})
+        widgets_on_dialog = []
+        widget = search["window"].get_child().get_first_child()
+        while widget is not None:
+            widgets_on_dialog.append(widget)
+            widget = widget.get_next_sibling()
+        cancel = next(widget for widget in widgets_on_dialog if isinstance(widget, Gtk.Button))
+        cancel.emit("clicked")
+        deadline = monotonic() + 4
+        while not search["done"] and monotonic() < deadline:
+            while context.pending():
+                context.iteration(False)
+            sleep(.01)
+        self.assertTrue(search["done"])
+        view.all()
+        wait_library()
         view.card_action("no_lyrics")
         wait_library()
         self.assertEqual(view.songs.get_n_items(), 1)
@@ -1071,7 +1149,7 @@ class GtkTests(Fixture):
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)
         view.refresh_night_summary()
         summary = view.night_summary.get_label()
-        self.assertIn("0 préparations complètes", summary)
+        self.assertIn("0 pistes avec mixage en cache", summary)
         self.assertIn("0 références temporelles validées", summary)
         self.assertIn("Dernières 24 h révolues · Réseau 0 textes / 0 LRC · Bibliothèque 0 textes / 0 LRC", summary)
         self.assertIn("0 reports mémoire · 0 reports quota", summary)
@@ -1100,6 +1178,11 @@ class GtkTests(Fixture):
         for i in range(selection.get_n_items()):
             if selection.get_item(i).data in ("Lune", "Soleil"):
                 selection.select_item(i, False)
+        target = next(item for item in children if isinstance(item, Gtk.DropDown))
+        for i in range(target.get_model().get_n_items()):
+            if target.get_model().get_item(i).get_string() == "Lune":
+                target.set_selected(i)
+                break
         lookup = {item.get_label(): item for item in children if isinstance(item, Gtk.Button)}
         lookup["Prévisualiser"].emit("clicked")
         context = GLib.MainContext.default()
@@ -1111,14 +1194,18 @@ class GtkTests(Fixture):
             sleep(.01)
         self.assertTrue(lookup["Confirmer le regroupement"].get_sensitive())
         self.assertFalse((self.root / "Lune" / album.name).exists())
-        lookup["Confirmer le regroupement"].emit("clicked")
+        # This fixture mutates its own library while the real Strawberry
+        # process can be playing in the desktop session.
+        with patch.object(window, "maintenance_busy", return_value=False):
+            lookup["Confirmer le regroupement"].emit("clicked")
         for _ in range(300):
             while context.pending():
                 context.iteration(False)
             if any(isinstance(item, Gtk.Label) and item.get_label().startswith("Artistes regroupés") for item in children):
                 break
             sleep(.01)
-        self.assertTrue((self.root / "Lune" / album.name / "Piste.opus").is_file())
+        self.assertTrue((self.root / "Lune" / album.name / "Piste.opus").is_file(),
+                        [item.get_label() for item in children if isinstance(item, Gtk.Label)])
 
         # A publication receipt must traverse the real background owner and
         # the GTK list without a manual inventory or a provider request.

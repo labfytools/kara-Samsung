@@ -688,8 +688,13 @@ class LyricsSources:
 
     def new_track(self):
         self.lrc.answers = {}
+
+    def start_form(self):
+        # Waiting for a shared lookup or finishing the previous form must
+        # not consume the provider budget of the form about to start.
+        deadline = time.monotonic() + 35
         for client in self.clients:
-            client.gate.deadline = time.monotonic() + 35
+            client.gate.deadline = deadline
 
     def close(self):
         for client in self.clients:
@@ -697,7 +702,7 @@ class LyricsSources:
                 client.opener.close()
 
     def find(self, title, artist, album, duration, album_artist, *, synced, local_text="",
-             registry=None, strict=False, context=()):
+             registry=None, strict=False, context=(), provider_only=None):
         signature = (title, artist, album, duration, album_artist)
         if registry:
             from _parole_import_metrics import LOOKUP, SUCCEEDED, observe, snapshot
@@ -715,6 +720,8 @@ class LyricsSources:
             ("QQ Music", self.qqmusic, {"synced": synced}),
             ("LyricDown", self.lyricdown, None) if synced else ("Genius", self.genius, {}),
         ]
+        if provider_only is not None:
+            clients = [entry for entry in clients if entry[0] == provider_only]
         if providers is not None:
             profiles = provider_profiles(registry, (name for name, _, _ in clients if name in providers),
                                          synced, context)
@@ -800,6 +807,8 @@ class LyricsSources:
             compatible = sorted((r for r in providers.values() if r["adapter"] == "lrclib"),
                                 key=lambda r: (-(r["successes"] + 1) / (r["attempts"] + 2), r["latency"], r["id"]))
             for row in compatible:
+                if provider_only is not None and row["id"] != provider_only:
+                    continue
                 conf = json.loads(row["config"])
                 if not conf.get("validated") or ("lrc" if synced else "lyrics") not in row["category"].split(","):
                     continue
@@ -1130,12 +1139,14 @@ def process_track(path, client, preview, synced=False, publication_root=None):
     return f"paroles intégrées · {source}"
 
 
-def process_import_track(path, client, index, settings, excluded, locks, activity, strawberry, *, notify=None):
-    from _parole_index import MEDIA, SIDECAR, document, reference_proof, sidecar as read_sidecar
+def process_import_track(path, client, index, settings, excluded, locks, activity, strawberry, *,
+                         notify=None, diagnostic=lambda _: None):
+    from _parole_index import SIDECAR, document, reference_proof, sidecar as read_sidecar
+    from _parole_local_reference import SOURCE, local_reference
 
     version = track_version(path)
     with index.db() as db:
-        row = db.execute("SELECT info,duration FROM songs WHERE path=? AND token=?", (str(path), document(version))).fetchone()
+        row = db.execute("SELECT * FROM songs WHERE path=? AND token=?", (str(path), document(version))).fetchone()
     known = json.loads(row["info"]) if row else {}
     if known.get("file_tags") and not known.get("probe_error"):
         tags = {**known["tags"], "duration_seconds": row["duration"]}
@@ -1166,58 +1177,81 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
     lock = locks[int.from_bytes(sha256(document(signature).encode()).digest()[:4]) % len(locks)]
     client.new_track()
 
-    def lookup(synced):
+    def lookup(synced, provider_only=None):
+        if provider_only is None and row and (local := local_reference(index, row, synced=synced)):
+            return "found", local.text, SOURCE, local
         with lock:
+            client.start_form()
             activity(synced, 1)
             try:
                 value, provider = client.find(*signature, synced=synced, local_text=local_text,
-                                              registry=index, strict=True, context=context)
-            except ServiceUnavailable:
-                return "temporary", None, None
+                                              registry=index, strict=True, context=context, provider_only=provider_only)
+            except ServiceUnavailable as error:
+                diagnostic(error.reason)
+                return "temporary", None, None, None
             except AmbiguousLyrics:
-                return "review", None, None
+                diagnostic("correspondance ambiguë")
+                return "review", None, None, None
             finally:
                 activity(synced, -1)
-            return ("missing" if value is None else "found" if value else "instrumental"), value, provider
+            return ("missing" if value is None else "found" if value else "instrumental"), value, provider, None
 
-    plain, text, plain_provider = (("present", None, None) if plain_present else
-                                   lookup(False) if settings["lyrics"] and path.suffix.lower() in STREAM_TAGS | FILE_TAGS
-                                   else ("missing", None, None))
-    if text:
-        def published(current, saved, previous):
-            notify(path, MEDIA, {"token": document(current), "tags": saved,
-                                 "same_streams_as": document(previous), "lyrics_provider": plain_provider})
-
-        try:
-            with resource_slot(index.root / INBOX / ".kara-traitements", PROCESSING, timeout=12):
-                version = save_lyrics(path, version, tags, text, index.root, published=published if notify else None)
-        except (OSError, ValueError, ImportIssue, subprocess.SubprocessError):
-            plain = "temporary"
-    # Publish verified plain text before a possibly slower timing request.
-    # The same client keeps the validated text and its shared provider result.
-    local_text = local_text or text or ""
-    timed_provider = "Strawberry"
-    if lrc_exists:
-        timed, lrc = ("present" if lrc_present else "review"), None
-    elif not settings["lrc"]:
-        timed, lrc = "missing", None
-    elif embedded := catalog_transcript(local_text, duration, synced=True):
-        timed, lrc = "found", embedded
-    else:
-        timed, lrc, timed_provider = lookup(True)
-    if lrc:
+    def publish(suffix, text, provider, donor):
         try:
             with shared_mutation(index.root):
-                if track_version(path) != version or path.resolve() != path:
-                    raise ValueError("fichier modifié pendant la recherche")
-                saved = save_lrc(lrc_path, lrc)
-                proof = reference_proof(path, ".lrc", version, timed_provider, external=timed_provider != "Strawberry")
-            if not saved:
-                timed = "present"
-            elif notify:
+                if track_version(path) != version or path.resolve() != path or donor and not donor.current():
+                    raise ValueError("fichier de référence modifié pendant la recherche")
+                # Publishing by exclusive hard link keeps existing sidecars,
+                # including one created by another worker during the lookup.
+                saved = save_lrc(path.with_suffix(suffix), text.strip())
+                proof = reference_proof(path, suffix, version, provider,
+                                        external=suffix == ".lrc" and provider not in ("Strawberry", SOURCE))
+            if saved and notify:
                 notify(path, SIDECAR, proof)
-        except (OSError, ValueError):
-            timed = "temporary"
+        except (OSError, ValueError) as error:
+            diagnostic(str(error))
+            return "temporary"
+        if not saved:
+            contents = read_sidecar(path, suffix)[1]
+            valid = catalog_transcript(contents, duration, synced=True) if suffix == ".lrc" else contents.strip()
+            return "present" if valid else "review"
+        return "found"
+
+    if lrc_exists:
+        timed = "present" if lrc_present else "review"
+    elif not settings["lrc"]:
+        timed = "missing"
+    elif embedded := catalog_transcript(local_text, duration, synced=True):
+        timed = publish(".lrc", embedded, "Strawberry", None)
+    else:
+        timed, lrc, provider, donor = lookup(True)
+        if lrc:
+            timed = publish(".lrc", lrc, provider, donor)
+    if plain_present:
+        return "present", timed
+    if timed in ("found", "present"):
+        # A verified LRC already contains the complete lyric text.
+        return timed, timed
+    if not settings["lyrics"]:
+        return "missing", timed
+    text_path = path.with_suffix(".txt")
+    if text_path.exists() or text_path.is_symlink():
+        diagnostic("fichier texte existant à vérifier")
+        return "review", timed
+    plain, text, provider, donor = lookup(False)
+    if text:
+        if not local_text and settings["lrc"] and not lrc_exists and index.source_enabled("LyricDown"):
+            # LyricDown verifies its timed text against the supplied words.
+            # This provider can only run after acquiring a usable text.
+            local_text = text
+            assisted, lrc, timed_provider, _ = lookup(True, provider_only="LyricDown")
+            if lrc:
+                timed = publish(".lrc", lrc, timed_provider, None)
+                if timed in ("found", "present"):
+                    return timed, timed
+            elif assisted == "temporary" and timed == "missing":
+                timed = assisted
+        plain = publish(".txt", text, provider, donor)
     return plain, timed
 
 

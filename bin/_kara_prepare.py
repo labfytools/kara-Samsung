@@ -744,11 +744,15 @@ def main():
     parser.add_argument("--threads", type=int, choices=range(1, 33))
     parser.add_argument("--backend-logs", action="store_true")
     parser.add_argument("--separate-if-needed", action="store_true")
+    parser.add_argument("--chronos-night-draft", action="store_true",
+                        help="Conserver le calage CHRONOS du texte en brouillon privé sans Demucs.")
     parser.add_argument("--chronos", choices=("huang", "wav2vec2", "huang-ft"),
                         help="Préparer aussi un défilement expérimental pour cette sélection.")
     args = parser.parse_args()
     if args.require_vulkan and args.device != "gpu":
         parser.error("La préparation Vulkan requiert --device gpu.")
+    if args.chronos_night_draft and (not args.plain_reference or not args.local_only or args.chronos):
+        parser.error("Le brouillon nocturne exige un texte et une préparation locale.")
 
     def cancel(_signal, _frame):
         raise KeyboardInterrupt
@@ -782,6 +786,18 @@ def main():
                 phase = stage
                 send("progress", song, phase=stage, percent=percent)
 
+            if args.chronos_night_draft:
+                from _kara_chronos import prepare as prepare_chronos
+
+                progress("chronos", 5)
+                source = {"kind": "night-plain", "provider": args.reference_provider,
+                          "original": plain.decode("utf-8"), "timed": False}
+                try:
+                    status = prepare_chronos(song, preparer.cache, "huang", supplied=source, allow_demucs=False)
+                except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
+                    send("chronos", song, engine="huang", status="unavailable", message=str(error))
+                else:
+                    send("chronos", song, engine="huang", status=status)
             result_available = False
             try:
                 ready, report, elapsed, duration = preparer.prepare(

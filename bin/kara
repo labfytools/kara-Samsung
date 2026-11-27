@@ -1884,19 +1884,26 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
                                remaining=str(item.remaining) if item.remaining else saved.get("remaining"),
                                identity=item.identity or saved.get("identity", ""), provider=item.provider,
                                added=saved.get("added", 0) + item.added, processed=item.processed)
+                if child.defer_enrichment and item.tracks:
+                    outcome["enrichment_pending"] = True
                 on_album(outcome)
                 progress.emit(event="album", **outcome)
                 raise
             except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as error:
                 record_error(child, "Import de l’album", error)
         enrichment = None
+        enrichment_pending = False
         if child.defer_enrichment and item.tracks and item.status != "duplicate":
             try:
                 # Another import can be initializing the index while this
                 # worker starts. Retry the mandatory admission after audio.
-                enrichment = schedule_enrichment(metrics or Index(root), item.tracks)
+                if metrics is None:
+                    enrichment_pending = True
+                else:
+                    enrichment = schedule_enrichment(metrics, item.tracks)
             except (OSError, sqlite3.Error) as error:
-                record_error(child, "Admission de l’enrichissement", error, "processing")
+                enrichment_pending = True
+                child.log("Paroles", f"Admission à reprendre : {type(error).__name__}")
         if item.status != "duplicate":
             if child.failures:
                 item.status = "partial" if item.tracks else "failure"
@@ -1913,7 +1920,7 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
             # directory. Keep the last durable reference to any draft.
             remaining = previous.get(url, {}).get("remaining")
         message = CATEGORIES.get(category) or {
-            "success": "Audio complet" if enrichment else "Import terminé",
+            "success": "Audio complet" if enrichment or enrichment_pending else "Import terminé",
             "duplicate": "Lien en double", "pending": "Arrêté avant téléchargement",
         }[item.status]
         outcome = dict(url=url, title=item.title, status=item.status, category=category, diagnostics=diagnostics,
@@ -1926,6 +1933,8 @@ def prepare_batch(urls, progress, stop, previous, *, titles=None, on_album=None,
             outcome["provider"] = item.provider
         if enrichment:
             outcome["enrichment"] = enrichment
+        if enrichment_pending:
+            outcome["enrichment_pending"] = True
         if metrics is not None and item.provider and item.status not in {"pending", "duplicate"}:
             if not plan_id(url):
                 measure_acquisition(metrics, item, started)
