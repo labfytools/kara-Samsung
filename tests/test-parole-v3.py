@@ -27,7 +27,8 @@ from _parole_codex import authenticate, daily_slot, validate
 from _parole_index import SIDECAR, Index, inventory, encoded_key, reference_proof, revision
 from _parole_maintenance import Journal, Maintenance
 from _parole_process import Interrupted, run
-from _parole_sources import LyricsEndpoint, discover, external_ips, public_url, seed, controls, validate_endpoint
+from _parole_sources import (LRCLIB_DAILY_REQUESTS, LyricsEndpoint, discover, external_ips,
+                             public_url, seed, controls, validate_endpoint)
 from _parole_work import lyrics_engine, save_correction
 
 ARTIST = "aaaaaaaa-0000-0000-0000-000000000001"
@@ -682,7 +683,8 @@ class SourceTests(Fixture):
         owner.output = Mock(wraps=owner.output)
         with self.index.db() as db:
             db.execute("""INSERT INTO daily_usage(bucket,day,used)
-                          SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 6000 ELSE 200 END FROM sources""")
+                          SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN ? ELSE 200 END FROM sources""",
+                       (LRCLIB_DAILY_REQUESTS,))
         settings = owner.current_settings = self.index.settings()
         self.index.enqueue("lrc", second["id"], "fixture")
         kinds = owner.network_kinds(settings, time())
@@ -761,7 +763,8 @@ class SourceTests(Fixture):
                 if not available:
                     with self.index.db() as db:
                         db.execute("""INSERT INTO daily_usage(bucket,day,used)
-                                      SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 6000 ELSE 200 END FROM sources""")
+                                      SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN ? ELSE 200 END FROM sources""",
+                                   (LRCLIB_DAILY_REQUESTS,))
                 settings = owner.current_settings = self.index.settings()
                 kinds = owner.network_kinds(settings, time())
                 self.assertEqual("lrc" in kinds, available)
@@ -861,7 +864,7 @@ class SourceTests(Fixture):
     def test_lyrics_quota_skips_network_but_keeps_local_text_provider_distinct(self):
         from _parole_sources import configure_limits, provider_limits, ready_categories
         seed(self.index)
-        self.assertEqual(provider_limits({"host": "lrclib.net"}), (6000, 2))
+        self.assertEqual(provider_limits({"host": "lrclib.net"}), (20_000, 2))
         self.assertEqual(provider_limits({"host": "musicbrainz.org"}), (200, 0))
         with self.index.db() as db:
             db.execute("UPDATE sources SET state='disabled' WHERE id NOT IN ('LRCLIB','LyricDown')")

@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Porter le plafond local de LRCLIB à 20 000 requêtes par jour et conserver le délai minimal de deux secondes entre requêtes.
+
 - Rechercher les LRC d’origine piste par piste dès leur classement, pendant le téléchargement du reste de l’album. Préserver les LRC fournis et reprendre les recherches interrompues depuis la file persistante.
 
 - Élargir le budget journalier local de LRCLIB, distinguer les envois des reports de quota et remettre en file les LRC reportés après une recherche manuelle.

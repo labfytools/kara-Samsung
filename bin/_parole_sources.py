@@ -54,7 +54,7 @@ HOST = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z
 PATH = re.compile(r"/[a-zA-Z0-9_/-]{0,200}")
 MAX_RESPONSE = 1_000_000
 DEFAULT_REQUESTS = 200
-LRCLIB_DAILY_REQUESTS = 6000
+LRCLIB_DAILY_REQUESTS = 20_000
 RECENT_SOURCE_LIMIT = 128
 RECENT_SOURCE_KIND = "source_latency_samples"
 LYRICS_STATS = "lyrics_source_statistics"
