@@ -9,7 +9,7 @@
   let organizer = sessionStorage.getItem(storageKey + ".organizer") === "true";
   let editing = false, adding = false, picked = null, externalOpen = false, catalogueRevision;
   let importId = localStorage.getItem(storageKey + ".import"), resultCount = null, resultUntil = 0;
-  let starting = false, autoMic = false, micAllowed = false, startIntent = false;
+  let starting = false;
   const searchInput = $("search"), nickname = $("nickname");
   nickname.value = localStorage.getItem("kara.nickname") || "";
   searchInput.value = localStorage.getItem(storageKey + ".search") || "";
@@ -140,20 +140,9 @@
           lastInvitation = party.turn;
           organizer = false;
           sessionStorage.removeItem(storageKey + ".organizer");
-          autoMic = startIntent = false;
-          micAllowed = true;
           micMessage = "";
           $("voice-consent").checked = false;
           nextWakeAttempt = 0;
-        }
-        if (party.turn_phase === "awaiting-mic" && !party.recording_voice && !autoMic && !mic) {
-          autoMic = true;
-          const offered = party.turn;
-          navigator.permissions?.query({name: "microphone"}).then(permission => {
-            if (permission.state === "granted" && lastInvitation === offered && micAllowed && !document.hidden &&
-                isMyTurn(state?.party) && state.party.turn_phase === "awaiting-mic" && !mic)
-              startMicrophone().catch(() => {});
-          }).catch(() => {});
         }
       } else releaseWake();
       const count = party.results?.length || 0;
@@ -175,7 +164,6 @@
         if (!externalOpen && !importId) search(true);
       }
       render();
-      maybeStart();
     } catch (error) {
       connected(false);
       if (error.status === 401) {
@@ -210,7 +198,6 @@
   $("mark-live").onclick = () => run($("mark-live"), mark);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
-      micAllowed = startIntent = false;
       stopMicrophone("background");
       releaseWake();
       if (isMyTurn(state?.party)) micMessage = "Micro interrompu en arrière-plan. Réactive-le pour reprendre.";
@@ -219,7 +206,6 @@
   window.addEventListener("pagehide", () => stopMicrophone("pagehide"));
   window.addEventListener("online", () => token ? poll() : search(true));
   window.addEventListener("offline", () => {
-    micAllowed = startIntent = false;
     stopMicrophone("network");
     micMessage = "Le micro ne transmet plus. Réactive-le après la reconnexion.";
     connected(false); render();
@@ -663,7 +649,7 @@
       $("connection").hidden ? "Serveur connecté" : "Serveur en reconnexion",
       party.tv ? "TV connectée" : "TV en attente", party.player && party.player + " · " + party.song
     ].filter(Boolean).join(" · ");
-    const key = JSON.stringify([party.can_open, party.phase, party.turn_phase, party.paused, party.mic_receiving, party.turn]);
+    const key = JSON.stringify([party.can_open, party.phase, party.turn_phase, party.paused, party.mic_confirmed, party.mic_receiving, party.turn]);
     const actions = $("commands");
     if (key !== adminKey) {
       adminKey = key;
@@ -678,7 +664,7 @@
       }
       if (party.phase === "running") {
         if (party.turn_phase === "playing") actions.append(ctl(party.paused ? "Reprendre" : "Pause", party.paused ? "resume" : "pause"));
-        if (party.turn_phase === "awaiting-mic" && party.mic_receiving)
+        if (party.turn_phase === "awaiting-mic" && party.mic_receiving && party.mic_confirmed)
           actions.append(button("Démarrer le tour", () => command("organizer-start", {turn: party.turn})));
         actions.append(ctl(party.turn_phase === "playing" ? "Abandonner le tour" : "Passer au suivant",
           "next", "", "Passer le tour actuel ?"),
@@ -807,17 +793,28 @@
     const phase = party.turn_phase;
     const enabled = !!party.audio?.available && window.isSecureContext && ["awaiting-mic", "playing"].includes(phase);
     $("micro").disabled = !enabled || starting;
-    $("micro").hidden = phase === "countdown" || phase === "opening" || phase === "finishing" || phase === "playing" && !!mic;
-    $("micro").textContent = phase === "playing" ? "Réactiver le micro" : starting ? "Connexion du micro…" : "Démarrer";
+    $("micro").hidden = !enabled || !!mic?.ready;
+    $("micro").textContent = starting ? "Connexion du micro…" :
+      phase === "playing" ? "Réactiver le micro" : "Activer le micro";
+    const testing = phase === "awaiting-mic";
+    const tested = !!mic?.ready && !!party.mic_confirmed;
+    $("confirm-return").hidden = !testing || !mic?.ready || tested;
+    $("confirm-return").disabled = !party.mic_receiving || !mic?.outputVerified;
+    $("start-turn").hidden = !testing || !tested;
+    $("start-turn").disabled = !party.mic_receiving;
+    $("return-output").textContent = mic?.outputVerified ? "Sortie vérifiée · " + mic.output : "";
     $("voice-consent-label").hidden = !party.recording_voice || !enabled || !!mic;
     $("witness-consent").hidden = !party.recording_witness;
     $("turn-title").textContent = phase === "countdown" ? "Départ dans " + party.countdown :
-      phase === "playing" ? "Tu chantes" : phase === "finishing" ? "Calcul du résultat…" : "À toi de chanter !";
+      phase === "playing" ? "Tu chantes" : phase === "finishing" ? "Calcul du résultat…" :
+        testing ? "Essai microphone" : "À toi de chanter !";
     $("turn-song").textContent = state.me.name + " · " + (party.song || "");
     $("live-score").textContent = Number.isFinite(party.score) ? party.score + " %" : "";
-    $("micro-status").textContent = micMessage || (party.mic_receiving ? "Micro connecté" :
-      phase === "playing" ? "Le microphone ne transmet plus." :
-      phase === "preparing" ? "Préparation du microphone…" : enabled ? "Appuie quand tu es prêt." : "");
+    $("micro-status").textContent = micMessage || (testing ?
+      tested ? "Retour confirmé. Tu peux démarrer." :
+        mic?.ready ? "Parle et règle le retour. Confirme quand tu entends ta voix sur l’enceinte." :
+          "Active le micro pour t’entendre avant le départ." :
+      phase === "playing" && !party.mic_receiving ? "Le microphone ne transmet plus." : "");
     $("return-volume").hidden = phase === "finishing";
     $("mark-area").hidden = !party.recording;
     const mix = state.me.mix || {};
@@ -833,16 +830,6 @@
       $("voice-applied").value = "0 % · micro coupé";
     }
     $("live-guide-note").hidden = !!mix.training || Number($("live-original").value) === 0;
-  }
-  async function maybeStart() {
-    const party = state?.party;
-    if (!startIntent || starting || !mic?.ready || !party?.mic_receiving || party.turn_phase !== "awaiting-mic") return;
-    starting = true;
-    startIntent = false;
-    render();
-    try { await command("player-start", {turn: party.turn}, "demarrer"); }
-    catch (error) { micMessage = error.message; }
-    finally { starting = false; render(); }
   }
   let liveMixPending = {}, liveMixTimer, liveMixBusy = false;
   async function sendLiveMix() {
@@ -886,7 +873,10 @@
       owner.socket.close();
     }
     if (owner.context) owner.context.close().catch(() => {});
-    $("micro-level").value = 0;
+    $("micro-level").value = $("return-level").value = -60;
+  }
+  function meterDb(value) {
+    return value > 0 ? Math.max(-60, Math.min(0, 20 * Math.log10(value))) : -60;
   }
   async function startMicrophone() {
     const version = ++micGeneration;
@@ -968,18 +958,20 @@
             context_begin_ms: begin, context_end_ms: end, context_frame: frame, sent_ms: performance.now()}));
         }
         if (data.levels) {
-          $("micro-level").value = data.rms;
+          $("micro-level").value = meterDb(data.rms);
+          $("return-level").value = meterDb(data.return_rms);
           if (owner.resetPending) {
             owner.resetPending = false;
             $("voice").value = data.requested_percent;
           }
           $("voice-applied").value = data.applied_percent + " %" + (data.return_muted ? " · retour coupé" :
-            data.return_started === false ? " · en attente du départ" :
-              data.applied_percent < data.requested_percent ? " · plafond de l’organisateur" : "");
+            data.applied_percent < data.requested_percent ? " · plafond de l’organisateur" : "");
         }
       };
       $("voice").value = ticket.volume;
       $("voice-applied").value = settings.applied_percent + " %";
+      owner.output = settings.device;
+      owner.outputVerified = settings.output_verified === true;
       owner.ready = true; micMessage = "";
       const agent = navigator.userAgent || "";
       const platform = /Android/.test(agent) ? "android" : /iPhone|iPad|iPod/.test(agent) ? "ios" : "other";
@@ -1020,13 +1012,18 @@
   }
 
   $("micro").onclick = () => run($("micro"), async () => {
-    micAllowed = true;
+    if (mic) return;
     micMessage = "";
-    startIntent = state?.party.turn_phase === "awaiting-mic";
-    if (!mic) await startMicrophone();
+    starting = true;
+    render();
+    try { await startMicrophone(); }
+    finally { starting = false; render(); }
     await poll();
-    maybeStart();
   });
+  $("confirm-return").onclick = () => run($("confirm-return"), () =>
+    command("audio-confirm-return", {turn: state.party.turn}, "confirmer-retour"));
+  $("start-turn").onclick = () => run($("start-turn"), () =>
+    command("player-start", {turn: state.party.turn}, "demarrer"));
   $("voice").oninput = () => {
     const value = Number($("voice").value);
     if (mic?.socket?.readyState === WebSocket.OPEN) mic.socket.send("volume:" + value);

@@ -101,6 +101,8 @@ class RemoteParty:
             turns = self.selected_turns()
             if not turns or not self.can_offer(*turns[0]):
                 raise RoomError("Choisis un premier morceau audio disponible pour ouvrir le salon.", 409)
+            if control.validating:
+                control.cancel_preparation()
             self.opened_early = True
             self.plan = turns
             self.queue = deque(turns)
@@ -110,10 +112,16 @@ class RemoteParty:
             self.next_at = time.monotonic()
         elif action in ("player-start", "organizer-start"):
             player = control.party.active
-            if (not self.opened_early or not player or action == "player-start" and player.name != name
+            if (not player or not player.mobile_id or action == "player-start" and player.name != name
                     or data.get("turn") != self.turn_id):
                 raise RoomError("Le démarrage est réservé au joueur du tour et à l’organisateur.", 403)
             control.request_turn_start()
+        elif action == "audio-confirm-return":
+            player = control.party.active
+            if (not player or player.name != name or not player.mobile_id or data.get("turn") != self.turn_id
+                    or control.turn_phase != "awaiting-mic"):
+                raise RoomError("Cet essai est réservé au joueur du tour.", 403)
+            control.room_audio.confirm_return(player.mobile_id)
         elif action == "player-retry-import":
             token = control.receiver.room.player_token(name)
             if token is None:
@@ -537,8 +545,9 @@ class RemoteParty:
         receiver.room.publish({
             "public": {"phase": self.phase, "revision": self.revision, "turn": self.turn_id,
                        "turn_phase": control.turn_phase, "player": active.name if active else None,
-                       "countdown": control.countdown() if self.opened_early else 0,
-                       "mic_receiving": control.room_audio.receiving(recent=True) if self.opened_early else False,
+                       "countdown": control.countdown(),
+                       "mic_receiving": control.room_audio.receiving(recent=True),
+                       "mic_confirmed": control.room_audio.test_passed(),
                        "score": (control.game_score.breakdown or {}).get("score") if active and self.opened_early else None,
                        "song": active.song.title if active and active.song else None,
                        "next": [{"player": player.name, "song": song.title} for player, song in self.queue],
@@ -547,7 +556,7 @@ class RemoteParty:
                        "recording": blackbox["active"], "recording_voice": blackbox["voice"],
                        "recording_witness": blackbox["witness"],
                        "last_result": self.last_result,
-                       "ranking": self.ranking(), "audio": audio, "player_start": self.opened_early,
+                       "ranking": self.ranking(), "audio": audio, "player_start": bool(active and active.mobile_id),
                        "original_voice_levels": ORIGINAL_VOICE_LEVELS},
             "admin": {"blackbox": blackbox, "failed": control.align_status if control.failed_alignments else "",
                       "can_skip": control.can_skip_failed(), "can_sing_only": bool(control.unscored_choices()),

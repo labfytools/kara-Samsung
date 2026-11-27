@@ -614,6 +614,10 @@ class Page(BaseHTTPRequestHandler):
                 self._private_transport()
                 receiver.room.identity(token)
                 return self._send(200, receiver.audio.ticket(token, consent=data.get("consent") is True))
+            if receiver.commands is not None and request.path == base + '/api/confirmer-retour':
+                self._private_transport()
+                name = receiver.room.identity(token)
+                return self._send(200, receiver.commands("audio-confirm-return", name, data))
             if receiver.commands is not None and request.path == base + '/api/demarrer':
                 self._private_transport()
                 name = receiver.room.identity(token)

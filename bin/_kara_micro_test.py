@@ -23,7 +23,8 @@ from scipy.signal import firwin, resample_poly
 from aiohttp import WSMsgType, web
 from _kara_audio_calibration import ANALOG_TARGET, await_owned, calibration_audio, close_process, selected_target
 from _kara_blackbox_clock import browser_anchor
-from _kara_monitor_profiles import DEFAULTS, PROFILE_PATH, PROFILES, device_key, output_port, read_profiles
+from _kara_monitor_profiles import (DEFAULTS, ECHO_GUARD_DB, PROFILE_PATH, PROFILES, RETURN_PEAK,
+                                    device_key, output_port, read_profiles)
 from _kara_voice_latency import RelativeTransit, SubmissionCadence, TimingWindow, TransportFreshness, player_backlog
 
 ROOT = Path.home() / ".local/state/kara/micro-test"
@@ -43,20 +44,24 @@ MONITOR_NODE = "kara-microphone"
 RESAMPLE_UP, RESAMPLE_DOWN = 160, 147
 RESAMPLE_DELAY = 12
 MONITOR_FIR = firwin(3201, 1 / RESAMPLE_UP, window=("kaiser", 5.0)).astype(np.float32)
-ECHO_GUARD_DB = 9
 DEFAULT_MONITOR_VOLUME = 50
 
 
 def monitor_peak(guard):
     # Reduce the gain on every acoustic round trip. Fold it into the existing
     # shaper so every sample is still emitted immediately, even in quiet speech.
-    return 0.82 * 10 ** (-ECHO_GUARD_DB / 20) if guard else 0.82
+    return RETURN_PEAK * 10 ** (-ECHO_GUARD_DB / 20) if guard else RETURN_PEAK
 
 
 def shape_monitor(samples, peak, drive=1.):
-    # Memoryless peak protection adds no buffering. Drive changes the slope
-    # for quiet singing without raising the protected acoustic peak.
-    return np.tanh(samples * (2.0 * drive)) * peak
+    # The guard preserves the legacy small-signal loop gain and ceiling.
+    # Leave speech linear up to the soft knee, then limit without lookahead.
+    signal = samples * (2.0 * drive)
+    knee = .65
+    magnitude = np.abs(signal)
+    limited = np.minimum(magnitude, knee) + (1. - knee) * np.tanh(
+        np.maximum(magnitude - knee, 0.) / (1. - knee))
+    return np.copysign(limited * peak, signal)
 
 
 def resample_live_block(samples, history):
@@ -85,52 +90,72 @@ async def read_pulse_status(stderr, status):
                     ("maxlength", "tlength", "prebuf", "minreq"), map(int, match.groups())))
 
 
-def set_stream_volume(stream_name, percent, *, verify=False):
+def set_stream_volume(stream_name, percent, *, verify=False, sink_index=None):
     # Match the unique live stream owned by this session, even if other pw-cat
     # instances or Strawberry are present. Re-resolve the index on each change.
-    try:
+    def owned_stream():
         inputs = json.loads(subprocess.check_output(
             ("pactl", "--format=json", "list", "sink-inputs"), timeout=2))
         owned = [entry for entry in inputs if entry["properties"].get("node.name") == stream_name]
-        if len(owned) == 1 and type(index := owned[0]["index"]) is int and index >= 0:
-            channels = owned[0].get("volume", {})
-            if verify and channels and all(value["value"] == 65536 for value in channels.values()):
-                return True
-            subprocess.run(("pactl", "set-sink-input-volume", str(index),
-                            f"{percent}%"), check=True, timeout=2,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if not verify:
-                return True
-            items = json.loads(subprocess.check_output(
-                ("pactl", "--format=json", "list", "sink-inputs"), timeout=2))
-            channels = next((item["volume"] for item in items if item["index"] == index
-                             and item["properties"].get("node.name") == stream_name), {})
-            return bool(channels) and all(value["value"] == 65536 for value in channels.values())
+        if len(owned) == 1 and type(owned[0]["index"]) is int and owned[0]["index"] >= 0:
+            return owned[0]
+        return {}
+
+    def unit_gain(stream):
+        channels = stream.get("volume", {})
+        return bool(channels) and all(value["value"] == 65536 for value in channels.values())
+
+    def on_output(stream):
+        return sink_index is None or (stream.get("sink") == sink_index and stream.get("mute") is False)
+
+    try:
+        stream = owned_stream()
+        if not stream or not on_output(stream):
+            return False
+        if verify and unit_gain(stream):
+            return True
+        index = stream["index"]
+        subprocess.run(("pactl", "set-sink-input-volume", str(index),
+                        f"{percent}%"), check=True, timeout=2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not verify:
+            return True
+        verified = owned_stream()
+        return verified.get("index") == index and on_output(verified) and unit_gain(verified)
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
-        pass
-    return False
+        return False
 
 
-async def prepare_room_stream(player, stream_name, *, native):
+async def prepare_room_stream(player, stream_name, *, native, sink_index):
     # A native pw-cat may block on its first stdin read, delaying the graph's
     # acknowledgement of the volume change. Clock one silent 10 ms block at
     # a time during startup only. Live microphone PCM remains unqueued here.
-    gain = asyncio.create_task(asyncio.to_thread(set_stream_volume, stream_name, 100, verify=True))
     silent = bytes(480 * 2 * 2)
-    try:
-        if native:
-            await asyncio.wait((gain,), timeout=.02)
-            until = time.monotonic() + 2.
-            while not gain.done() and time.monotonic() < until:
+    for attempt in range(2):
+        gain = asyncio.create_task(asyncio.to_thread(
+            set_stream_volume, stream_name, 100, verify=True, sink_index=sink_index))
+        try:
+            if native:
+                await asyncio.wait((gain,), timeout=.02)
+                until = time.monotonic() + 2.
+                while not gain.done() and time.monotonic() < until:
+                    player.stdin.write(silent)
+                    await asyncio.wait_for(player.stdin.drain(), timeout=.3)
+                    await asyncio.wait((gain,), timeout=.01)
+            if await gain:
+                return True
+            if attempt == 0:
+                # Pulse and native policy may publish the sink input just
+                # after the player starts. Retry with a silent block only.
                 player.stdin.write(silent)
                 await asyncio.wait_for(player.stdin.drain(), timeout=.3)
-                await asyncio.wait((gain,), timeout=.01)
-        return await gain
-    except (OSError, TimeoutError):
-        return False
-    finally:
-        # Never let a volume command outlive the stream identity it targets.
-        await asyncio.gather(gain, return_exceptions=True)
+                await asyncio.sleep(.10)
+        except (OSError, TimeoutError):
+            return False
+        finally:
+            # No volume command may outlive the stream identity it targets.
+            await asyncio.gather(gain, return_exceptions=True)
+    return False
 
 
 def lan_ip():
@@ -500,10 +525,12 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                         samples = resample_poly(samples, RESAMPLE_UP, RESAMPLE_DOWN)
                     else:
                         samples = resample_live_block(samples, history)
-                # Keep the existing vocal compression. The optional ceiling
-                # reduction does not gate, reshape or delay individual syllables.
+                if route:
+                    audio_stats["resampled_rms"] = float(np.sqrt(np.mean(samples * samples)))
                 samples = shape_monitor(samples, peak, route.return_drive if route else 1.)
                 if route:
+                    audio_stats["guarded_rms"] = float(np.sqrt(np.mean(samples * samples)))
+                    audio_stats["guarded_peak"] = float(np.max(np.abs(samples)))
                     samples = room_audio.apply_return(route, samples)
                     audio_stats["return_rms"] = float(np.sqrt(np.mean(samples * samples)))
                     audio_stats["return_peak"] = float(np.max(np.abs(samples)))
@@ -525,6 +552,9 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                         write_returned * 1000, (write_returned - write_started) * 1000)
                     await asyncio.wait_for(player.stdin.drain(), timeout=0.3)
                     drained_at = time.monotonic()
+                    if route and audio_stats["return_peak"] >= .001:
+                        room_audio.return_submitted(route, drained_at)
+                    audio_stats["meter_at"] = drained_at
                     write_ms = (drained_at - write_started) * 1000
                     distributions["stdin_write_drain_ms"].append(drained_at * 1000, write_ms)
                     cadence.observe(drained_at * 1000, len(pcm) // 4)
@@ -575,15 +605,17 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                 # launched at 1. Set and verify unit gain before admitting
                 # PCM. Only the room's protected DSP owns the return fader.
                 unit_gain = await await_owned(asyncio.create_task(
-                    prepare_room_stream(player, stream_name, native=not experimental)))
+                    prepare_room_stream(player, stream_name, native=not experimental,
+                                        sink_index=route.settings["output_index"])))
                 if not unit_gain:
                     room_audio.diagnostics.emit("audio", "error", **route.context, operation="return-stream-gain")
-                    raise web.HTTPServiceUnavailable(text="Gain du flux de retour PipeWire indisponible")
-                room_audio.diagnostics.emit("audio", "return-stream-gain", **route.context, applied_db=0.)
+                    raise web.HTTPServiceUnavailable(text="Sortie du retour ou gain PipeWire non vérifié")
+                room_audio.diagnostics.emit("audio", "return-stream-gain", **route.context, applied_db=0.,
+                                            output_verified=True)
             if ACTIVE_SESSION.get("monitor_offer") is not offer:
                 raise web.HTTPConflict(text="Demande remplacée par une nouvelle session micro")
             await ws.prepare(request)
-            if ACTIVE_SESSION.get("monitor_offer") is not offer or (route and not room_audio.attach(route, ws)):
+            if ACTIVE_SESSION.get("monitor_offer") is not offer or (route and not room_audio.attach(route, ws, output_verified=True)):
                 await ws.close(code=4000, message=b"Nouvelle session micro")
                 return ws
             ACTIVE_SESSION["ws"] = ws
@@ -615,6 +647,8 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                 settings["applied_percent"] = room_audio.applied(route)
                 settings["requested_percent"] = room_audio.requested(route)
                 settings["return_muted"] = room_audio.muted(route)
+                settings["device"] = route.settings["output_description"]
+                settings["output_verified"] = True
             await ws.send_json(settings)
             async for msg in ws:
                 if route and not room_audio.allowed(route, ws):
@@ -819,12 +853,14 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                             levels["applied_percent"] = room_audio.applied(route)
                             levels["requested_percent"] = room_audio.requested(route)
                             levels["return_muted"] = room_audio.muted(route)
-                            levels["return_started"] = route.return_enabled
-                            levels["return_rms"] = audio_stats.get("return_rms", 0.)
-                            levels["return_peak"] = audio_stats.get("return_peak", 0.)
+                            fresh = now - audio_stats.get("meter_at", 0.) < .25
+                            for name in ("rms", "peak", "resampled_rms", "guarded_rms", "guarded_peak",
+                                         "return_rms", "return_peak"):
+                                levels[name] = round(audio_stats.get(name, 0.), 5) if fresh else 0.
                             levels["return_drive"] = route.return_drive
                             levels["return_fader_gain"] = route.gain
                             levels["return_peak_limit"] = peak
+                            levels["stage"] = "microphone-test" if route.testing else "turn"
                             room_audio.metrics(route, levels)
                             if (room_audio.diagnostics.active()
                                     and (clock_probe is None or time.monotonic_ns() - clock_probe[1] > 2_000_000_000)

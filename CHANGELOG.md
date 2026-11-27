@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Régler séparément la musique et le retour vocal, vérifier la sortie PipeWire et entendre le micro avant le départ. Consigner les niveaux de la chaîne dans BlackBox.
+
 - Ouvrir le salon avec le fichier audio sélectionné, afficher le LRC original et réserver Turbo à la reconnaissance du chanteur. Archiver les traitements de minutage IA et conserver les recherches multisources.
 
 - Compléter les débuts de ligne CHRONOS manquants avec ceux du LRC lorsque le texte correspond.

@@ -41,7 +41,7 @@ class BlackBoxTests(unittest.TestCase):
             with patch.object(audio, "_route_settings", return_value=("fixture", "device", {
                     "volume_percent": 45, "profile": "fixture", "mic_gain_percent": 100,
                     "chrome_echo": True, "chrome_noise": False})):
-                reader = audio.open_turn("owner", "Alex", "a" * 16, "Essai", scoring=False, require_consent=True)
+                reader = audio.open_turn("owner", "Alex", "a" * 16, "Essai", scoring=False)
             try:
                 audio.runner = object()
                 route = audio.route
@@ -54,12 +54,10 @@ class BlackBoxTests(unittest.TestCase):
                 audio.ticket("owner", consent=True)
                 audio.record_playing(False)
                 audio.record_received(route, samples, 48000, now + .01, 1, (now + .01) * 1000, None)
-                audio.record_playing(True)
+                audio.record_test(True)
                 audio.record_received(route, samples, 48000, now + .02, 1, (now + .02) * 1000, None)
                 audio.pcm(route, samples, 48000, now + .02, 1, (now + .02) * 1000)
                 audio.return_pcm(route, samples, 1)
-                self.assertEqual(audio.applied(route), 0)
-                audio.enable_return()
                 self.assertEqual(audio.applied(route), 45)
                 audio.mute_return()
                 self.assertEqual(audio.applied(route), 0)

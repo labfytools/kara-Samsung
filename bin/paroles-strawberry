@@ -30,6 +30,7 @@ from _kara_remote_party import RemoteParty
 from _kara_room_audio import RoomAudio
 from _kara_mobile_imports import MobileImports
 from _kara_mobile_room import RoomError
+from _kara_monitor_profiles import ROOM_MUSIC_BUDGET
 from _kara_prepare import PreparedCache, lrc_token
 from _kara_stem_playback import StemPlayback, STRENGTHS
 from _kara_stems import cached_stems
@@ -643,16 +644,17 @@ class LyricsWindow(Gtk.ApplicationWindow):
                       GLib.Variant("(ssv)", (INTERFACE, "Volume", GLib.Variant("d", level))),
                       None, Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
 
-    def apply_player_mix(self, player, *, music_changed=True, original_changed=True):
+    def apply_player_mix(self, player, *, music_changed=True, original_changed=True, music_callback=None):
         if self.turn_music_restore is None or self.turn_phase not in ("opening", "playing"):
             return
         ceiling = round(100 * min(1., self.turn_music_restore))
         music = player.music_volume if player.music_volume is not None else 100
         if self.turn_original_mix:
             if music_changed:
-                self.write_music_volume(min(music, ceiling) / 100)
+                gain = ROOM_MUSIC_BUDGET * min(music, ceiling) / 100
+                self.write_music_volume(gain, music_callback, stage=True)
                 self.blackbox.emit("audio", "original-mix", turn=self.bb_turn, player=player.name,
-                                   music_requested=music, music_applied=min(music, ceiling))
+                                   music_requested=music, music_applied=min(music, ceiling), music_gain=gain)
             return
         self.vocal_effect.set_turn_mix(music, player.original_voice, ceiling)
         if original_changed:
@@ -1168,8 +1170,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if player.mobile_id:
             try:
                 self.game_score.network_socket = self.room_audio.open_turn(
-                    player.mobile_id, player.name, self.bb_turn, player.song.title, scoring=scored,
-                    require_consent=independent)
+                    player.mobile_id, player.name, self.bb_turn, player.song.title, scoring=scored)
                 self.vocal_effect.output_override = self.room_audio.selected_sink()
             except ValueError as error:
                 self.bb_turn = None
@@ -1187,7 +1188,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.turn_scored = scored
         self.turn_original_mix = original_mix
         self.game_toggle.set_sensitive(scored)
-        self.turn_phase = "preparing"
+        self.turn_phase = "awaiting-mic" if player.mobile_id else "preparing"
+        self.room_audio.record_test(bool(player.mobile_id))
         self.turn_tail = None
         self.record_turn = scored and not independent and self.players_window.record_next.get_active()
         self.players_window.record_next.set_active(False)
@@ -1205,12 +1207,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if scored:
             self.game_toggle.set_active(True)
             self.sync_game()
-        elif self.game_score.network_socket is not None:
-            self.turn_phase = "awaiting-mic"
-            self.turn_deadline = time.monotonic() + 75.
-        else:
-            # Explicit sing-only turns use the ordinary player path. They
-            # never acquire the scoring worker, capture or recording route.
+        elif not player.mobile_id:
             self.begin_playback(player)
 
     def countdown(self):
@@ -1219,15 +1216,16 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def request_turn_start(self):
         if self.turn_phase in ("countdown", "opening", "playing"):
             return
-        if self.turn_phase != "awaiting-mic" or not self.room_audio.receiving(recent=True):
-            raise RoomError("Le microphone doit transmettre avant le départ.", 409)
+        if (self.turn_phase != "awaiting-mic" or not self.room_audio.receiving(recent=True)
+                or not self.room_audio.test_passed()):
+            raise RoomError("Confirme que tu entends ton retour avant de démarrer.", 409)
         if self.music_volume is None or time.monotonic() - self.player_seen > 2:
             raise RoomError("Le lecteur musical est indisponible.", 503)
-        if time.monotonic() - self.receiver.secure_tv_seen >= 4:
+        if self.remote_party.opened_early and time.monotonic() - self.receiver.secure_tv_seen >= 4:
             raise RoomError("La télévision Kara est déconnectée.", 409)
         player = self.party.active
         if not self.song_available(player.song):
-            raise RoomError("La chanson doit être préparée de nouveau.", 409)
+            raise RoomError("Le fichier audio est indisponible.", 409)
         self.turn_phase = "countdown"
         self.countdown_end = time.monotonic() + 3.
         self.blackbox.emit("party", "countdown", turn=self.bb_turn, player=player.name, seconds=3)
@@ -1238,10 +1236,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if self.music_volume is None:
             self.finish_turn(error="Le volume de Strawberry est indisponible.")
             return
-        self.room_audio.enable_return()
+        self.room_audio.record_test(False)
         self.turn_music_restore = self.music_volume
         self.guide_intervals.clear()
-        self.apply_player_mix(player)
 
         def opened(bus, result):
             if player is not self.party.active or self.turn_phase != "opening":
@@ -1253,13 +1250,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
             else:
                 self.turn_opened = True
 
-        def muted(bus, result):
+        def music_set(bus, result):
             if player is not self.party.active or self.turn_phase != "opening":
                 return
             try:
                 bus.call_finish(result)
             except GLib.Error:
-                self.finish_turn(error="Impossible d’isoler la sortie originale de Strawberry.")
+                self.finish_turn(error="Impossible de régler le volume musical dans Strawberry.")
                 return
             self.player_command("OpenUri", GLib.Variant("(s)", (player.song.path.as_uri(),)), opened)
 
@@ -1267,9 +1264,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
             # A sing-only turn with display timing can use the original audio.
             # Avoid starting the stem route or muting Strawberry.
             self.vocal_effect.disable()
-            self.player_command("OpenUri", GLib.Variant("(s)", (player.song.path.as_uri(),)), opened)
+            self.apply_player_mix(player, music_callback=music_set)
         else:
-            self.write_music_volume(0., muted, stage=True)
+            self.apply_player_mix(player)
+            self.write_music_volume(0., music_set, stage=True)
         self.refresh_game()
 
     def scoring_source(self):
@@ -1339,8 +1337,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.effect_toggle.set_active(True)
         if self.vocal_effect.active:
             return True
-        self.finish_turn(pause=True, error="Impossible de mélanger les deux pistes du morceau.")
-        return False
+        self.effect_toggle.set_active(False)
+        self.turn_mix_strength = None
+        self.turn_original_mix = True
+        if self.turn_scored:
+            self.drop_turn_score("Instrumental indisponible")
+        self.apply_player_mix(self.party.active)
+        return True
 
     def advance_turn(self, now):
         player = self.party.active
@@ -1349,33 +1352,23 @@ class LyricsWindow(Gtk.ApplicationWindow):
         game = self.game_score
         if self.turn_phase == "preparing":
             if game.ready:
-                if game.network_socket is not None:
-                    self.turn_phase = "awaiting-mic"
-                    self.turn_deadline = now + 75.
-                else:
-                    self.begin_playback(player)
+                self.begin_playback(player)
             elif game.process is None or now >= self.turn_deadline:
                 self.drop_turn_score(game.message or "Turbo indisponible")
-                if player.mobile_id:
-                    self.turn_phase = "awaiting-mic"
-                    self.turn_deadline = now + 75.
-                else:
-                    self.begin_playback(player)
+                self.begin_playback(player)
         elif self.turn_phase == "opening" and now >= self.turn_deadline:
             self.finish_turn(error="Strawberry n’a pas démarré la chanson sélectionnée.")
         elif self.turn_phase == "awaiting-mic":
-            if not self.remote_party.opened_early and self.room_audio.receiving():
-                self.begin_playback(player)
-            elif self.turn_scored and game.process is None:
+            if self.turn_scored and (game.process is None or not game.ready and now >= self.turn_deadline):
                 self.drop_turn_score(game.message or "Turbo indisponible")
-            elif not self.remote_party.opened_early and now >= self.turn_deadline:
-                self.finish_turn(error="Le microphone du joueur n’a pas démarré.")
         elif self.turn_phase == "countdown":
-            if (not self.room_audio.receiving(recent=True) or now - self.receiver.secure_tv_seen >= 4
+            if (not self.room_audio.receiving(recent=True) or not self.room_audio.test_passed()
+                    or self.remote_party.opened_early and now - self.receiver.secure_tv_seen >= 4
                     or now - self.player_seen > 2 or not self.song_available(player.song)):
                 self.turn_phase = "awaiting-mic"
-                self.turn_deadline = now + 75.
             elif now >= self.countdown_end:
+                if self.turn_scored and not game.ready:
+                    self.drop_turn_score(game.message or "Turbo indisponible")
                 self.begin_playback(player)
         elif self.turn_phase == "playing" and game.requested and game.process is None:
             self.drop_turn_score(game.message or "Le moteur de score s’est arrêté")
@@ -1389,6 +1382,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
         # A decoder failure must leave the live return and playback owned by
         # the turn. Discard scoring work without closing its audio route.
         self.turn_scored = False
+        self.room_audio.disable_scoring()
+        if self.record_turn:
+            self.game_score.record_turn()
+            self.record_turn = False
         self.game_score.stop()
         self.blackbox.emit("party", "score-unavailable", **self.game_score.diagnostic_turn)
         self.players_window.message.set_text(f"{detail} · chant sans note.")
@@ -2095,7 +2092,11 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                    strawberry_monotonic_ns=round(self.updated * 1_000_000_000),
                                    playback_rate=self.rate)
         else:
-            self.acoustic.update()
+            if (player and player.mobile_id and self.turn_phase in ("awaiting-mic", "countdown")
+                    and self.room_audio.consented()):
+                self.acoustic.update(context, self.room_audio.selected_sink())
+            else:
+                self.acoustic.update()
             self.capture_output()
         if self.game_toggle.get_active() and self.turn_phase in ("", "playing"):
             times, word_times, word_ends = self.game_score.reference_clock

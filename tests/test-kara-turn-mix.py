@@ -8,7 +8,7 @@ import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import wave
 
 import gi
@@ -117,6 +117,24 @@ class ReturnTests(unittest.TestCase):
         loud = shape_monitor(np.linspace(-1, 1, 1000), limit, 3.)
         self.assertLessEqual(float(np.max(np.abs(loud))), limit)
         self.assertLess(TURN_MUSIC_GAIN + TURN_GUIDE_GAIN + limit, 1.)
+
+    def test_linear_room_fader_and_emergency_cut_have_independent_peak_budget(self):
+        from _kara_monitor_profiles import ROOM_MUSIC_BUDGET
+
+        room = RoomAudio(Mock())
+        with patch.object(room, "_route_settings", return_value=("sink", "device", {
+                "volume_percent": 73, "profile": "balanced"})):
+            reader = room.open_turn("owner", "Joueur", "tour", "Titre", scoring=False)
+        self.addCleanup(reader.close)
+        self.addCleanup(room.close_turn)
+        route = room.route
+        samples = shape_monitor(np.full(480, .1, dtype=np.float32), monitor_peak(True))
+        for _ in range(40):
+            result = room.apply_return(route, samples)
+        self.assertAlmostEqual(float(result[-1] / samples[-1]), .73, places=3)
+        self.assertLess(ROOM_MUSIC_BUDGET + monitor_peak(True), 1.)
+        room.mute_return()
+        self.assertFalse(room.apply_return(route, samples).any())
 
     def test_frame_clock_preserves_continuity_gaps_and_microphone_gain_independence(self):
         rows = []

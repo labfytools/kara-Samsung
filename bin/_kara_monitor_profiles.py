@@ -15,6 +15,11 @@ PROFILES = {"stable": (20, 4), "balanced": (10, 4), "low-latency": (10, 2)}
 DEFAULTS = {"profile": "balanced", "volume_percent": 50, "mic_gain_percent": 55,
             "echo_guard": True, "chrome_echo": True, "chrome_noise": True,
             "pulse_buffer": "standard", "experimental": True}
+# Both room music paths reserve the same peak budget. The guard remains
+# available at unity stream gain, even when music and voice peak together.
+ECHO_GUARD_DB = 9
+RETURN_PEAK = .82
+ROOM_MUSIC_BUDGET = .67
 MAX_BYTES = 16 * 1024
 ALSA_NODE = r"alsa_output\.[\w.:-]{1,180}"
 ALSA_PORT = r"[\w.:-]{1,128}"

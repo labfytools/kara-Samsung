@@ -131,3 +131,28 @@ awk -F '[ :=]+' '
 ```
 
 Vérifier d’abord avec le retour coupé que chaque son produit un seul événement et relever les réflexions éventuelles. Ajuster si besoin le placement ou le seuil `-35` dBFS, puis figer ce réglage par sortie. Retour actif, retenir seulement les paires direct puis retour identifiables et noter les ambiguïtés ou les clics sans retour. Les écarts se calculent en soustrayant les deux instants du même micro témoin. Les distances différentes jusqu’à ce micro ajoutent un décalage fixe à géométrie constante. Le regroupement de crêtes à 25 ms et la résolution de 5 ms limitent la méthode. Si le niveau ou l’acoustique empêche de séparer les deux arrivées, les valeurs restent indéterminées et l’écoute renseigne seulement la continuité et le délai perçu. Le pas de 5 ms du pipeline a été vérifié sur deux transitoires synthétiques espacés de 170 ms.
+
+## Retour en salle
+
+Sur la capture BlackBox du 27 novembre, entre 5 s et 75 s de lecture,
+le microphone Wi-Fi mesure −13,48 dBFS RMS et −0,92 dBFS crête.
+Le retour capturé mesure −28,38 dBFS RMS et −19,40 dBFS crête.
+Le moniteur flottant du mix atteint −5,06 dBFS RMS et présente des
+crêtes supérieures au plein niveau numérique. Le transport a reçu
+9 685 paquets sans perte et le flux PipeWire du retour était à 0 dB.
+
+Le retour en salle conserve la protection de 9 dB et sa crête maximale de
+0,291. La mise en forme laisse un régime linéaire aux faibles amplitudes et
+limite progressivement les fortes amplitudes. Le fader du retour applique
+ensuite un gain d’amplitude linéaire. À 73 %, le rejeu du segment capturé
+donne −21,81 dBFS RMS et −13,47 dBFS crête à la sortie du traitement.
+La somme des budgets de crête du retour et du mix de musique est de 0,961
+avant le gain de la sortie. Les essais PCM et ce rejeu caractérisent
+le traitement logiciel. L’essai parlé sur l’enceinte sert à confirmer
+l’audibilité et la stabilité acoustique.
+
+BlackBox distingue l’entrée Wi-Fi, le niveau après rééchantillonnage,
+le niveau avant le fader, le retour soumis à PipeWire et le moniteur de
+sortie lorsqu’il est collecté. Le flux du retour doit être vérifié à
+0 dB sur le périphérique sélectionné. Le joueur confirme l’écoute avant
+le départ.

@@ -44,7 +44,7 @@ class ProfileStoreTests(unittest.TestCase):
         with patch.dict(os.environ, {"KARA_MIX_TRIAL": "edenwood-sbc-natif"}):
             room = RoomAudio(Mock())
         room.loop = room.runner = object()
-        edenwood = {"name": "bluez_output.12_34_56_78_9A_BC.1", "description": "EDENWOOD PARTY 250 V2",
+        edenwood = {"index": 26, "name": "bluez_output.12_34_56_78_9A_BC.1", "description": "EDENWOOD PARTY 250 V2",
                     "properties": {"api.bluez5.codec": "sbc"}}
         with patch("_kara_room_audio.pulse_sinks", return_value=[edenwood]):
             sink, _, settings = room._route_settings()
@@ -362,7 +362,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 player = self.players[-1]
                 await socket.send_bytes(packet(0, 8000, ms=ms))
                 actual = await self.block(player, ms * 48)
-                baseline = np.tanh(16000 / 32768) * .82 * 32767
+                baseline = micro.shape_monitor(np.array([8000 / 32768]), micro.monitor_peak(False))[0] * 32767
                 self.assertAlmostEqual(20 * np.log10(actual / baseline), -9, places=2)
                 await socket.send_bytes(packet(1, 9000, ms=ms))
                 await self.stop_and_check(socket, player)
@@ -429,9 +429,10 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_room_worklet_clock_and_background_reason_survive_reconnect(self):
         timeline = []
         diagnostics = SimpleNamespace(emit=lambda *k, **data: timeline.append((k, data)),
-                                      pcm=lambda *_a, **_data: None)
+                                      pcm=lambda *_a, **_data: None, active=lambda: False)
         room = RoomAudio(diagnostics)
-        settings = preferences.DEFAULTS | {"profile": "low-latency", "experimental": False}
+        settings = preferences.DEFAULTS | {"profile": "low-latency", "experimental": False,
+                                          "output_index": 4, "output_description": "Enceinte de test"}
         with patch.object(room, "_route_settings", return_value=("sink-test", "test", settings)):
             reader = room.open_turn("player", "Joueur", "tour", "Titre")
         self.addCleanup(reader.close)
@@ -449,6 +450,8 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.commands[-1][0][0], "pw-cat")
             self.assertEqual(micro.set_stream_volume.call_args.args[1], 100)
             self.assertTrue(micro.set_stream_volume.call_args.kwargs["verify"])
+            self.assertEqual(micro.set_stream_volume.call_args.kwargs["sink_index"], 4)
+            self.assertEqual((ready["output_verified"], ready["device"]), (True, "Enceinte de test"))
             self.players[-1].gate.set()
             return ws
 
@@ -462,11 +465,23 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         await self.block(self.players[-1], 480)
         ends = [struct.unpack_from("<d", reader.recv(649))[0] for _ in range(2)]
         self.assertAlmostEqual(ends[1] - ends[0], .01, places=8)
+        room.record_test(True)
+        levels = await self.levels(ws)
+        self.assertEqual(levels["stage"], "microphone-test")
+        self.assertGreater(levels["rms"], levels["guarded_rms"])
+        self.assertGreater(levels["guarded_rms"], levels["return_rms"])
+        self.assertGreater(levels["return_rms"], 0)
+        self.assertFalse(room.test_passed())
+        with self.assertRaises(RoomError):
+            room.confirm_return("another-player")
+        room.confirm_return("player")
+        self.assertTrue(room.test_passed())
         await ws.send_str("stop:background")
         await ws.receive(timeout=1)
         await self.released()
         self.assertEqual([d["reason"] for k, d in timeline if k == ("audio", "disconnect")], ["background"])
         ws = await connect()
+        self.assertFalse(room.test_passed())
         await ws.send_bytes(packet_v2(0, 480, 2.))
         await self.block(self.players[-1], 480)
         self.assertGreater(struct.unpack_from("<d", reader.recv(649))[0], ends[-1])
@@ -484,7 +499,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             written = await asyncio.wait_for(player.pending_write.get(), 1)
             played.append(np.frombuffer(written, dtype="<i2")[::2])
         continuous = resample_poly(samples.astype(np.float32) / 32768, 160, 147)
-        expected = (np.tanh(continuous * 2.0) * 0.82 * 32767).astype("<i2")
+        expected = (micro.shape_monitor(continuous, micro.monitor_peak(False)) * 32767).astype("<i2")
         np.testing.assert_array_equal(np.concatenate(played)[12:], expected[:-12])
         await self.stop_and_check(socket, player)
 
@@ -564,8 +579,9 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(diagnostic["timings_ms"]["stdin_write_drain_ms"]["n"], 0)
                 player.gate.set()
                 kept = [await self.block(player, 48 * block_ms) for _ in range(capacity)]
-                expected = [int(np.tanh(np.float32((1000 + i * 500) / 32768) * 2)
-                                * .82 * 32767) for i in range(9 - capacity, 9)]
+                expected = (micro.shape_monitor(
+                    np.array([(1000 + i * 500) / 32768 for i in range(9 - capacity, 9)], dtype=np.float32),
+                    micro.monitor_peak(False)) * 32767).astype("<i2").tolist()
                 self.assertLess(first, kept[0])
                 self.assertEqual(kept, expected)
                 self.assertTrue(player.pending_write.empty())
@@ -614,6 +630,18 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VolumeTests(unittest.TestCase):
+    def test_stream_verification_requires_expected_output_unmuted_at_unity(self):
+        stream = {"index": 5, "sink": 4, "mute": False,
+                  "properties": {"node.name": "kara-return"}, "volume": {"mono": {"value": 65536}}}
+        with patch.object(micro.subprocess, "check_output") as query, patch.object(micro.subprocess, "run") as run:
+            query.return_value = json.dumps([stream])
+            self.assertTrue(micro.set_stream_volume("kara-return", 100, verify=True, sink_index=4))
+            self.assertFalse(micro.set_stream_volume("kara-return", 100, verify=True, sink_index=3))
+            stream["mute"] = True
+            query.return_value = json.dumps([stream])
+            self.assertFalse(micro.set_stream_volume("kara-return", 100, verify=True, sink_index=4))
+            run.assert_not_called()
+
     def test_only_owned_stream_can_receive_gain_change(self):
         rows = [{"index": 3, "properties": {"node.name": "Strawberry"}},
                 {"index": 4, "properties": {"node.name": "pw-cat"}},

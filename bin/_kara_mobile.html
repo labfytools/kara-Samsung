@@ -76,9 +76,17 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
 </section>
   <section id="view-mic" class="card hero" hidden>
     <h2 id="turn-title"></h2><p id="turn-song"></p><p id="live-score"></p><p id="micro-status" class="muted">Le micro apparaît quand c’est ton tour.</p>
-    <label id="voice-consent-label" hidden><input id="voice-consent" type="checkbox">J’accepte la collecte audio BlackBox pendant mon tour<span id="witness-consent">, y compris le microphone témoin de la pièce</span></label>
-    <button id="micro" class="primary mic-button" disabled>Démarrer</button>
-    <meter id="micro-level" min="0" max="1" value="0" aria-label="Niveau vocal"></meter>
+    <label id="voice-consent-label" hidden><input id="voice-consent" type="checkbox">J’accepte la collecte audio BlackBox pendant l’essai et le tour<span id="witness-consent">, y compris le microphone témoin de la pièce</span></label>
+    <button id="micro" class="primary mic-button" disabled>Activer le micro</button>
+    <p id="return-output" class="muted"></p>
+    <label for="micro-level">Micro reçu</label>
+    <meter id="micro-level" min="-60" max="0" value="-60"></meter>
+    <label for="return-level">Retour après traitement</label>
+    <meter id="return-level" min="-60" max="0" value="-60"></meter>
+    <div class="actions">
+      <button id="confirm-return" hidden>J’entends ma voix</button>
+      <button id="start-turn" class="primary" hidden>Démarrer le tour</button>
+    </div>
     <div id="return-volume" hidden>
       <label for="live-music">Musique <output id="live-music-value"></output></label>
       <input type="range" id="live-music" min="0" max="100" value="100">

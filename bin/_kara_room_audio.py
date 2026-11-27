@@ -44,7 +44,10 @@ class Route:
     last_sample: float = 0.
     last_arrival: float = 0.
     muted: bool = False
-    return_enabled: bool = True
+    output_verified: bool = False
+    heard_return: bool = False
+    audible_submission: float = 0.
+    testing: bool = False
     recording_consent: bool = False
     recording_on: bool = False
     connection: str | None = None
@@ -62,10 +65,6 @@ class Route:
     @property
     def context(self):
         return {"player": self.player, "turn": self.turn, "song": self.song}
-
-    @property
-    def wireless_output(self):
-        return self.sink.startswith("bluez_output.")
 
     @property
     def return_drive(self):
@@ -219,6 +218,11 @@ class RoomAudio:
             # The organizer can increase the ceiling in explicit steps.
             settings["turn_return_drive"] = 3.
         settings["echo_guard"] = True
+        if type(output.get("index")) is not int or output["index"] < 0:
+            raise RoomError("Identifiant PipeWire de la sortie indisponible.", 409)
+        settings["output_index"] = output["index"]
+        label = output.get("description")
+        settings["output_description"] = label[:160] if isinstance(label, str) and label else "Sortie PipeWire"
         # Read the same sink snapshot used for route admission. A generated
         # device ID avoids storing a MAC and changes conservatively on restart.
         if device not in self.diagnostic_devices:
@@ -232,7 +236,7 @@ class RoomAudio:
                                       and len(specification) <= 64 else None}
         return sink, device, settings
 
-    def open_turn(self, owner, player, turn, song, *, scoring=True, require_consent=False):
+    def open_turn(self, owner, player, turn, song, *, scoring=True):
         self.close_turn()
         sink, device, settings = self._route_settings()
         sender, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -243,7 +247,6 @@ class RoomAudio:
                                           self.default_preferences.get(owner, min(100, settings["volume_percent"])))
             self.route = Route(owner, player, turn, song, sink, device, settings, volume, sender, scoring=scoring)
             self.last_authorized = None
-            self.route.return_enabled = not require_consent
         configuration = {key: settings[key] for key in ("mic_gain_percent", "chrome_echo", "chrome_noise",
                          "profile", "pulse_buffer", "echo_guard", "capture_output") if key in settings}
         configuration_id = sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
@@ -279,6 +282,14 @@ class RoomAudio:
                 self.route.recording_on = playing
                 if not playing:
                     self.route.authorized_start = None
+
+    def record_test(self, testing):
+        with self.lock:
+            route = self.route
+            if not route or testing == route.testing:
+                return
+            route.testing = testing
+            self.diagnostics.emit("audio", "microphone-test", **route.context, active=testing)
 
     def capture_window(self, turn, begin, end=None):
         with self.lock:
@@ -316,7 +327,7 @@ class RoomAudio:
             route.armed_until = time.monotonic() + 8
             return route
 
-    def attach(self, route, ws):
+    def attach(self, route, ws, *, output_verified=False):
         with self.lock:
             if route is not self.route or route.claimed is not None:
                 return False
@@ -324,6 +335,9 @@ class RoomAudio:
             route.connection = token_hex(16)
             route.authorized_start = None
             route.receiving = False
+            route.output_verified = output_verified
+            route.heard_return = False
+            route.audible_submission = 0.
             route.gain = 0.
             route.seq = None
             route.clock_excess = None
@@ -340,6 +354,7 @@ class RoomAudio:
             if route.claimed is ws:
                 route.claimed = None
                 route.receiving = False
+                route.output_verified = route.heard_return = False
                 self.diagnostics.emit("audio", "disconnect", **route.context, reason=reason, code=code,
                                       connection=route.connection)
                 route.recording_consent = False
@@ -365,7 +380,7 @@ class RoomAudio:
 
     def return_pcm(self, route, pcm, sequence):
         with self.lock:
-            if route is self.route and route.recording_on and route.recording_consent:
+            if route is self.route and (route.testing or route.recording_on) and route.recording_consent:
                 self.diagnostics.pcm("return", 48000, 2, pcm, sequence=sequence, **route.context,
                                      connection=route.connection)
 
@@ -377,7 +392,7 @@ class RoomAudio:
         # Capture decoded WebSocket payload before freshness, frame ordering,
         # bridge and scoring. Rejections remain observable at their own boundary.
         with self.lock:
-            if route is self.route and route.recording_on and route.recording_consent:
+            if route is self.route and (route.testing or route.recording_on) and route.recording_consent:
                 self.diagnostics.pcm("wifi", rate, 1, data, sequence=sequence, **route.context,
                                      connection=route.connection,
                                      packet_timing={"frame_end": frame_end, "send_ms": send_ms, "received_s": received})
@@ -387,26 +402,48 @@ class RoomAudio:
             return route is self.route and route.claimed is ws
 
     def apply_return(self, route, samples):
-        # Audio samples headed to Whisper have already taken the independent
-        # capture route. Only the playback stream uses this bounded ramp.
+        # Only the monitor uses this gain. PipeWire stays at unity and the
+        # recognizer already owns a separate copy of the microphone PCM.
         with self.lock:
-            exponent = 2 if route.wireless_output and route.return_drive > 1 else 3
-            target = (min(route.volume, self.ceiling) / 100.) ** exponent if self._return_enabled(route) else 0.
-        first = route.gain
-        route.gain += (target - first) * min(1., len(samples) / 2400.)
+            if route is not self.route or route.muted:
+                route.gain = 0.
+                return np.zeros_like(samples)
+            target = min(route.volume, self.ceiling) / 100.
+            first = route.gain
+            route.gain += (target - first) * min(1., len(samples) / 2400.)
         return samples * np.linspace(first, route.gain, len(samples), dtype=np.float32)
 
     def applied(self, route):
         with self.lock:
-            return min(route.volume, self.ceiling) if self._return_enabled(route) else 0
+            return min(route.volume, self.ceiling) if route is self.route and not route.muted else 0
 
-    def _return_enabled(self, route):
-        return route is self.route and route.return_enabled and not route.muted
+    def return_submitted(self, route, now):
+        with self.lock:
+            if route is self.route:
+                route.audible_submission = now
 
-    def enable_return(self):
+    def confirm_return(self, owner):
+        with self.lock:
+            route = self.route
+            if (route is None or route.owner != owner or not route.output_verified or not route.receiving
+                    or time.monotonic() - route.last_arrival >= 1.5
+                    or time.monotonic() - route.audible_submission >= 5.
+                    or route.muted or not min(route.volume, self.ceiling)):
+                raise RoomError("Parle dans le micro et vérifie le retour sur la sortie affichée.", 409)
+            route.heard_return = True
+            self.diagnostics.emit("audio", "return-confirmed", **route.context, connection=route.connection)
+
+    def test_passed(self):
+        with self.lock:
+            route = self.route
+            return bool(route and route.heard_return and route.output_verified and not route.muted
+                        and min(route.volume, self.ceiling))
+
+    def disable_scoring(self):
         with self.lock:
             if self.route:
-                self.route.return_enabled = True
+                self.route.scoring = False
+                self.last_authorized = None
 
     def requested(self, route):
         with self.lock:
@@ -431,6 +468,9 @@ class RoomAudio:
                 return
             route.volume = value
             route.muted = False
+            if value == 0:
+                route.heard_return = False
+                route.audible_submission = 0.
             self.preferences[(route.owner, route.device)] = value
             applied = min(value, self.ceiling)
         self.diagnostics.emit("audio", "voice-volume", **route.context, requested=value, applied=applied)
@@ -443,6 +483,8 @@ class RoomAudio:
                 raise RoomError("Le niveau dépasse le plafond de ce profil de calibration.")
             with self.lock:
                 self.ceiling = value
+                if value == 0 and self.route:
+                    self.route.heard_return = False
         elif action == "audio-profile" and (value == "device" or isinstance(value, str) and value in PROFILES):
             if self.mix_trial and value != "device":
                 raise RoomError("Le lecteur est fixé par le profil de calibration.")
@@ -485,6 +527,8 @@ class RoomAudio:
             route = self.route
             if route:
                 route.muted = True
+                route.heard_return = False
+                route.audible_submission = 0.
                 self.diagnostics.emit("audio", "return-cut", **route.context)
 
     def default_player_volume(self, owner, percent):
@@ -508,7 +552,8 @@ class RoomAudio:
     def pcm(self, route, data, rate, received, sequence, send_clock, frame_end=None):
         # Training keeps Wi-Fi capture and the return. With no Whisper
         # consumer, sending to its socket would discard good microphone blocks.
-        if route.scoring:
+        scoring = route.scoring
+        if scoring:
             reading = np.frombuffer(data, dtype="<i2").astype(np.float32)
             scaled = resample_poly(reading, 1, 3) if rate == 48000 else resample_poly(reading, 160, 441)
             pcm = np.clip(np.rint(scaled), -32768, 32767).astype("<i2").tobytes()
@@ -536,7 +581,7 @@ class RoomAudio:
                 return
             route.receiving = True
             route.last_arrival = received
-            if route.scoring:
+            if scoring and route.scoring:
                 try:
                     route.sender.send(struct.pack("<d", end) + pcm)
                 except (BlockingIOError, OSError):
@@ -546,7 +591,7 @@ class RoomAudio:
             route.seq = sequence
             route.sent += 1
             timing = {"frame_end": frame_end, "send_ms": send_clock, "received_s": received}
-            if route.recording_on and route.recording_consent and route.scoring:
+            if route.recording_on and route.recording_consent and scoring and route.scoring:
                 # The preceding block can contain warm-up samples. Use the
                 # end of the first admitted block as the conservative bound.
                 if route.authorized_start is None:

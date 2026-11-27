@@ -44,10 +44,23 @@ La télévision présente les joueurs, le départ et les paroles.
 **Nouvelle partie** revient aux inscriptions.
 
 Le compte à rebours est piloté par le serveur. Le joueur actif et
-l’organisateur peuvent le demander lorsque le téléphone transmet, que la
-télévision authentifiée répond et que Strawberry est disponible. Une
-interruption pendant le compte à rebours ramène le chanteur à l’attente.
-Le retour vocal est activé au départ de la chanson.
+l’organisateur peuvent le demander après l’essai microphone, lorsque le
+téléphone transmet, que la télévision authentifiée répond et que Strawberry
+est disponible. Une interruption pendant le compte à rebours ramène le
+chanteur à l’essai.
+
+1. Sur le téléphone, **Activer le micro** ouvre le retour avec les protections.
+2. Vérifie le nom de la sortie. Parle et observe **Micro reçu** et **Retour
+   après traitement**. Les curseurs **Musique** et **Ma voix** sont indépendants.
+3. Confirme **J’entends ma voix** après écoute sur l’enceinte, puis choisis
+   **Démarrer le tour**. **Couper le retour** reste disponible pendant
+   l’essai et le chant. Une reconnexion demande une nouvelle confirmation.
+
+La préparation de Turbo peut avancer pendant l’essai. Le départ reste
+possible en chant libre si le moteur de notation est indisponible.
+BlackBox consigne les niveaux et la confirmation. Les pistes audio de
+l’essai suivent les mêmes autorisations explicites que celles du tour.
+[Mesures et structure de gains](audio-latency-optimization.md#retour-en-salle)
 
 Pendant le tour, **Musique**, **Chanteur original** et **Ma voix** règlent
 trois flux distincts. Le fader de retour et sa coupure laissent le signal
