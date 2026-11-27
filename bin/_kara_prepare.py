@@ -13,11 +13,11 @@ import signal
 import stat
 import subprocess
 import sys
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryFile
 from time import monotonic, sleep
-from urllib.error import URLError
 
 from _kara_paths import BIN, STATE, music_library
+from _kara_preparation_error import PreparationError, error_details
 from _kara_audio_identity import pcm_digest
 from _kara_reference import (METHOD, MIN_LINE_COVERAGE, MIN_TOKEN_CONFIDENCE, MIN_TRANSCRIPT_AGREEMENT,
                              MIN_WORD_COVERAGE, VERSION, alignment, lrc_text)
@@ -345,8 +345,9 @@ def retrieve(song):
                              "--lrc-stdout", "--", str(song)],
                             capture_output=True, timeout=120, check=False)
     if result.returncode:
-        raise ValueError(result.stderr.decode(errors="replace").strip()[-350:] or
-                         "Aucune source de paroles minutées disponible.")
+        raise PreparationError(result.stderr.decode(errors="replace").strip() or
+                               "Aucune source de paroles minutées disponible.", phase="lyrics",
+                               exit_code=result.returncode)
     data = json.loads(result.stdout)
     raw = data["lyrics"].encode()
     if len(raw) > MAX_LRC_BYTES:
@@ -362,7 +363,7 @@ def choose_alignment(orders, heard, duration, progress):
 
 class Preparer:
     def __init__(self, cache, *, device="gpu", threads=None, logs=False, reader=retrieve,
-                 separate_if_needed=False, trace=None, require_vulkan=False):
+                 separate_if_needed=False, trace=None, require_vulkan=False, diagnostic=None):
         self.cache = cache
         self.device = device
         self.threads = threads if threads is not None else (4 if device == "gpu" else 8)
@@ -370,6 +371,7 @@ class Preparer:
         self.reader = reader
         self.separate_if_needed = separate_if_needed
         self.trace = trace
+        self.diagnostic = diagnostic
         self.require_vulkan = require_vulkan
         self.decoder = None
         self.binary = None
@@ -421,9 +423,12 @@ class Preparer:
             # The existing Demucs CLI terminates its child on SIGTERM. Release
             # the model before a full separation to avoid concurrent memory peaks.
             self.close()
-            with subprocess.Popen([sys.executable, "-B", str(BIN / "_kara_stems.py"), str(song)],
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL) as separation:
+            # The stem CLI emits a bounded series of progress events and a
+            # terminal diagnostic. Keep that wire through the supervised wait.
+            with TemporaryFile() as output, subprocess.Popen(
+                    [sys.executable, "-B", str(BIN / "_kara_stems.py"), str(song)],
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=output) as separation:
+                failure = None
                 try:
                     separation.wait(timeout=900)
                 except (KeyboardInterrupt, subprocess.TimeoutExpired) as error:
@@ -432,8 +437,26 @@ class Preparer:
                         separation.wait(timeout=12)
                     except subprocess.TimeoutExpired:
                         separation.kill()
+                        separation.wait()
                     if isinstance(error, KeyboardInterrupt):
                         raise
+                    failure = str(error)
+                if separation.returncode and self.diagnostic:
+                    output.seek(0)
+                    messages = output.read(128_000).decode(errors="replace")
+                    terminal = None
+                    for line in messages.splitlines():
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(event, dict) and event.get("event") == "error":
+                            terminal = {key: value for key, value in event.items() if key != "event"}
+                    if terminal is None:
+                        terminal = {"phase": "separation", "exit_code": separation.returncode,
+                                    "message": messages.strip() or failure or "Séparation Demucs interrompue.",
+                                    "protection": None}
+                    self.diagnostic(song, engine="demucs", **terminal)
             stems = cached_stems(song)
         return stems[1] if stems else None
 
@@ -728,6 +751,12 @@ class Preparer:
 PREPARATION_ERRORS = (EOFError, OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError)
 
 
+def turbo_error_details(preparer, error, phase):
+    decoder = preparer.decoder
+    code = decoder.process.poll() if decoder is not None else None
+    return error_details(error, phase, exit_code=code if code else None)
+
+
 def prepare_chronos_track(song, preparer, engine, *, for_party, force, progress, send):
     from _kara_chronos import (cached, displayable, local_tokens, playback_experiment,
                                prepare as align, source_for, timed_lines)
@@ -750,7 +779,7 @@ def prepare_chronos_track(song, preparer, engine, *, for_party, force, progress,
                       "provider": provider, "timed": True}
         except PREPARATION_ERRORS as error:
             lookup_error = str(error)
-            send("diagnostic", song, engine=engine, phase="lyrics", message=lookup_error)
+            send("diagnostic", song, engine=engine, **error_details(error, "lyrics"))
     if local_tokens(song) != before:
         raise ValueError("Le morceau ou les paroles ont changé pendant la recherche.")
     seconds = receipt["duration"] if receipt else probe_duration(song)
@@ -764,13 +793,17 @@ def prepare_chronos_track(song, preparer, engine, *, for_party, force, progress,
     progress("chronos", 15)
     preparer.close()
     selected = "huang" if draft else engine
+    protection = None
     try:
         status = align(song, preparer.cache, selected, supplied=source, allow_demucs=not draft,
                        for_party=for_party, source_clock=(seconds, lines) if lines else None,
-                       expected_tokens=before)
+                       expected_tokens=before,
+                       diagnostic=lambda **fields: send("diagnostic", song, engine=selected, **fields))
     except PREPARATION_ERRORS as error:
         status = "unavailable"
-        send("chronos", song, engine=selected, status=status, message=str(error))
+        details = error_details(error, "chronos")
+        protection = details["protection"]
+        send("chronos", song, engine=selected, status=status, **details)
     else:
         send("chronos", song, engine=selected, status=status)
     playable = displayable(playback_experiment(song, preparer.cache, engine))
@@ -778,21 +811,36 @@ def prepare_chronos_track(song, preparer, engine, *, for_party, force, progress,
     cached_score = bool(score and not force)
     if cached_score:
         ready, report = True, score["report"]
-    elif draft or (lines and playable and not force) or (lookup_error and before[1] is None):
+    elif protection and not protection.startswith("Lecture en cours"):
+        ready, report = False, {"message": protection}
+    elif draft or (lines and playable and not force) or lookup_error:
         ready = False
         report = {"message": ("Minutage disponible · chant sans note. Relance l’analyse Turbo pour préparer la notation."
                               if playable else lookup_error or "Minutage indisponible.")}
     else:
         timed = source["original"].encode() if source["timed"] and before[1] is None else None
+        phase = "score-reference"
+
+        def score_progress(stage, percent):
+            nonlocal phase
+            phase = stage
+            progress(stage, percent)
+
         try:
             ready, report, _, seconds = preparer.prepare(
-                song, force=force, progress=progress, timed=timed,
+                song, force=force, progress=score_progress, timed=timed,
                 provider=source.get("provider") or "Strawberry")
         except PREPARATION_ERRORS as error:
+            details = turbo_error_details(preparer, error, phase)
             preparer.close()
-            ready, report = False, {"message": str(error)}
-            send("diagnostic", song, engine="turbo", message=str(error))
-    send("result", song, ready=ready, experimental=playable and not ready, cached=cached_score,
+            ready, report = False, {"message": details["message"]}
+            send("diagnostic", song, engine="turbo", **details)
+        else:
+            if not ready:
+                send("diagnostic", song, engine="turbo", phase="score-validation", exit_code=None, protection=None,
+                     message=report.get("message", "Référence temporelle insuffisante pour noter le morceau."))
+    send("result", song, ready=ready, experimental=playable and not ready, timing_playable=playable,
+         cached=cached_score,
          report=report, seconds=round(monotonic() - begun, 3), duration=round(seconds, 3))
     return ready, playable
 
@@ -843,7 +891,8 @@ def main():
                         reader=local_reader if args.local_only else retrieve,
                         separate_if_needed=args.separate_if_needed, require_vulkan=args.require_vulkan,
                         trace=(lambda song, kind, **payload: send("evidence", song, kind=kind, evidence=payload))
-                        if args.trace else None)
+                        if args.trace else None,
+                        diagnostic=lambda song, **fields: send("diagnostic", song, **fields))
     plain = read_source(args.plain_reference) if args.plain_reference is not None else None
     timed = read_source(args.timed_reference) if args.timed_reference is not None else None
     if args.rejected_lrc is not None and (plain is None and timed is None or
@@ -872,7 +921,8 @@ def main():
                 try:
                     status = prepare_chronos(song, preparer.cache, "huang", supplied=source, allow_demucs=False)
                 except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
-                    send("chronos", song, engine="huang", status="unavailable", message=str(error))
+                    send("chronos", song, engine="huang", status="unavailable",
+                         **error_details(error, "chronos"))
                 else:
                     send("chronos", song, engine="huang", status=status)
             if args.chronos and plain is None and timed is None:
@@ -882,7 +932,7 @@ def main():
                         force=args.force or song in force_paths, progress=progress, send=send)
                 except PREPARATION_ERRORS as error:
                     preparer.close()
-                    send("error", song, phase=phase, message=str(error))
+                    send("error", song, **error_details(error, phase))
                     failed = True
                 else:
                     failed |= not (ready or playable)
@@ -893,9 +943,10 @@ def main():
                     song, force=args.force or song in force_paths, progress=progress, plain=plain,
                     previous=args.previous_path, timed=timed, provider=args.reference_provider, rejected=args.rejected_lrc,
                     observed_corrections=args.observed_corrections_only)
-            except (EOFError, OSError, ValueError, RuntimeError, KeyError, URLError, subprocess.SubprocessError) as error:
+            except PREPARATION_ERRORS as error:
+                details = turbo_error_details(preparer, error, phase)
                 preparer.close()
-                send("error", song, message=str(error))
+                send("error", song, **details)
                 failed = True
             else:
                 result_available = True
@@ -911,7 +962,8 @@ def main():
                 try:
                     status = prepare_chronos(song, preparer.cache, args.chronos)
                 except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
-                    send("chronos", song, engine=args.chronos, status="unavailable", message=str(error))
+                    send("chronos", song, engine=args.chronos, status="unavailable",
+                         **error_details(error, "chronos"))
                 else:
                     send("chronos", song, engine=args.chronos, status=status)
             if result_available:

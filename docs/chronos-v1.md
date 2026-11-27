@@ -39,6 +39,12 @@ partagent un plafond de 128 Mio.
 
 ## BlackBox Studio
 
+Pendant la préparation, la capture de diagnostic enregistre le message
+du moteur, l’étape, le code de sortie disponible et le motif de protection
+éventuel. Un refus avant lancement laisse le code vide. Le journal conserve
+aussi le code final du processus de préparation. Le masquage des secrets
+BlackBox s’applique aux diagnostics.
+
 Démarrer une capture avant le tour. Le mode vocal et le consentement du
 microphone restent ceux de BlackBox V3. Dans **Rapport et rejeu**, sélectionner
 **Référence des paroles** pour consulter ensemble les paroles originales,

@@ -135,6 +135,76 @@ class ChronosTests(unittest.TestCase):
             self.assertEqual([call.kwargs for call in guard.call_args_list],
                              [{"require_quiet": True}, {"require_quiet": False}])
 
+    def test_engine_diagnostics_preserve_the_inner_failure_and_exit_code(self):
+        from _kara_preparation_error import error_details
+
+        def failed_run(_args, *, event, **kwargs):
+            self.assertTrue(kwargs["merge_stderr"])
+            event({"event": "chronos-phase", "phase": "separation"})
+            event({"event": "chronos-error", "phase": "separate", "message": "Erreur exacte\nDétail",
+                   "exit_code": 17, "protection": None})
+            event({"event": "chronos-error", "phase": "separation", "message": "Erreur enveloppante",
+                   "exit_code": 1, "protection": None})
+            return 1, b"systemd log"
+
+        with TemporaryDirectory() as directory, patch("_kara_chronos.ROOT", Path(directory)), patch.dict(
+                os.environ, {"KARA_CHRONOS_PYTHON": sys.executable}), patch(
+                "_kara_chronos.run", side_effect=failed_run):
+            with self.assertRaises(RuntimeError) as failed:
+                calculate("audio", {}, "huang")
+        self.assertEqual(error_details(failed.exception, "chronos"), {
+            "phase": "separate", "message": "Erreur exacte\nDétail", "exit_code": 17, "protection": None})
+
+    @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK") == "1", "requires GTK")
+    def test_async_preparation_writes_exact_blackbox_diagnostics(self):
+        from gi.repository import Gio, GLib
+        from _kara_blackbox import events
+        from types import MethodType
+
+        executable = Path(__file__).resolve().parents[1] / "bin/paroles-strawberry"
+        window = runpy.run_path(str(executable), run_name="kara_preparation_diagnostics")["LyricsWindow"]
+        with TemporaryDirectory() as directory:
+            song = Path(directory) / "fixture.opus"
+            box = BlackBox(Path(directory) / "blackbox")
+            box.start(consent=True)
+            session = box.status()["session"]
+            records = [
+                {"event": "chronos", "path": str(song), "engine": "huang", "status": "unavailable",
+                 "phase": "admission", "message": "Réserve mémoire", "exit_code": None,
+                 "protection": "Réserve mémoire"},
+                {"event": "diagnostic", "path": str(song), "engine": "turbo", "phase": "vocal_refinement",
+                 "message": "Le détail exact\nde l’erreur.", "exit_code": 7, "protection": None},
+            ]
+            process = Gio.Subprocess.new(
+                [sys.executable, "-c", "import sys; print(sys.argv[1]); print(sys.argv[2], file=sys.stderr); sys.exit(9)",
+                 "\n".join(map(json.dumps, records)), "Diagnostic du processus"],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+            loop = GLib.MainLoop()
+            subject = SimpleNamespace(blackbox=box, closed=False, align_job=process, track=None,
+                                      active_plan={song: "Fixture"}, align_finished=set(),
+                                      align_diagnostics="", chronos_reports={}, batch_failed={},
+                                      batch_protected={}, stem_queue={}, stem_failed=set(), preload_cancelled=False,
+                                      batch_experimental=set(), training_songs=set(), start_stem_generation=loop.quit)
+            for name in ("read_alignment", "alignment_exit", "log_preparation_error"):
+                setattr(subject, name, MethodType(getattr(window, name), subject))
+            subject.preparation_status_code = window.preparation_status_code
+            stream = Gio.DataInputStream.new(process.get_stdout_pipe())
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, subject.read_alignment, process)
+            deadline = GLib.timeout_add_seconds(5, lambda: (loop.quit(), GLib.SOURCE_CONTINUE)[1])
+            loop.run()
+            GLib.source_remove(deadline)
+            box.stop(wait=True)
+            rows = list(events(box.root / session / "events.jsonl"))
+            errors = {(row["component"], row["data"]["phase"]): row["data"] for row in rows
+                      if row["event"] == "error"}
+            self.assertEqual(errors["chronos", "admission"]["protection"], "Réserve mémoire")
+            self.assertIsNone(errors["chronos", "admission"]["exit_code"])
+            self.assertEqual(errors["turbo", "vocal_refinement"]["message"], "Le détail exact\nde l’erreur.")
+            self.assertEqual(errors["turbo", "vocal_refinement"]["exit_code"], 7)
+            self.assertEqual(errors["turbo", "worker"]["message"], "Diagnostic du processus\n")
+            self.assertEqual(errors["turbo", "worker"]["exit_code"], 9)
+            self.assertIsNone(subject.align_job)
+
     def test_timed_source_survives_engine_and_score_failures_without_duplicate_work(self):
         from _kara_chronos import playback_experiment
         from _kara_prepare import PreparedCache, Preparer, prepare_chronos_track

@@ -127,7 +127,14 @@ class TurboDecoder:
                 raise TimeoutError("Délai dépassé pour le moteur Turbo.")
             data = os.read(self.process.stdout.fileno(), 8192)
             if not data:
-                raise EOFError("Le moteur Turbo s’est arrêté.")
+                # EOF can arrive just before the kernel publishes the exit.
+                try:
+                    code = self.process.wait(timeout=.25)
+                except subprocess.TimeoutExpired:
+                    code = None
+                error = EOFError("Le moteur Turbo s’est arrêté.")
+                error.returncode = code
+                raise error
             self.buffer.extend(data)
             if len(self.buffer) > 65536:
                 raise ValueError("Sortie Turbo invalide.")

@@ -10,17 +10,18 @@ from time import monotonic
 
 
 class Interrupted(Exception):
-    pass
+    returncode = None
 
 
-def run(command, *, stop, timeout, env=None, maximum=1_048_576, event=None, retain=()):
+def run(command, *, stop, timeout, env=None, maximum=1_048_576, event=None, retain=(), merge_stderr=False):
     if stop():
         raise Interrupted
     guard = Path(__file__).with_name("_parole_guard.py")
     # A guard retains the maintenance owner lease until it reaps the engine.
     # No logind FD is passed, so a dead owner cannot leave policy inhibited.
     with subprocess.Popen([sys.executable, "-B", str(guard), str(os.getpid()), *command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, start_new_session=True, env=env, pass_fds=retain) as process:
+                          stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
+                          start_new_session=True, env=env, pass_fds=retain) as process:
         deadline = monotonic() + timeout
         output = bytearray()
         pending = bytearray()
@@ -61,7 +62,7 @@ def run(command, *, stop, timeout, env=None, maximum=1_048_576, event=None, reta
                 except subprocess.TimeoutExpired:
                     pass
             return process.returncode, bytes(output)
-        except BaseException:
+        except BaseException as error:
             # The worker and descendants inherit the same group. SIGTERM
             # permits atomic workers to drop their drafts, then bound cleanup.
             try:
@@ -76,4 +77,7 @@ def run(command, *, stop, timeout, env=None, maximum=1_048_576, event=None, reta
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            process.wait()
+            if isinstance(error, (Interrupted, TimeoutError, ValueError)):
+                error.returncode = process.returncode
             raise

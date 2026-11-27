@@ -26,6 +26,7 @@ from _kara_blackbox import BlackBox, digest
 from _kara_blackbox_lyrics import record as record_lyrics, snapshot as lyrics_snapshot
 from _kara_chronos import ENGINES as CHRONOS_ENGINES, cache_path as chronos_path
 from _kara_chronos import display_index as chronos_index, displayable, playback_experiment
+from _kara_preparation_error import error_details
 from _parole_transcribe import NAME as DRAFT_FILE
 from _kara_remote_party import RemoteParty
 from _kara_room_audio import RoomAudio
@@ -998,6 +999,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.batch_reports = {}
         self.chronos_reports = {}
         self.batch_experimental = set()
+        self.batch_playable = set()
+        self.batch_protected = {}
+        self.align_diagnostics = ""
         self.batch_ready = {}
         if for_party:
             self.party_selection = self.party_choice()
@@ -1015,7 +1019,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.stem_failed.clear()
         for path in plan:
             if local_track(path.as_uri()) != path:
-                self.batch_failed[path] = "Fichier audio local introuvable."
+                message = "Fichier audio local introuvable."
+                self.batch_failed[path] = message
+                self.log_preparation_error("turbo", plan[path], {"phase": "input", "message": message})
                 self.align_finished.add(path)
         if self.preparation_window is not None and self.preparation_only:
             self.preparation_window.set_busy(True)
@@ -1032,10 +1038,11 @@ class LyricsWindow(Gtk.ApplicationWindow):
                        *(arg for path in retried for arg in ("--force-path", path)), *paths]
             try:
                 process = Gio.Subprocess.new(command, Gio.SubprocessFlags.STDOUT_PIPE |
-                                             Gio.SubprocessFlags.STDERR_SILENCE)
+                                             Gio.SubprocessFlags.STDERR_MERGE)
             except GLib.Error as error:
                 for path in paths:
                     self.batch_failed[Path(path)] = str(error)
+                    self.log_preparation_error("turbo", plan[Path(path)], error_details(error, "spawn"))
             else:
                 self.align_job = process
                 self.show_align_status("Vérification de la préparation Turbo…", 0)
@@ -1055,9 +1062,11 @@ class LyricsWindow(Gtk.ApplicationWindow):
             for path in self.training_only & self.batch_failed.keys():
                 if path not in self.stem_failed and local_track(path.as_uri()) == path and cached_stems(path):
                     self.batch_failed.pop(path)
-            for path in self.active_plan:
-                if path in self.stem_failed and path not in self.batch_experimental:
-                    self.batch_failed[path] = "Pistes séparées indisponibles pour le mixage."
+            for path in self.stem_failed:
+                self.batch_ready.pop(path, None)
+                self.batch_failed.setdefault(path, "Pistes séparées indisponibles pour le mixage.")
+                if path in self.batch_playable:
+                    self.batch_experimental.add(path)
             self.failed_alignments = self.batch_failed
             self.experimental_songs = self.batch_experimental
             self.preparation_reports = self.batch_reports
@@ -1077,7 +1086,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 self.experimental_songs.discard(path)
                 self.experimental_songs.update(self.batch_experimental)
                 if path in self.stem_failed:
-                    self.batch_failed[path] = "Pistes séparées indisponibles pour le mixage."
+                    self.batch_failed.setdefault(path, "Pistes séparées indisponibles pour le mixage.")
+                    if path in self.batch_playable:
+                        self.experimental_songs.add(path)
                     self.prepared_stems.pop(path, None)
                 elif path not in self.batch_experimental:
                     try:
@@ -1125,6 +1136,20 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.players_window.refresh()
         GLib.timeout_add(650, self.hide_alignment_bars)
 
+    def log_preparation_error(self, engine, title, details):
+        message = details.get("message", "")
+        # A BlackBox record has a fixed size. Long diagnostics keep all
+        # chunks in order without truncating ordinary exception messages.
+        for offset in range(0, max(1, len(message)), 4000):
+            self.blackbox.emit(engine, "error", song=title, phase=details.get("phase"),
+                               message=message[offset:offset + 4000], message_offset=offset,
+                               exit_code=details.get("exit_code"), protection=details.get("protection"))
+
+    @staticmethod
+    def preparation_status_code(process, result):
+        process.wait_finish(result)
+        return -process.get_term_sig() if process.get_if_signaled() else process.get_exit_status()
+
     def start_stem_generation(self):
         if self.closed or not self.validating or self.stem_job:
             return
@@ -1140,12 +1165,14 @@ class LyricsWindow(Gtk.ApplicationWindow):
             command = ("nice", "-n", "8", sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path))
             try:
                 process = Gio.Subprocess.new(command, Gio.SubprocessFlags.STDOUT_PIPE |
-                                             Gio.SubprocessFlags.STDERR_SILENCE)
-            except GLib.Error:
+                                             Gio.SubprocessFlags.STDERR_MERGE)
+            except GLib.Error as error:
+                self.log_preparation_error("demucs", title, error_details(error, "spawn"))
                 self.stem_failed.add(path)
                 self.stem_completed += 1
                 continue
             self.stem_job = (path, process)
+            self.stem_diagnostics = ""
             self.show_align_status(f"Demucs · {title} · chargement du modèle", 0)
             stream = Gio.DataInputStream.new(process.get_stdout_pipe())
             stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_stem_event, process)
@@ -1158,28 +1185,49 @@ class LyricsWindow(Gtk.ApplicationWindow):
         path = self.stem_job[0]
         try:
             line, _ = stream.read_line_finish_utf8(result)
-            event = json.loads(line) if line else None
-        except (GLib.Error, ValueError):
+        except GLib.Error as error:
+            self.stem_diagnostics += str(error)
+            line = None
+        if line is None:
+            process.wait_async(None, self.stem_exit)
+            return
+        try:
+            event = json.loads(line)
+        except ValueError:
             event = None
         if not isinstance(event, dict):
-            self.stem_job = None
-            process.wait_async(None, GameScore.reaped)
-            if not cached_stems(path):
-                self.stem_failed.add(path)
-            elif self.track == path:
-                self.vocal_effect.refresh_stems()
-                self.update_vocal_effect()
-            self.stem_completed += 1
-            self.start_stem_generation()
-            return
-        if event.get("event") == "progress":
+            self.stem_diagnostics = (self.stem_diagnostics + line + "\n")[-24_000:]
+        elif event.get("event") == "progress":
             self.show_align_status(f"Demucs · {event.get('status', 'Séparation en cours')}",
                                    min(100, max(0, int(event.get("percent", 0)))))
         elif event.get("event") == "error":
+            self.log_preparation_error("demucs", self.active_plan[path], event)
             self.stem_failed.add(path)
             if self.players_window is not None:
-                self.players_window.message.set_text(event.get("message", "Séparation IA indisponible"))
+                self.players_window.message.set_text(event["message"])
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_stem_event, process)
+
+    def stem_exit(self, process, result):
+        if self.closed or not self.stem_job or self.stem_job[1] is not process:
+            return
+        path, self.stem_job = self.stem_job[0], None
+        try:
+            code = self.preparation_status_code(process, result)
+        except GLib.Error as error:
+            code = None
+            self.stem_diagnostics += str(error)
+        title = self.active_plan[path]
+        self.blackbox.emit("demucs", "worker-exit", song=title, phase="separation", exit_code=code)
+        if not cached_stems(path):
+            if self.stem_diagnostics or path not in self.stem_failed:
+                self.log_preparation_error("demucs", title, {"phase": "separation", "exit_code": code,
+                                           "message": self.stem_diagnostics or "Cache de séparation invalide"})
+            self.stem_failed.add(path)
+        elif self.track == path:
+            self.vocal_effect.refresh_stems()
+            self.update_vocal_effect()
+        self.stem_completed += 1
+        self.start_stem_generation()
 
     def hide_alignment_bars(self):
         if not self.closed and not self.validating:
@@ -1212,21 +1260,19 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         try:
             line, _ = stream.read_line_finish_utf8(result)
-            event = json.loads(line) if line else None
-        except (GLib.Error, ValueError):
+        except GLib.Error as error:
+            self.align_diagnostics += str(error)
+            line = None
+        if line is None:
+            process.wait_async(None, self.alignment_exit)
+            return
+        try:
+            event = json.loads(line)
+        except ValueError:
             event = None
         if not isinstance(event, dict):
-            self.align_job = None
-            process.wait_async(None, GameScore.reaped)
-            if not self.preload_cancelled:
-                for path in self.active_plan.keys() - self.align_finished:
-                    self.batch_failed[path] = "La préparation Turbo a été interrompue."
-                # Preserve instrumental preparation independently of lyric recovery.
-                self.stem_queue = {path: title for path, title in self.active_plan.items()
-                                   if (path not in self.batch_experimental or path in self.training_songs)
-                                   and local_track(path.as_uri()) == path and cached_stems(path) is None}
-                self.stem_completed = len(self.active_plan) - len(self.stem_queue)
-            self.start_stem_generation()
+            self.align_diagnostics = (self.align_diagnostics + line + "\n")[-24_000:]
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
             return
         path = Path(event.get("path", ""))
         if path in self.active_plan:
@@ -1237,13 +1283,26 @@ class LyricsWindow(Gtk.ApplicationWindow):
             if kind == "chronos":
                 self.chronos_reports[path] = event["status"]
                 self.blackbox.emit("chronos", "preparation", song=title, engine=event["engine"],
-                                   status=event["status"], reason=event.get("message"))
+                                   status=event["status"], reason=(event.get("message") or "")[:4000] or None,
+                                   phase=event.get("phase"), exit_code=event.get("exit_code"),
+                                   protection=event.get("protection"))
+                if event.get("message"):
+                    self.log_preparation_error("chronos", title, event)
+                protection = event.get("protection")
+                if protection and not protection.startswith("Lecture en cours"):
+                    self.batch_protected[path] = protection
                 if path == self.track:
                     self.file_token = None
                     self.load_lines()
             elif kind == "evidence":
                 self.blackbox.emit("turbo", event["kind"], song=title, evidence=event["evidence"])
-            elif kind in ("error", "progress", "result"):
+            elif kind in ("error", "diagnostic"):
+                engine = event.get("engine", "turbo")
+                component = "chronos" if engine in CHRONOS_ENGINES else engine
+                self.log_preparation_error(component, title, event)
+                if engine == "demucs":
+                    self.stem_failed.add(path)
+            elif kind in ("progress", "result"):
                 self.blackbox.emit("turbo", kind, song=title,
                                    phase=event.get("phase"), progress=event.get("percent"),
                                    ready=event.get("ready"), report=event.get("report"),
@@ -1265,6 +1324,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 self.align_finished.add(path)
                 if event.get("experimental"):
                     self.batch_experimental.add(path)
+                if event.get("timing_playable"):
+                    self.batch_playable.add(path)
                 self.batch_reports[path] = event.get("report", {})
                 item = self.references.cached(path, verify=False) if event.get("ready") else None
                 if item is not None:
@@ -1280,6 +1341,39 @@ class LyricsWindow(Gtk.ApplicationWindow):
                     self.file_token = None
                     self.load_lines()
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.read_alignment, process)
+
+    def alignment_exit(self, process, result):
+        if self.closed or self.align_job is not process:
+            return
+        self.align_job = None
+        try:
+            code = self.preparation_status_code(process, result)
+        except GLib.Error as error:
+            code = None
+            self.align_diagnostics += str(error)
+        self.blackbox.emit("turbo", "worker-exit", phase="preparation", exit_code=code)
+        if self.align_diagnostics:
+            self.log_preparation_error("turbo", None, {"phase": "worker", "message": self.align_diagnostics,
+                                                       "exit_code": code})
+        if not self.preload_cancelled:
+            for path in self.active_plan.keys() - self.align_finished:
+                message = self.align_diagnostics or "La préparation Turbo a été interrompue."
+                self.batch_failed[path] = message
+                self.log_preparation_error("turbo", self.active_plan[path], {"phase": "worker",
+                                           "message": message, "exit_code": code})
+            # Active resource guards also defer new heavy stem work. Receive
+            # fresh stems only for scoring or the dedicated training mix.
+            for path, title in self.active_plan.items():
+                if (path in self.batch_experimental and path not in self.training_songs or path in self.stem_failed
+                        or local_track(path.as_uri()) != path or cached_stems(path)):
+                    continue
+                if path in self.batch_protected:
+                    self.stem_failed.add(path)
+                    self.batch_failed.setdefault(path, self.batch_protected[path])
+                else:
+                    self.stem_queue[path] = title
+            self.stem_completed = len(self.active_plan) - len(self.stem_queue)
+        self.start_stem_generation()
 
     def build_timing_controls(self):
         self.timing_menu = Gtk.MenuButton(label="Minutage", tooltip_text="Ajuster le défilement PC et TV")

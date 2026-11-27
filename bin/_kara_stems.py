@@ -20,6 +20,7 @@ from tempfile import TemporaryDirectory
 from _kara_paths import CACHE, kara_data
 from _kara_audio_identity import pcm_digest
 from _kara_import_resources import lease
+from _kara_preparation_error import PreparationError, error_details
 
 MODEL = "htdemucs"
 ROOT = CACHE / "paroles-strawberry/stems"
@@ -140,7 +141,8 @@ def admit_storage(root, seconds):
                 used += info.st_blocks * 512
     working = int(max(seconds, 1) * 3 * 1024**2)
     if used + working > MAX_STEM_CACHE or shutil.disk_usage(root).free < MIN_DISK_FREE + working:
-        raise RuntimeError("Plafond du cache Demucs (4 Gio) ou réserve disque (20 Gio) : retire des morceaux de la sélection.")
+        raise PreparationError("Plafond du cache Demucs (4 Gio) ou réserve disque (20 Gio) : retire des morceaux de la sélection.",
+                               phase="storage-admission", protection="Réserve disque ou plafond de cache Demucs")
 
 
 def rebind(song, previous):
@@ -287,7 +289,7 @@ def separate_locked(song):
             buffer = ""
             try:
                 while data := os.read(process.stdout.fileno(), 2048):
-                    buffer = (buffer + data.decode("utf-8", "replace"))[-2048:]
+                    buffer = (buffer + data.decode("utf-8", "replace"))[-8192:]
                     matches = re.findall(r"(?:^|\r)\s*(\d{1,3})%\|", buffer)
                     if matches:
                         pct = min(100, int(matches[-1]))
@@ -305,7 +307,8 @@ def separate_locked(song):
                     process.wait()
                 raise
             if code:
-                raise RuntimeError("Demucs a interrompu la séparation (ressources ou modèle)")
+                raise PreparationError(buffer.strip() or "Demucs a interrompu la séparation.",
+                                       phase="separation", exit_code=code)
         stem_dir = result_dir / MODEL / original.stem
         files = (stem_dir / "no_vocals.flac", stem_dir / "vocals.flac")
         if not all(p.is_file() and p.stat().st_size > 4096 for p in files):
@@ -371,5 +374,5 @@ if __name__ == "__main__":
             raise RuntimeError("Cache de séparation invalide")
         emit("complete", instrumental=str(paths[0]), vocals=str(paths[1]), model=MODEL)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
-        emit("error", message=str(error) or "Séparation annulée")
+        emit("error", **error_details(error, "separation"))
         raise SystemExit(1)

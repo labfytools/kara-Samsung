@@ -14,6 +14,7 @@ from time import monotonic
 from _kara_import_resources import lease
 from _kara_paths import BIN, CACHE
 from _kara_prepare import atomic, file_token, lrc_token, path_id, read_source
+from _kara_preparation_error import PreparationError
 from _kara_stems import duration as audio_duration
 from _kara_turbo import digest
 from _parole_process import Interrupted, run
@@ -204,7 +205,7 @@ def guard(directory, *, require_quiet=True):
         return "Lecture en cours. Kara garde la priorité."
 
 
-def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True, for_party=False):
+def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True, for_party=False, diagnostic=None):
     """Run one explicit alignment under the existing Parole process supervisor."""
     if engine not in (*ENGINES, "edition") or not allow_demucs and engine != "huang":
         raise ValueError("Moteur CHRONOS inconnu.")
@@ -218,6 +219,18 @@ def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True, f
         scratch = Path(temporary)
         atomic(scratch / "source.json", json.dumps(source, ensure_ascii=False).encode())
         last_check, reason = 0., None
+        phase = "admission"
+        worker_error = None
+
+        def observe(event):
+            nonlocal phase, worker_error
+            if event.get("event") == "chronos-phase":
+                phase = event["phase"]
+            elif event.get("event") == "chronos-error" and worker_error is None:
+                worker_error = event
+            elif event.get("event") == "chronos-warning" and diagnostic is not None:
+                diagnostic(phase=event["phase"], message=event["message"],
+                           exit_code=event["exit_code"], protection=event["protection"])
 
         def stop():
             nonlocal last_check, reason
@@ -225,8 +238,8 @@ def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True, f
                 last_check = monotonic()
                 try:
                     reason = guard(scratch, require_quiet=not for_party)
-                except (OSError, ValueError, TypeError, subprocess.SubprocessError):
-                    reason = "Mesures système CHRONOS indisponibles"
+                except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+                    reason = f"Mesures système CHRONOS indisponibles · {error}"
             return reason is not None
 
         args = ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=8G",
@@ -234,21 +247,32 @@ def calculate(song, source, engine, *, expected_audio=None, allow_demucs=True, f
                 str(BIN / "_kara_chronos_worker.py"), str(song), str(scratch), engine,
                 expected_audio or ""]
         try:
-            code, output = run(args, stop=stop, timeout=365, maximum=32_768,
+            code, output = run(args, stop=stop, timeout=365, maximum=32_768, event=observe, merge_stderr=True,
                                env=dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="2",
                                         MKL_NUM_THREADS="2", PYTHONNOUSERSITE="1",
                                         KARA_CHRONOS_TIMED_PARTY="1" if for_party else "0",
                                         KARA_CHRONOS_ALLOW_DEMUCS="1" if allow_demucs else "0"))
-        except Interrupted:
-            raise RuntimeError(reason) from None
+        except Interrupted as error:
+            raise PreparationError(reason, phase=phase, protection=reason, exit_code=error.returncode) from None
+        except (OSError, ValueError) as error:
+            raise PreparationError(str(error), phase=phase, exit_code=getattr(error, "returncode", None)) from error
         if code:
-            raise RuntimeError(output.decode(errors="replace").strip()[-600:] or
-                               f"Exécution CHRONOS indisponible (sortie {code}).")
-        return load_json(scratch / "result.json")
+            if worker_error:
+                child_code = worker_error["exit_code"]
+                raise PreparationError(worker_error["message"], phase=worker_error["phase"],
+                                       exit_code=child_code if child_code is not None else code,
+                                       protection=worker_error["protection"])
+            raise PreparationError(output.decode(errors="replace").strip() or
+                                   f"Exécution CHRONOS indisponible (sortie {code}).",
+                                   phase=phase, exit_code=code)
+        try:
+            return load_json(scratch / "result.json")
+        except (OSError, ValueError) as error:
+            raise PreparationError(str(error), phase="publication", exit_code=code) from error
 
 
 def prepare(song, cache, engine, *, supplied=None, allow_demucs=True, for_party=False, source_clock=None,
-            expected_tokens=None):
+            expected_tokens=None, diagnostic=None):
     before = local_tokens(song)
     if expected_tokens is not None and expected_tokens != before:
         raise ValueError("Le morceau ou les paroles ont changé avant la préparation CHRONOS.")
@@ -262,6 +286,8 @@ def prepare(song, cache, engine, *, supplied=None, allow_demucs=True, for_party=
             and (not allow_demucs or previous.get("separation_allowed", True))):
         return previous["status"]
     admission = {"for_party": True} if for_party else {}
+    if diagnostic is not None:
+        admission["diagnostic"] = diagnostic
     failure = None
     try:
         result = calculate(song, source, engine, allow_demucs=allow_demucs, **admission)

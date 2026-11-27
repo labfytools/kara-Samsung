@@ -15,6 +15,7 @@ from _kara_chronos import (ASSETS, SETTINGS, atomic, audio_duration, implementat
                            load_json, reference_lines, timed_lines)
 from _kara_chronos_policy import decide, difficult, support
 from _kara_import_resources import lease
+from _kara_preparation_error import error_details
 from _kara_stems import ROOT as STEM_ROOT
 from _kara_turbo import RATE, TurboDecoder, build_decoder, decode_segment, digest, pcm_file
 from _kara_words import detect_language, words
@@ -116,11 +117,12 @@ def rows_for(source_lines, proposals, seconds):
     return result
 
 
-def work(song, scratch, engine, expected):
+def work(song, scratch, engine, expected, progress):
     from _kara_chronos_contrast import scores
     from _kara_chronos_phones import HOP, decode, emissions, phonemizer
     from _kara_chronos_separate import unmix
 
+    progress("source")
     source = load_json(scratch / "source.json")
     lines = reference_lines(source)
     tokens = [token for line in lines for token in line.split()]
@@ -145,11 +147,13 @@ def work(song, scratch, engine, expected):
     phones = phonemizer("fr-fr" if language == "fr" else "en-us", configured("PHONEMIZER"))
     voice = scratch / "voice.wav"
     if engine == "wav2vec2":
+        progress("separation")
         weights = verify(configured("DEMUCS_BASE"), models, "htdemucs")
         with lease(STEM_ROOT / "demucs.lock", wait=False) as slot:
             if slot is None:
                 raise RuntimeError("Demucs est déjà utilisé par Kara ou Parole.")
             separate(weights, song, seconds, voice)
+        progress("phonetic-alignment")
         model_root = configured("WAV2VEC")
         model = verify(model_root / "model_int8.onnx", models, "wav2vec2-phoneme-int8")
         vocabulary = load_json(verify(model_root / "vocab.json", models, "wav2vec2-phoneme-int8"))
@@ -158,12 +162,14 @@ def work(song, scratch, engine, expected):
         atomic(scratch / "wav2vec.json", json.dumps(work_item, ensure_ascii=False).encode())
         child("--wav2vec", voice, scratch)
         raw = load_json(scratch / "speech-rows.json")
+        progress("lexical-validation")
         heard = observations(voice, language, models)
         flags = support(tokens, raw, heard)
         proposals = [dict(row, source="demucs", lexical=flag, acoustic=False)
                      if row else None for row, flag in zip(raw, flags, strict=True)]
         record_view(result, voice, "demucs")
     else:
+        progress("model")
         assets = configured("HUANG")
         for name in ("model.py", "utils.py", "checkpoint_Baseline"):
             verify(assets / name, models, "huang")
@@ -178,31 +184,40 @@ def work(song, scratch, engine, expected):
             assigned = decode(lp, tokens, phones)
             return assigned, scores(lp, assigned, phone2int, HOP)
 
+        progress("separation")
         unmix(verify(configured("UMX"), models, "open-unmix-hq"), song, seconds, voice)
         record_view(result, voice, "umx")
+        progress("phonetic-alignment")
         base, contrast = evaluate(voice)
         # Timed sources already provide a display clock. In party
         # preparation, Huang can corroborate new onsets acoustically without
         # a second, full-song transcription. Replays keep their lexical audit.
         phonetic_only = (os.environ.get("KARA_CHRONOS_TIMED_PARTY") == "1"
                          and bool(timed_lines(source, seconds)))
+        if not phonetic_only:
+            progress("lexical-validation")
         heard = [] if phonetic_only else observations(voice, language, models)
         result["lexical_evidence"] = "not-requested" if phonetic_only else "turbo"
         deep, deep_contrast = None, None
         if allow_demucs and (engine == "huang-ft" or difficult(base)):
+            phase = "demucs-ft-separation"
+            progress(phase)
             try:
                 weights = verify(configured("DEMUCS_FT"), models, "htdemucs-ft-vocals")
                 with lease(STEM_ROOT / "demucs.lock", wait=False) as slot:
                     if slot is None:
                         raise RuntimeError("Demucs est déjà utilisé.")
                     ft = scratch / "ft.wav"
-                    separate(weights, song, seconds, ft)
+                    separate(weights, song, seconds, ft, recover=engine != "huang-ft")
                 record_view(result, ft, "htdemucs-ft")
+                phase = "demucs-ft-alignment"
+                progress(phase)
                 deep, deep_contrast = evaluate(ft)
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                 if engine == "huang-ft":
                     raise
                 result["separation_deferral"] = str(error)
+                emit("chronos-warning", **error_details(error, phase))
         groups = [line.split() for line in lines]
         if engine == "huang-ft":
             proposals = decide(groups, deep, None, heard, {"umx": deep_contrast})
@@ -215,6 +230,7 @@ def work(song, scratch, engine, expected):
             for row in proposals:
                 if row and row["source"] == "demucs":
                     row["source"] = "htdemucs-ft"
+    progress("decision")
     result["source_observations"] = heard
     # Source agreement is a diagnostic on this exact recording. The
     # forced timestamps alone never establish an edition or remove text.
@@ -249,15 +265,16 @@ def record_view(result, path, name):
                                  "frames_per_cell": width, "envelope_s8": b64encode(cells).decode("ascii")}
 
 
-def child(action, *arguments):
+def child(action, *arguments, recover=False):
     subprocess.run([sys.executable, "-B", __file__, action, *map(str, arguments)],
-                   stdin=subprocess.DEVNULL, check=True, timeout=295)
+                   stdin=subprocess.DEVNULL, check=True, timeout=295,
+                   env=dict(os.environ, KARA_CHRONOS_RECOVER_STAGE="1" if recover else "0"))
 
 
-def separate(weights, song, seconds, voice):
+def separate(weights, song, seconds, voice, *, recover=False):
     # Terminating the worker releases Torch's CPU arena. All stages remain
     # in the same supervised cgroup and retain the parent's model admission.
-    child("--separate", weights, song, seconds, voice)
+    child("--separate", weights, song, seconds, voice, recover=recover)
 
 
 def stage(arguments):
@@ -279,11 +296,23 @@ def stage(arguments):
         atomic(scratch / "speech-rows.json", json.dumps(rows, ensure_ascii=False, allow_nan=False).encode())
 
 
+def emit(event, **fields):
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+
+
 def main():
+    phase = "model-admission"
+
+    def progress(stage):
+        nonlocal phase
+        phase = stage
+        emit("chronos-phase", phase=phase)
+
     try:
         if find_spec("onnxruntime") is None:
             sys.path.append(str(configured("ONNX_SITE")))
         if sys.argv[1].startswith("--"):
+            # The enclosing worker owns the stage and the process status.
             stage(sys.argv[1:])
             return 0
         song, scratch, engine, expected = sys.argv[1:]
@@ -305,11 +334,18 @@ def main():
                 if result["source_sha"] != expected or result["target_sha"] != other:
                     raise ValueError("La source a changé pendant la comparaison.")
             else:
-                result = work(Path(song), scratch, engine, expected)
+                result = work(Path(song), scratch, engine, expected, progress)
+        progress("publication")
         atomic(scratch / "result.json", json.dumps(result, ensure_ascii=False, allow_nan=False,
                                                   separators=(",", ":")).encode())
-    except (ValueError, RuntimeError, OSError, KeyError, ImportError, subprocess.SubprocessError) as error:
-        print(f"CHRONOS · {error}", flush=True)
+    except (EOFError, ValueError, RuntimeError, OSError, KeyError, ImportError, subprocess.SubprocessError) as error:
+        if sys.argv[1].startswith("--"):
+            # A child shares the supervised output. Relay its exception
+            # before the parent's CalledProcessError describes the wrapper.
+            emit("chronos-warning" if os.environ.get("KARA_CHRONOS_RECOVER_STAGE") == "1" else "chronos-error",
+                 **error_details(error, sys.argv[1].removeprefix("--"), exit_code=1))
+        else:
+            emit("chronos-error", **error_details(error, phase, exit_code=1))
         return 1
     return 0
 
