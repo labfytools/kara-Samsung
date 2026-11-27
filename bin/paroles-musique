@@ -29,7 +29,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from _musique_oz import (INBOX, SHARED_LIBRARY, audio_files, canonical_album_artist,
                          probe, share_file, shared_mutation)
-from _paroles_lrc import MAX_LRC_BYTES, WORD_STAMP, parse_lrc
+from _paroles_lrc import MAX_LRC_BYTES, WORD_STAMP, has_word_timing, parse_lrc
 from _kara_import_resources import PROCESSING, RATE_DIRECTORY, defer_service, resource_slot, wait_service
 from _kara_import_result import ImportIssue
 from _parole_import_metrics import ACCESS_DENIED, ACCESS_REVIEW_DELAY
@@ -819,6 +819,9 @@ class LyricsSources:
         signature = (title, artist, album, duration, album_artist)
         code = normalize_isrc(isrc)
         self.original_lrc = original_lrc
+        prefer_words = synced and original_lrc
+        choice = (None, None)
+        entries = []
         from _parole_lrclib_local import candidates, configured_snapshot
 
         if provider_only is None and (snapshot_path := configured_snapshot()):
@@ -826,13 +829,17 @@ class LyricsSources:
             try:
                 records = candidates(snapshot_path, *signature)
                 if value := best_transcript(records, *signature, synced=synced, strict=True, original_lrc=original_lrc):
-                    if registry:
-                        matches = [row for row in records
-                                   if transcript(row, duration, synced, original_lrc=original_lrc) == value]
-                        identity = matches[0]["id"] if len(matches) == 1 else None
-                        save_candidates(registry, recording, [dict(cache_value(value, {"catalogue_id": identity}),
-                            provider="LRCLIB local", decision="selected")], synced=synced)
-                    return value, "LRCLIB local"
+                    matches = [row for row in records
+                               if transcript(row, duration, synced, original_lrc=original_lrc) == value]
+                    identity = matches[0]["id"] if len(matches) == 1 else None
+                    entries.append(dict(cache_value(value, {"catalogue_id": identity}),
+                                        provider="LRCLIB local", decision="compatible"))
+                    if not prefer_words or has_word_timing(value):
+                        if registry:
+                            entries[0]["decision"] = "selected"
+                            save_candidates(registry, recording, entries, synced=synced)
+                        return value, "LRCLIB local"
+                    choice = value, "LRCLIB local"
             except (OSError, sqlite3.Error, ValueError):
                 # A stale, damaged or missing mirror leaves the normal
                 # network path available with its own quota and evidence.
@@ -897,11 +904,12 @@ class LyricsSources:
         if provider_only is not None:
             names = [name for name in names if name == provider_only]
 
-        entries, instrumental, failed, ambiguous = [], None, None, False
+        instrumental, failed, ambiguous = None, None, False
         quota = None
-        choice = (None, None)
         for name in names:
-            if choice[0] and not ambiguous and name != "LRCLIB":
+            if prefer_words and choice[0] and not self.lrc.gate.remaining(1):
+                break
+            if not prefer_words and choice[0] and not ambiguous and name != "LRCLIB":
                 continue
             if registry and name not in providers:
                 continue
@@ -959,7 +967,9 @@ class LyricsSources:
                             quota = error
                         else:
                             failed = error or failed
-                        ambiguous |= conflict
+                        # An optional word-timing search cannot invalidate
+                        # the compatible result already available as fallback.
+                        ambiguous |= conflict and (not prefer_words or not choice[0])
                         entries.extend(dict(item, provider=name) for item in candidates)
                         if identity:
                             if not error and not conflict:
@@ -984,6 +994,14 @@ class LyricsSources:
             if value:
                 entries.append(dict(result, provider=name, decision="compatible"))
                 if ambiguous:
+                    continue
+                if prefer_words:
+                    if has_word_timing(value) and (not choice[0] or
+                            choose_transcript([(choice[0], {}), (value, {})], True, False) == value):
+                        choice = value, name
+                        break
+                    if not choice[0]:
+                        choice = value, name
                     continue
                 if choice[0] is None or WORD_STAMP.search(value):
                     choice = value, name

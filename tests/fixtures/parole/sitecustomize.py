@@ -43,7 +43,7 @@ if "PAROLE_TEST_CONFIG" in os.environ:
                     return response("Fixture: le serveur des paroles ne répond pas en JSON.".encode(), "text/plain")
                 return response({"trackName": parameters["track_name"][0], "artistName": config["artist"],
                                  "albumName": album, "duration": 4, "plainLyrics": "Son créé pour le test.",
-                                 "syncedLyrics": "[00:00.20]Son créé pour le test."})
+                                 "syncedLyrics": config["synced_lyrics"]})
             raise HTTPError(query.full_url, 404, "Service inexistant pour ce test", None, None)
 
     if Path(sys.argv[0]).name in {"musique-pochettes", "paroles-musique", "_parole_work.py"}:

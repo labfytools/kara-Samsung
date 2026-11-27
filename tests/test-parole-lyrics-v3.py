@@ -74,6 +74,39 @@ class LyricsTests(unittest.TestCase):
         self.engine.save_lrc(destination, TIMED, original=True)
         self.assertEqual(destination.read_bytes(), original.encode("utf-8"))
 
+    def test_native_word_timing_wins_over_an_equivalent_line_result(self):
+        self.only("LRCLIB", "NetEase", "QQ Music")
+        words = "\ufeff[00:01.000]<00:01.000>Premier <00:01.804>mot  \r\n"
+        client = self.engine.LyricsSources()
+        with patch.object(client.lrc, "find", return_value=TIMED), patch.object(
+            client.netease, "find", return_value=words
+        ), patch.object(client.qqmusic, "find", side_effect=AssertionError("LRC au mot déjà trouvé")):
+            result = client.find(*SONG, synced=True, original_lrc=True, strict=True, registry=self.index)
+        self.assertEqual(result, (words, "NetEase"))
+        with patch.object(self.engine.LrcLib, "find", side_effect=AssertionError("LRC ligne en cache")), patch.object(
+            self.engine.NetEase, "find", side_effect=AssertionError("LRC mot à mot en cache")
+        ):
+            result = self.engine.LyricsSources().find(
+                *SONG, synced=True, original_lrc=True, strict=True, registry=self.index)
+        self.assertEqual(result, (words, "NetEase"))
+
+    def test_native_line_fallback_survives_unusable_word_alternatives(self):
+        self.only("LRCLIB", "NetEase", "QQ Music")
+        for unreliable in ("[00:01.00]Premier mot<00:02.00>",
+                           "[00:02.00]<00:02.00>Premier <00:02.20>mot",
+                           "[00:01.00]<00:01.00>Autre phrase",
+                           self.engine.AmbiguousLyrics("variantes incompatibles")):
+            with self.subTest(alternative=unreliable):
+                client = self.engine.LyricsSources()
+                options = ({"side_effect": unreliable} if isinstance(unreliable, Exception)
+                           else {"return_value": unreliable})
+                with patch.object(client.lrc, "find", return_value=TIMED), patch.object(
+                    client.netease, "find", **options
+                ), patch.object(client.qqmusic, "find", return_value=None):
+                    result = client.find(*SONG, synced=True, original_lrc=True, strict=True,
+                                         registry=self.index, refresh=True)
+                self.assertEqual(result, (TIMED, "LRCLIB"))
+
     def test_lrc_red_verifies_edition_and_preserves_bytes_and_attribution_from_cache(self):
         self.only(RED)
         raw = "\ufeff[00:01.00]<00:01.00>Original  \r\n[00:02.50]Suite\r\n"

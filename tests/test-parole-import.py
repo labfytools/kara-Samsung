@@ -37,6 +37,7 @@ from _parole_jamendo import parse_release as jamendo_edition
 from _musique_oz import artist_spelling, probe
 
 TOOLS = {name: shutil.which(name) for name in ("yt-dlp", "ffmpeg", "ffprobe")}
+FIXTURE_LRC = "[00:00.20]<00:00.20>Son <00:00.55>créé <00:01.00>pour <00:01.40>le <00:01.60>test."
 
 
 def playlist(name):
@@ -302,7 +303,7 @@ class AlbumImportTests(unittest.TestCase):
             "real_downloader": TOOLS["yt-dlp"], "artist": "Atelier test", "media": self.media,
             "requests": str(self.requests), "cover": str(self.cover), "temp": str(self.temp),
             "playlist_failures": {"PLDOWN": MISSING, "PLNETWORK": "ERROR: HTTP Error 503: Service Unavailable"},
-            "transfer_failures": ["soundPART02"], "lyric_failures": [],
+            "transfer_failures": ["soundPART02"], "lyric_failures": [], "synced_lyrics": FIXTURE_LRC,
             "playlists": {
                 "OLAK5uy_FIXTURE": {"title": "100% Signal: A", "browse": "MPREb_FIXTURE", "tracks": [
                     {"id": "soundGOOD01", "title": "Signal un", "catalogue_id": "discoGOOD01"},
@@ -367,7 +368,7 @@ class AlbumImportTests(unittest.TestCase):
         for index, track in enumerate(tracks, 1):
             self.assertTrue(track.name.startswith(f"{index:02d} - "))
             if enriched:
-                self.assertIn("[00:00.20]Son créé pour le test.", track.with_suffix(".lrc").read_text())
+                self.assertEqual(track.with_suffix(".lrc").read_bytes(), FIXTURE_LRC.encode())
             exported = json.loads(subprocess.check_output(
                 [TOOLS["ffprobe"], "-v", "error", "-show_entries", "stream_tags", "-of", "json", str(track)]
             ))["streams"][0]["tags"]
@@ -1381,7 +1382,7 @@ finally:
             self.assertIsNone(worker.poll())
             self.assertEqual(queue.outcomes(identity), {})
             self.assertEqual(list(self.library.rglob("*.opus")), [track])
-            self.assertEqual(lrc.read_bytes(), "[00:00.20]Son créé pour le test.".encode())
+            self.assertEqual(lrc.read_bytes(), FIXTURE_LRC.encode())
             self.assertEqual(track.read_bytes(), audio)
         finally:
             release.set()
@@ -1397,7 +1398,7 @@ finally:
         self.assertFalse(second.with_suffix(".lrc").exists())
         self.enrich_one_during_playback()
         self.assertTrue(second.with_suffix(".lrc").is_file())
-        self.assertEqual(lrc.read_bytes(), "[00:00.20]Son créé pour le test.".encode())
+        self.assertEqual(lrc.read_bytes(), FIXTURE_LRC.encode())
 
     def test_cancel_artist_during_http_wait_while_strawberry_has_priority(self):
         marker = self.temp / "manual-http"

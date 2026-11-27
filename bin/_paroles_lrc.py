@@ -110,3 +110,9 @@ def playback_lrc(text):
                         for point, first, end in sorted(set(points)) if start <= point < stop)
         result.append(((start - shift) / 1000, phrase, markers))
     return result
+
+
+def has_word_timing(text):
+    # A bracket alone does not establish a highlight. Use the same parser
+    # as Kara so that misplaced or trailing markers cannot win a download.
+    return bool(WORD_STAMP.search(text) and any(marks for _, _, marks in playback_lrc(text)))
