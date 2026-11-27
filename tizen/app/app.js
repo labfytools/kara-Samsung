@@ -12,6 +12,32 @@
     var displayedTrack;
     var displayedLine;
     var displayedCredits = "";
+    var requestedScreenSaver;
+
+    function setScreenSaver(enabled) {
+        if (typeof tizen === "undefined" || requestedScreenSaver === enabled) return;
+        requestedScreenSaver = enabled;
+        function failed() {
+            if (requestedScreenSaver !== enabled) return;
+            requestedScreenSaver = undefined;
+            diagnostic("screensaver-error");
+        }
+        try {
+            var app = webapis.appcommon;
+            var states = app.AppCommonScreenSaverState;
+            app.setScreenSaver(enabled ? states.SCREEN_SAVER_ON : states.SCREEN_SAVER_OFF, function () {
+                if (requestedScreenSaver === enabled) diagnostic(enabled ? "screensaver-on" : "screensaver-off");
+            }, failed);
+        } catch (error) {
+            failed();
+        }
+    }
+
+    function updateScreenSaver() {
+        // Samsung owns the system policy. Kara holds only the foreground
+        // screensaver setting, including while Strawberry is briefly paused.
+        setScreenSaver(document.hidden || tvIsClosed);
+    }
 
     function renderCredits(links) {
         var items = Array.isArray(links) ? links.slice(0, 3) : [];
@@ -44,6 +70,7 @@
         if (typeof state.tv_close === "number") {
             if (seenClose !== null && seenClose !== state.tv_close) {
                 tvIsClosed = true;
+                updateScreenSaver();
                 element("tv-closed").hidden = false;
                 element("reopen-tv").focus();
             }
@@ -154,6 +181,7 @@
     }
 
     function retry() {
+        updateScreenSaver();
         clearTimeout(timer);
         if (request) { var previous = request; request = null; previous.abort(); }
         retryDelay = 750;
@@ -162,10 +190,16 @@
     }
     element("retry").onclick = retry;
     element("reopen-tv").onclick = function () { window.location.reload(); };
+    document.addEventListener("visibilitychange", updateScreenSaver);
+    window.addEventListener("pageshow", updateScreenSaver);
+    window.addEventListener("pagehide", function () { setScreenSaver(true); });
     document.addEventListener("keydown", function (event) {
         if (event.keyCode === 10009 || event.keyCode === 27) {
             event.preventDefault();
-            if (typeof tizen !== "undefined") tizen.application.getCurrentApplication().exit();
+            if (typeof tizen !== "undefined") {
+                setScreenSaver(true);
+                tizen.application.getCurrentApplication().exit();
+            }
         }
     });
     element("retry").focus();

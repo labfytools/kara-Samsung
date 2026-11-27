@@ -322,15 +322,22 @@ class Receiver(DisplayListener):
             state["cover_data"] = cover
         return state
 
-    def tv_report(self, params):
+    def tv_report(self, params, *, secure_display=False):
         event = params.get("event", [""])[0]
-        if event not in ("render-error", "rendered", "remote-back", "remote-reopen", "display-disconnect"):
+        screen_events = ("screensaver-on", "screensaver-off", "screensaver-error")
+        if event in screen_events:
+            if not secure_display:
+                raise DisplayError("Diagnostic réservé à la Samsung.", 403)
+        elif event not in ("render-error", "rendered", "remote-back", "remote-reopen", "display-disconnect"):
             raise DisplayError("Diagnostic TV inconnu.")
         clock = time.monotonic()
         with self._state_lock:
             if clock - self.tv_diagnostic_seen < .2:
                 return
             self.tv_diagnostic_seen = clock
+        if event in screen_events:
+            # Only the authenticated Samsung can report its API result.
+            print(f"Kara TV {event}", flush=True)
         fields = {}
         for name in ("revision", "browser_ms", "rtt_ms"):
             value = params.get(name, [""])[0]
@@ -397,7 +404,7 @@ class Page(BaseHTTPRequestHandler):
                 return self.send_data(200, receiver.tv_request(
                     secure_display=secure, cover_revision=params.get("cover", [None])[0]))
             if path in (DISPLAY_DIAGNOSTIC, base + "/diagnostic"):
-                receiver.tv_report(params)
+                receiver.tv_report(params, secure_display=secure)
                 return self.send_data(200, {"ok": True})
             # The LAN browser uses the packaged renderer, with a relative
             # endpoint and no copy of the private Samsung bearer key.

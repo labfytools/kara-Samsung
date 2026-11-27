@@ -47,7 +47,7 @@ const document = {
   addEventListener() {}
 };
 vm.runInNewContext(fs.readFileSync(path.join(directory, "app.js"), "utf8"), {
-  window: {KARA_DISPLAY_KEY: "fixture"}, document, XMLHttpRequest: Request, performance,
+  window: {KARA_DISPLAY_KEY: "fixture", addEventListener() {}}, document, XMLHttpRequest: Request, performance,
   setTimeout(callback, delay) { timers.set(++nextTimer, {callback, delay}); return nextTimer; },
   clearTimeout(id) { timers.delete(id); }
 });
@@ -104,4 +104,46 @@ assert.equal(nodes.get("title").textContent, "Nouveau titre");
 assert.equal(nodes.get("plain-lyrics").textContent, "Paroles simples disponibles");
 assert.equal(nodes.get("album-art").hidden, true);
 assert.ok(!nodes.has("room-qr"));
-console.log("Tizen simulé : connexion, pochette, mots, pause, avance, déplacements et paroles simples.");
+
+assert.match(html, /src="\$WEBAPIS\/webapis\/webapis\.js"/);
+const pageEvents = {}, docEvents = {}, power = [], nativeRequests = [];
+const nativeTimers = [];
+const nativeDocument = {...document, hidden: false, addEventListener(event, callback) { docEvents[event] = callback; }};
+class NativeRequest extends Request { send() { nativeRequests.push(this); } }
+let reject = false;
+let exited = false;
+vm.runInNewContext(fs.readFileSync(path.join(directory, "app.js"), "utf8"), {
+  window: {KARA_DISPLAY_KEY: "fixture", addEventListener(event, callback) { pageEvents[event] = callback; }},
+  document: nativeDocument, XMLHttpRequest: NativeRequest, performance,
+  setTimeout(callback) { nativeTimers.push(callback); return nativeTimers.length; }, clearTimeout() {},
+  tizen: {application: {getCurrentApplication() { return {exit() { exited = true; }}; }}},
+  webapis: {appcommon: {
+    AppCommonScreenSaverState: {SCREEN_SAVER_ON: "on", SCREEN_SAVER_OFF: "off"},
+    setScreenSaver(state, success, error) { power.push(state); (reject ? error : success)(); }
+  }}
+});
+assert.deepEqual(power, ["off"]);
+assert.match(nativeRequests[0].url, /event=screensaver-off$/);
+pageEvents.pageshow();
+assert.deepEqual(power, ["off"]);
+nativeRequests.at(-1).respond(200, {...first, playback_state: "Paused", tv_close: 0});
+assert.deepEqual(power, ["off"]);
+nativeDocument.hidden = true;
+docEvents.visibilitychange();
+pageEvents.pagehide();
+assert.deepEqual(power, ["off", "on"]);
+nativeDocument.hidden = false;
+reject = true;
+docEvents.visibilitychange();
+assert.match(nativeRequests.at(-1).url, /event=screensaver-error$/);
+reject = false;
+pageEvents.pageshow();
+assert.match(nativeRequests.at(-1).url, /event=screensaver-off$/);
+nativeTimers.shift()();
+nativeRequests.at(-1).respond(200, {...first, tv_close: 1});
+assert.equal(nodes.get("tv-closed").hidden, false);
+assert.deepEqual(power, ["off", "on", "off", "off", "on"]);
+docEvents.keydown({keyCode: 10009, preventDefault() {}});
+assert.equal(exited, true);
+assert.equal(power.at(-1), "on");
+console.log("Tizen simulé : connexion, paroles, crédits et cycle de l’économiseur Samsung.");

@@ -1,6 +1,8 @@
 # Kara sur Samsung
 
-Ouvre **Kara** depuis **Applications** sur la télévision. La version 2.2.2 suit le morceau en cours dans Strawberry et affiche le LRC d’origine, ou les paroles simples. Les crédits lrc.red et Unison apparaissent sous l’artiste lorsque leur LRC est affiché. **Réessayer** relance la connexion au PC. Le réglage **Minutage** de Parole s’applique à la TV.
+Ouvre **Kara** depuis **Applications** sur la télévision. La version 2.2.3 suit le morceau en cours dans Strawberry et affiche le LRC d’origine, ou les paroles simples. Les crédits lrc.red et Unison apparaissent sous l’artiste lorsque leur LRC est affiché. **Réessayer** relance la connexion au PC. Le réglage **Minutage** de Parole s’applique à la TV.
+
+Kara demande à Samsung de suspendre l’économiseur d’écran tant que l’affichage est au premier plan, même pendant une pause. L’économiseur est rétabli à la sortie et en arrière-plan. La minuterie de mise en veille et la mise hors tension automatique restent des réglages système Samsung. [API AppCommon](https://developer.samsung.com/smarttv/develop/guides/fundamentals/setting-screensaver.html)
 
 ## Construire une mise à jour
 

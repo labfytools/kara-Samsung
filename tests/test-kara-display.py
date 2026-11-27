@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -52,6 +52,16 @@ class DisplayTests(unittest.TestCase):
             urlopen("http://" + self.receiver.host + "/tv/etat", timeout=2)
         self.assertEqual(error.exception.code, 403)
         error.exception.close()
+
+    def test_screensaver_report_uses_the_authenticated_samsung_route(self):
+        with self.assertRaises(HTTPError) as error:
+            self.get("diagnostic?event=screensaver-off")
+        self.assertEqual(error.exception.code, 403)
+        error.exception.close()
+        with patch("builtins.print") as journal:
+            self.receiver.tv_report({"event": ["screensaver-off"]}, secure_display=True)
+        journal.assert_called_once_with("Kara TV screensaver-off", flush=True)
+        self.assertEqual(self.journal.emit.call_args.args, ("television", "screensaver-off"))
 
 
 if __name__ == "__main__":
