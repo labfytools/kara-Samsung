@@ -29,6 +29,11 @@ Icon=multimedia-player
 Terminal=false
 Categories=AudioVideo;Audio;
 StartupNotify=true
+Actions=ImportAlbums;
+
+[Desktop Action ImportAlbums]
+Name=Importer des albums
+Exec=/usr/bin/python3 -B {quoted} --import
 """)
             draft.flush()
             temporary.replace(desktop)

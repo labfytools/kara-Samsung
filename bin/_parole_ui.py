@@ -365,6 +365,8 @@ class ParoleView:
         artist_pane.append(scroller(tree_view, min_content_width=160, vexpand=True))
         self.search_lyrics = button("Rechercher les paroles", self.search_artist_lyrics, sensitive=False)
         artist_pane.append(self.search_lyrics)
+        self.import_artist = button("Importer un album de cet artiste", self.import_selected_artist, sensitive=False)
+        artist_pane.append(self.import_artist)
         panes.set_start_child(artist_pane)
         panes.set_shrink_start_child(False)
         self.songs = Gio.ListStore(item_type=Row)
@@ -515,6 +517,7 @@ class ParoleView:
         selected = self.tree_selection.get_selected_item()
         self.scope = selected.get_item().data if selected else ()
         self.search_lyrics.set_sensitive(bool(self.scope))
+        self.import_artist.set_sensitive(bool(self.scope))
         self.reset()
 
     def open_tree(self, _, pos):
@@ -938,6 +941,10 @@ class ParoleView:
         if self.scope and (kind != "album" or len(self.scope) >= 3):
             self.manual_codex(kind, self.scope[1] if kind == "album" else self.scope[0])
 
+    def import_selected_artist(self, _button):
+        if self.scope:
+            self.control.open_import(artist=self.scope[0])
+
     def search_artist_lyrics(self, _widget):
         if not self.scope:
             return
@@ -1129,6 +1136,10 @@ class ParoleView:
         actions.append(button("Exclure cette édition", exclude))
         if state in ("incomplete", "missing"):
             actions.append(button("Autoriser l’import…", lambda *_: self.allow_import(window, kind, subject, title)))
+            if self.scope:
+                artist = self.scope[0]
+                actions.append(button("Ouvrir l’import d’albums",
+                                      lambda _: self.control.open_import(artist=artist)))
         if kind == "album":
             actions.append(button("Rechercher avec Codex", lambda *_: self.manual_codex(kind, subject, status)))
         window.present()

@@ -1,5 +1,7 @@
 # Import d’albums dans Paroles Strawberry
 
+Le bouton **Importer des albums** et le raccourci **Ctrl+I** ouvrent la file et les sources. Le menu de l’application **Parole** propose aussi l’action **Importer des albums**. Depuis la bibliothèque, **Importer un album de cet artiste** préremplit le nom sélectionné.
+
 Le tableau de bord et la maintenance sont documentés dans [Parole V3](parole-v3.md).
 
 ## Publication audio et enrichissement

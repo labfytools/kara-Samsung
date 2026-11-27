@@ -1103,9 +1103,17 @@ class GtkTests(Fixture):
         self.assertTrue(formats.get_sensitive())
         self.assertFalse(path.with_suffix(".lrc").exists())
 
-        window.open_import()
+        view.tree_selection.set_selected(0)
+        self.assertTrue(view.import_artist.get_sensitive())
+        view.import_artist.emit("clicked")
+        self.assertEqual(window.album_import.artist.get_text(), view.scope[0])
         self.assertTrue(window.album_import.get_reveal_child())
         self.assertEqual(window.album_import.get_root(), window.import_window)
+        self.assertIs(window.import_window.get_application(), app)
+        window.import_window.close()
+        self.assertFalse(window.import_window.get_visible())
+        window.open_import()
+        self.assertTrue(window.import_window.get_visible())
         imports = window.album_import
         self.assertEqual(imports.selected_provider(), "Toutes les sources")
         providers = imports.provider.get_model()
