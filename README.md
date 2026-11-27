@@ -23,4 +23,4 @@ Le poste utilise Strawberry, MPRIS, Python avec GTK 4 et PyGObject, et les utili
 
 Les anciens parcours sont conservés dans les branches locales `archive/kara-avant-back-to-basics-20261127` et `archive/kara-multijoueur-2.1.0`. Les données privées et les captures restent dans l’espace utilisateur.
 
-Pour revenir à une version précédente, restaurer le raccourci, l’unité utilisateur et ses paramètres de lancement depuis la sauvegarde de déploiement, puis redémarrer le service. La télévision accepte le paquet précédent signé avec le même certificat auteur. La restauration de la version s’effectue sur les données présentes afin de garder les imports et LRC acquis depuis la mise à jour.
+Pour revenir à une version précédente, restaurer le raccourci, l’unité utilisateur et ses paramètres de lancement depuis la sauvegarde de déploiement, puis redémarrer le service. Le paquet Samsung signé précédent est conservé pour le retour arrière. La restauration de la version s’effectue sur les données présentes afin de garder les imports et LRC acquis depuis la mise à jour.
