@@ -5,6 +5,9 @@ import re
 from time import time
 from urllib.parse import urlencode
 
+from _kara_import_result import ImportIssue
+from _parole_lyrics_lookup import lookup_slot
+from _parole_index import encoded_key
 from _parole_sources import ProviderUnavailable, fetch, record
 
 SOURCE = "Unison"
@@ -36,13 +39,22 @@ def inspect(payload, expected, matches):
         return None
     # Keep the attribution and destination only. Neither the lyrics nor
     # their timestamps become an offline copy via this discovery route.
-    return {"url": f"{BASE}/song/{video}", "contributor": name, "profile": f"{BASE}/curator/{profile}"}
+    return {"url": f"{BASE}/song/{video}", "contributor": name, "profile": f"{BASE}/curator/{profile}",
+            "format": data["format"]}
 
 
 def discover(index, song, value, matches):
     code = isrc(value)
     if not code or not index.source_enabled(SOURCE):
         return None
+    try:
+        with lookup_slot(index, encoded_key(SOURCE, code)):
+            return discover_locked(index, song, code, matches)
+    except ImportIssue:
+        return None
+
+
+def discover_locked(index, song, code, matches):
     with index.db(wait=.15) as db:
         row = db.execute("""SELECT checked,value FROM reviews
                             WHERE kind='unison_candidate' AND subject=?""", (song["id"],)).fetchone()
@@ -50,14 +62,20 @@ def discover(index, song, value, matches):
         saved = json.loads(row["value"])
         if saved["token"] == song["token"] and saved["isrc"] == code:
             return saved["candidate"]
+    result, error = probe(index, code, matches)
+    if not error:
+        index.review("unison_candidate", song["id"], "found" if result else "absent",
+                     {"token": song["token"], "isrc": code, "candidate": result})
+    return result
+
+
+def probe(index, code, matches):
     began = time()
     try:
         payload = fetch(f"{BASE}/lyrics?{urlencode({'isrc': code})}", registry=index, provider=SOURCE)
-    except (ProviderUnavailable, ValueError):
-        record(index, SOURCE, "error", time() - began)
-        return None
+    except (ProviderUnavailable, ValueError) as error:
+        record(index, SOURCE, "error", time() - began, error=str(error))
+        return None, str(error)
     result = inspect(payload, code, matches)
     record(index, SOURCE, "found" if result else "absent", time() - began)
-    index.review("unison_candidate", song["id"], "found" if result else "absent",
-                 {"token": song["token"], "isrc": code, "candidate": result})
-    return result
+    return result, None

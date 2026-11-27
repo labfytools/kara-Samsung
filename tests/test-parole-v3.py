@@ -1081,6 +1081,26 @@ class GtkTests(Fixture):
                 yield from descendants(child)
                 child = child.get_next_sibling()
 
+        from _parole_sources import configure_limits
+
+        configure_limits(window.maintenance.index, "LRCLIB", 0, 0)
+        view.settings("lyrics_sources")
+        source_buttons = {widget.get_label(): widget for widget in descendants(view.settings_dialog)
+                          if isinstance(widget, Gtk.Button)}
+        self.assertTrue({"Monter", "Descendre", "Tester", "Limites…"} <= source_buttons.keys())
+        test_source = source_buttons["Tester"]
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.base / "state")}):
+            test_source.emit("clicked")
+        self.assertFalse(test_source.get_sensitive())
+        deadline = monotonic() + 6
+        while not test_source.get_sensitive() and monotonic() < deadline:
+            if not context.iteration(False):
+                sleep(.005)
+        self.assertTrue(test_source.get_sensitive())
+        self.assertTrue(any(isinstance(widget, Gtk.Label) and "LRCLIB · Quota local en pause" in widget.get_text()
+                            for widget in descendants(view.settings_dialog)))
+        view.settings_dialog.close()
+
         editor_buttons = {widget.get_label(): widget for widget in descendants(detail) if isinstance(widget, Gtk.Button)}
         formats = next(widget for widget in descendants(detail) if isinstance(widget, Gtk.DropDown))
         editor = next(widget for widget in descendants(detail) if isinstance(widget, Gtk.TextView))

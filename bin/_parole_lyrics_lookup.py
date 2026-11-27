@@ -1,6 +1,7 @@
 """Transport et cache bornés des réponses de paroles déjà vérifiées."""
 from collections import OrderedDict
-from contextlib import closing
+from contextlib import closing, contextmanager
+from hashlib import sha256
 from http.client import HTTPException, HTTPSConnection
 from io import BytesIO
 import json
@@ -12,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import OpenerDirector, getproxies
 
+from _kara_import_resources import resource_slot
 from _parole_index import document, encoded_key
 
 MAX_AGE = 7 * 86400
@@ -20,6 +22,10 @@ MAX_ROWS = 2048
 CACHE_KIND = "lyrics_query_v1"
 PROFILE_KIND = "lyrics_source_profile"
 OUTAGE_KIND = "lyrics_source_outage"
+TEMPORARY_KIND = "lyrics_query_temporary"
+EVIDENCE_KIND = "lyrics_source_candidates"
+MAX_CANDIDATES = 4
+MAX_EVIDENCE_ROWS = 512
 
 
 def contexts(tags):
@@ -150,9 +156,24 @@ class KeepAlive:
 def cache_identity(provider, signature, synced, local_text, strict, configuration):
     # Keep the exact version/credits in the key. LyricDown aligns an existing
     # text, and its timing is only reusable with the same reference text.
-    if provider == "LRCLIB":
-        signature = ("lrclib-2", *signature)
-    return encoded_key(provider, signature, synced, encoded_key(local_text) if synced else "", strict, configuration)
+    settings = json.loads(configuration)
+    # Admission/order changes do not alter previously verified content.
+    config = {name: settings.get(name) for name in ("host", "path")}
+    return encoded_key("lyrics-v3", provider, signature, synced,
+                       encoded_key(local_text) if synced else "", strict, config)
+
+
+def previous_identity(provider, signature, synced, local_text, strict, configuration):
+    version = ("lrclib-2", *signature) if provider == "LRCLIB" else signature
+    return encoded_key(provider, version, synced, encoded_key(local_text) if synced else "", strict, configuration)
+
+
+@contextmanager
+def lookup_slot(index, identity):
+    # A process death releases the lease. Recheck SQLite under the same lease
+    # for desktop, import and night workers. Stripes bound the number of files.
+    with resource_slot(index.folder / "lyrics-queries" / identity[:2], 1, timeout=35):
+        yield
 
 
 def cached(index, identity):
@@ -162,25 +183,101 @@ def cached(index, identity):
                              (CACHE_KIND, identity)).fetchone()
         if row and time() - row["checked"] < (MAX_ABSENCE_AGE if row["state"] == "absent" else MAX_AGE):
             value = json.loads(row["value"])
+            if isinstance(value, dict) and isinstance(value.get("text"), (str, type(None))):
+                text = value["text"]
+                if text is None or sha256(text.encode()).hexdigest() == value.get("sha256"):
+                    return True, value
             if value is None or isinstance(value, str):
-                return True, value
+                return True, cache_value(value)
     except (sqlite3.Error, ValueError):
         pass
     return False, None
+
+
+def cache_value(text, metadata=None):
+    return {"text": text, "sha256": sha256(text.encode()).hexdigest() if text is not None else None,
+            "metadata": metadata or {}}
 
 
 def remember(index, identity, value):
     try:
         with index.db(wait=.2) as db:
             db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",
-                       (CACHE_KIND, identity, "absent" if value is None else "verified", time(), document(value)))
+                       (CACHE_KIND, identity, "absent" if value["text"] is None else "verified",
+                        time(), document(value)))
+            db.execute("DELETE FROM reviews WHERE kind=? AND subject=?", (TEMPORARY_KIND, identity))
     except sqlite3.Error:
         pass
+
+
+def temporary(index, identity, provider, reason):
+    # An access failure has no negative-catalogue semantics. Admission is
+    # controlled separately by the provider's persisted retry horizon.
+    try:
+        with index.db(wait=.2) as db:
+            row = db.execute("SELECT until FROM import_provider_limits WHERE source=?", (provider,)).fetchone()
+            db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",
+                       (TEMPORARY_KIND, identity, "temporary", time(),
+                        document({"provider": provider, "reason": reason, "retry_at": row[0] if row else None})))
+    except sqlite3.Error:
+        pass
+
+
+def save_candidates(index, recording, entries, *, synced):
+    if not recording or not entries:
+        return
+    path, token = recording
+    subject = encoded_key(str(path))
+    try:
+        with index.db(wait=.2) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM reviews WHERE kind=? AND subject=?",
+                             (EVIDENCE_KIND, subject)).fetchone()
+            value = json.loads(row[0]) if row else {}
+            if value.get("token") != list(token):
+                value = {"token": list(token)}
+            form = "synced" if synced else "plain"
+            # Merge evidence from narrowed diagnostics with the earlier run.
+            previous = value.get(form, [])
+            entries = list({(item["provider"], item["sha256"], item["decision"]): item
+                            for item in [*entries, *previous]}.values())[:MAX_CANDIDATES]
+            value[form] = entries
+            db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",
+                       (EVIDENCE_KIND, subject, "observed", time(), document(value)))
+            db.execute("""DELETE FROM reviews WHERE rowid IN (SELECT rowid FROM reviews WHERE kind=?
+                          ORDER BY checked DESC LIMIT -1 OFFSET ?)""", (EVIDENCE_KIND, MAX_EVIDENCE_ROWS))
+    except (sqlite3.Error, ValueError):
+        pass
+
+
+def playback_candidates(path, root):
+    # Read-only consumer for BlackBox and CHRONOS. No index is created on
+    # playback, and evidence for a file replaced in place is ignored.
+    from _kara_paths import STATE
+    from _kara_prepare import file_token
+
+    location = STATE / "kara/parole" / encoded_key(str(root.resolve())) / "maintenance.sqlite3"
+    if not location.is_file():
+        return {}
+    try:
+        with closing(sqlite3.connect(location.as_uri() + "?mode=ro", uri=True, timeout=.1)) as db:
+            row = db.execute("SELECT value FROM reviews WHERE kind=? AND subject=?",
+                             (EVIDENCE_KIND, encoded_key(str(path)))).fetchone()
+        value = json.loads(row[0]) if row else {}
+        if value.get("token") == list(file_token(path)):
+            return {form: [{k: v for k, v in item.items() if k != "text"}
+                           for item in value.get(form, [])] for form in ("synced", "plain")}
+    except (sqlite3.Error, ValueError, OSError):
+        pass
+    return {}
 
 
 def prune(index):
     try:
         with index.db(wait=.2) as db:
+            db.execute("DELETE FROM reviews WHERE kind=? AND checked<?", (TEMPORARY_KIND, time() - MAX_ABSENCE_AGE))
+            db.execute("""DELETE FROM reviews WHERE rowid IN (SELECT rowid FROM reviews WHERE kind=?
+                          ORDER BY checked DESC LIMIT -1 OFFSET ?)""", (TEMPORARY_KIND, MAX_ROWS))
             db.execute("DELETE FROM reviews WHERE kind=? AND checked<?", (CACHE_KIND, time() - MAX_AGE))
             db.execute("""DELETE FROM reviews WHERE rowid IN (SELECT rowid FROM reviews WHERE kind=?
                           ORDER BY checked DESC LIMIT -1 OFFSET ?)""", (CACHE_KIND, MAX_ROWS))

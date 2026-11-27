@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Mutualiser les quotas, les recherches concurrentes et le cache par fournisseur de paroles. Ajouter le tableau de bord, les repères au mot LRCLIB et le lecteur facultatif d’une sauvegarde SQLite.
+
 - Autoriser les recherches de paroles d’artiste et d’import pendant la lecture Strawberry. Donner la priorité à la recherche manuelle et permettre l’annulation d’une réponse HTTP en attente.
 
 - Rechercher les paroles et les LRC de tous les albums locaux d’un artiste, avec suivi et annulation depuis Parole.

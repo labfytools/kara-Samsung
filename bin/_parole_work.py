@@ -93,11 +93,12 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
         try:
             lyrics, provider = engine.LyricsSources().find(
                 title, artist, tags.get("album"), duration, tags.get("albumartist"),
-                synced=synced, local_text=local_text, registry=index, strict=True)
+                synced=synced, local_text=local_text, registry=index, strict=True,
+                context=engine.contexts(tags), isrc=tags.get("isrc"), recording=(path, token))
         except engine.AmbiguousLyrics:
             lyrics, missing = None, "ambiguous"
         except engine.ServiceUnavailable as error:
-            return {"state": error.reason}
+            lyrics, missing = None, error.reason
     if lyrics is None:
         if not read_only:
             from _parole_unison import discover as unison
@@ -308,9 +309,56 @@ def import_enrichment(index, kind, subject, report):
             "providers": sorted({provider for c in clients for provider in c.providers})}
 
 
+# Public diagnostic recordings keep the source test independent of the
+# library and its sidecars. Catalogue matching uses the normal admission.
+def test_lyrics_source(index, identity):
+    from _parole_sources import lyrics_rows, seed
+    from _parole_unison import probe as unison_probe
+
+    seed(index)
+    row = next((item for item in lyrics_rows(index) if item["id"] == identity), None)
+    if not row:
+        return {"state": "unknown"}
+    if row["availability"] != "ready":
+        return {"state": row["availability"], "next_available": row["next_available"]}
+    if identity == "Unison":
+        candidate, error = unison_probe(index, "FR8EU2300090", lambda data: data.get("song") == "Explorer")
+        return {"state": "temporary" if error else "candidate" if candidate else "not_found",
+                "format": candidate and candidate["format"], "detail": error}
+    if identity == "LyricDown":
+        # This source transfers line timings only after independent
+        # verification against an existing full reference text.
+        engine = lyrics_engine()
+        try:
+            page = engine.LyricsSources().lyricdown
+            page.failure = None
+            page.gate.provider = (index, identity)
+            connected = page.page("/search/Yellow/") is not None
+        except (OSError, ValueError, engine.ServiceUnavailable) as error:
+            return {"state": "temporary", "detail": str(error)}
+        return {"state": "reachable" if connected else "temporary",
+                "detail": "La validation LRC exige un texte de référence." if connected else str(page.failure)}
+    engine = lyrics_engine()
+    client = engine.LyricsSources()
+    signature = ("Yellow", "Coldplay", "Parachutes", 269, "Coldplay")
+    forms = (True, False) if "lrc" in row["category"].split(",") else (False,)
+    try:
+        for synced in forms:
+            text, _ = client.find(*signature, synced=synced, registry=index,
+                                  strict=True, provider_only=identity, refresh=True)
+            if text:
+                return {"state": "found", "format": "mot" if synced and engine.WORD_STAMP.search(text)
+                        else "ligne" if synced else "texte"}
+    except engine.ServiceUnavailable as error:
+        return {"state": "temporary", "detail": str(error)}
+    except engine.AmbiguousLyrics as error:
+        return {"state": "ambiguous", "detail": str(error)}
+    return {"state": "not_found"}
+
+
 def main():
     kind, subject = sys.argv[1:3]
-    index = Index(music_library())
+    index = Index(Path(sys.argv[3]) if kind == "lyrics_source_test" and len(sys.argv) == 4 else music_library())
     if kind in ("lyrics", "lrc"):
         result = lookup_song(index, subject, kind == "lrc",
                              local_reference_only=sys.argv[3:] == ["--local-reference-only"])
@@ -331,6 +379,8 @@ def main():
                              local_reference_only=sys.argv[3:] == ["--local-reference-only"])
     elif kind == "cover":
         result = {"state": cover(index, subject)}
+    elif kind == "lyrics_source_test":
+        result = test_lyrics_source(index, subject)
     elif kind == "source_probe":
         result = {"state": verify_documentation(index, subject)}
     elif kind == "source":

@@ -2345,6 +2345,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 try:
                     document = lyrics_snapshot(files, source, original_text, displayed, reference)
                     document["chronos"] = experiment
+                    from _parole_lyrics_lookup import playback_candidates
+
+                    if candidates := playback_candidates(original, LIBRARY):
+                        document["lyrics_candidates"] = candidates
                     if experiment and experiment["audio_sha256"] != files["original"]["sha256"]:
                         document["chronos"] = None
                         document["chronos_state"] = "audio-identity-mismatch"

@@ -185,3 +185,5 @@ Un service utilisateur transitoire a démarré la maintenance sans fenêtre sur 
 Sur le bureau réel, l’option **Maintenir éveillé** de QuickShell bloquait le verrouillage et l’extinction automatiques. Après sa désactivation par l’utilisateur, le signal d’inactivité, le verrouillage QuickShell et l’extinction Sway ont été observés sur secteur, capot ouvert. Le service installé a ensuite démarré sans fenêtre et terminé l’inventaire initial sans erreur.
 
 Un premier essai sur secteur a duré 24,3 s capot fermé sans calcul lourd. Un [parcours physique ultérieur](parole-performances.md#relevé-archasp-du-25-novembre-2026) a validé un titre complet en 318,4 s, avec des maxima de 62,6 °C au CPU et 56 °C au GPU. La préparation capot fermé reste désactivée sur le service installé. Une période nocturne entière sous charge reste à observer. La préemption par une partie Kara a été vérifiée sur fixtures avec un vrai sous-processus supervisé.
+
+Les contrôles des budgets, le diagnostic par fournisseur et le miroir SQLite sont détaillés dans [Sources de paroles V3](parole-sources-v3.md).

@@ -201,6 +201,13 @@ def prepare(song, cache, engine, *, supplied=None, allow_demucs=True):
     if local_tokens(song) != before or supplied is None and source_for(song, cache) != source:
         raise ValueError("Le morceau ou les paroles ont changé pendant la préparation CHRONOS.")
     result.update(tokens=before, source_sha256=key, separation_allowed=allow_demucs)
+    from _kara_paths import music_library
+    from _parole_lyrics_lookup import playback_candidates
+
+    if candidates := playback_candidates(song, music_library()):
+        # Alternative catalogue evidence is diagnostic. It is not supplied
+        # to the model and cannot change the input identity or score.
+        result["lyrics_candidates"] = candidates
     raw = json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     if len(raw) > MAX_RESULT:
         raise ValueError("Résultat trop volumineux pour le cache CHRONOS.")

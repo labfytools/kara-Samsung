@@ -1,7 +1,7 @@
 """Registre des fournisseurs et transport HTTPS."""
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from hashlib import sha256
 import http.client
@@ -45,6 +45,11 @@ MAX_RESPONSE = 1_000_000
 DEFAULT_REQUESTS = 200
 RECENT_SOURCE_LIMIT = 128
 RECENT_SOURCE_KIND = "source_latency_samples"
+LYRICS_STATS = "lyrics_source_statistics"
+LYRICS_RATE = "lyrics_source_remote_quota"
+LYRICS_BROKER_UPSTREAMS = ("LRCLIB", "NetEase")
+LYRICS_DEFAULT_ORDER = ("LRCLIB", "NetEase", "QQ Music", "Genius", "LyricDown", "lyrics.ovh", "Unison")
+
 SOURCE_OUTCOMES = frozenset(("found", "absent", "error", "ambiguous", "different_edition"))
 COVER_PROVIDERS = {host: identity for identity, (host, category, _) in BUILTINS.items()
                    if "cover" in category or identity == "MusicBrainz"}
@@ -94,6 +99,96 @@ def configure_limits(index, identity, daily, seconds):
         db.execute("UPDATE sources SET config=? WHERE id=?", (document(config), identity))
 
 
+def lyrics_priority(row):
+    configured = row["decoded"].get("lyrics_priority")
+    defaults = {name: i for i, name in enumerate(LYRICS_DEFAULT_ORDER)}
+    return (configured if type(configured) is int and configured >= 0
+            else len(defaults) + defaults.get(row["id"], len(defaults)), row["id"])
+
+
+def lyrics_rows(index, *, db=None, now=None):
+    now = time() if now is None else now
+    if db is None:
+        with index.db(wait=.2) as connection:
+            return lyrics_rows(index, db=connection, now=now)
+    rows = db.execute("""SELECT s.*,coalesce(u.used,0) AS used_today,l.until AS limited_until,
+                                l.status AS last_http, r.value AS lyrics_stats, q.value AS remote_quota,
+                                q.checked AS quota_checked
+                         FROM sources s LEFT JOIN daily_usage u
+                           ON u.bucket='provider:'||s.id AND u.day=?
+                         LEFT JOIN import_provider_limits l ON l.source=s.id AND l.until>?
+                         LEFT JOIN reviews r ON r.kind=? AND r.subject=s.id
+                         LEFT JOIN reviews q ON q.kind=? AND q.subject=s.id
+                         WHERE s.adapter='lrclib' OR s.category LIKE '%lyrics%' OR s.category='lrc'""",
+                      (date.fromtimestamp(now).isoformat(), now, LYRICS_STATS, LYRICS_RATE)).fetchall()
+    result = []
+    for raw in rows:
+        row = dict(raw)
+        row["decoded"] = json.loads(row["config"])
+        daily, row["interval"] = provider_limits(row["decoded"])
+        row["remaining"] = max(0, daily - row["used_today"])
+        row["lyrics_stats"] = json.loads(row["lyrics_stats"]) if row["lyrics_stats"] else {}
+        row["remote_quota"] = (json.loads(row["remote_quota"])
+                               if row["quota_checked"] and now - row["quota_checked"] < 300 else None)
+        if row["state"] != "active":
+            row.update(availability=row["state"], next_available=None)
+        elif not daily:
+            row.update(availability="paused", next_available=None)
+        else:
+            reopen = row["limited_until"]
+            if not row["remaining"]:
+                tomorrow = date.fromtimestamp(now) + timedelta(days=1)
+                midnight = datetime.combine(tomorrow, datetime.min.time()).timestamp()
+                reopen = max(reopen or 0, midnight)
+            row.update(availability="limited" if reopen else "ready", next_available=reopen)
+        result.append(row)
+    by_id = {row["id"]: row for row in result}
+    broker = by_id.get("lyrics.ovh")
+    if broker and broker["availability"] == "ready":
+        upstreams = [by_id.get(name, {}) for name in LYRICS_BROKER_UPSTREAMS
+                     if by_id.get(name, {}).get("availability") != "ready"]
+        if upstreams:
+            dates = [row.get("next_available") for row in upstreams]
+            broker.update(availability="upstream", next_available=max(dates) if all(dates) else None)
+    return sorted(result, key=lyrics_priority)
+
+
+def move_lyrics_source(index, identity, delta):
+    if delta not in (-1, 1):
+        raise ValueError("Déplacement de fournisseur invalide")
+    with index.db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        # Discovery-only and broker routes retain their execution semantics.
+        rows = [row for row in lyrics_rows(index, db=db) if row["id"] not in ("Unison", "lyrics.ovh")]
+        position = next((i for i, row in enumerate(rows) if row["id"] == identity), -1)
+        neighbor = position + delta
+        if position < 0 or not 0 <= neighbor < len(rows):
+            return
+        rows[position], rows[neighbor] = rows[neighbor], rows[position]
+        for order, row in enumerate(rows):
+            config = dict(row["decoded"], lyrics_priority=order)
+            db.execute("UPDATE sources SET config=? WHERE id=?", (document(config), row["id"]))
+
+
+def record_lyrics(index, identity, synced):
+    with index.db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT value FROM reviews WHERE kind=? AND subject=?", (LYRICS_STATS, identity)).fetchone()
+        value = json.loads(row[0]) if row else {}
+        form = "lrc" if synced else "plain"
+        value[form] = value.get(form, 0) + 1
+        db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",
+                   (LYRICS_STATS, identity, "observed", time(), document(value)))
+
+
+def record_quota(index, identity, headers):
+    # Only an explicit numeric remaining value is presented as remote.
+    # Stale observations don't affect admission or masquerade as local limits.
+    raw = headers.get("RateLimit-Remaining") or headers.get("X-RateLimit-Remaining")
+    if raw and re.fullmatch(r"[0-9]{1,12}", raw):
+        index.review(LYRICS_RATE, identity, "observed", int(raw))
+
+
 def provider_policy(index, identity, *, validation=False):
     with index.db() as db:
         row = db.execute("SELECT state,config FROM sources WHERE id=?", (identity,)).fetchone()
@@ -120,7 +215,10 @@ def ready_sources(index, now):
 
 def ready_categories(index, now):
     ready = set()
-    for identity, row in ready_sources(index, now).items():
+    available = ready_sources(index, now)
+    for identity, row in available.items():
+        if identity == "lyrics.ovh" and any(upstream not in available for upstream in LYRICS_BROKER_UPSTREAMS):
+            continue
         if identity == "LyricDown":
             # This adapter needs an existing text. It cannot keep the
             # unrestricted LRC queue or unknown songs falsely eligible.
@@ -173,7 +271,8 @@ def download_interval(index, identity, interval):
     return max(interval, configured)
 
 
-def wait_provider(index, identity, host, interval, *, max_wait=5, validation=False, paced=False):
+def wait_provider(index, identity, host, interval, *, max_wait=5, validation=False, paced=False,
+                  lyrics=False):
     daily, configured = provider_policy(index, identity, validation=validation)
     now = time()
     with index.db(wait=.15) as db:
@@ -185,7 +284,13 @@ def wait_provider(index, identity, host, interval, *, max_wait=5, validation=Fal
         try:
             # Catalogue and audio share the host gate. Scheduled audio
             # already reserved its interval at global track admission.
-            wait_service(host, max(interval, configured), max_wait=max_wait)
+            if lyrics:
+                # Some catalogues use separate hosts for search and lyrics.
+                # Their configured interval is shared across both hosts.
+                wait_service(host if host == "lrclib.net" else "lyrics:" + identity,
+                             max(interval, configured), max_wait=max_wait)
+            else:
+                wait_service(host, max(interval, configured), max_wait=max_wait)
         except ImportIssue as error:
             raise ProviderUnavailable("Temporisation fournisseur") from error
     if not validation and not index.source_enabled(identity):
@@ -272,7 +377,8 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
 def fetch_response(parts, interval, accept, registry, provider, validation):
     service = parts.hostname if registry is not None or parts.hostname == "lrclib.net" else "parole-" + parts.hostname
     if registry is not None:
-        wait_provider(registry, provider, service, interval, validation=validation)
+        wait_provider(registry, provider, service, interval, validation=validation,
+                      lyrics=provider == "Unison")
     else:
         try:
             wait_service(service, interval, max_wait=5)
@@ -286,11 +392,15 @@ def fetch_response(parts, interval, accept, registry, provider, validation):
             connection.request("GET", path, headers={
                 "Accept": accept, "User-Agent": "Parole/3 (https://github.com/labfytools/kara-Samsung)"})
             response = connection.getresponse()
+            if registry and provider:
+                record_quota(registry, provider, getattr(response, "headers", {}))
             if response.status == 404:
                 return None
-            if response.status == 429 or response.status >= 500:
+            if response.status in (401, 403, 429, 451) or response.status >= 500:
                 retry = response.getheader("Retry-After", "")
-                delay = provider_backoff(registry, provider, service, retry_delay(retry), response.status)
+                denied = response.status in (401, 403, 451)
+                delay = provider_backoff(registry, provider, service, max(300 if denied else 0, retry_delay(retry)),
+                                         response.status, lookup_access=denied)
                 defer_service(service, delay)
                 raise ProviderUnavailable(f"Fournisseur HTTP {response.status}")
             if response.status != 200:
@@ -444,13 +554,14 @@ def discover(index, source, research_id):
         return identity, bool(cursor.rowcount)
 
 
-def record(index, identity, result, seconds):
+def record(index, identity, result, seconds, *, error=""):
     with index.db() as db:
         now = time()
         changed = db.execute("""UPDATE sources SET attempts=attempts+1, successes=successes+?, failures=failures+?,
-                      used=?, latency=(latency*attempts+?)/(attempts+1), error=? WHERE id=?""",
-                   (result == "found", result == "error", now, seconds,
-                    "Indisponible" if result == "error" else "", identity)).rowcount
+                      used=?, latency=(latency*attempts+?)/(attempts+1),
+                      error=CASE WHEN ? THEN ? ELSE error END WHERE id=?""",
+                   (result == "found", result == "error", now, seconds, result == "error",
+                    error[:200] or "Indisponible", identity)).rowcount
         if changed and result in SOURCE_OUTCOMES and isfinite(seconds) and 0 <= seconds <= 600:
             row = db.execute("SELECT value FROM reviews WHERE kind=? AND subject=?",
                              (RECENT_SOURCE_KIND, identity)).fetchone()
@@ -498,7 +609,8 @@ def controls(index, identity, action):
         if action == "reset":
             db.execute("UPDATE sources SET attempts=0,successes=0,failures=0,latency=0,error='' WHERE id=?", (identity,))
             db.execute("DELETE FROM import_provider_metrics WHERE source=?", (identity,))
-            db.execute("DELETE FROM reviews WHERE kind=? AND subject=?", (RECENT_SOURCE_KIND, identity))
+            db.execute("DELETE FROM reviews WHERE kind IN (?,?) AND subject=?",
+                       (RECENT_SOURCE_KIND, LYRICS_STATS, identity))
         elif action in ("excluded", "disabled") or (
                 action == "active" and source["state"] != "excluded"
                 and (source["adapter"] == "builtin" or config.get("validated"))):

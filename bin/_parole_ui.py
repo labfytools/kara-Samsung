@@ -6,6 +6,7 @@ import json
 from math import ceil
 from pathlib import Path
 import sqlite3
+import sys
 from time import monotonic, time
 from uuid import uuid4
 
@@ -13,7 +14,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from _kara_party import Song
 from _kara_import import show_details
-from _kara_paths import STATE
+from _kara_paths import BIN, STATE
 from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, rebind_preparations, undo as undo_group
 from _parole_audition import DraftAudition, vocal_file
 from _parole_index import key, document, encoded_key, sidecar
@@ -21,7 +22,7 @@ from _parole_import_enrichment import artist_results, queue_artist
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_music_registry import set_alias
-from _parole_sources import configure_limits, controls, provider_limits
+from _parole_sources import configure_limits, controls, lyrics_rows, move_lyrics_source, provider_limits
 from _parole_resources import GIB
 from _parole_work import save_correction
 
@@ -1471,6 +1472,9 @@ class ParoleView:
         source = new()
         self.source_controls(source)
         stack.add_titled(scroller(source), "sources", "Sources")
+        lyrics_sources = new()
+        self.lyrics_source_controls(lyrics_sources)
+        stack.add_titled(scroller(lyrics_sources), "lyrics_sources", "Sources de paroles")
         storage = new()
         number(storage, "cache_gib", "Plafond du cache Kara (Gio)", 1, 1000)
         number(storage, "reserve_gib", "Réserve libre par partition (Gio)", 20, 150)
@@ -1696,6 +1700,110 @@ class ParoleView:
     def codex_label(row):
         request = json.loads(row["payload"])
         return f"{request['kind']} · {request['artist']} {request['title'] or request['album']} · {row['state']}"
+
+    def lyrics_source_controls(self, area):
+        store = Gio.ListStore(item_type=Row)
+        selection = Gtk.SingleSelection(model=store)
+        states = {"ready": "Disponible", "limited": "Temporairement indisponible",
+                  "paused": "Quota local en pause", "disabled": "Désactivé",
+                  "excluded": "Exclu", "pending": "À vérifier", "upstream": "Source amont indisponible"}
+
+        def display(widget, row):
+            value = row.data
+            stats = value["lyrics_stats"]
+            rate = f"{100 * value['successes'] / value['attempts']:.0f} %" if value["attempts"] else "—"
+            available = states.get(value["availability"], value["availability"])
+            if value["next_available"]:
+                available += " jusqu’au " + datetime.fromtimestamp(value["next_available"]).strftime("%d/%m %H:%M")
+            quota = value["remote_quota"]
+            extra = (" · découverte attribuée" if value["id"] == "Unison" else
+                     " · agrégateur" if value["id"] == "lyrics.ovh" else "")
+            widget.set_text(
+                f"{value['name']}{extra} · {available} · {value['used_today']} requêtes HTTP aujourd’hui\n"
+                f"Quota local restant {value['remaining']} · quota distant "
+                f"{quota if quota is not None else 'non communiqué'} · "
+                f"{stats.get('plain', 0)} textes simples · {stats.get('lrc', 0)} LRC · Réussite {rate}\n"
+                f"Dernière erreur {value['error'] or '—'}"
+            )
+        view = Gtk.ListView(model=selection, factory=factory(
+            display, lambda: Gtk.Label(xalign=0, wrap=True, margin_top=5, margin_bottom=5)))
+        area.append(scroller(view, min_content_height=280, vexpand=True))
+        actions = box(Gtk.Orientation.HORIZONTAL, 4)
+        area.append(actions)
+        status = Gtk.Label(xalign=0, wrap=True)
+        area.append(status)
+
+        def refresh(_=None):
+            selected = selection.get_selected_item()
+            identity = selected.data["id"] if selected else None
+            try:
+                rows = lyrics_rows(self.index)
+            except (sqlite3.Error, ValueError) as error:
+                status.set_text(str(error))
+                return
+            store.splice(0, store.get_n_items(), [Row(row) for row in rows])
+            if identity:
+                for i, row in enumerate(rows):
+                    if row["id"] == identity:
+                        selection.set_selected(i)
+                        break
+
+        def action(widget, mode):
+            selected = selection.get_selected_item()
+            if not selected:
+                return
+            row = selected.data
+            identity = row["id"]
+            if mode in (-1, 1):
+                move_lyrics_source(self.index, identity, mode)
+            elif mode == "limits":
+                self.source_rate_dialog(row, row["decoded"])
+                return
+            elif mode == "test":
+                status.set_text(f"Test de {identity} en cours…")
+                widget.set_sensitive(False)
+                try:
+                    # Use the normal subprocess entry point and shared quota;
+                    # GTK never waits for the remote endpoint.
+                    child = Gio.Subprocess.new(
+                        [sys.executable, "-B", str(BIN / "_parole_work.py"), "lyrics_source_test", identity,
+                         str(self.index.root)],
+                        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+                except GLib.Error as error:
+                    status.set_text(error.message)
+                    widget.set_sensitive(True)
+                    return
+
+                def complete(process, result):
+                    widget.set_sensitive(True)
+                    try:
+                        _, stdout, _ = process.communicate_utf8_finish(result)
+                        value = json.loads(stdout)
+                        labels = {"found": "Correspondance vérifiée", "candidate": "Lien attribué",
+                                  "not_found": "Enregistrement de test introuvable", "reachable": "Service joignable",
+                                  "temporary": "Échec temporaire", "ambiguous": "Correspondance ambiguë"}
+                        detail = labels.get(value["state"], states.get(value["state"], value["state"]))
+                        if format_name := value.get("format"):
+                            detail += f" ({format_name})"
+                        if value.get("detail"):
+                            detail += f" · {value['detail']}"
+                        status.set_text(f"{identity} · {detail}")
+                    except (GLib.Error, TypeError, ValueError, KeyError):
+                        status.set_text(f"{identity} · test interrompu")
+                    refresh()
+
+                child.communicate_utf8_async(None, None, complete)
+                return
+            else:
+                controls(self.index, identity, mode)
+                self.maintenance.wake.set()
+            refresh()
+
+        for label, mode in (("Monter", -1), ("Descendre", 1), ("Activer", "active"),
+                            ("Désactiver", "disabled"), ("Limites…", "limits"), ("Tester", "test")):
+            actions.append(button(label, lambda widget, selected=mode: action(widget, selected)))
+        actions.append(button("Actualiser", refresh))
+        refresh()
 
     def source_controls(self, area):
         store = Gio.ListStore(item_type=Row)
