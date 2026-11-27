@@ -230,6 +230,20 @@ class LyricsTests(unittest.TestCase):
             row = db.execute("SELECT value FROM reviews WHERE kind=?", (EVIDENCE_KIND,)).fetchone()
         self.assertEqual({v["metadata"]["catalogue_id"] for v in json.loads(row[0])["synced"]}, {1, 2})
 
+    def test_lrc_equivalence_requires_each_line_and_bounded_spread(self):
+        choose = self.engine.choose_transcript
+        first = "[00:01.00]Premier texte\n[00:03.00]Deuxième ligne"
+        close = "[00:01.08]Premier texte\n[00:03.03]Deuxième ligne"
+        self.assertIn(choose([(first, {}), (close, {})], True, True), (first, close))
+        for other in (close.replace("03.03", "03.11"), close.replace("Deuxième", "Dernière"),
+                      close.splitlines()[0]):
+            with self.assertRaises(self.engine.AmbiguousLyrics):
+                choose([(first, {}), (other, {})], True, True)
+        marks = first.replace("Premier texte", "<00:01.00>Premier <00:01.50>texte")
+        self.assertEqual(choose([(first, {}), (marks, {})], True, True), marks)
+        with self.assertRaises(self.engine.AmbiguousLyrics):
+            choose([(marks, {}), (marks.replace("01.50", "01.76"), {})], True, True)
+
     def test_artist_outcomes_are_exclusive_and_provider_yield_counts_publications(self):
         from _parole_import_enrichment import ARTIST_OUTCOMES, artist_summary
 

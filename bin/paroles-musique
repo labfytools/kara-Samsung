@@ -1203,9 +1203,22 @@ def words_of(text, synced):
 
 def choose_transcript(finalists, synced, strict):
     matches = {text for text, _ in finalists}
-    forms = {tuple((stamp, words_of(line, False)) for stamp, line in parse_lrc(text))
-             if synced else words_of(text, False) for text in matches}
-    if len(forms) == 1:
+    if len(matches) == 1:
+        return matches.pop()
+    if synced:
+        # Compare every corresponding line after parsing its effective
+        # offset. A catalogue may hold several encodings of the same
+        # alignment. Bound the spread across all variants to 100 ms;
+        # identical words alone say nothing about their recorded timing.
+        rows = [parse_lrc(text) for text in matches]
+        words = {tuple(words_of(line, False) for _, line in variant) for variant in rows}
+        word_stamps = {tuple(stamps) for text in matches if (stamps := WORD_STAMP.findall(text))}
+        equivalent = (bool(matches) and all(rows) and len(words) == 1 and len(word_stamps) <= 1 and
+                      all(round((max(t for t, _ in group) - min(t for t, _ in group)) * 1000) <= 100
+                          for group in zip(*rows, strict=True)))
+    else:
+        equivalent = bool(matches) and "" not in matches and len({words_of(text, False) for text in matches}) == 1
+    if equivalent:
         return min(matches, key=lambda text: (-len(WORD_STAMP.findall(text)) if synced else 0, text))
     if strict:
         raise AmbiguousLyrics("Textes ou repères divergents pour la même identité")

@@ -36,7 +36,7 @@ Un résultat conserve sa source, l’identifiant de catalogue disponible et l’
 
 L’identité de recherche part des tags. Des variantes bornées enlèvent le numéro de piste, isolent les crédits principaux et invités et simplifient accents et ponctuation. Une variante ne change pas les métadonnées d’origine. Le texte simple tolère une autre publication et un écart de durée allant jusqu’au plus grand de huit secondes et 5 %. Le LRC exige une preuve d’édition, un écart d’au plus trois secondes et des repères compatibles avec la durée. Un ISRC contradictoire bloque les deux formats. Les décisions V3 ne remplissent pas le nouveau cache.
 
-Quand les candidats divergent, les autres fournisseurs admissibles sont consultés. Un texte local peut départager deux textes, et deux catalogues directs peuvent corroborer la même variante. Lorsque deux LRC ont les mêmes mots et des repères différents, le texte seul laisse la décision ouverte. Les alternatives sont conservées avec leur identité et leur empreinte pour la vérification.
+Quand les candidats divergent, les autres fournisseurs admissibles sont consultés. Un texte local peut départager deux textes, et deux catalogues directs peuvent corroborer la même variante. Deux LRC déjà rattachés à la même édition sont équivalents si le texte de chaque ligne concorde, que l’écart entre tous les débuts de ligne correspondants est au plus de 100 ms et que leurs éventuels jeux de repères au mot ne se contredisent pas. Au-delà, le texte seul laisse la décision ouverte. Les alternatives sont conservées avec leur identité et leur empreinte pour la vérification.
 
 ## LRCLIB hors ligne
 
