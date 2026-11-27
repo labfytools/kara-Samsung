@@ -12,11 +12,9 @@ from uuid import uuid4
 
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
-from _kara_party import Song
 from _kara_import import show_details
 from _kara_paths import BIN, STATE
 from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, rebind_preparations, undo as undo_group
-from _parole_audition import DraftAudition, vocal_file
 from _parole_index import key, document, encoded_key, sidecar
 from _parole_import_enrichment import artist_results, queue_artist, ARTIST_OUTCOMES, artist_summary, track_outcome
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
@@ -234,7 +232,6 @@ class Console:
         measured = self.maintenance.metrics
         if "index_pending" in measured and (auxiliary := measured.get("index_aux")) is not None:
             self.index_metrics.set_label(f"INDEX · {measured['index_pending']} pistes en file · "
-                                         f"{auxiliary['deep']} analyses à traiter · {auxiliary['drafts']} brouillons · "
                                          f"{auxiliary['errors']} erreurs média")
         self.bar.set_visible(bool(progress and progress[2] is not None))
         if progress and progress[2] is not None:
@@ -276,21 +273,19 @@ class Console:
 
 CARDS = (
     ("artists", "Artistes", "all"), ("albums", "Albums", "all"), ("total", "Chansons", "all"),
-    ("lyrics", "Avec paroles", "lyrics"), ("lrc", "Avec LRC", "lrc"), ("ready", "Prêtes pour Kara", "ready"),
+    ("lyrics", "Avec paroles", "lyrics"), ("lrc", "Avec LRC", "lrc"),
     ("incomplete", "Albums incomplets", "incomplete"), ("missing", "Albums manquants", "missing"),
     ("codex", "Recherches Codex", "codex"), ("sources", "Sources actives", "sources"),
     ("bytes", "Audio en bibliothèque", "storage"), ("cache", "Cache Kara", "storage"),
 )
 FILTERS = (("all", "Toutes les chansons"), ("lyrics", "Avec paroles"), ("no_lyrics", "Sans paroles"),
            ("lrc", "Avec LRC"), ("no_lrc", "Sans LRC"), ("bad_lrc", "LRC à vérifier"),
-           ("ready", "Prêtes pour Kara"), ("not_ready", "Préparation à faire"),
-           ("partial", "Préparation partielle"), ("stale", "Cache obsolète"), ("incomplete", "Albums incomplets"),
+           ("incomplete", "Albums incomplets"),
            ("duplicates", "Flux audio identiques"))
 SQL_FILTER = {
     "lyrics": "lyrics NOT IN ('absent','instrumental','inconnu')",
     "no_lyrics": "lyrics='absent'", "lrc": "lrc IN ('local','externe','généré','intégré')",
-    "no_lrc": "lrc='absent'", "bad_lrc": "lrc='à vérifier'", "ready": "kara='prêt'", "not_ready": "kara!='prêt'",
-    "partial": "kara='partiel'", "stale": "kara='obsolète'",
+    "no_lrc": "lrc='absent'", "bad_lrc": "lrc='à vérifier'",
     "incomplete": "edition IN (SELECT subject FROM reviews WHERE kind='album' AND state='incomplete')",
     "duplicates": "audio!='' AND audio IN (SELECT audio FROM songs WHERE audio!='' GROUP BY audio HAVING count(*)>1)",
 }
@@ -298,7 +293,6 @@ SQL_FILTER = {
 
 class ParoleView:
     def __init__(self, controller, maintenance):
-        self.draft_audition = DraftAudition(controller.permits_draft_audition)
         self.control = controller
         self.maintenance = maintenance
         self.index = maintenance.index
@@ -371,8 +365,6 @@ class ParoleView:
         artist_pane.append(scroller(tree_view, min_content_width=160, vexpand=True))
         self.search_lyrics = button("Rechercher les paroles", self.search_artist_lyrics, sensitive=False)
         artist_pane.append(self.search_lyrics)
-        self.generate_lyrics = button("Générer les paroles manquantes", self.generate_artist_lyrics, sensitive=False)
-        artist_pane.append(self.generate_lyrics)
         panes.set_start_child(artist_pane)
         panes.set_shrink_start_child(False)
         self.songs = Gio.ListStore(item_type=Row)
@@ -381,7 +373,7 @@ class ParoleView:
         table = Gtk.ColumnView(model=self.song_selection, show_column_separators=False, show_row_separators=True)
         for field, caption, expand in (
             ("title", "Titre", True), ("artist", "Artiste", True), ("album", "Album", True), ("duration", "Durée", False),
-            ("lyrics", "Paroles", False), ("lrc", "LRC", False), ("kara", "Préparation Kara", False),
+            ("lyrics", "Paroles", False), ("lrc", "LRC", False),
         ):
             col = Gtk.ColumnViewColumn.new(caption, factory(lambda widget, row, kind=field: self.render_cell(widget, row, kind)))
             col.set_expand(expand)
@@ -410,8 +402,7 @@ class ParoleView:
                        button("Vérifier la discographie", lambda *_: self.review_scope("discography")),
                        button("Regrouper les artistes", self.artist_groups),
                        button("Exclure cet artiste de la maintenance", self.exclude_artist),
-                       button("Liste de lecture Strawberry", controller.show_library),
-                       button("Préparer des morceaux pour Kara", controller.show_preparation)):
+                       button("Liste de lecture Strawberry", controller.show_library)):
             menu.append(widget)
         popover.set_child(menu)
         manual.set_popover(popover)
@@ -527,7 +518,6 @@ class ParoleView:
         selected = self.tree_selection.get_selected_item()
         self.scope = selected.get_item().data if selected else ()
         self.search_lyrics.set_sensitive(bool(self.scope))
-        self.generate_lyrics.set_sensitive(bool(self.scope))
         self.reset()
 
     def open_tree(self, _, pos):
@@ -604,11 +594,6 @@ class ParoleView:
                 counts.update(artists=db.execute("SELECT count(*) FROM library_artists").fetchone()[0],
                               albums=db.execute("SELECT count(*) FROM library_editions").fetchone()[0],
                               errors=db.execute("SELECT count(*) FROM songs WHERE json_extract(info,'$.probe_error')=1").fetchone()[0],
-                              drafts=db.execute("""SELECT count(*) FROM tasks AS t JOIN songs AS s ON s.id=t.subject
-                                WHERE t.kind='transcription' AND t.state='review' AND t.detail='brouillon à vérifier'
-                                AND (s.lyrics='absent' OR s.lrc='absent')""").fetchone()[0],
-                              deep=db.execute("""SELECT count(*) FROM tasks WHERE kind IN ('prepare','transcription')
-                                AND state IN ('queued','running','temporary','suspended')""").fetchone()[0],
                               incomplete=db.execute("SELECT count(*) FROM reviews WHERE kind='album' AND state='incomplete'").fetchone()[0],
                               missing=db.execute("""SELECT count(DISTINCT json_extract(j.value,'$.id'))
                                 FROM reviews r, json_each(r.value,'$.missing') j
@@ -736,13 +721,13 @@ class ParoleView:
             self.request_night_summary()
 
     def display_stats(self, stats):
-        self.maintenance.metrics["index_aux"] = {key: stats[key] for key in ("errors", "deep", "drafts")}
+        self.maintenance.metrics["index_aux"] = {"errors": stats["errors"]}
         stats["cache"] = self.maintenance.resources.storage.get("bytes")
         for name, value in self.cards.items():
             data = stats[name]
             if data is None:
                 formatted = "—"
-            elif name in ("lyrics", "lrc", "ready"):
+            elif name in ("lyrics", "lrc"):
                 formatted = f"{100*data/stats['total']:.1f} %" if stats["total"] else "—"
             elif name in ("bytes", "cache"):
                 formatted = display_size(data)
@@ -756,11 +741,7 @@ class ParoleView:
         local_lyrics, local_lrc = counts.get("local_lyrics", 0), counts.get("local_lrc", 0)
         return (
             f"{label} · Réseau {network_lyrics} textes / {network_lrc} LRC · Bibliothèque {local_lyrics} textes / {local_lrc} LRC",
-            f"{counts.get('draft', 0)} brouillons Turbo · {counts.get('validated_lyrics', 0)} textes et "
-            f"{counts.get('validated_lrc', 0)} minutages de brouillon validés",
-            f"{counts.get('generated', 0)} LRC générés · {counts.get('corrected', 0)} LRC recalés · "
-            f"{counts.get('ready', 0)} chansons prêtes · {counts.get('memory', 0)} reports mémoire · "
-            f"{counts.get('quota', 0)} reports quota",
+            f"{counts.get('memory', 0)} reports mémoire · {counts.get('quota', 0)} reports quota",
         )
 
     def request_night_summary(self):
@@ -769,7 +750,7 @@ class ParoleView:
         self.night_summary_at = monotonic() + 3.
 
         def load():
-            return self.index.night_progress(), self.index.activity_progress(), self.index.closed_progress()
+            return self.index.activity_progress(), self.index.closed_progress()
 
         def finish(future):
             if not self.control.closed and self.night_summary is not None:
@@ -782,11 +763,8 @@ class ParoleView:
         self.control.tag_reader.submit(load).add_done_callback(lambda result: GLib.idle_add(finish, result))
 
     def refresh_night_summary(self, snapshot=None):
-        progress, activity, closed = snapshot or (self.index.night_progress(), self.index.activity_progress(),
-                                                    self.index.closed_progress())
-        ready, references, remaining, report = progress
-        lines = [f"Bibliothèque · {ready} pistes avec mixage en cache · {references} références temporelles validées · "
-                 f"{remaining} restantes dans la file"]
+        activity, closed = snapshot or (self.index.activity_progress(), self.index.closed_progress())
+        lines = []
         night = self.maintenance.night
         state = night.desktop
         power = {True: "Secteur", False: "Batterie"}.get(night.power, "Alimentation inconnue")
@@ -798,16 +776,14 @@ class ParoleView:
         lines.extend((f"{lid} · {power} · {screens} · {lock}", inhibitor))
         if night.reason:
             lines.append(night.reason)
-        hour, day, drafts = activity
-        lines.extend((f"Brouillons à vérifier · {drafts}",
-                      *self.activity_lines("Dernière heure révolue", hour),
+        hour, day, _ = activity
+        lines.extend((*self.activity_lines("Dernière heure révolue", hour),
                       *self.activity_lines("Dernières 24 h révolues", day)))
         if closed:
             stamp = datetime.fromtimestamp(closed["started"]).strftime("%d/%m à %H:%M")
             completed = closed["completed"]
-            labels = {"prepare": "préparations", "lyrics": "paroles", "lrc": "LRC", "cover": "pochettes",
-                      "metadata": "métadonnées", "album": "albums", "discography": "discographies",
-                      "transcription": "transcriptions à vérifier"}
+            labels = {"lyrics": "paroles", "lrc": "LRC", "cover": "pochettes",
+                      "metadata": "métadonnées", "album": "albums", "discography": "discographies"}
             counts = [f"{completed[kind]} {label}" for kind, label in labels.items() if kind in completed]
             lines.append(f"Capot fermé le {stamp} · {sum(completed.values())} tâches réalisées · "
                          f"{closed['interrupted']} interruptions · {closed['deferred']} reports")
@@ -820,30 +796,6 @@ class ParoleView:
         storage = self.maintenance.resources.storage
         if "shared_bytes" in storage:
             lines.append(f"Espace mutualisé par liens · {display_size(storage['shared_bytes'])}")
-        if report:
-            stamp = datetime.fromtimestamp(report["started"]).strftime("%d/%m à %H:%M")
-            seconds = report["seconds"]
-            cadence = f" · {report['ready'] * 3600 / seconds:.1f} prêtes/h" if seconds > 0 else ""
-            delta = report["cache_bytes"] - report["cache_baseline"]
-            sign = "+" if delta >= 0 else "−"
-            lines.extend((
-                f"Session du {stamp} · {report['ready']} prêtes · {report['corrected']} LRC corrigés · "
-                f"{report['generated']} LRC générés",
-                f"{report['failed']} échecs · {report['interrupted']} interruptions · {report['deferred']} reports",
-                f"Traitement cumulé · {seconds / 60:.1f} min{cadence}",
-                f"Cache utilisé · {display_size(report['cache_bytes'])} · {sign}{display_size(abs(delta))} sur la session",
-            ))
-            averages = []
-            for key, label in (("demucs", "Demucs"), ("turbo", "Transcription Turbo"),
-                               ("reprises", "Reprises"), ("taille", "Cache par préparation")):
-                total, count = report.get("measurements", {}).get(key, (0, 0))
-                if count:
-                    value = display_size(total / count) if key == "taille" else f"{total / count:.1f} s"
-                    averages.append(f"{label} · {value} ({count})")
-            if averages:
-                lines.append("Moyennes · " + "  ·  ".join(averages))
-        else:
-            lines.append("Aucune session nocturne enregistrée.")
         self.night_summary.set_text("\n".join(lines))
 
     def selected(self):
@@ -854,7 +806,7 @@ class ParoleView:
             self.details(row.data)
 
     def details(self, row):
-        from _kara_prepare import lrc_token
+        from _kara_files import lrc_token
 
         window = Gtk.Window(title=row["title"], transient_for=self.control, destroy_with_parent=True,
                             default_width=720, default_height=550)
@@ -863,11 +815,10 @@ class ParoleView:
         panel.append(Gtk.Label(label=row["title"], xalign=0, css_classes=["track-title"]))
         panel.append(Gtk.Label(label=f"{row['artist']} · {row['album']}", xalign=0, wrap=True, css_classes=["muted"]))
         metadata = json.loads(row["info"])
-        report = metadata.get("report", {})
         identity = row["id"]
         with self.index.db() as db:
             checks = db.execute("""SELECT kind,state,attempts,detail,due FROM tasks WHERE subject=?
-                                   ORDER BY kind""", (identity,)).fetchall()
+                                   AND kind NOT IN ('prepare', 'transcription') ORDER BY kind""", (identity,)).fetchall()
             identification = db.execute("SELECT value FROM reviews WHERE kind='metadata' AND subject=? AND state='identified'",
                                         (identity,)).fetchone()
             unison = db.execute("SELECT value FROM reviews WHERE kind='unison_candidate' AND subject=? AND state='found'",
@@ -876,20 +827,10 @@ class ParoleView:
                 SELECT provider,external_id,edition,recording,confidence,tags,evidence FROM canonical_references
                 WHERE path=? AND song IN ('',?) ORDER BY provider,external_id LIMIT 30
             """, (row["path"], identity))]
-        coverage = (f"{report.get('coverage', 0):.0%} mots · {report.get('line_coverage', 0):.0%} lignes"
-                    if "coverage" in report else "Non mesurée")
         updated = datetime.fromtimestamp(row["checked"]).strftime("%d/%m/%Y à %H:%M")
-        verified = report.get("reference_validated", row["kara"] == "prêt")
-        reference = "validée" if verified else "insuffisante" if "coverage" in report else "absente"
-        provider = metadata.get("lrc_provider") or report.get("source")
+        provider = metadata.get("lrc_provider")
         lrc = row["lrc"] + (f" ({provider})" if provider else "")
-        details = [f"Préparation Kara · {row['kara']}",
-                   f"Référence temporelle · {reference}",
-                   f"Instrumental {'disponible' if report.get('instrumental') else 'absent'}",
-                   f"Voix séparée {'disponible' if report.get('voice') else 'absente'}",
-                   f"Couverture {coverage}",
-                   f"Paroles · {metadata.get('lyrics_provider') or row['lyrics']}",
-                   f"LRC source · {lrc}",
+        details = [f"Paroles · {metadata.get('lyrics_provider') or row['lyrics']}", f"LRC source · {lrc}",
                    f"Vérifié le {updated}"]
         details.extend(f"{t['kind']} · {t['detail']} ({t['attempts']} tentatives)" for t in checks
                        if t["detail"] and t["state"] in ("review", "temporary", "suspended"))
@@ -917,13 +858,6 @@ class ParoleView:
                 widget, "Candidats conservés pour cet enregistrement",
                 json.dumps(candidates, ensure_ascii=False, indent=2))))
         versions = {}
-        from _parole_transcribe import correction_identity, correction_input, provenance as draft_provenance
-        from _parole_transcribe import read_draft, review_ranges
-
-        draft = (read_draft(self.maintenance.cache, path)
-                 if any(item["kind"] == "transcription" for item in checks) else None)
-        draft_format = None
-
         def replace_text(value):
             # A format change or cancellation starts a fresh undo history.
             # Ctrl+Z must never restore another format into this buffer.
@@ -934,8 +868,6 @@ class ParoleView:
                 buffer.end_irreversible_action()
 
         def reload_text(*_):
-            nonlocal draft_format
-            draft_format = None
             suffix = ".lrc" if forms.get_selected() else ".txt"
             version, value = sidecar(path, suffix)
             versions[suffix] = json.loads(version) if version and version != "invalid" else None
@@ -967,7 +899,7 @@ class ParoleView:
             suffix = ".lrc" if forms.get_selected() else ".txt"
             try:
                 save_correction(self.index, identity, suffix, versions[suffix], text,
-                                expected_audio=row["token"], draft=draft_format == suffix)
+                                expected_audio=row["token"])
             except (OSError, ValueError, sqlite3.Error, SystemExit) as error:
                 status.set_text(str(error))
                 return
@@ -980,109 +912,6 @@ class ParoleView:
         editbar.append(edit)
         editbar.append(save)
         editbar.append(cancel)
-        if draft and draft["plain"]:
-            def load_draft(_):
-                nonlocal draft_format
-                if view.get_editable():
-                    status.set_text("Enregistre ou annule la correction en cours.")
-                    return
-                suffix = ".lrc" if forms.get_selected() else ".txt"
-                field = "lrc" if suffix == ".lrc" else "lyrics"
-                if row[field] != "absent" or sidecar(path, suffix)[0]:
-                    status.set_text("Une référence existe déjà pour ce format.")
-                    return
-                draft_format = suffix
-                replace_text(draft["timed"] if suffix == ".lrc" else draft["plain"])
-                start_edit(None)
-                status.set_text("Minutage du brouillon à vérifier." if suffix == ".lrc" else "Texte du brouillon à vérifier.")
-
-            editbar.append(button("Charger le brouillon Turbo", load_draft))
-
-            def show_draft(widget):
-                value = {"provenance": draft_provenance(draft), "structure": draft.get("structure", {}),
-                         "comparaisons": draft.get("comparisons", [])}
-                show_details(widget, "Transcription expérimentale", json.dumps(value, ensure_ascii=False, indent=2))
-
-            panel.append(button("Fiabilité et répétitions du brouillon", show_draft))
-        if draft and correction_input(draft):
-            def review_with_codex(widget):
-                task = correction_identity(identity, draft)
-                with self.index.db() as db:
-                    prior = db.execute("SELECT value FROM reviews WHERE kind='codex' AND subject=? AND state='proposal'",
-                                       (task,)).fetchone()
-                if prior:
-                    result = json.loads(prior[0])
-                    passages = {item["id"]: item["first"] for item in correction_input(draft)}
-                    rows = [f"{passages[item['id']]}\n→ {item['suggestion']}\n{item['reason']}"
-                            for item in result["suggestions"] if item["id"] in passages]
-                    show_details(widget, "Suggestions à écouter", "\n\n".join(rows) or "Codex n’a proposé aucune correction.")
-                    return
-                confirm = Gtk.AlertDialog(message="Soumettre les passages incertains à Codex ?",
-                                          detail="Seuls les extraits de transcription sont envoyés. "
-                                                 "Les propositions seront consultables ici pour correction manuelle.",
-                                          buttons=["Annuler", "Soumettre"], cancel_button=0, default_button=0)
-
-                def answered(dialog, result):
-                    try:
-                        if dialog.choose_finish(result) != 1:
-                            return
-                        queued = self.maintenance.queue_draft_correction(identity, draft)
-                    except (GLib.Error, OSError, ValueError, sqlite3.Error):
-                        status.set_text("Relecture momentanément indisponible.")
-                    else:
-                        status.set_text("Relecture mise en file." if queued else "Active Codex dans les paramètres.")
-
-                confirm.choose(window, None, answered)
-
-            panel.append(button("Relire les passages avec Codex", review_with_codex))
-        if draft and (ranges := review_ranges(draft)):
-            expander = Gtk.Expander(label="Passages à vérifier")
-            review = box()
-            audition = self.draft_audition
-            separated = vocal_file(path) is not None
-            panel.connect("unmap", lambda *_: audition.stop(panel))
-
-            def expanded(widget, _param):
-                if not widget.get_expanded():
-                    audition.stop(panel)
-
-            expander.connect("notify::expanded", expanded)
-
-            options = box(Gtk.Orientation.HORIZONTAL, 6)
-            repeat = Gtk.CheckButton(label="Répéter 3 fois")
-            slow = Gtk.CheckButton(label="Vitesse 80 %")
-            options.append(repeat)
-            options.append(slow)
-
-            def preview(start, end, isolated):
-                audition.start(panel, self.index.root, path, row["token"], start, end, status.set_text,
-                               isolated=isolated, slow=slow.get_active(), repeat=repeat.get_active())
-
-            def jump(_widget, start):
-                error = self.control.seek_draft_review(path, start)
-                status.set_text(error or "Repère envoyé à Strawberry")
-
-            def stamp(seconds):
-                minute, second = divmod(int(seconds), 60)
-                return f"{minute:02d}:{second:02d}"
-
-            def stop_preview(_widget):
-                audition.stop(panel)
-                status.set_text("")
-
-            options.append(button("Arrêter l’écoute", stop_preview))
-            review.append(options)
-            for start, end, text in ranges:
-                line = box(Gtk.Orientation.HORIZONTAL, 6)
-                line.append(button(f"{stamp(start)} – {stamp(end)}", lambda widget, at=start: jump(widget, at)))
-                line.append(button("Mix", lambda _widget, a=start, b=end: preview(a, b, False),
-                                   tooltip_text="Écouter le passage dans le mix"))
-                line.append(button("Voix", lambda _widget, a=start, b=end: preview(a, b, True),
-                                   tooltip_text="Écouter la voix séparée déjà disponible", sensitive=separated))
-                line.append(Gtk.Label(label=text, xalign=0, wrap=True, hexpand=True))
-                review.append(line)
-            expander.set_child(scroller(review, min_content_height=110, max_content_height=200))
-            panel.append(expander)
         if identification:
             found = json.loads(identification[0])
             if found.pop("token", None) == row["token"]:
@@ -1097,15 +926,6 @@ class ParoleView:
                 panel.append(links)
         editbar.append(button("Rechercher avec Codex",
                               lambda *_: self.manual_codex("lrc" if forms.get_selected() else "lyrics", identity, status)))
-        song = Song(path, row["title"], row["artist"], row["album"], row["duration"] or None)
-
-        def prepare(_):
-            if not self.control.preload_songs([song]):
-                status.set_text("Une autre préparation ou partie est en cours.")
-            else:
-                status.set_text("Préparation Kara démarrée")
-
-        editbar.append(button("Préparer pour Kara", prepare))
         panel.append(scroller(view, vexpand=True))
         panel.append(status)
         forms.connect("notify::selected", reload_text)
@@ -1127,28 +947,6 @@ class ParoleView:
     def research_scope(self, kind):
         if self.scope and (kind != "album" or len(self.scope) >= 3):
             self.manual_codex(kind, self.scope[1] if kind == "album" else self.scope[0])
-
-    def generate_artist_lyrics(self, widget):
-        if not self.scope:
-            return
-        owner = self.scope[0]
-
-        def finished(future):
-            widget.set_sensitive(bool(self.scope))
-            try:
-                missing, queued = future.result()
-            except (OSError, ValueError, sqlite3.Error):
-                message = "La file de transcription est temporairement indisponible."
-            else:
-                self.maintenance.wake.set()
-                message = (f"{owner} · {missing} pistes sans référence · {queued} transcriptions ajoutées ou prioritaires. "
-                           "Les brouillons seront traités un par un lorsque les ressources le permettront.")
-            show_details(widget, "Génération locale des paroles", message)
-            return GLib.SOURCE_REMOVE
-
-        widget.set_sensitive(False)
-        self.control.tag_reader.submit(self.index.queue_artist_transcriptions, owner).add_done_callback(
-            lambda future: GLib.idle_add(finished, future))
 
     def search_artist_lyrics(self, _widget):
         if not self.scope:
@@ -1508,8 +1306,8 @@ class ParoleView:
         night.append(self.night_summary)
         self.refresh_night_summary()
         toggles(night, (("night_enabled", "Activer les recherches nocturnes de paroles"),
-                        ("night_screen_off", "Préparer lorsque l’écran est éteint"),
-                        ("night_lid", "Préparer lorsque le capot est fermé"),
+                        ("night_screen_off", "Rechercher les références lorsque l’écran est éteint"),
+                        ("night_lid", "Rechercher les références lorsque le capot est fermé"),
                         ("night_lid_qualified", "Refroidissement capot fermé vérifié sur cet ordinateur")))
         for spec in (
             ("night_idle", "Inactivité minimale (secondes)", 30, 3600),

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import re
 
-from _kara_prepare import file_token
+from _kara_files import file_token
 from _parole_index import document, sidecar
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 

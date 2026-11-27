@@ -13,7 +13,7 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 #artist{font-size:2.25vw;color:#a6adc8;margin-top:1vh}
 #score{position:absolute;right:0;top:0;color:#b4befe;font-size:6vw;font-weight:700;white-space:nowrap}
 #lyrics{text-align:center;margin-top:7vh}
-.line{white-space:pre-line;overflow-wrap:break-word;line-height:1.14;font-weight:600;margin:2.5vh auto;max-width:87vw}
+.line{white-space:pre-wrap;overflow-wrap:break-word;line-height:1.14;font-weight:600;margin:2.5vh auto;max-width:87vw}
 #previous{font-size:2.5vw;color:#7f849c;min-height:4vh}
 #current{font-size:5.4vw;color:#cdd6f4;min-height:9vh}
 #next{font-size:3.2vw;color:#a6adc8}
@@ -39,16 +39,20 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 @media(max-width:800px){#mobile-room{max-width:65vw}#room-qr{width:100px;height:100px}#room-title{font-size:15px}#room-url,#room-members{display:none}}
 :fullscreen #full{display:none}
 :-webkit-full-screen #full{display:none}
+#album-art{position:absolute;top:0;right:0;width:13vh;height:13vh;object-fit:contain;border-radius:1vh}
+#plain-lyrics{max-height:42vh;overflow:auto;white-space:pre-wrap;font:2vw/1.4 system-ui,sans-serif}
+[hidden]{display:none!important}
 </style>
 </head>
 <body>
-<header><h1 id="title">Karaoké</h1><div id="artist"></div><div id="score"></div></header>
+<header><h1 id="title">Karaoké</h1><div id="artist"></div><img id="album-art" alt="Pochette de l’album" hidden></header>
 <main id="lyrics">
 <div id="previous" class="line"></div>
 <div id="current" class="line">En attente de Strawberry…</div>
 <div id="progress"><div id="fill"></div></div>
 <div id="next" class="line"></div>
 <div id="following" class="line"></div>
+<pre id="plain-lyrics" hidden></pre>
 </main>
 <p id="status"></p>
 <button id="full" type="button">Plein écran</button>
@@ -65,6 +69,7 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
     var seenReload = null;
     var seenClose = null;
     var closed = false;
+    var coverRevision = "";
     function closeTV() {
         closed = true;
         element("tv-closed").style.display = "flex";
@@ -95,14 +100,32 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
             seenClose = data.tv_close;
         }
         if (closed) return;
-        var lines = data.lines || ["", "", "", ""];
-        var progress = Math.max(0, Math.min(1, data.progress || 0));
+        var music = data.display_mode === "music" || !data.display_mode && data.party_phase !== "running";
+        var playing = data.turn_phase === "playing";
+        var lines = (music || playing) ? data.lines || [] : [];
+        var plain = (music || playing) && !lines.some(Boolean) ? data.plain_lyrics || "" : "";
+        var cover = element("album-art");
+        if (coverRevision !== data.cover_revision) {
+            coverRevision = data.cover_revision || "";
+            if (data.cover_data) cover.src = data.cover_data;
+            else cover.removeAttribute("src");
+        }
+        cover.hidden = !music || !coverRevision;
+        var notice = data.notice || " ";
+        if (!music && !playing) {
+            notice = data.countdown > 0 ? String(data.countdown) :
+                data.current_player ? "À toi de chanter, " + data.current_player + " !" : "Salon ouvert";
+        }
+        element("mobile-room").hidden = !music;
+        element("progress").hidden = !lines[1];
+        var progress = lines[1] ? Math.max(0, Math.min(1, data.progress || 0)) : 0;
         var current = element("current");
-        var text = lines[1] || data.notice || " ";
-        var count = Math.floor(progress * text.length);
-        show("title", data.title || "Karaoké");
-        show("artist", data.artist || "");
-        show("score", data.score == null ? "" : data.score + " %");
+        var text = lines[1] || (plain ? "" : notice);
+        var count = lines[1] && typeof data.highlight_chars === "number" ? data.highlight_chars : Math.floor(progress * text.length);
+        show("title", (music ? data.title : data.current_song || (playing && data.title)) || "Kara");
+        show("artist", music || playing ? data.artist || "" : "");
+        show("plain-lyrics", plain);
+        element("plain-lyrics").hidden = !plain;
         show("previous", lines[0] || "");
         if (!current.firstChild || current.getAttribute("data-text") !== text ||
                 current.getAttribute("data-progress") !== String(count)) {
@@ -117,7 +140,7 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
         }
         show("next", lines[2] || "");
         show("following", lines[3] || "");
-        show("status", data.status || "");
+        show("status", music && data.playback_state === "Paused" ? "En pause" : data.status || "");
         element("fill").style.width = (100 * progress) + "%";
         const names = element("room-members");names.replaceChildren();
         const mobiles = data.connected || [];
@@ -129,7 +152,7 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
     }
     function poll() {
         var xhr = new XMLHttpRequest();
-        xhr.open("GET", location.pathname + "/etat", true);
+        xhr.open("GET", location.pathname + "/etat?qr=0&cover=" + encodeURIComponent(coverRevision), true);
         xhr.timeout = 1800;
         xhr.onloadend = function () {
             if (xhr.status === 200) {

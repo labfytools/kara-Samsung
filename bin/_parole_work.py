@@ -15,7 +15,7 @@ from threading import Lock, local
 from time import monotonic
 
 from _kara_paths import BIN, DATA, music_library
-from _kara_prepare import file_token
+from _kara_files import file_token
 from _musique_oz import shared_mutation
 from _parole_catalogue import check_album, check_discography, check_recording, request, MBID
 from _parole_index import SIDECAR, Index, collection_reader, document, key, reference_proof, sidecar
@@ -443,7 +443,7 @@ def main():
 
 
 def save_correction(index, identity, suffix, original_version, text, *, expected_audio=None, draft=False):
-    from _kara_prepare import atomic, lrc_token
+    from _kara_files import atomic, lrc_token
     from _musique_oz import share_file
     from _paroles_lrc import MAX_LRC_BYTES
     from tempfile import NamedTemporaryFile

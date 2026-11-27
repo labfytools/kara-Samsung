@@ -1,6 +1,7 @@
 """Silent regression tests through Kara's real room, persistence and scoring APIs."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import runpy
 from pathlib import Path
 import socket
 import ssl
@@ -29,7 +30,7 @@ from _kara_party import Party, Singer, Song, search_key
 from _kara_remote_party import RemoteParty
 from _kara_room_audio import RoomAudio, Route
 from _kara_scoring import score_reference_line
-from _kara_tv import Receiver, rotating_context
+from _kara_tv import Receiver, current_cover, rotating_context
 
 
 class BlackBoxTests(unittest.TestCase):
@@ -41,7 +42,7 @@ class BlackBoxTests(unittest.TestCase):
             with patch.object(audio, "_route_settings", return_value=("fixture", "device", {
                     "volume_percent": 45, "profile": "fixture", "mic_gain_percent": 100,
                     "chrome_echo": True, "chrome_noise": False})):
-                reader = audio.open_turn("owner", "Alex", "a" * 16, "Essai", scoring=False)
+                audio.open_turn("owner", "Alex", "a" * 16, "Essai")
             try:
                 audio.runner = object()
                 route = audio.route
@@ -49,21 +50,20 @@ class BlackBoxTests(unittest.TestCase):
                 samples = bytes(1920)
                 audio.record_playing(True)
                 audio.record_received(route, samples, 48000, now, 0, now * 1000, None)
-                audio.pcm(route, samples, 48000, now, 0, now * 1000)
+                audio.accept_pcm(route, len(samples) // 2, 48000, now, now * 1000)
                 self.assertFalse(audio.consented())
                 audio.ticket("owner", consent=True)
                 audio.record_playing(False)
                 audio.record_received(route, samples, 48000, now + .01, 1, (now + .01) * 1000, None)
                 audio.record_test(True)
                 audio.record_received(route, samples, 48000, now + .02, 1, (now + .02) * 1000, None)
-                audio.pcm(route, samples, 48000, now + .02, 1, (now + .02) * 1000)
+                audio.accept_pcm(route, len(samples) // 2, 48000, now + .02, (now + .02) * 1000)
                 audio.return_pcm(route, samples, 1)
                 self.assertEqual(audio.applied(route), 45)
                 audio.mute_return()
                 self.assertEqual(audio.applied(route), 0)
             finally:
                 audio.close_turn()
-                reader.close()
                 box.stop(wait=True)
             self.assertTrue(box.status(storage=True)["verified"])
             folder, = box.root.glob("session-*")
@@ -214,7 +214,6 @@ class FakeController:
         self.calls = []
         self.batch = []
         self.available = set()
-        self.game_score = SimpleNamespace(breakdown=None, requested=False)
 
     def song_available(self, song, *, unscored=False, training=False):
         return song.path.is_file()
@@ -262,7 +261,6 @@ class FakeController:
 
     def finish_turn(self, **kwargs):
         player = self.party.active
-        player.result = None if player.training else {"summary": {"score": 87, "coverage": 92}}
         self.remote_party.turn_completed(player, "Fin du passage", played=True)
         self.party.active = None
         self.turn_phase = ""
@@ -323,6 +321,63 @@ class RoomTests(unittest.TestCase):
             remote.command("player-start", "Alex", data)
             remote.command("player-start", "Alex", data)
             self.assertEqual(control.calls.count("countdown"), 1)
+
+    def test_multiple_singers_finish_on_player_eof_and_leave_pause_intact(self):
+        # The server and room own the real interleaved queue. Only the MPRIS
+        # port is replaced; the production EOF transition is used for every song.
+        source = runpy.run_path(str(Path(__file__).resolve().parents[1] / "bin/paroles-strawberry"), run_name="kara_classic_party_fixture")
+        observe = source["LyricsWindow"].observe_turn
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            control = FakeController(root)
+            control.receiver = receiver = Receiver("127.0.0.1", b"", on_mobile=control.mobile_event)
+            self.addCleanup(receiver.close)
+            control.log_playback_reference = Mock()
+            songs = [Song(root / name, name, "Artiste", "Album") for name in ("Un", "Deux", "Trois")]
+            for song in songs:
+                song.path.touch()
+            room = receiver.room
+            room.update_catalogue([(song, search_key(song.title)) for song in songs])
+            alex, sam = (room.join(name)["token"] for name in ("Alex", "Sam"))
+            for owner, song, add in ((alex, songs[0], False), (alex, songs[1], True), (sam, songs[2], False)):
+                key = room.search(owner, song.title)["results"][0]["id"]
+                room.choose(owner, key, confirm=True, replace=not add)
+            self.idle_until(lambda: len(control.party.players) == 2)
+            remote = control.remote_party
+            remote.open()
+            played = []
+            for name, song in (("Alex", songs[0]), ("Sam", songs[2]), ("Alex", songs[1])):
+                remote.tick(max(remote.next_at, time.monotonic()))
+                self.assertEqual((control.party.active.name, control.party.active.song), (name, song))
+                self.assertEqual(control.turn_phase, "awaiting-mic")
+                control.turn_phase = "opening"
+                control.turn_opened = True
+                control.track = song.path
+                observe(control, "Playing")
+                self.assertEqual(control.turn_phase, "playing")
+                observe(control, "Paused")
+                self.assertEqual(control.turn_phase, "playing")
+                observe(control, "Stopped")
+                self.assertIsNone(control.party.active)
+                played.append(song.title)
+            remote.tick(remote.next_at)
+            self.assertEqual(remote.phase, "finished")
+            self.assertEqual([row["title"] for row in remote.history["Alex"]], [played[0], played[2]])
+            self.assertEqual([row["title"] for row in remote.history["Sam"]], [played[1]])
+
+    def test_cover_is_bounded_and_updated_only_when_the_tv_requests_a_new_revision(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cover.jpg").write_bytes(b"\xff\xd8\xff" + b"album")
+            cover = current_cover(root / "song.opus", "https://example.invalid/remote.jpg")
+            self.assertTrue(cover[1].startswith("data:image/jpeg;base64,"))
+            receiver = Receiver("127.0.0.1", b"")
+            self.addCleanup(receiver.close)
+            receiver.update({"display_mode": "music"}, cover=cover)
+            self.assertEqual(json.loads(receiver.tv_request(cover_revision=""))["cover_data"], cover[1])
+            self.assertNotIn("cover_data", json.loads(receiver.tv_request(cover_revision=cover[0])))
+            receiver.update({"display_mode": "game"})
+            self.assertEqual(json.loads(receiver.tv_request(cover_revision=cover[0]))["cover_revision"], "")
 
     def test_unconfirmed_selection_does_not_schedule_preparation(self):
         with TemporaryDirectory() as directory:
@@ -519,13 +574,13 @@ class RoomTests(unittest.TestCase):
                 req("/api/pret", {"ready": True}, b)
                 with ThreadPoolExecutor(2) as pool:
                     own_mix = {"request": "6" * 24, "player": "Camille",
-                               "music": 42, "voice": 55, "training": True, "original": 50}
+                               "music": 42, "voice": 55}
                     with patch.object(control.room_audio, "_route_settings", return_value=("sink", "device", {})):
                         response = pool.submit(req, "/api/reglages-joueur", own_mix, b)
                         self.idle_until(response.done)
                         self.assertTrue(response.result()["ok"])
                     self.assertEqual(req("/api/etat", token=b)["me"]["mix"],
-                                     {"music": 42, "voice": 55, "training": True, "original": 50})
+                                     {"music": 42, "voice": 55})
                     self.assertEqual(req("/api/etat", token=a)["me"]["mix"]["music"], None)
                     command(pool, b, "audio-player-mix", "7", expected=403, player="Camille", music=100)
                     command(pool, a, "audio-player-mix", "8", player="Camille", music=30)
@@ -581,14 +636,13 @@ class RoomTests(unittest.TestCase):
                     command(pool, a, "blackbox-start", "b", consent=True)
                     command(pool, a, "prepare", "c")
                     self.assertEqual([song.title for song in control.batch], ["Second", "Second", "Premier"])
-                    self.assertEqual([player.name for player, _ in control.remote_party.plan if player.training], ["Morgan"])
                     control.validating = False
                     control.party_ready = True
                     control.remote_party.prepared()
                     command(pool, a, "start", "d")
                     command(pool, a, "start", "d")
                     self.assertEqual(control.calls, ["prepare", "start"])
-                    command(pool, a, "audio-player-mix", "9", expected=409, player="Morgan", training=False)
+                    command(pool, a, "audio-player-mix", "9", expected=400, player="Morgan", music=-1)
                     command(pool, a, "pause", "e")
                     command(pool, a, "resume", "f")
                     req("/api/retirer-choix", {}, b, expected=409)
@@ -599,8 +653,10 @@ class RoomTests(unittest.TestCase):
                     control.blackbox.stop(wait=True)
                     self.assertEqual(control.blackbox.status()["latest"]["reason"], "party-end")
                     self.assertTrue(req("/api/etat", token=a)["me"]["organizer"])
-                    self.assertEqual(req("/api/etat", token=a)["party"]["results"][0]["summary"]["score"], 87)
-                    self.assertIsNone(req("/api/etat", token=b)["party"]["results"][0]["summary"])
+                    for player_token in (a, b):
+                        passages = req("/api/etat", token=player_token)["party"]["results"]
+                        self.assertTrue(passages[0]["played"])
+                        self.assertNotIn("summary", passages[0])
                     command(pool, a, "new", "3")
                     self.assertFalse(req("/api/etat", token=b)["me"]["ready"])
                     self.assertEqual(len(req("/api/etat", token=b)["me"]["songs"]), 1)
@@ -648,48 +704,38 @@ class RoomTests(unittest.TestCase):
         self.assertEqual(imports.snapshot(token="joueur"), [])
         self.assertEqual(imports.snapshot(token="joueur", history=True)[0]["state"], "done")
 
-    def test_audio_uses_bound_turn_and_independent_pcm_without_opening_pipewire(self):
+    def test_transport_clock_and_fader_are_independent(self):
         with TemporaryDirectory() as directory:
             room = RoomAudio(BlackBox(Path(directory) / "blackbox"))
-            sender, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-            self.addCleanup(sender.close)
-            self.addCleanup(reader.close)
             room.route = route = Route("alice-session", "Alice", "0123456789abcdef", "Titre", "test",
-                                       "test", {"volume_percent": 60}, 60, sender)
-            data = struct.pack("<h", 1000) * 960
-            room.pcm(route, data, 48000, 7., 0, 1200.)
-            first = reader.recv(4096)
+                                       "test", {"volume_percent": 60}, 60)
+            self.assertTrue(room.accept_pcm(route, 480, 48000, 7., 1200., 480))
             room.volume(route, "20")
-            room.pcm(route, data, 48000, 7.020, 1, 1220.)
-            second = reader.recv(4096)
-            self.assertEqual(first[8:], second[8:])
-            self.assertAlmostEqual(struct.unpack_from("<d", second)[0], 7.020)
+            self.assertFalse(room.accept_pcm(route, 480, 48000, 7.010, 1210., 480))
+            self.assertTrue(room.accept_pcm(route, 480, 48000, 7.020, 1220., 1440))
+            self.assertAlmostEqual(route.last_sample, 7.020)
             self.assertEqual(room.applied(route), 20)
             room.close_turn()
             self.assertFalse(room.receiving())
 
-    def test_training_keeps_wifi_capture_without_feeding_a_score_worker(self):
+    def test_capture_archives_only_the_wanted_live_stages(self):
         tracks = []
         diagnostics = SimpleNamespace(emit=lambda *_args, **_data: None,
                                       pcm=lambda track, *_args, **_data: tracks.append(track))
         room = RoomAudio(diagnostics)
-        settings = {"volume_percent": 60, "profile": "balanced"}
-        with patch.object(room, "_route_settings", return_value=("sink", "device", settings)):
-            reader = room.open_turn("owner", "Joueur", "turn", "Titre", scoring=False)
-        self.addCleanup(reader.close)
+        with patch.object(room, "_route_settings", return_value=("sink", "device", {
+                "volume_percent": 60, "profile": "balanced"})):
+            room.open_turn("owner", "Joueur", "turn", "Titre")
         self.addCleanup(room.close_turn)
-        data = struct.pack("<h", 1000) * 960
+        data = struct.pack("<h", 1000) * 480
         room.record_playing(True)
         room.route.recording_consent = True
-        for sequence in range(256):
-            room.record_received(room.route, data, 48000, 10 + sequence / 50, sequence, 1000 + 20 * sequence, None)
-            room.pcm(room.route, data, 48000, 10 + sequence / 50, sequence, 1000 + 20 * sequence)
-        self.assertTrue(room.receiving())
-        self.assertEqual(room.route.failed_blocks, 0)
-        self.assertEqual(tracks, ["wifi"] * 256)
-        reader.setblocking(False)
-        with self.assertRaises(BlockingIOError):
-            reader.recv(4096)
+        for sequence in range(20):
+            now = 10 + sequence / 100
+            room.record_received(room.route, data, 48000, now, sequence, now * 1000, None)
+            self.assertTrue(room.accept_pcm(room.route, 480, 48000, now, now * 1000, (sequence + 1) * 480))
+            room.return_pcm(room.route, data * 2, sequence)
+        self.assertEqual(tracks, ["wifi", "return"] * 20)
 
 
 if __name__ == "__main__":

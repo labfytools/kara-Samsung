@@ -91,7 +91,8 @@ class BlackBoxStudio(Gtk.Window):
         self.capture = Gtk.Label(xalign=0, wrap=True)
         self.preflight = Gtk.Label(xalign=0, wrap=True, selectable=True)
         self.control = button("Configurer et démarrer", lambda *_: self.owner.toggle_blackbox(None, parent=self))
-        self.marker = Gtk.DropDown(model=Gtk.StringList.new(list(MARKERS.values())))
+        self.markers = ("problem", "return", "echo", "display", "dropout", "music-volume", "mic-volume", "speech")
+        self.marker = Gtk.DropDown(model=Gtk.StringList.new([MARKERS[key] for key in self.markers]))
         self.note = Gtk.Entry(placeholder_text="Commentaire facultatif", max_length=240, hexpand=True)
         self.mark_button = button("Marquer ce moment", self.mark)
         for child in (self.capture, self.control, self.preflight, self.marker, self.note, self.mark_button):
@@ -117,9 +118,9 @@ class BlackBoxStudio(Gtk.Window):
         return GLib.SOURCE_CONTINUE
 
     def mark(self, *_):
-        context = self.owner.game_score.diagnostic_turn
+        context = self.owner.turn_context()
         position = self.owner.base_position + (monotonic() - self.owner.updated) * self.owner.rate
-        self.owner.blackbox.mark(tuple(MARKERS)[self.marker.get_selected()], self.note.get_text(),
+        self.owner.blackbox.mark(self.markers[self.marker.get_selected()], self.note.get_text(),
                                  **context, position=position)
         self.note.set_text("")
 
@@ -287,16 +288,10 @@ class BlackBoxStudio(Gtk.Window):
     def report_page(self):
         page = box()
         controls = box(Gtk.Orientation.HORIZONTAL)
-        for action, label in (("report", "Rapport"), ("export", "Aperçu expurgé"), ("replay", "Rejouer le score"),
-                              ("compare", "Comparer ±0,75 et ±1,25 s"), ("compare-aec", "Comparer AEC"),
+        for action, label in (("report", "Rapport"), ("export", "Aperçu expurgé"),
                               ("lyrics-reference", "Référence des paroles")):
             controls.append(button(label, lambda *_args, kind=action: self.run_report(kind)))
         page.append(controls)
-        replay_controls = box(Gtk.Orientation.HORIZONTAL)
-        self.replay_engine = Gtk.DropDown(model=Gtk.StringList.new(["Huang", "Wav2Vec2", "Huang / HTDemucs-FT"]))
-        replay_controls.append(self.replay_engine)
-        replay_controls.append(button("Recalculer CHRONOS hors ligne", lambda *_: self.run_report("chronos-replay")))
-        page.append(replay_controls)
         scroll, self.report = text_panel()
         page.append(scroll)
         self.pages.append_page(page, Gtk.Label(label="Rapport et rejeu"))
@@ -307,22 +302,16 @@ class BlackBoxStudio(Gtk.Window):
             return
         selected = self.cycles.get_selected()
         turn = self.turns[selected - 1] if 0 < selected <= len(self.turns) else None
-        if action in ("compare-aec", "lyrics-reference", "chronos-replay") and turn is None:
+        if action == "lyrics-reference" and turn is None:
             fill(self.report, "Choisis un tour V3 dans la chronologie.")
             return
         fill(self.report, "Traitement…")
-        engine = ("huang", "wav2vec2", "huang-ft")[self.replay_engine.get_selected()]
 
         def run():
             args = [str(BIN / "kara-blackbox"), "--root", str(self.root), action, path.name, "--limit", "50"]
-            if action == "compare":
-                args.extend(("--tolerance", ".75", "--tolerance", "1.25"))
-            if action == "chronos-replay":
-                args.extend(("--chronos-engine", engine))
-            if turn and action in ("compare", "replay", "compare-aec", "lyrics-reference", "chronos-replay"):
+            if turn and action == "lyrics-reference":
                 args.extend(("--cycle", f"{path.name}/{turn}"))
-            command = subprocess.run(args, capture_output=True, text=True,
-                                     timeout=390 if action == "chronos-replay" else 120)
+            command = subprocess.run(args, capture_output=True, text=True, timeout=120)
             if command.returncode:
                 raise ValueError(command.stderr.strip())
             return [json.loads(line) for line in command.stdout.splitlines()]
@@ -331,8 +320,5 @@ class BlackBoxStudio(Gtk.Window):
             if self.path != path:
                 return
             fill(self.report, "\n\n".join(json.dumps(result, indent=2, ensure_ascii=False) for result in results))
-            if action == "chronos-replay" and results:
-                self.recalculated = results[0]
-                self.refresh_timeline()
 
         self.submit(run, show, lambda message: fill(self.report, message))

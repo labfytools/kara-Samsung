@@ -718,8 +718,10 @@ def create_app(token, origin, *, local_diagnostics=False, profiles_path=PROFILE_
                                     await ws.close(code=1011, message=b"Reprise audio trop tardive")
                                     break
                                 continue
-                        if route:
-                            room_audio.pcm(route, data, capture_rate, received_at, seq, send_ms, frame_end)
+                        if route and not room_audio.accept_pcm(
+                                route, len(data) // 2, capture_rate, received_at, send_ms, frame_end):
+                            delivery_stats["invalid_packets"] += 1
+                            continue
                         wait_ms = supply_wait_ms(received_at)
                         starvations += wait_ms > 0
                         starvation_ms += wait_ms

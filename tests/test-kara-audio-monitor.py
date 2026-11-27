@@ -434,8 +434,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         settings = preferences.DEFAULTS | {"profile": "low-latency", "experimental": False,
                                           "output_index": 4, "output_description": "Enceinte de test"}
         with patch.object(room, "_route_settings", return_value=("sink-test", "test", settings)):
-            reader = room.open_turn("player", "Joueur", "tour", "Titre")
-        self.addCleanup(reader.close)
+            room.open_turn("player", "Joueur", "tour", "Titre")
         self.addCleanup(room.close_turn)
         client = TestClient(TestServer(micro.create_app("", "https://kara.test", room_audio=room)))
         await client.start_server()
@@ -461,10 +460,11 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         ws = await connect()
         await ws.send_bytes(packet_v2(0, 480, 5.))
         await self.block(self.players[-1], 480)
+        first_end = room.route.last_sample
         await ws.send_bytes(packet_v2(1, 960, 17.))
         await self.block(self.players[-1], 480)
-        ends = [struct.unpack_from("<d", reader.recv(649))[0] for _ in range(2)]
-        self.assertAlmostEqual(ends[1] - ends[0], .01, places=8)
+        last_end = room.route.last_sample
+        self.assertAlmostEqual(last_end - first_end, .01, places=8)
         room.record_test(True)
         levels = await self.levels(ws)
         self.assertEqual(levels["stage"], "microphone-test")
@@ -484,7 +484,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(room.test_passed())
         await ws.send_bytes(packet_v2(0, 480, 2.))
         await self.block(self.players[-1], 480)
-        self.assertGreater(struct.unpack_from("<d", reader.recv(649))[0], ends[-1])
+        self.assertGreater(room.route.last_sample, last_end)
         await self.stop_and_check(ws, self.players[-1])
 
     async def test_44100_resample_keeps_continuity_across_packets(self):

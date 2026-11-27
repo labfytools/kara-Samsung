@@ -16,7 +16,7 @@ from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
 from _kara_paths import STATE
-from _kara_prepare import file_token
+from _kara_files import file_token
 from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, manual_album_artist, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _parole_taglib import helper as taglib_helper, read as taglib_read

@@ -1,5 +1,7 @@
 # Kara V1 — salle locale et BlackBox
 
+> Guide historique. Voir [Kara V2](kara-v2.md) pour le parcours classique et les commandes actuelles.
+
 ## Démarrer la salle
 
 Parole et Strawberry tournent sur ArchASP. Parole garde la propriété du lecteur, des tours, de la file d’import et des traitements Turbo. La fenêtre peut être minimisée. Fermer Parole arrête sa salle. Le client Tizen conserve son appairage LAN et se reconnecte pendant une coupure. Quand un joueur rejoint ou retrouve la salle, Kara rouvre l’affichage de l’application Tizen déjà ouverte si l’écran a été fermé depuis Parole.

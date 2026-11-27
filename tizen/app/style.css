@@ -5,9 +5,8 @@ body{padding:6vh 7vw;background:radial-gradient(ellipse at 50% 45%,#292a45 0,#1e
 header{position:relative;min-height:14vh;border-bottom:1px solid #45475a;padding:0 22vw 2vh 0}
 h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 #artist{font-size:2.25vw;color:#a6adc8;margin-top:1vh}
-#score{position:absolute;right:0;top:0;color:#b4befe;font-size:6vw;font-weight:700;white-space:nowrap}
 #lyrics{text-align:center;margin-top:7vh}
-.line{white-space:pre-line;overflow-wrap:break-word;line-height:1.14;font-weight:600;margin:2.5vh auto;max-width:87vw}
+.line{white-space:pre-wrap;overflow-wrap:break-word;line-height:1.14;font-weight:600;margin:2.5vh auto;max-width:87vw}
 #previous{font-size:2.5vw;color:#7f849c;min-height:4vh}
 #current{font-size:5.4vw;font-weight:700;color:#919bb8;min-height:9vh}
 #current .sung{color:#ffe16b;text-shadow:0 0 .22em rgba(255,225,107,.24)}
@@ -25,7 +24,7 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 #party{width:26vw;flex:none;margin:1.5vh 0 0 2vw;padding:2.1vh 1.2vw;border:1px solid #45475a;border-radius:1.15vw;background:#242437;max-height:82vh;display:flex;flex-direction:column;gap:1vh}
 #party h2{margin:0 0 1.7vh .4vw;color:#cdd6f4;font-size:1.8vw}
 #players{position:relative;margin:0;padding:0;max-height:41vh;min-height:0;overflow-y:auto;list-style:none}
-#players li{position:relative;display:flex;align-items:center;padding:1.35vh .75vw 1.9vh;margin:0 0 .75vh;border:2px solid var(--player-color,#45475a);border-radius:.7vw;background:#1e1e2e}
+#players li{position:relative;display:block;padding:1.35vh .75vw 1.9vh;margin:0 0 .75vh;border:2px solid var(--player-color,#45475a);border-radius:.7vw;background:#1e1e2e}
 #players li:last-child{margin-bottom:0}
 #players li.singing{border-color:var(--player-color,#b4befe);background:#313244;box-shadow:0 0 0 1px var(--player-color,#b4befe)}
 .player-identity{flex:1;min-width:0}
@@ -33,9 +32,6 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 .player-name{font-size:1.65vw;line-height:1.25;color:var(--player-color,#cdd6f4)}
 .player-song{color:#a6adc8;font-size:1.05vw;margin-top:.35vh}
 .player-song:empty{display:none}
-.player-score{font-size:1.65vw;margin-left:1vw;white-space:nowrap;flex:none;font-variant-numeric:tabular-nums}
-.player-gauge{position:absolute;left:.75vw;right:.75vw;bottom:.55vh;height:.33vh;min-height:2px;overflow:hidden;background:#45475a;border-radius:8px}
-.player-fill{height:100%;width:0;transition:width 230ms ease,background-color 230ms ease}
 #status{text-align:center;color:#a6adc8;font-size:1.8vw;margin-top:4vh}
 #party h2{display:flex;align-items:center;justify-content:space-between;margin-bottom:1vh}
 #player-count{font-size:1.3vw;color:#b4befe;background:#313244;padding:.45vh .9vw;border-radius:2vw}
@@ -63,3 +59,5 @@ header .logo{float:left;margin-right:1.5vw}
 #pin{color:#b4befe;font-size:3vw;letter-spacing:.18em;font-variant-numeric:tabular-nums}
 #server-status{color:#a6e3a1;font-size:1.15vw;margin:1vh 0 0}
 #upcoming{color:#a6adc8;max-width:38vw;margin:0 auto;font-size:1.5vw;line-height:1.5}
+#album-art{float:right;width:13vh;height:13vh;margin-right:-20vw;border-radius:.7vw;object-fit:contain}
+#plain-lyrics{max-height:38vh;overflow:auto;white-space:pre-wrap;color:#cdd6f4;font:2.25vw/1.4 Inter,Arial,sans-serif}

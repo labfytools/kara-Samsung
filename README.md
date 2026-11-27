@@ -1,6 +1,6 @@
 <h1 align="center">Kara Samsung</h1>
 
-<p align="center">Karaoké multijoueur pour Arch Linux et Samsung Tizen : paroles synchronisées, Strawberry, microphones mobiles et analyse vocale.</p>
+<p align="center">Karaoké multijoueur pour Arch Linux et Samsung Tizen : paroles LRC originales, Strawberry et microphones mobiles.</p>
 
 <p align="center">
   <img alt="Arch Linux" src="https://img.shields.io/badge/Arch_Linux-Sway-1793d1?style=flat-square&logo=archlinux&logoColor=white">
@@ -18,9 +18,7 @@
 
 ## ✦ Overview
 
-**Kara Samsung** associe Strawberry (MPRIS), un poste Linux sous Sway, une interface TV Samsung Tizen et des téléphones pour une expérience de karaoké multijoueur. Le prototype intègre les paroles synchronisées, la préparation de parties et l'analyse expérimentale de voix chantée.
-
-Le retour micro sans fil par navigateur, AudioWorklet, WebSocket et PipeWire est **expérimental** ; la latence acoustique et la régularité réseau sont encore à valider. Ce dépôt n'est pas une application prête à installer sur toutes les TV Samsung.
+**Kara Samsung** est un karaoké multijoueur sur Arch Linux et la télévision Samsung. Les joueurs rejoignent le salon depuis leur téléphone. Strawberry joue le morceau original, la télévision suit le LRC et PipeWire restitue le micro sur l’enceinte. Parole conserve la bibliothèque, les imports, les recherches de paroles et la synchronisation USB.
 
 ## ✦ Stack
 
@@ -29,7 +27,6 @@ Le retour micro sans fil par navigateur, AudioWorklet, WebSocket et PipeWire est
 | Arch Linux · Sway · Strawberry · MPRIS | Samsung Tizen · JavaScript · HTML/CSS |
 | Python · GTK4 / PyGObject · aiohttp | Application Web TV · interface joueurs |
 | PipeWire · NumPy · SciPy | HTTPS/WebSocket · AudioWorklet · PCM 20 ms |
-| C · algorithme DTW | Client smartphone utilisé comme micro |
 
 ```mermaid
 flowchart LR
@@ -37,18 +34,14 @@ flowchart LR
     K --> TV[Serveur paroles : 8765]
     TV --> T[Samsung Tizen]
     TV --> P[Téléphones joueurs]
-    M[Micro smartphone / AudioWorklet] --> W[WebSocket HTTPS : 8766]
+    M[Micro smartphone / AudioWorklet] --> W[WebSocket sécurisé : 8444]
     W --> A[Python / PipeWire]
     A --> H[Enceinte]
 ```
 
 ## ✦ Architecture
 
-Le service TV (port **8765**) et le prototype de micro (port **8766**) sont distincts. Le microphone navigateur transmet des blocs audio de 20 ms. Les compteurs d'arrivée, de pertes et les diagnostics d'horodatage sont destinés à identifier la latence ; ils ne prouvent pas à eux seuls le temps de restitution acoustique.
-
-L'interface de calibration n'envoie jamais le micro en direct à l'enceinte, afin d'éviter les boucles d'écho. Les artefacts Tizen et les environnements présents sur ArchASP ne sont pas des dépendances portables incluses dans Git.
-
-La [calibration audio expérimentale](docs/audio-calibration.md) lance en un clic un amorçage puis six chirps et six séquences PN alternés, sans compensation. Les tests synthétiques sont disponibles et le protocole physique S21FE, analogique puis EDENWOOD choisie manuellement, reste à réaliser.
+Le service utilisateur Kara sert la télévision et la page mobile en HTTPS. Il reçoit le PCM du téléphone sur un WebSocket distinct. Le joueur teste et confirme le retour sur l’enceinte avant le tour. Le volume musical et le volume du microphone se règlent séparément. BlackBox permet d’observer les niveaux, le transport et la sortie. Les outils historiques de notation et de minutage IA sont archivés sur la branche locale `archive/kara-avant-back-to-basics-20261127`.
 
 ## ✦ Repository
 
@@ -86,14 +79,14 @@ Autres points d'entrée existants : `~/.local/bin/paroles-strawberry` (interface
 
 ## ✦ Documentation
 
-Le [guide Kara V1](docs/kara-v1.md) décrit la salle HTTPS, les commandes mobiles, le format BlackBox et le replay local.
+Le [guide Kara](docs/kara-v2.md) décrit l’attente musicale, le jeu et l’essai microphone.
 
 | Ressource | Contenu |
 | --- | --- |
 | [Calibration audio](docs/audio-calibration.md) | Contrats, algorithmes, limites de mesure, tests et protocole S21FE à réaliser |
-| [Qualification du chant](docs/kara-qualification-chant.md) | Banc PCM, score, résultats comparatifs et protocole ADB |
+| [Qualification historique du chant](docs/kara-qualification-chant.md) | Archives des essais de reconnaissance |
 | [Source Tizen](tizen/app/README.md) | Application TV |
-| [Kara V2](docs/kara-v2.md) | Parcours mobile, préparation anticipée, BlackBox et démarrage avec Sway |
+| [Kara V2](docs/kara-v2.md) | Parcours mobile, attente musicale, BlackBox et démarrage avec Sway |
 | [Code micro](bin/_kara_micro_test.py) | Serveur HTTPS WebSocket |
 | [Page micro](bin/_kara_micro_test.html) | Interface mobile et calibration |
 | [AudioWorklet](bin/_kara_micro_worklet.js) | Capture audio et paquets PCM |

@@ -172,7 +172,6 @@ class MobileRoom:
             return {
                 'me': {'name': member['name'], 'organizer': member['organizer'], 'ready': member['ready'],
                        'mix': self._party.get('mix', {}).get(member['name'], {}),
-                   'unscored': self._party.get('unscored', {}).get(member['name'], []),
                        'songs': [self.describe(key, self._songs[key]) for key in member['songs'] if key in self._songs],
                        'song': selected.title if selected else '',
                        'artist': selected.artist if selected else ''},

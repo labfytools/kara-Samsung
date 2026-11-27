@@ -1,8 +1,8 @@
 # Kara sur Samsung
 
-Ouvre **Kara** depuis **Applications** sur la télévision. Le client 2.0.0
+Ouvre **Kara** depuis **Applications** sur la télévision. Le client 2.1.0
 attend le serveur HTTPS d’ArchASP puis affiche le QR de jeu et le PIN de
-l’organisateur. **Réessayer** relance immédiatement la connexion.
+l’organisateur avec le morceau joué dans Strawberry. **Réessayer** relance immédiatement la connexion.
 
 ## Construire une mise à jour
 

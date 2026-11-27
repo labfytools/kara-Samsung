@@ -30,18 +30,19 @@ restent en lecture seule pendant la partie. Le PC et la TV suivent leurs
 timestamps de ligne et leurs repères Enhanced LRC quand ils sont présents.
 Le décalage manuel par morceau s’applique aux deux affichages.
 
-L’action **Préparer les instrumentaux** dans Paroles Strawberry lance
-uniquement la séparation des pistes audio choisies. Avec un LRC et un
-instrumental en cache, Kara peut noter la voix du joueur avec Turbo. Les
-repères au mot permettent une mesure du timing. Les lignes seules permettent
-une comparaison lexicale. Si un prérequis de la note manque, le morceau reste
-jouable en chant libre, avec le mix original si nécessaire.
+Le salon affiche le titre, l’artiste, la pochette et les paroles du morceau
+en cours dans Strawberry. Le QR reste visible pendant la sélection des
+joueurs. Sans LRC, la TV affiche le texte simple disponible ou la pochette.
+Une pause fige la position. Un déplacement ou un changement de morceau
+repositionne l’affichage.
 
 ## Tour et organisation
 
 L’organisateur peut changer l’ordre, reporter puis replacer un joueur.
-La télévision présente les joueurs, le départ et les paroles.
-**Nouvelle partie** revient aux inscriptions.
+La télévision passe au jeu à l’ouverture du salon. Strawberry joue le mix
+original et le serveur passe au tour suivant à la fin du morceau. Une fois
+la partie terminée, la TV suit de nouveau la lecture Strawberry et retrouve
+le QR. **Nouvelle partie** permet aux joueurs de confirmer de nouveaux choix.
 
 Le compte à rebours est piloté par le serveur. Le joueur actif et
 l’organisateur peuvent le demander après l’essai microphone, lorsque le
@@ -56,23 +57,14 @@ chanteur à l’essai.
    **Démarrer le tour**. **Couper le retour** reste disponible pendant
    l’essai et le chant. Une reconnexion demande une nouvelle confirmation.
 
-La préparation de Turbo peut avancer pendant l’essai. Le départ reste
-possible en chant libre si le moteur de notation est indisponible.
 BlackBox consigne les niveaux et la confirmation. Les pistes audio de
 l’essai suivent les mêmes autorisations explicites que celles du tour.
 [Mesures et structure de gains](audio-latency-optimization.md#retour-en-salle)
 
-Pendant le tour, **Musique**, **Chanteur original** et **Ma voix** règlent
-trois flux distincts. Le fader de retour et sa coupure laissent le signal
-d’analyse disponible. Le plafond musical et les protections de retour
-s’appliquent toujours. Les valeurs définies par l’organisateur sont attribuées
-aux nouveaux joueurs. L’organisateur peut aussi rétablir ces valeurs pour un
-joueur déjà inscrit.
-
-Le fond de la page passe du neutre au rouge, à l’orange, au vert olive ou au
-vert selon les scores publiables par le moteur. Les paliers sont à 40, 70
-et 90 %. Quand la couverture empêche le moteur de publier un score, la page
-reste neutre et le résultat final indique la couverture disponible.
+Pendant le tour, **Musique** et **Ma voix** règlent séparément le morceau
+et le retour. Le plafond musical réserve une marge pour la voix. Les valeurs
+par défaut de l’organisateur sont attribuées aux nouveaux joueurs et peuvent
+être rétablies pour un joueur déjà inscrit.
 
 ## BlackBox
 

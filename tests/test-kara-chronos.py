@@ -311,60 +311,6 @@ class ChronosTests(unittest.TestCase):
                 song.with_suffix(".txt").write_text("A corrected reference")
                 self.assertIsNone(playback_experiment(song, cache, "huang"))
 
-    @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK") == "1", "requires GTK")
-    def test_actual_kara_display_preserves_score_clock_and_uses_only_observed_onsets(self):
-        executable = Path(__file__).resolve().parents[1] / "bin/paroles-strawberry"
-        window = runpy.run_path(str(executable), run_name="kara_chronos_fixture")["LyricsWindow"]
-        document = alignment()
-        subject = SimpleNamespace(times=[.5, 4.], view_lyrics=["Hello night", "Again"],
-                                  chronos_reference=document, chronos_times=[1.2], chronos_indices=[0])
-        self.assertEqual(window.view_anchor(subject, .8), -1)
-        self.assertEqual(window.view_anchor(subject, 4.), 0)
-        self.assertEqual(window.display_progress(subject, 2., 0), 5 / 11)
-        self.assertEqual(subject.times, [.5, 4.])
-
-    @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK") == "1", "requires GTK")
-    def test_experimental_plot_and_capture_preserve_original_mix_and_no_score(self):
-        from _kara_blackbox_lyrics import load
-
-        executable = Path(__file__).resolve().parents[1] / "bin/paroles-strawberry"
-        window = runpy.run_path(str(executable), run_name="kara_generated_fixture")["LyricsWindow"]
-        with TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            song = root / "audio"
-            song.write_bytes(b"fixture")
-            box = BlackBox(root / "blackbox")
-            box.start(consent=True)
-            session = box.status()["session"]
-            context = {"turn": "b" * 16, "player": "Fixture", "song": "Fixture"}
-            experiment = {"engine": "Turbo", "audio_sha256": digest(song),
-                          "lines": [{"start": 1., "text": "Hello night", "words": []}],
-                          "source": {"kind": "generated-transcription", "original": "Hello night",
-                                     "transcription": {"status": "experimental", "reliability": "partial"}}}
-            player = SimpleNamespace(song=SimpleNamespace(path=song))
-            queue = SimpleNamespace(submit=lambda work: work())
-            calls = []
-            subject = SimpleNamespace(blackbox=box, game_score=SimpleNamespace(diagnostic_turn=context),
-                                      scoring_source=lambda: None, active_reference=None, tag_text="",
-                                      chronos_reference=experiment, tag_reader=queue,
-                                      music_volume=.5, turn_original_mix=True,
-                                      room_audio=SimpleNamespace(enable_return=lambda: None),
-                                      guide_intervals=[], apply_player_mix=lambda player: None,
-                                      vocal_effect=SimpleNamespace(disable=lambda: None),
-                                      player_command=lambda name, *args: calls.append(name),
-                                      write_music_volume=lambda *_a, **_kw: self.fail("Strawberry must stay audible"),
-                                      refresh_game=lambda: None)
-            window.begin_playback(subject, player)
-            self.assertEqual(calls, ["OpenUri"])
-            with patch.dict(window.log_playback_reference.__globals__, {"LIBRARY": root}):
-                window.log_playback_reference(subject, song)
-            box.stop(wait=True)
-            item = load(box.root / session, context["turn"])["reference"]
-            self.assertIsNone(item["historical"])
-            self.assertEqual(item["source"], "generated-transcription")
-            self.assertEqual(item["transcription"]["reliability"], "partial")
-            self.assertEqual(item["displayed"], [[1., "Hello night"]])
-
     def test_existing_capture_replay_and_historical_score_invariance(self):
         with TemporaryDirectory() as directory:
             base = Path(directory)

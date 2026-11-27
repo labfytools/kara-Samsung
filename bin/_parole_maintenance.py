@@ -20,9 +20,8 @@ from time import monotonic, time
 
 from _kara_import_resources import lease
 from _kara_paths import BIN
-from _kara_prepare import PreparedCache, file_token, lrc_token
-from _kara_refine import VERSION as REFINEMENT_VERSION
-from _kara_stems import ROOT as STEM_ROOT, FILES, cached_stems, stem_directory
+from _kara_files import file_token
+from _kara_stems import ROOT as STEM_ROOT
 from _parole_codex import KINDS, research
 from _parole_artist_groups import recover as recover_artist_groups
 from _parole_index import (ARTWORK, LOCAL_REFERENCE_MISS, REFERENCE_REUSE_SECONDS, Index, affected_tracks,
@@ -143,12 +142,10 @@ class Maintenance:
         self.collection = collection
         self.import_queue = import_queue
         self.import_diagnostics = ImportDiagnostics(self, import_queue) if import_queue is not None else None
-        self.cache = cache or PreparedCache()
         self.resources = Resources(self.index.root)
         self.journal = Journal(self.index.folder)
         self.night = Night(self.index, self.journal)
         self.night_running = False
-        self.night_network_next = True
         self.night_settings_at = 0.
         self.next_night_watch = 0.
         self.night_policy = None
@@ -288,42 +285,13 @@ class Maintenance:
             return {path: detail for subject in subjects
                     for path, detail in self.import_lyrics_live.get(subject, {}).items()}
 
-    def inspect_cache(self, path, old, token, side):
-        def available(candidate):
-            try:
-                return file_token(candidate)
-            except FileNotFoundError:
-                return None
-
-        try:
-            reference = self.cache.folder(path) / "prepared.json"
-            rt = available(reference)
-            model = available(self.cache.model)
-            stem = stem_directory(path)
-            stem_tokens = [available(stem / name) for name in ("meta.json", *FILES)]
-            # A previous inventory contains coverage but cannot distinguish a
-            # rejected reference from a validated reference awaiting stems.
-            saved = document([rt, model, stem_tokens, REFINEMENT_VERSION, "reference-status"])
-            if old and old["cache"] == saved and old["token"] == token and old["side"] == side:
-                return saved, old["kara"], json.loads(old["info"]).get("report", {})
-            item = self.cache.cached(path, verify=False) if rt and model else None
-            stems = cached_stems(path) if all(stem_tokens) else None
-            if item and item.get("refinement", {}).get("version") != REFINEMENT_VERSION:
-                item = None
-            report = {"instrumental": bool(stems), "voice": bool(stems), "reference_validated": bool(item)}
-            if item:
-                report.update(coverage=item["report"]["word_coverage"], line_coverage=item["report"]["line_coverage"],
-                              source=item["source"].get("provider", "bibliothèque"),
-                              corrected=item["report"].get("changed", 0))
-            negative = self.cache.cached(path, verify=False, insufficient=True) if rt and model and not item else None
-            if negative:
-                report.update(coverage=negative["report"]["word_coverage"],
-                              line_coverage=negative["report"]["line_coverage"])
-            state = ("prêt" if item and stems else "partiel" if item or stems or negative else
-                     "obsolète" if rt or old and old["kara"] == "prêt" else "absent")
-            return saved, state, report
-        except (OSError, ValueError):
-            return "", "absent", {}
+    @staticmethod
+    def inspect_cache(_path, old, token, side):
+        # Keep the historical cache receipt when its song and sidecars are
+        # unchanged. The library indexer does not inspect or build AI caches.
+        if old and old["token"] == token and old["side"] == side:
+            return old["cache"], old["kara"], json.loads(old["info"]).get("report", {})
+        return "", "absent", {}
 
     def stopped(self):
         if self.shutdown.is_set() or self.interrupt.is_set():
@@ -446,8 +414,7 @@ class Maintenance:
                     self.journal.emit("INDEX", "Écart détecté dans les agrégats de bibliothèque", "WARNING")
                 self.metrics["index_stats_seconds"] = monotonic() - before_stats
                 self.next_stats_audit = time() + DAY
-            policy = tuple(settings[name] for name in ("lyrics", "lrc", "autoprepare", "metadata", "albums",
-                                                       "discography", "cover", "night_enabled", "generate", "releases"))
+            policy = tuple(settings[name] for name in ("lyrics", "lrc", "metadata", "albums", "discography", "cover", "night_enabled", "releases"))
             if not stopped() and (changed or replan or self.plan_policy != policy):
                 before_plan = monotonic()
                 self.plan(settings)
@@ -708,23 +675,6 @@ class Maintenance:
         identity = query["research_id"]
         if self.index.enqueue("codex", identity, identity, 15 if manual else 48, query, force=manual):
             self.journal.emit("CODEX", f"Recherche mise en file · {query['artist']} {query['title'] or query['album']}")
-            self.wake.set()
-        return True
-
-    def queue_draft_correction(self, song_id, draft):
-        from _parole_transcribe import correction_identity, correction_input
-
-        if not self.index.settings()["codex"]:
-            return False
-        ranges = correction_input(draft)
-        if not ranges:
-            return False
-        identity = correction_identity(song_id, draft)
-        # The confirmation grants the specific excerpts. Codex receives
-        # no library path, audio, identity tags or publication permission.
-        payload = {"research_id": identity, "kind": "draft_correction", "manual": True,
-                   "language": draft["language"], "ranges": ranges}
-        if self.index.enqueue("codex", identity, identity, 15, payload):
             self.wake.set()
         return True
 
@@ -1166,248 +1116,11 @@ class Maintenance:
         self.metrics[f"{kind}_last_seconds"] = round(monotonic() - started, 3)
         self.changed()
 
-    def night_reference(self, song, path):
-        settings = self.current_settings
-        # Retain a verified provider response across Demucs/Turbo cancellation.
-        # Audio/sidecar edits and changed enabled sources invalidate that reply.
-        local = json.loads(song["info"])
-        local_text = sidecar(path, ".txt")[1] or local.get("plain", "")
-        available = ready_categories(self.index, time()) & {"lyrics", "lrc", "lrc_text"}
-        timed_ready = "lrc" in available or ("lrc_text" in available and bool(local_text.strip()))
-        with self.index.db() as db:
-            sources = [tuple(row) for row in db.execute(
-                "SELECT id,config FROM sources WHERE state='active' ORDER BY id")]
-            revision = encoded_key(song["token"], song["side"], local_text,
-                                   settings["lrc"], settings["lyrics"], settings["generate"], sources)
-            receipt = db.execute("SELECT checked,value FROM reviews WHERE kind='prepare_reference' AND subject=?",
-                                 (song["id"],)).fetchone()
-        if receipt and time() - receipt["checked"] < REFERENCE_REUSE_SECONDS:
-            saved = json.loads(receipt["value"])
-            lrc_deferred = saved.pop("lrc_deferred", False)
-            if saved.pop("revision", None) == revision and not (lrc_deferred and timed_ready):
-                return saved
-
-        def lookup(kind, *, local_only=False):
-            command = [sys.executable, "-B", str(BIN / "_parole_work.py"), kind, song["id"]]
-            if local_only:
-                command.append("--local-reference-only")
-            try:
-                _, data = self.output(command, settings["network_timeout"], maximum=6 * MAX_LRC_BYTES + 1024)
-            except TimeoutError:
-                return {"state": "unavailable"}
-            result = json.loads(data)
-            return {"state": "unavailable"} if result["state"] == "local_miss" else result
-
-        result = {"state": "not_found"}
-        if settings["lrc"]:
-            if timed_ready:
-                self.journal.emit("LRC", f"Dernière recherche de minutage · {song['title']}")
-                result = lookup("prepare_lrc")
-            elif song["lrc"] == "intégré" or song["audio"]:
-                result = lookup("prepare_lrc", local_only=True)
-            else:
-                # An unavailable provider cannot establish that lyrics are
-                # absent. Keep unknown songs eligible for a later search.
-                result = {"state": "unavailable"}
-            if result["state"] == "found":
-                result["mode"] = "timed"
-        if result["state"] not in ("found", "instrumental", "rescan") and settings["generate"]:
-            # Provider timeouts and HTTP limits do not invalidate a known
-            # lyric text. The completed lookup attempt may therefore fall
-            # back to acoustically observed timestamps from that text.
-            if local_text.strip() and len(local_text.encode()) <= MAX_LRC_BYTES:
-                result = {"state": "found", "lyrics": local_text,
-                          "source": local.get("text_provider") or local.get("lyrics_provider") or "bibliothèque"}
-            elif settings["lyrics"]:
-                if "lyrics" in available or song["audio"]:
-                    result = lookup("prepare_plain", local_only="lyrics" not in available)
-                else:
-                    result = {"state": "unavailable"}
-            if result["state"] == "found":
-                result["mode"] = "plain"
-        if (result["state"] in ("found", "not_found", "ambiguous", "invalid", "instrumental")
-                and result.get("source") != LOCAL_SOURCE):
-            # A plain fallback is reusable while timed providers wait. Once
-            # they reopen, give timing another chance before generating it.
-            deferred = result.get("mode") == "plain" and settings["lrc"] and not timed_ready
-            self.index.review("prepare_reference", song["id"], result["state"],
-                              dict(result, revision=revision, lrc_deferred=deferred))
-        return result
-
-    def prepare(self, task, *, nocturnal=False):
-        identity = task["subject"]
-        song = self.index.song(identity)
-        if song is None:
-            return "excluded", "disparu", 0
-        path = Path(song["path"])
-        if path.resolve(strict=True) != path or not path.is_relative_to(self.index.root):
-            return "excluded", "chemin hors bibliothèque", 0
-        if document(file_token(path)) != song["token"]:
-            self.refresh_song(song)
-            return "temporary", "modification détectée", 10
-        info = json.loads(song["info"])
-        plain = sidecar(path, ".txt")[1] or info.get("plain")
-        source_lrc = path.with_suffix(".lrc")
-        try:
-            rejected = lrc_token(source_lrc)
-        except ValueError:
-            return "review", "LRC original non ordinaire", 0
-        local = rejected is not None and song["lrc"] in ("local", "externe", "généré")
-        saved = self.cache.cached(path, verify=False)
-        if nocturnal and local and not saved:
-            insufficient = self.cache.cached(path, verify=False, insufficient=True)
-            if insufficient:
-                # A structurally valid LRC can fail the acoustic check. Its
-                # negative receipt survives the handoff to a verified alternate.
-                local = False
-                if insufficient["source"]["kind"] == "fallback":
-                    return "review", "référence Kara insuffisante", 0
-        reference_option, provider = None, "Strawberry"
-        if not saved and not local and nocturnal:
-            if json.loads(song["side"]) != [sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]:
-                self.refresh_song(song)
-                return "temporary", "paroles modifiées", 10
-            result = self.night_reference(song, path)
-            if result["state"] == "instrumental":
-                self.index.update(identity, lyrics="instrumental", checked=time())
-                return "excluded", "instrumental", 0
-            if result["state"] in ("temporary", "network", "unavailable", "limited", "rescan"):
-                return "temporary", "dernière recherche indisponible", 300
-            if result["state"] != "found":
-                if result["state"] == "not_found" and self.current_settings["codex"] and self.current_settings["codex_auto"]:
-                    self.queue_codex("lrc", identity, "aucun LRC vérifié")
-                if result["state"] in ("not_found", "ambiguous") and self.current_settings["night_transcribe"]:
-                    self.index.queue_transcription(song)
-                return "review", "référence fiable absente", 0
-            reference_option = "--timed-reference" if result["mode"] == "timed" else "--plain-reference"
-            plain, provider = result["lyrics"], result["source"]
-        elif not saved and not local:
-            with self.index.db() as db:
-                pending = db.execute("""SELECT state,detail,updated FROM tasks
-                                        WHERE kind='lrc' AND subject=?""", (identity,)).fetchone()
-            if source_lrc.is_symlink() or source_lrc.exists():
-                return "review", "LRC existant à vérifier", 0
-            if not self.current_settings["generate"] or not plain or not self.current_settings["lrc"]:
-                return "review", "référence absente", 0
-            if not pending or pending["state"] != "review" or pending["detail"] != "not_found":
-                return "temporary", "dernière recherche LRC en attente", 1800
-            if time() - pending["updated"] > DAY:
-                self.index.enqueue("lrc", identity, task["revision"], priority=13, force=True)
-                return "temporary", "dernière recherche LRC replanifiée", 300
-            if self.current_settings["codex"]:
-                research = self.query("lrc", identity)
-                with self.index.db() as db:
-                    awaiting = db.execute("SELECT state,due FROM tasks WHERE kind='codex' AND subject=?",
-                                          (research["research_id"],)).fetchone() if research else None
-                if awaiting and awaiting["state"] in ("queued", "running") and time() - task["due"] < 300:
-                    return "temporary", "recherche approfondie en attente", 300
-            reference_option = "--plain-reference"
-        duration = song["duration"]
-        if not duration:
-            from _kara_stems import duration as media_duration
-            duration = media_duration(path)
-        if not 1 <= duration <= 3600:
-            return "review", "durée hors limites du moteur Kara", 0
-        self.resources.collect_storage(monotonic(), force=True)
-        if not self.resources.allowed_storage(self.current_settings, duration):
-            return "suspended", "plafond du cache ou réserve disque", 1800
-
-        def status(category):
-            def receive(event):
-                if event.get("event") == "progress" and type(event.get("percent")) in (int, float):
-                    phase = PHASES.get(event.get("phase"), "Séparation voix / musique" if category == "DEMUCS" else "Préparation")
-                    self.progress = (category, f"{song['title']} · {phase}", max(0, min(100, event["percent"])) / 100)
-                elif event.get("event") == "chronos":
-                    self.journal.emit("LRC", f"CHRONOS · {song['title']} · {event['status']}"
-                                      + (f" · {event['message']}" if event.get("message") else ""))
-                elif event.get("event") == "result":
-                    seconds = event.get("seconds")
-                    if type(seconds) in (int, float):
-                        self.metrics["turbo_seconds"] = seconds
-                    if nocturnal and not event.get("cached"):
-                        report = event.get("report", {})
-                        refinement = report.get("refinement", {})
-                        # A cached first-pass report describes old work. A
-                        # local retry can contribute only its own elapsed time.
-                        measurements = {}
-                        if refinement.get("decodes"):
-                            measurements["reprises"] = refinement.get("seconds")
-                        if not refinement.get("reused_reference") and not report.get("reused_first_pass"):
-                            measurements["turbo"] = report.get("analysis_seconds")
-                        self.night_measures.update((name, seconds) for name, seconds in measurements.items()
-                                                   if type(seconds) in (int, float) and isfinite(seconds)
-                                                   and seconds >= 0)
-            return receive
-
-        # Full-library preparation can reuse an existing voice reference.
-        # Only Kara's explicit selection path may create a Demucs stem pair.
-        analyzed = not saved or saved.get("refinement", {}).get("version") != REFINEMENT_VERSION
-        if analyzed:
-            self.journal.emit("TURBO", f"Analyse Turbo{' Vulkan' if nocturnal else ''} · {song['title']}")
-            with tempfile.TemporaryDirectory(prefix="prepare-", dir=self.index.folder) as workspace:
-                (Path(workspace) / ".parole-stage").touch()
-                command = ["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_prepare.py"),
-                           "--cache", str(self.cache.root), "--local-only"]
-                if nocturnal:
-                    command.extend(("--device", "gpu", "--require-vulkan", "--observed-corrections-only"))
-                if song["previous"] and not reference_option:
-                    command.extend(("--previous-path", song["previous"]))
-                if reference_option:
-                    reference = Path(workspace) / "reference.txt"
-                    reference.write_text(plain, encoding="utf-8")
-                    command.extend((reference_option, str(reference), "--reference-provider", provider))
-                    if nocturnal and reference_option == "--plain-reference" and os.environ.get("KARA_CHRONOS_PYTHON"):
-                        command.append("--chronos-night-draft")
-                    if rejected:
-                        command.extend(("--rejected-lrc", document(rejected)))
-                rc, _ = self.output([*command, "--", str(path)], 1800, status("TURBO"))
-                if rc and not self.cache.cached(path, verify=False, insufficient=True):
-                    return "temporary", "analyse Turbo indisponible", 6 * HOUR
-        reference = self.cache.cached(path, verify=False)
-        valid_reference = reference and reference.get("refinement", {}).get("version") == REFINEMENT_VERSION
-        prepared_stems = cached_stems(path) if valid_reference and not nocturnal else None
-        if valid_reference:
-            if nocturnal:
-                folder = self.cache.folder(path)
-                try:
-                    # Measure this complete generation, excluding locks,
-                    # superseded drafts and unrelated changes to the cache.
-                    files = (folder / "prepared.json", folder / (reference["lrc_sha256"] + ".lrc"))
-                    self.night_measures["taille"] = sum(file.stat().st_blocks * 512 for file in files)
-                except OSError:
-                    pass
-            updated = {"audio": reference["audio"].get("pcm_sha256", "")}
-            if prepared_stems:
-                updated["kara"] = "prêt"
-            origin = reference["source"]
-            generated = bool(origin.get("plain_sha256") and reference_option == "--plain-reference")
-            corrected = bool(reference["report"].get("changed") and analyzed)
-            if origin.get("plain_sha256") and origin["kind"] == "local":
-                updated["lrc"] = "généré"
-                updated["provenance"] = {"lrc_provider": f"Turbo · {origin['provider']}"}
-            if generated:
-                self.journal.emit("LRC", f"LRC généré et validé · {song['title']}")
-            if corrected:
-                self.journal.emit("LRC", f"Minutage corrigé dans Kara · {song['title']}")
-            self.refresh_song(song, **updated)
-            self.night_lrc = (corrected, generated)
-            if not prepared_stems:
-                self.journal.emit("LRC", f"Référence temporelle validée · {song['title']}")
-                return "done", "référence prête", 0
-            self.journal.emit("KARA", f"Chanson prête · {song['title']}")
-            return "done", "prêt", 0
-        self.refresh_song(song)
-        if (nocturnal and local and analyzed and
-                self.cache.cached(path, verify=False, insufficient=True)):
-            return "temporary", "LRC local insuffisant · recherche d’une autre référence", 10
-        return "review", "référence Kara insuffisante", 0
-
     def do_codex(self, task):
         query = json.loads(task["payload"])
-        draft = query["kind"] == "draft_correction"
-        message = ("Relecture de passages de transcription" if draft else
-                   f"Recherche approfondie · {query['artist']} {query['title'] or query['album']}")
-        self.journal.emit("CODEX", message)
+        if query["kind"] == "draft_correction":
+            return "excluded", "Correction de brouillon IA archivée", 0
+        self.journal.emit("CODEX", f"Recherche approfondie · {query['artist']} {query['title'] or query['album']}")
         try:
             result, error = research(self.index, query, self.current_settings, self.stopped,
                                      lambda text: self.journal.emit("CODEX", text))
@@ -1424,10 +1137,6 @@ class Maintenance:
                                (document(time() + (DAY if error == "quota_distant" else HOUR)),))
                 return "temporary", error, HOUR
             return "temporary", error, min(DAY, 1800 * 2**min(task["attempts"], 5))
-        if draft:
-            self.index.review("codex", task["subject"], "proposal", result)
-            self.changed()
-            return "review", "suggestions de transcription à écouter", 0
         if query["kind"] in ("adapter", "import_patch"):
             proposed = bool(result["adapter_python"])
             self.index.review("codex", task["subject"], "proposal" if proposed else "review", result)
@@ -1448,41 +1157,6 @@ class Maintenance:
                 self.journal.emit("SOURCE", "Adaptateur spécifique à examiner" if source["adapter"] == "custom" else
                                   "Fournisseur proposé · validation nécessaire")
         return ("done" if result["status"] == "found" else "review", result["status"], 0)
-
-    def transcribe_task(self, task):
-        song = self.index.song(task["subject"])
-        if not song or song["lyrics"] != "absent" or song["lrc"] != "absent":
-            return "excluded", "référence disponible ou piste disparue", 0
-        path = Path(song["path"])
-        if path.resolve(strict=True) != path or not path.is_relative_to(self.index.root):
-            return "excluded", "chemin hors bibliothèque", 0
-        if document(file_token(path)) != song["token"] or any(sidecar(path, ext)[0] for ext in (".txt", ".lrc")):
-            return "excluded", "morceau ou référence modifiée", 0
-        duration = song["duration"]
-        if not 1 <= duration <= 3600:
-            return "review", "durée hors limites du moteur Kara", 0
-        self.resources.collect_storage(monotonic(), force=True)
-        if not self.resources.allowed_storage(self.current_settings, duration):
-            return "suspended", "plafond du cache ou réserve disque", 1800
-
-        def progress(event):
-            percent = event.get("percent")
-            if event.get("event") == "progress" and type(percent) in (int, float):
-                self.progress = "TRANSCRIPTION", song["title"], max(0, min(100, percent)) / 100
-
-        # The draft and its reusable first pass are signed against the
-        # original mix. Only Kara preparation requires the Demucs pair.
-        code, data = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_parole_transcribe.py"),
-                                  str(self.cache.root), str(path)], 1800, progress)
-        if code:
-            return "temporary", "transcription indisponible", 6 * HOUR
-        receipt = json.loads(data.splitlines()[-1])
-        if receipt.get("event") != "draft":
-            return "temporary", "brouillon indisponible", 6 * HOUR
-        detail = "brouillon à vérifier" if receipt["lines"] else "transcription incertaine"
-        self.journal.emit("TRANSCRIPTION", f"{receipt['lines']} lignes proposées · {receipt['omitted']} incertaines · "
-                          "brouillon texte")
-        return "review", detail, 0
 
     def execute(self, task, *, nocturnal=False, local_reference_only=False):
         started = monotonic()
@@ -1521,10 +1195,8 @@ class Maintenance:
         try:
             if nocturnal and self.stopped():
                 raise Interrupted
-            if kind == "prepare":
-                result = ("suspended", "Minutage IA archivé", DAY)
-            elif kind == "transcription":
-                result = self.transcribe_task(task)
+            if kind in HEAVY:
+                result = ("suspended", "Traitement IA Kara archivé", DAY)
             elif kind == "codex":
                 result = self.do_codex(task)
             elif kind == "cleanup":
@@ -1786,11 +1458,6 @@ class Maintenance:
         self.authorized_imports(settings)
         if not self.resources.allowed_storage(settings):
             return
-        if (not imports_pending and self.index.work_due(("transcription",), now, manual_only=True)
-                and self.resources.check(settings)
-                and (task := self.index.claim(("transcription",), now, manual_only=True))):
-            self.execute(task)
-            return
         self.tick_network(settings, now, self.network_kinds(settings, now))
 
     def network_kinds(self, settings, now, *, nocturnal=False):
@@ -1861,33 +1528,15 @@ class Maintenance:
 
     def tick_night(self, settings, now):
         kinds = self.network_kinds(settings, now, nocturnal=True)
-        network_due = (self.index.work_due(kinds, now) or
-                       self.index.work_due(self.local_reference_kinds(settings), now, local_reference=True))
-        # Old automatic jobs remain intact for diagnosis and can still be
-        # promoted by an explicit review request. The scheduler claims only
-        # manually requested drafts and never claims legacy alignment work.
-        transcription_due = self.index.work_due(("transcription",), now, manual_only=True)
-        # Offer the other class the next turn. A bounded network batch
-        # alternates with one song, so neither class can starve the other.
-        order = (True, False) if self.night_network_next else (False, True)
-        for light in order:
-            if not (network_due if light else transcription_due):
-                continue
-            if not self.night_allowed(settings, running=False, light=light) or not self.night.open(settings):
-                continue
-            if light:
-                if not self.tick_network(settings, now, kinds, nocturnal=True):
-                    self.night.report("Recherches nocturnes en attente · aucune tâche disponible")
-                    continue
-            else:
-                task = self.index.claim(("transcription",), now, manual_only=True)
-                if task is None:
-                    continue
-                self.execute(task, nocturnal=True)
-            self.night_network_next = not light
+        due = (self.index.work_due(kinds, now) or
+               self.index.work_due(self.local_reference_kinds(settings), now, local_reference=True))
+        # The nighttime owner still serves the Parole provider tasks. Keep
+        # archived compute jobs in SQLite and outside the claim set.
+        try:
+            if due and self.night_allowed(settings, running=False, light=True) and self.night.open(settings):
+                return self.tick_network(settings, now, kinds, nocturnal=True)
+            if not due:
+                self.night.report("Mode nocturne en attente · file prête au prochain travail")
+            return False
+        finally:
             self.night.stop_work()
-            return True
-        self.night.stop_work()
-        if not (network_due or transcription_due):
-            self.night.report("Mode nocturne en attente · file prête au prochain travail")
-        return False

@@ -10,7 +10,7 @@ import sqlite3
 from time import time
 from unicodedata import normalize
 
-from _kara_prepare import file_token
+from _kara_files import file_token
 from _kara_words import FORM, IGNORED_HINTS, detect_language, words
 from _parole_index import LEXICON, document, key, sidecar, sidecar_token
 from _parole_music_identity import isrc, mbid

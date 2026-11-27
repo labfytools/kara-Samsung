@@ -10,12 +10,12 @@ import os
 import re
 from pathlib import Path
 import signal
-import stat
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryFile
 from time import monotonic, sleep
 
+from _kara_files import atomic, file_token, lrc_token
 from _kara_paths import BIN, STATE, music_library
 from _kara_preparation_error import PreparationError, error_details
 from _kara_audio_identity import pcm_digest
@@ -33,23 +33,6 @@ SECTION = re.compile(r"^\[(?:intro|outro|couplet|refrain|chorus|verse|bridge|pon
                      r"interlude)(?:\s+\d+)?(?:\s*:\s*[^\]]{1,100})?\]$", re.I)
 
 
-def file_token(path):
-    info = path.stat()
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("Un fichier ordinaire est requis.")
-    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
-
-
-def lrc_token(path):
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("Le fichier LRC doit être un fichier ordinaire.")
-    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
-
-
 def read_source(path):
     with path.open("rb") as source:
         raw = source.read(MAX_LRC_BYTES + 1)
@@ -64,27 +47,6 @@ def fingerprint(raw):
 
 def path_id(song):
     return fingerprint(os.fsencode(song))
-
-
-def atomic(path, data):
-    # Rename is the publication point. Flush both data and directory so a
-    # process or machine interruption cannot publish a partial generation.
-    draft = None
-    try:
-        with NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-            draft = Path(stream.name)
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(draft, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if draft is not None:
-            draft.unlink(missing_ok=True)
 
 
 def number(value, low, high):

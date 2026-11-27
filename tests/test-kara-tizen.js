@@ -54,7 +54,7 @@ const step = () => {
   timer.callback();
   return requests.at(-1);
 };
-assert.match(requests[0].url, /^https:\/\/kara\.labfytools\.com:8443\/tv\/etat\?qr=1$/);
+assert.match(requests[0].url, /^https:\/\/kara\.labfytools\.com:8443\/tv\/etat\?qr=1&cover=$/);
 assert.equal(requests[0].Authorization, "Bearer fixture");
 requests[0].respond(0);
 assert.match(nodes.get("hint").textContent, /nouvelle tentative/);
@@ -62,11 +62,22 @@ assert.equal([...timers.values()][0].delay, 750);
 step().respond(503);
 assert.equal([...timers.values()][0].delay, 1500);
 const join_url = "https://kara.labfytools.com:8443/fixture/jouer";
-step().respond(200, {join_url, qr_data: "fixturePNG", organizer_pin: "0123", party_phase: "lobby"});
+step().respond(200, {join_url, qr_data: "fixturePNG", organizer_pin: "0123", party_phase: "lobby",
+  display_mode: "music", title: "Accueil", artist: "Artiste", cover_revision: "first", cover_data: "data:image/jpeg;base64,cover",
+  lines: ["", "Bonjour à tous", "Suite"], highlight_chars: 7, progress: 0.5});
 assert.equal(nodes.get("connect").hidden, true);
 assert.equal(nodes.get("pin").textContent, "0123");
 assert.equal(nodes.get("room-url").textContent, join_url);
 assert.equal(nodes.get("room-qr").src, "data:image/png;base64,fixturePNG");
+assert.equal(nodes.get("title").textContent, "Accueil");
+assert.equal(nodes.get("artist").textContent, "Artiste");
+assert.equal(nodes.get("album-art").hidden, false);
+assert.equal(nodes.get("album-art").src, "data:image/jpeg;base64,cover");
+assert.equal(nodes.get("current").children.at(-2).textContent, "Bonjour");
+assert.match(step().url, /cover=first$/);
+requests.at(-1).respond(200, {join_url, display_mode: "music", title: "Accueil", cover_revision: "first",
+  playback_state: "Paused", lines: ["", "Bonjour à tous", "Suite"], highlight_chars: 7});
+assert.equal(nodes.get("status").textContent, "En pause");
 step().respond(200, {join_url, party_phase: "running", current_song: "Fiesta", current_player: "Alex", countdown: 2});
 assert.equal(nodes.get("mobile-room").hidden, true);
 assert.equal(nodes.get("current").children.at(-1).textContent, "2");
@@ -75,9 +86,13 @@ step().respond(200, {join_url, party_phase: "running", turn_phase: "playing", cu
 assert.equal(nodes.get("next").textContent, "Suite");
 assert.equal(nodes.get("fill").style.width, "50%");
 step().respond(0);
-step().respond(200, {join_url, party_phase: "finished", ranking: [{name: "Alex", score: 91}]});
-assert.match(nodes.get("status").textContent, /Alex.*91/);
+step().respond(200, {join_url, party_phase: "finished", display_mode: "music", title: "Nouveau titre",
+  cover_revision: "", plain_lyrics: "Paroles simples disponibles"});
+assert.equal(nodes.get("title").textContent, "Nouveau titre");
+assert.equal(nodes.get("plain-lyrics").textContent, "Paroles simples disponibles");
+assert.equal(nodes.get("album-art").hidden, true);
+assert.equal(nodes.get("mobile-room").hidden, false);
 step().respond(200, {join_url, organizer_pin: "0234", party_phase: "lobby"});
 assert.equal(nodes.get("pin").textContent, "0234");
 assert.equal(nodes.get("mobile-room").hidden, false);
-console.log("Tizen simulé : démarrage, réessais, QR et PIN, compte à rebours, chant, reprise et classement.");
+console.log("Tizen simulé : attente musicale, pochette, pause, QR et PIN, compte à rebours, chant et retour à la musique.");

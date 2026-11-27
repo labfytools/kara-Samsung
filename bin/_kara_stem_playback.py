@@ -15,11 +15,11 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstController", "1.0")
 from gi.repository import Gst, GLib, GstController
 
-from _kara_party import ORIGINAL_VOICE_LEVELS
 from _kara_stems import cached_stems
 from _kara_vocal_effect import VocalEffect
 
 Gst.init(None)
+ORIGINAL_VOICE_LEVELS = (0, 20, 50, 80)
 STRENGTHS = tuple(("Instrumental" if not level else f"Voix {level} %", level / 100)
                   for level in ORIGINAL_VOICE_LEVELS)
 # Even simultaneous full-scale samples leave room for the protected return

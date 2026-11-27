@@ -2,6 +2,9 @@
 
 ## En développement
 
+- Revenir au karaoké classique avec le mix d’origine, le tour suivant automatique et l’écoute micro préalable. Retirer la notation, la reconnaissance vocale et la préparation acoustique du parcours. Conserver les fonctions de bibliothèque Parole.
+- Afficher la lecture Strawberry et sa pochette sur la TV avant et après la partie. Passer au jeu à l’ouverture du salon. Mettre à jour le client Samsung en version 2.1.0 et versionner les ressources JavaScript mobiles.
+
 - Régler séparément la musique et le retour vocal, vérifier la sortie PipeWire et entendre le micro avant le départ. Consigner les niveaux de la chaîne dans BlackBox.
 
 - Ouvrir le salon avec le fichier audio sélectionné, afficher le LRC original et réserver Turbo à la reconnaissance du chanteur. Archiver les traitements de minutage IA et conserver les recherches multisources.

@@ -218,15 +218,13 @@
     const next = party.next || [];
     const index = next.findIndex(item => item.player === state.me.name);
     const song = (index >= 0 && songs.find(item => item.title === next[index].song)) || songs[0];
-    const unscored = state.me.unscored?.includes(song?.title);
-    const failed = song?.preparation === "failed" && !unscored;
+    const failed = song?.preparation === "failed";
     const running = party.phase === "running";
     const waiting = running ? "En attente de ton tour" : "En attente de l’ouverture du salon";
     $("waiting-title").textContent = failed ? "Fichier audio indisponible" : waiting;
     $("waiting-song").textContent = song ? [song.title, song.artist].filter(Boolean).join(" · ") : "";
     const before = index < 0 ? "" : index + (party.player ? 1 : 0) + " passage(s) avant toi";
     $("waiting-detail").textContent = [
-      unscored ? "Tour sans note." : "",
       before,
       party.player ? party.player + " chante " + party.song : "",
       party.notice
@@ -493,79 +491,29 @@
     }
   }
   function displayResults(party) {
-    const scores = $("scores");
-    scores.replaceChildren();
-    for (const turn of party.results || []) {
-      const note = turn.summary;
-      const row = element("div", undefined, "track");
-      const info = element("div", undefined, "track-info");
-      info.append(element("strong", turn.title), element("small", note ?
-        note.coverage + " % des mots évalués" : turn.detail));
-      row.append(info, element("span", note?.score != null ? note.score + " %" :
-        note ? "Note indisponible" : "Sans note", "tag"));
-      scores.append(row);
-    }
-    if (!scores.childElementCount) scores.append(element("p", "Tes résultats apparaîtront après ton tour.", "muted"));
-    $("ranking").replaceChildren(...(party.ranking || []).map(row => element("p",
-      row.name + " · " + (row.score != null ? row.score + " %" : "Sans note") + " · " + row.scored + "/" + row.turns + " tours notés")));
+    $("turn-history").replaceChildren(...(party.results || []).map(turn =>
+      element("li", [turn.title, turn.detail].filter(Boolean).join(" · "))));
   }
-  $("admin-form").onsubmit = event => {
-    event.preventDefault();
-    run(event.submitter, async () => {
-      await enroll();
-      await api("organisateur", {code: $("admin-code").value.trim()});
-      $("admin-code").value = "";
-      await poll();
-    });
-  };
-  function canChooseMode(party) {
-    return ["lobby", "ready", "finished"].includes(party.phase);
-  }
-  function playerMixForm(mix, party, save) {
+  function playerMixForm(mix, _party, save) {
     const form = element("form", undefined, "stack");
-    const slider = (title, position, max, format, initial) => {
-      const label = element("label", undefined, "mix-slider");
-      const caption = element("span", undefined, "row between");
-      const value = element("output", initial);
-      caption.append(element("span", title), value);
+    for (const [key, label] of [["music", "Musique"], ["voice", "Retour vocal"]]) {
+      const field = element("label", label);
       const input = element("input");
-      input.type = "range"; input.min = "0"; input.max = String(max); input.step = "1";
-      input.value = String(position);
-      input.setAttribute("aria-label", title);
-      input.setAttribute("aria-valuetext", initial);
-      label.append(caption, input);
-      let changed = false;
-      input.oninput = () => {
-        changed = true;
-        value.textContent = format(Number(input.value));
-        input.setAttribute("aria-valuetext", value.textContent);
-      };
-      return {label, position: () => Number(input.value), changed: () => changed};
-    };
-    const percent = value => value + " %";
-    // Until a slider is moved, the server keeps the room or output default.
-    const music = slider("Volume musique", mix.music ?? 100, 100, percent,
-      mix.music == null ? "Volume de la salle" : percent(mix.music));
-    const voice = slider("Retour du micro", mix.voice ?? 50, 100, percent,
-      mix.voice == null ? "Profil de la sortie" : percent(mix.voice));
-    form.append(music.label, voice.label);
-    const modeLabel = element("label", undefined);
-    const mode = element("input"); mode.type = "checkbox"; mode.checked = mix.training;
-    mode.disabled = !canChooseMode(party);
-    modeLabel.append(mode, "Entraînement sans note");
-    const original = slider("Chanteur original", mix.original, 100, percent, percent(mix.original));
-    const submit = element("button", "Appliquer");
-    form.append(modeLabel, original.label, submit);
+      input.type = "number";
+      input.min = 0;
+      input.max = 100;
+      input.name = key;
+      input.value = mix[key] ?? "";
+      field.append(input);
+      form.append(field);
+    }
+    const apply = element("button", "Appliquer");
+    form.append(apply);
     form.onsubmit = event => {
       event.preventDefault();
-      run(submit, async () => {
-        const data = {};
-        if (music.changed() && music.position() !== mix.music) data.music = music.position();
-        if (voice.changed() && voice.position() !== mix.voice) data.voice = voice.position();
-        if (mode.checked !== mix.training) data.training = mode.checked;
-        if (original.changed() && original.position() !== mix.original) data.original = original.position();
-        if (Object.keys(data).length) await save(data);
-      });
+      const data = Object.fromEntries(Array.from(form.elements)
+        .filter(input => input.name && input.value !== "").map(input => [input.name, Number(input.value)]));
+      run(apply, () => save(data));
     };
     return form;
   }
@@ -591,7 +539,7 @@
       identity.append(element("strong", player.name), element("small", [
         participant?.online ? "Connecté" : player.mobile ? "Hors ligne" : "Sur le bureau",
         participant?.song, participant?.preparation === "ready" ? "Prêt" : participant?.preparation === "failed" ?
-          "Préparation en échec" : participant?.ready ? "Préparation en cours" : "",
+          "Fichier audio indisponible" : participant?.ready ? "Choix confirmé" : "",
         imports.find(([, names]) => names?.includes(player.name))?.[0],
         position >= 0 ? "Position " + (position + 1) : ""
       ].filter(Boolean).join(" · ")));
@@ -605,7 +553,7 @@
         if (player.name !== state.me.name && player.name !== party.player) row.append(button("Retirer", () => confirm("Retirer " + player.name + " de la partie ?") &&
           command("remove-player", {player: player.name})));
       }
-      if (position >= 0 || player.name === party.player && ["preparing", "awaiting-mic"].includes(party.turn_phase))
+      if (position >= 0 || player.name === party.player && party.turn_phase === "awaiting-mic")
         row.append(button("Reporter", () => command("defer-player", {player: player.name})));
       if (party.deferred?.includes(player.name)) row.append(button("Replacer", () => command("return-player", {player: player.name})));
       if (player.name === party.player || party.last_result?.player === player.name)
@@ -622,8 +570,7 @@
           line.append(element("span", song.title + " · " + preparation, "track-info"));
           if (song.preparation === "failed") {
             const selection = {player: player.name, song: song.title};
-            line.append(button("Relancer Turbo", () => command("retry-song", selection)),
-              button("Chanter sans note", () => command("allow-unscored", selection)));
+            line.append(button("Vérifier le fichier", () => command("retry-song", selection)));
           }
           songs.append(line);
         }
@@ -694,7 +641,6 @@
     $("bb-control").textContent = party.blackbox?.active ? "Arrêter BlackBox" : "Activer BlackBox";
     $("bb-control").disabled = !!party.blackbox?.finalizing;
     $("bb-voice-choice").hidden = !!(party.blackbox?.active || party.blackbox?.finalizing);
-    $("bb-mode-choice").hidden = $("bb-voice-choice").hidden || !$("bb-voice").checked;
     $("sound-settings").hidden = !party.audio?.available;
     if (party.audio) {
       $("audio-profile").value = party.audio.profile;
@@ -708,22 +654,14 @@
       const voice = $("bb-voice").checked;
       const tracks = Array.from($("bb-tracks").querySelectorAll("input:checked"), input => input.value);
       const subject = voice ? "les diagnostics et les pistes audio sélectionnées pendant les tours" : "les diagnostics";
-      const pair = !voice || tracks.includes("wifi") && (tracks.includes("monitor") || tracks.includes("playback"));
-      const check = pair ? "" : "\nPrévol AEC incomplet. Sélectionne le micro reçu et une référence de sortie pour les comparer.";
-      if (confirm("Confirmer l’accord des participants et des responsables des mineurs pour " + subject + " ?" + check)) {
-        await command("blackbox-start", {consent: true, voice, tracks, mode: voice ? $("bb-mode").value : "diagnostic_light"});
+      if (confirm("Confirmer l’accord des participants et des responsables des mineurs pour " + subject + " ?")) {
+        await command("blackbox-start", {consent: true, voice, tracks, mode: voice ? "deep_analysis" : "diagnostic_light"});
         $("bb-voice").checked = false;
         const witness = $("bb-tracks").querySelector("input[value=witness]");
         if (witness) witness.checked = false;
       }
     }
   });
-  $("bb-voice").onchange = () => { $("bb-mode-choice").hidden = !$("bb-voice").checked; };
-  $("bb-mode").onchange = () => {
-    const mode = $("bb-mode").value;
-    for (const track of $("bb-tracks").querySelectorAll("input"))
-      if (track.value !== "witness") track.checked = mode !== "calibration" || ["wifi", "monitor", "playback", "return"].includes(track.value);
-  };
   $("music-volume").onchange = () => command("music-volume", {percent: Number($("music-volume").value)}).catch(error => notice(error.message));
   $("audio-output").onchange = () => command("audio-output", {value: $("audio-output").value}).catch(error => notice(error.message));
   $("audio-profile").onchange = () => command("audio-profile", {value: $("audio-profile").value}).catch(error => notice(error.message));
@@ -731,9 +669,8 @@
   $("micro-cut").onclick = () => run($("micro-cut"), () => command("audio-cut"));
 
 
-  for (const [value, title] of [["wifi", "Audio reçu des téléphones"], ["whisper", "Signal envoyé au moteur de score"],
-    ["turbo", "Fenêtres exactes envoyées à Turbo"], ["return", "Retour vocal numérique"], ["playback", "Mix Kara à l’entrée de la sortie"],
-    ["monitor", "Monitor PipeWire"], ["witness", "Micro témoin du Vivobook"]]) {
+  for (const [value, title] of [["wifi", "Micro reçu"], ["return", "Retour vocal traité"],
+    ["monitor", "Moniteur PipeWire"], ["witness", "Micro témoin"]]) {
     const label = element("label");
     const input = element("input");
     input.type = "checkbox"; input.checked = value !== "witness"; input.value = value;
@@ -749,10 +686,6 @@
     });
   };
 
-  function scoreShade(score) {
-    if (!Number.isFinite(score) || score < 0 || score > 100) return "neutral";
-    return score >= 90 ? "green" : score >= 70 ? "olive" : score >= 40 ? "orange" : "red";
-  }
   function render() {
     const party = state?.party || {};
     const turn = isMyTurn(party);
@@ -778,12 +711,11 @@
     $("results").hidden = !results || showOrganizer;
     $("view-admin").hidden = !showOrganizer;
     $("imports").hidden = !state || turn || !!job;
-    document.body.dataset.score = scoreShade(turn && party.turn_phase === "playing" ? party.score : null);
     if (turn) displayMicrophone(party);
     if (job) displayImport(job);
     if (waiting) displayWaiting(party);
     if (results) {
-      $("result-title").textContent = party.phase === "finished" ? "Résultats de la partie" : "Mon résultat";
+      $("result-title").textContent = party.phase === "finished" ? "Partie terminée" : "Mes passages";
       displayResults(party);
     }
     if (showOrganizer) displayAdmin(party);
@@ -806,30 +738,25 @@
     $("voice-consent-label").hidden = !party.recording_voice || !enabled || !!mic;
     $("witness-consent").hidden = !party.recording_witness;
     $("turn-title").textContent = phase === "countdown" ? "Départ dans " + party.countdown :
-      phase === "playing" ? "Tu chantes" : phase === "finishing" ? "Calcul du résultat…" :
+      phase === "playing" ? "Tu chantes" :
         testing ? "Essai microphone" : "À toi de chanter !";
     $("turn-song").textContent = state.me.name + " · " + (party.song || "");
-    $("live-score").textContent = Number.isFinite(party.score) ? party.score + " %" : "";
     $("micro-status").textContent = micMessage || (testing ?
       tested ? "Retour confirmé. Tu peux démarrer." :
         mic?.ready ? "Parle et règle le retour. Confirme quand tu entends ta voix sur l’enceinte." :
           "Active le micro pour t’entendre avant le départ." :
       phase === "playing" && !party.mic_receiving ? "Le microphone ne transmet plus." : "");
-    $("return-volume").hidden = phase === "finishing";
+    $("return-volume").hidden = false;
     $("mark-area").hidden = !party.recording;
     const mix = state.me.mix || {};
     const ceiling = party.audio?.music_ceiling ?? 100;
-    for (const [key, id, fallback] of [["music", "live-music", 100], ["original", "live-original", 0]]) {
-      const input = $(id);
-      if (document.activeElement !== input && !(key in liveMixPending)) input.value = String(mix[key] ?? fallback);
-      const requested = Number(input.value);
-      $(id + "-value").value = (key === "music" ? Math.min(requested, ceiling) : requested) + " %";
-    }
+    const music = $("live-music");
+    if (document.activeElement !== music && !("music" in liveMixPending)) music.value = String(mix.music ?? 100);
+    $("live-music-value").value = Math.min(Number(music.value), ceiling) + " %";
     if (!mic?.ready) {
       if (document.activeElement !== $("voice") && !("voice" in liveMixPending)) $("voice").value = String(mix.voice ?? 50);
       $("voice-applied").value = "0 % · micro coupé";
     }
-    $("live-guide-note").hidden = !!mix.training || Number($("live-original").value) === 0;
   }
   let liveMixPending = {}, liveMixTimer, liveMixBusy = false;
   async function sendLiveMix() {
@@ -852,12 +779,6 @@
     const value = Number($("live-music").value);
     $("live-music-value").value = Math.min(value, state.party.audio?.music_ceiling ?? 100) + " %";
     liveMix("music", value);
-  };
-  $("live-original").oninput = () => {
-    const value = Number($("live-original").value);
-    $("live-original-value").value = value + " %";
-    $("live-guide-note").hidden = !!state.me.mix?.training || value === 0;
-    liveMix("original", value);
   };
   function stopMicrophone(reason = "user") {
     ++micGeneration;

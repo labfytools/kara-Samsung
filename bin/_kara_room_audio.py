@@ -7,8 +7,6 @@ import json
 import os
 import re
 from secrets import token_hex, token_urlsafe
-import socket
-import struct
 from subprocess import SubprocessError
 from threading import Event, Lock, Thread
 import time
@@ -16,7 +14,6 @@ from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import web
 import numpy as np
-from scipy.signal import resample_poly
 
 from _kara_audio_calibration import selected_target
 from _kara_mobile_room import RoomError
@@ -34,13 +31,11 @@ class Route:
     device: str
     settings: dict
     volume: int
-    sender: socket.socket
     claim: str | None = None
     claimed: object = None
     armed_until: float = 0.
     closed: bool = False
     receiving: bool = False
-    failed_blocks: int = 0
     last_sample: float = 0.
     last_arrival: float = 0.
     muted: bool = False
@@ -58,9 +53,6 @@ class Route:
     clock_excess: float | None = None
     frame_origin: float | None = None
     frame_end: int | None = None
-    seq: int | None = None
-    scoring: bool = True
-    authorized_start: float | None = None
 
     @property
     def context(self):
@@ -94,11 +86,10 @@ class RoomAudio:
         self.calibrating_mix = os.environ.get("KARA_MIX_CALIBRATION") == "1"
         self.ceiling = 50 if self.calibrating_mix or self.mix_trial else 100
         # Preferences are scoped to the ephemeral room identity and physical
-        # output. They cannot change the PCM consumed by the score engine.
+        # output. The input PCM stays separate from the return fader.
         self.preferences = {}
         self.default_preferences = {}
         self.preference_device = None
-        self.last_authorized = None
         self.diagnostic_devices = {}
 
     def status(self):
@@ -236,25 +227,21 @@ class RoomAudio:
                                       and len(specification) <= 64 else None}
         return sink, device, settings
 
-    def open_turn(self, owner, player, turn, song, *, scoring=True):
+    def open_turn(self, owner, player, turn, song):
         self.close_turn()
         sink, device, settings = self._route_settings()
-        sender, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sender.setblocking(False)
         with self.lock:
             self.preference_device = device
             volume = self.preferences.get((owner, device),
                                           self.default_preferences.get(owner, min(100, settings["volume_percent"])))
-            self.route = Route(owner, player, turn, song, sink, device, settings, volume, sender, scoring=scoring)
-            self.last_authorized = None
-        configuration = {key: settings[key] for key in ("mic_gain_percent", "chrome_echo", "chrome_noise",
+            self.route = Route(owner, player, turn, song, sink, device, settings, volume)
+            configuration = {key: settings[key] for key in ("mic_gain_percent", "chrome_echo", "chrome_noise",
                          "profile", "pulse_buffer", "echo_guard", "capture_output") if key in settings}
         configuration_id = sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
         self.diagnostics.emit("audio", "route", player=player, turn=turn, song=song, output=sink,
-                              profile=settings["profile"], guard=True, requested_percent=volume, scoring=scoring,
+                              profile=settings["profile"], guard=True, requested_percent=volume,
                               trial=self.mix_trial_name, capture_settings=configuration,
                               audio_configuration_id=configuration_id)
-        return reader
 
     def close_turn(self):
         with self.lock:
@@ -262,10 +249,8 @@ class RoomAudio:
             if route is None:
                 return
             route.closed = True
-            route.sender.close()
             ws = route.claimed
-        self.diagnostics.emit("audio", "capture-end", **route.context, blocks=route.sent,
-                              bridge_drops=route.failed_blocks)
+        self.diagnostics.emit("audio", "capture-end", **route.context, blocks=route.sent)
         if ws is not None and self.loop:
             asyncio.run_coroutine_threadsafe(ws.close(code=4000, message=b"Tour termine"), self.loop)
 
@@ -275,13 +260,10 @@ class RoomAudio:
             return bool(route and route.receiving and (not recent or time.monotonic() - route.last_arrival < 1.5))
 
     def record_playing(self, playing):
-        # Warm-up and the countdown still feed the live application. The
-        # recorder starts only at the playing aperture of the current tour.
+        # Keep the consented diagnostic aperture separate from live playback.
         with self.lock:
             if self.route:
                 self.route.recording_on = playing
-                if not playing:
-                    self.route.authorized_start = None
 
     def record_test(self, testing):
         with self.lock:
@@ -290,12 +272,6 @@ class RoomAudio:
                 return
             route.testing = testing
             self.diagnostics.emit("audio", "microphone-test", **route.context, active=testing)
-
-    def capture_window(self, turn, begin, end=None):
-        with self.lock:
-            allowed = self.last_authorized
-            return bool(allowed and allowed[0] == turn and allowed[1] <= begin <= allowed[2]
-                        and (end is None or begin < end <= allowed[2]))
 
     def selected_sink(self):
         with self.lock:
@@ -333,13 +309,11 @@ class RoomAudio:
                 return False
             route.claimed = ws
             route.connection = token_hex(16)
-            route.authorized_start = None
             route.receiving = False
             route.output_verified = output_verified
             route.heard_return = False
             route.audible_submission = 0.
             route.gain = 0.
-            route.seq = None
             route.clock_excess = None
             route.frame_origin = None
             route.frame_end = None
@@ -402,8 +376,8 @@ class RoomAudio:
             return route is self.route and route.claimed is ws
 
     def apply_return(self, route, samples):
-        # Only the monitor uses this gain. PipeWire stays at unity and the
-        # recognizer already owns a separate copy of the microphone PCM.
+        # Only the monitor uses this gain. PipeWire stays at unity and
+        # the original Wi-Fi PCM remains available to the recorder.
         with self.lock:
             if route is not self.route or route.muted:
                 route.gain = 0.
@@ -438,12 +412,6 @@ class RoomAudio:
             route = self.route
             return bool(route and route.heard_return and route.output_verified and not route.muted
                         and min(route.volume, self.ceiling))
-
-    def disable_scoring(self):
-        with self.lock:
-            if self.route:
-                self.route.scoring = False
-                self.last_authorized = None
 
     def requested(self, route):
         with self.lock:
@@ -549,53 +517,30 @@ class RoomAudio:
                 if key[0] == owner:
                     self.preferences.pop(key)
 
-    def pcm(self, route, data, rate, received, sequence, send_clock, frame_end=None):
-        # Training keeps Wi-Fi capture and the return. With no Whisper
-        # consumer, sending to its socket would discard good microphone blocks.
-        scoring = route.scoring
-        if scoring:
-            reading = np.frombuffer(data, dtype="<i2").astype(np.float32)
-            scaled = resample_poly(reading, 1, 3) if rate == 48000 else resample_poly(reading, 160, 441)
-            pcm = np.clip(np.rint(scaled), -32768, 32767).astype("<i2").tobytes()
+    def accept_pcm(self, route, frames, rate, received, send_clock, frame_end=None):
+        # Reject overlapping render blocks before they enter the monitor.
+        # A real jump in the source clock is preserved as a transport gap.
         with self.lock:
             if route is not self.route:
-                return
+                return False
             if frame_end is not None:
-                # Render-frame positions preserve PCM spacing. Reception
-                # anchors each activation once; callback jitter cannot punch
-                # holes in contiguous blocks. Real frame jumps remain holes.
-                first_frame = frame_end - len(data) // 2
+                first_frame = frame_end - frames
                 if first_frame < 0 or route.frame_end is not None and first_frame < route.frame_end:
-                    return
+                    return False
                 if route.frame_origin is None:
                     route.frame_origin = received - frame_end / rate
                 end = route.frame_origin + frame_end / rate
                 if end > received + .250:
-                    return
+                    return False
                 route.frame_end = frame_end
             else:
                 transit = received - send_clock / 1000.
                 route.clock_excess = transit if route.clock_excess is None else min(route.clock_excess, transit)
                 end = send_clock / 1000. + route.clock_excess
             if end <= route.last_sample:
-                return
+                return False
             route.receiving = True
             route.last_arrival = received
-            if scoring and route.scoring:
-                try:
-                    route.sender.send(struct.pack("<d", end) + pcm)
-                except (BlockingIOError, OSError):
-                    route.failed_blocks += 1
-                    return
             route.last_sample = end
-            route.seq = sequence
             route.sent += 1
-            timing = {"frame_end": frame_end, "send_ms": send_clock, "received_s": received}
-            if route.recording_on and route.recording_consent and scoring and route.scoring:
-                # The preceding block can contain warm-up samples. Use the
-                # end of the first admitted block as the conservative bound.
-                if route.authorized_start is None:
-                    route.authorized_start = end
-                self.last_authorized = (route.turn, route.authorized_start, end)
-                self.diagnostics.pcm("whisper", 16000, 1, pcm, capture_end=end, sequence=sequence,
-                                     packet_timing=timing, connection=route.connection, **route.context)
+            return True

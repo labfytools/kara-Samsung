@@ -11,18 +11,6 @@ from urllib.parse import unquote, urlsplit
 from gi.repository import GLib, Gtk, Pango
 
 
-SCORE_COLORS = ((243, 139, 168), (249, 226, 175), (166, 227, 161))
-ORIGINAL_VOICE_LEVELS = (0, 20, 50, 80)
-
-
-def score_color(score):
-    if score is None:
-        return "#a6adc8"
-    start, end = SCORE_COLORS[:2] if score < 50 else SCORE_COLORS[1:]
-    fraction = (score if score < 50 else score - 50) / 50
-    return "#" + "".join(f"{round(a + (b - a) * fraction):02x}" for a, b in zip(start, end))
-
-
 def search_key(text):
     return "".join(c for c in normalize("NFKD", text.casefold()) if not (0x300 <= ord(c) <= 0x36f))
 
@@ -40,13 +28,9 @@ class Song:
 class Singer:
     name: str
     song: Song | None = None
-    score: int | None = None
     done: bool = False
-    result: dict | None = None
     mobile_id: str | None = None  # Identifiant de session éphémère, jamais persisté.
     music_volume: int | None = None
-    training: bool = False
-    original_voice: int = 0
 
 
 def catalogue(database, library):
@@ -75,7 +59,6 @@ class Party:
         self.players = []
         self.active = None
         self.excluded = set()
-        self.unscored = set()
         self.error = ""
         try:
             names = json.loads(path.read_text())
@@ -123,9 +106,7 @@ class Party:
     def board(self):
         return [
             {"name": player.name, "song": player.song.title if player.song else "",
-             "score": player.score, "active": player is self.active,
-             "done": player.done, "mobile": player.mobile_id is not None,
-             "coverage": ((player.result or {}).get("summary") or {}).get("coverage")}
+             "active": player is self.active, "done": player.done, "mobile": player.mobile_id is not None}
             for player in self.players
         ]
 
@@ -138,7 +119,6 @@ class PlayersWindow(Gtk.Window):
         self.party = controller.party
         self.database = database
         self.library = library
-        self.score_labels = {}
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                        margin_top=16, margin_bottom=16, margin_start=18, margin_end=18)
         self.set_child(root)
@@ -157,27 +137,13 @@ class PlayersWindow(Gtk.Window):
         root.append(scroll)
 
         controls = Gtk.Box(spacing=8)
-        self.validate = Gtk.Button(label="Préparer la partie", css_classes=["suggested-action"])
-        self.validate.connect("clicked", controller.validate_party)
-        controls.append(self.validate)
-        self.skip = Gtk.Button(label="Écarter les morceaux en échec", visible=False)
-        self.skip.connect("clicked", controller.skip_failed)
-        controls.append(self.skip)
-        self.free = Gtk.Button(label="Autoriser le chant sans note", visible=False)
-        self.free.connect("clicked", controller.allow_unscored)
-        controls.append(self.free)
-        self.next = Gtk.Button(label="Tour suivant")
-        self.next.connect("clicked", self.start_next)
-        controls.append(self.next)
+        self.open = Gtk.Button(label="Ouvrir le salon", css_classes=["suggested-action"])
+        self.open.connect("clicked", controller.open_party)
+        controls.append(self.open)
         self.finish = Gtk.Button(label="Terminer le tour")
         self.finish.connect("clicked", lambda *_: controller.finish_turn(pause=True))
         controls.append(self.finish)
         root.append(controls)
-        self.record_next = Gtk.CheckButton(label="Enregistrer le prochain tour")
-        self.record_next.set_tooltip_text("Garde le signal du micro sur ce PC pour le diagnostic")
-        root.append(self.record_next)
-        self.align_progress = Gtk.ProgressBar(show_text=True, visible=False, css_classes=["alignment-progress"])
-        root.append(self.align_progress)
         self.message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
         root.append(self.message)
         self.refresh()
@@ -207,27 +173,13 @@ class PlayersWindow(Gtk.Window):
         self.message.set_text("")
         self.refresh()
 
-    def start_next(self, _button):
-        if self.controller.remote_party.locked:
-            return
-        player = self.party.next_player()
-        if player is not None:
-            self.controller.start_turn(player)
-
     def refresh(self):
-        editing = (self.party.active is None and not self.controller.validating
-                   and not self.controller.remote_party.locked)
-        ready = editing and self.controller.party_ready
-        self.record_next.set_sensitive(editing)
+        editing = self.party.active is None and not self.controller.remote_party.locked
         self.name.set_sensitive(editing)
         self.add_button.set_sensitive(editing)
-        self.validate.set_sensitive(editing and not ready and bool(self.party.players)
-                                    and all(player.song is not None for player in self.party.players))
-        self.skip.set_visible(editing and self.controller.can_skip_failed())
-        self.free.set_visible(editing and bool(self.controller.unscored_choices()))
+        self.open.set_sensitive(editing and self.controller.remote_party.can_open())
         while child := self.rows.get_first_child():
             self.rows.remove(child)
-        self.score_labels.clear()
         if not self.party.players:
             self.rows.append(Gtk.Label(label="Ajoute les joueurs de la partie.", xalign=0,
                                        css_classes=["lyrics-info"]))
@@ -241,95 +193,20 @@ class PlayersWindow(Gtk.Window):
                                     css_classes=["party-name"]))
             song = player.song
             detail = " · ".join(part for part in (song.title, song.artist) if part) if song else "Choisis une chanson"
-            if song and song.path in self.party.excluded:
-                detail += " · Écarté"
-            elif song and song.path in self.party.unscored:
-                detail += " · Chant sans note"
-            elif song:
-                status = self.controller.preparation_status(song.path)
-                if status:
-                    detail += f" · {status}"
             labels.append(Gtk.Label(label=detail, tooltip_text=detail, xalign=0,
                                     ellipsize=Pango.EllipsizeMode.END, css_classes=["lyrics-info"]))
             row.append(labels)
-            score = Gtk.Label(width_chars=6, xalign=1)
-            self.score_labels[player] = score
-            row.append(score)
-            choose = Gtk.Button(label="Choisir")
-            choose.set_sensitive(editing)
-            choose.connect("clicked", self.choose_song, player)
-            row.append(choose)
-            sing = Gtk.Button(label="Chanter sans note" if song and song.path in self.party.unscored else "Chanter")
-            sing.set_sensitive(ready and song is not None and song.path not in self.party.excluded)
-            sing.connect("clicked", lambda _button, singer=player: self.controller.start_turn(singer))
-            row.append(sing)
-            if player.result:
-                details = Gtk.Button(label="Détail")
-                details.connect("clicked", self.show_result, player)
-                row.append(details)
+            if player.mobile_id is None:
+                choose = Gtk.Button(label="Choisir")
+                choose.set_sensitive(editing)
+                choose.connect("clicked", self.choose_song, player)
+                row.append(choose)
             remove = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text=f"Retirer {player.name}")
             remove.set_sensitive(editing)
             remove.connect("clicked", self.remove, player)
             row.append(remove)
             self.rows.append(row)
-        self.next.set_sensitive(ready and self.party.next_player() is not None)
         self.finish.set_sensitive(self.party.active is not None)
-        self.refresh_scores()
-
-    def refresh_scores(self):
-        for player, label in self.score_labels.items():
-            points = "—" if player.score is None else f"{player.score} %"
-            summary = (player.result or {}).get("summary")
-            coverage = f" · {summary['coverage']} % évalués" if summary else ""
-            label.set_markup(f'<span weight="bold" foreground="{score_color(player.score)}">{points}</span>{coverage}')
-            label.set_tooltip_text(f"{summary['verified']}/{summary['total']} mots évalués" if summary else None)
-
-    def show_result(self, _button, player):
-        result = player.result
-        summary = result.get("summary")
-        if summary is None:
-            return
-        detail = Gtk.Window(title=f"Résultat · {player.name}", transient_for=self,
-                            default_width=580, default_height=450, destroy_with_parent=True)
-        scroll = Gtk.ScrolledWindow()
-        detail.set_child(scroll)
-        view = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD,
-                            left_margin=16, right_margin=16, top_margin=12)
-        scroll.set_child(view)
-        timing = f"{summary['timing']} %" if summary["timing"] is not None else "—"
-        score = "Score indisponible" if summary["score"] is None else f"Score {summary['score']} %"
-        lyrics = f"{summary['lyrics']} %" if summary["verified"] else "—"
-        text = [f"{score} · Paroles {lyrics} · Timing {timing}",
-                f"Couverture du tour {summary['coverage']} % · {summary['verified']}/{summary['total']} mots évalués",
-                f"Référence {summary['reference_coverage']} % · {summary['eligible']}/{summary['total']} mots évaluables",
-                f"{summary['correct']} corrects · {summary['incorrect']} incorrects",
-                f"{summary['unevaluable']} non évalués au total ({summary['unreliable_reference']} sans repère, "
-                f"{summary['uncertain']} incertains ou fenêtre écartée, {summary['not_assessed']} non traités)",
-                f"{summary['extras']} supplémentaires reconnus"]
-        labels = {"correct": "correct", "early": "en avance", "late": "en retard",
-                  "missing": "manquant", "incorrect": "incorrect", "extra": "en plus", "uncertain": "incertain"}
-        reasons = {"reference": "repère indisponible", "confidence": "confiance faible",
-                   "backing": "accompagnement dominant", "silence": "signal faible",
-                   "unverified": "source non vérifiée", "capture": "capture incomplète", "decoder": "échec de décodage"}
-        for index, line in sorted(result["lines"].items()):
-            text.append(f"\nLigne {index + 1}")
-            for word in line:
-                label = word["expected"] or word.get("heard", "")
-                status = labels[word["status"]]
-                if "heard" in word and word["expected"] and (word["status"] == "incorrect" or word["status"] == "uncertain"):
-                    status += f" ({word['heard']})"
-                start = word.get("expected_start")
-                if start is not None:
-                    status += f" · attendu {start:.2f} s"
-                if "start" in word:
-                    status += f" · reconnu {word['start']:.2f} s · confiance {word['confidence']:.2f}"
-                if "delay" in word:
-                    status += f" {word['delay']:+.2f} s"
-                if word.get("reason") in reasons:
-                    status += f" · {reasons[word['reason']]}"
-                text.append(f"{label} · {status}")
-        view.get_buffer().set_text("\n".join(text))
-        detail.present()
 
     def choose_song(self, _button, player):
         picker = Gtk.Window(title=f"Chanson pour {player.name}", transient_for=self, destroy_with_parent=True,
@@ -366,12 +243,12 @@ class PlayersWindow(Gtk.Window):
                 notice.set_text("Aucune chanson ne correspond.")
 
         def select(_list, row):
-            if self.controller.validating or self.party.active is not None:
+            if self.controller.remote_party.locked or self.party.active is not None:
                 return
             song = shown[row.get_index()]
             player.song = song
             self.controller.party_ready = False
-            player.score, player.done, player.result = None, False, None
+            player.done = False
             self.message.set_text(f"{song.title} sélectionné pour {player.name}")
             self.refresh()
             picker.close()

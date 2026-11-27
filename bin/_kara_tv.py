@@ -1,12 +1,14 @@
 """Sert une vue de la partie en lecture seule sur le réseau local."""
 from base64 import b64encode
 from collections import OrderedDict
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import IPv4Address, ip_network
 import json
 import os
 import re
 import ssl
+import stat
 import sys
 from pathlib import Path
 from secrets import compare_digest, token_hex
@@ -14,7 +16,7 @@ import subprocess
 from tempfile import NamedTemporaryFile
 from threading import BoundedSemaphore, RLock, Thread
 import time
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from _kara_mobile_room import MobileRoom, RoomError
 from _kara_paths import BIN, CONFIG, STATE
@@ -191,6 +193,47 @@ def rotating_context(fullchain, key):
     return initial
 
 
+def current_cover(track, art_url):
+    """Return a bounded inline image for the current MPRIS track.
+
+    Strawberry exports embedded art as a user-owned temporary file. Only
+    that format and the album's own sidecar may cross the TV boundary.
+    """
+    temp = Path(os.environ.get("TMPDIR", "/tmp")).resolve()
+    try:
+        url = urlsplit(art_url or "")
+        path = Path(unquote(url.path))
+    except ValueError:
+        url, path = urlsplit(""), Path()
+    candidates = []
+    if (url.scheme == "file" and url.netloc in ("", "localhost") and path.parent == temp
+            and re.fullmatch(r"strawberry-cover-[A-Za-z0-9_-]{1,64}\.(?:jpeg|jpg|png)", path.name)):
+        candidates.append(path)
+    if track:
+        candidates.extend(track.parent / name for name in ("cover.jpg", "cover.png"))
+    for candidate in candidates:
+        try:
+            with open(candidate, "rb", opener=lambda name, flags: os.open(
+                    name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)) as source:
+                info = os.fstat(source.fileno())
+                if (not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 524288
+                        or candidate.parent == temp and info.st_uid != os.getuid()):
+                    continue
+                data = source.read(524289)
+        except OSError:
+            continue
+        if len(data) > 524288:
+            continue
+        if data.startswith(b"\xff\xd8\xff"):
+            media = "image/jpeg"
+        elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+            media = "image/png"
+        else:
+            continue
+        return sha256(data).hexdigest()[:16], f"data:{media};base64," + b64encode(data).decode("ascii")
+    return "", ""
+
+
 class Receiver(RoomListener):
 
     def __init__(self, address, html, *, port=0, code=None, on_mobile=None,
@@ -205,6 +248,7 @@ class Receiver(RoomListener):
         self.mobile_html = mobile_html
         self.state = b"{}"
         self.state_no_qr = b"{}"
+        self.cover = "", ""
         self._state_lock = RLock()
         self.tv_reload = 0
         self.tv_close = 0
@@ -243,6 +287,9 @@ class Receiver(RoomListener):
                          .replace(b'__MOBILE_JOIN_URL__', self.join_url.encode('ascii')))
         self.room = MobileRoom(on_mobile, reserved_names, diagnostics=diagnostics, admin_code=admin_code)
         self.mobile_script = (BIN / "_kara_mobile.js").read_bytes() if commands else b""
+        if self.mobile_script:
+            revision = sha256(self.mobile_script).hexdigest()[:16].encode("ascii")
+            self.mobile_html = self.mobile_html.replace(b'src="mobile.js"', b'src="mobile.js?v=' + revision + b'"')
         try:
             self.qr = subprocess.check_output(
                 ('qrencode', '-t', 'PNG', '-s', '7', '-m', '3', '-o', '-', self.join_url), timeout=3)
@@ -261,12 +308,13 @@ class Receiver(RoomListener):
                 except (OSError, ValueError):
                     self.audio.failure = "Configuration de l’écouteur WSS invalide."
 
-    def update(self, state):
+    def update(self, state, *, cover=("", "")):
         with self._state_lock:
+            self.cover = cover
             # Révision persistante à travers les rafraîchissements de l’état.
             # Elle ne recrée pas la salle ni ses sessions mobiles.
             payload = {**state, 'tv_reload': self.tv_reload, 'tv_close': self.tv_close,
-                       'join_url': self.join_url}
+                       'join_url': self.join_url, 'cover_revision': self.cover[0]}
             self._update_states(payload)
 
     def _update_states(self, payload):
@@ -322,9 +370,9 @@ class Receiver(RoomListener):
         self.shutdown()
         self.server_close()
 
-    def tv_request(self, client=False, *, include_qr=True, secure_display=False):
-        if client:
-            with self._state_lock:
+    def tv_request(self, client=False, *, include_qr=True, secure_display=False, cover_revision=None):
+        with self._state_lock:
+            if client:
                 clock = time.monotonic()
                 if clock - self.tv_seen > 4 and self.diagnostics:
                     self.diagnostics.emit("television", "reconnect" if self.tv_seen else "connect",
@@ -332,16 +380,21 @@ class Receiver(RoomListener):
                 self.tv_seen = clock
                 if secure_display:
                     self.secure_tv_seen = clock
-        raw = self.state if include_qr else self.state_no_qr
-        if not secure_display:
+            raw = self.state if include_qr else self.state_no_qr
+            revision, cover = self.cover
+        if not secure_display and cover_revision is None:
             return raw
         state = json.loads(raw)
-        state["join_url"] = self.join_url
-        if include_qr:
-            state["qr_data"] = self.qr_data
-        if state.get("party_phase", "lobby") in ("lobby", "preparing", "ready"):
-            state["organizer_pin"] = self.room.current_admin_code()
-        return state
+        if cover_revision is not None and revision != cover_revision and cover:
+            state["cover_data"] = cover
+        if secure_display:
+            state["join_url"] = self.join_url
+            if include_qr:
+                state["qr_data"] = self.qr_data
+            if state.get("party_phase", "lobby") != "running":
+                state["organizer_pin"] = self.room.current_admin_code()
+            return state
+        return json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
 
     def tv_report(self, params):
         event = params.get("event", [""])[0]
@@ -437,17 +490,20 @@ class Page(BaseHTTPRequestHandler):
                 if (not self.server.tls or not receiver.display_key or not key.isascii()
                         or not compare_digest(key, "Bearer " + receiver.display_key)):
                     raise RoomError("Écran Kara non autorisé.", 403)
-                params = parse_qs(request.query)
+                params = parse_qs(request.query, keep_blank_values=True)
                 if path == DISPLAY_DIAGNOSTIC:
                     receiver.tv_report(params)
                     return self._send(200, {"ok": True})
                 include_qr = params.get("qr", ["1"])[0] != "0"
-                return self._send(200, receiver.tv_request(client=True, include_qr=include_qr, secure_display=True))
+                return self._send(200, receiver.tv_request(
+                    client=True, include_qr=include_qr, secure_display=True, cover_revision=params.get("cover", [None])[0]))
             if path == base:
                 return self._send(200, receiver.html, 'text/html')
             if path == base + '/etat':
-                include_qr = parse_qs(request.query).get("qr", ["1"])[0] != "0"
-                return self._send(200, receiver.tv_request(client=True, include_qr=include_qr), 'application/json-raw')
+                params = parse_qs(request.query, keep_blank_values=True)
+                include_qr = params.get("qr", ["1"])[0] != "0"
+                return self._send(200, receiver.tv_request(
+                    client=True, include_qr=include_qr, cover_revision=params.get("cover", [None])[0]), 'application/json-raw')
             if path == base + '/tv-diagnostic':
                 receiver.tv_report(parse_qs(request.query))
                 return self._send(200, {"ok": True})

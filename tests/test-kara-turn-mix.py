@@ -124,8 +124,7 @@ class ReturnTests(unittest.TestCase):
         room = RoomAudio(Mock())
         with patch.object(room, "_route_settings", return_value=("sink", "device", {
                 "volume_percent": 73, "profile": "balanced"})):
-            reader = room.open_turn("owner", "Joueur", "tour", "Titre", scoring=False)
-        self.addCleanup(reader.close)
+            room.open_turn("owner", "Joueur", "tour", "Titre")
         self.addCleanup(room.close_turn)
         route = room.route
         samples = shape_monitor(np.full(480, .1, dtype=np.float32), monitor_peak(True))
@@ -135,52 +134,6 @@ class ReturnTests(unittest.TestCase):
         self.assertLess(ROOM_MUSIC_BUDGET + monitor_peak(True), 1.)
         room.mute_return()
         self.assertFalse(room.apply_return(route, samples).any())
-
-    def test_frame_clock_preserves_continuity_gaps_and_microphone_gain_independence(self):
-        rows = []
-        diagnostics = SimpleNamespace(emit=lambda *a, **k: None,
-                                      pcm=lambda track, rate, channels, block, **k: rows.append((track, k)))
-        room = RoomAudio(diagnostics)
-        for rate in (44100, 48000):
-            with self.subTest(rate=rate):
-                rows.clear()
-                settings = {"volume_percent": 50, "profile": "balanced", "mic_gain_percent": 100,
-                            "chrome_echo": True, "chrome_noise": False}
-                with patch.object(room, "_route_settings", return_value=("bluez_output.test", "test", settings)):
-                    reader = room.open_turn("owner", "Joueur", "tour", "Titre")
-                try:
-                    route = room.route
-                    room.runner = object()
-                    room.ticket("owner", consent=True)
-                    self.assertTrue(room.attach(route, object()))
-                    room.record_playing(True)
-                    frames = rate // 100
-                    payload = struct.pack("<h", 500) * frames
-                    for sequence in range(400):
-                        # Main-thread dispatch jitters by a few milliseconds;
-                        # a single missing render packet has a real PCM gap.
-                        index = sequence + (sequence >= 200)
-                        received = 1000 + index * .010001 + (.002 if sequence % 2 else 0)
-                        room.pcm(route, payload, rate, received, index, 5., (index + 1) * frames)
-                        stamp, = struct.unpack_from("<d", first := reader.recv(649))
-                        self.assertAlmostEqual(stamp, 1000 + index * .01, places=9)
-                        if sequence == 0:
-                            reference = first[8:]
-                            room.volume(route, "100")
-                        self.assertEqual(first[8:], reference)
-                    previous = route.last_sample
-                    ws = route.claimed
-                    room.detach(route, ws, reason="background", code=1000)
-                    room.ticket("owner", consent=True)
-                    self.assertTrue(room.attach(route, object()))
-                    room.pcm(route, payload, rate, 1006., 0, 8., frames)
-                    stamp, = struct.unpack_from("<d", reader.recv(649))
-                    self.assertGreater(stamp - previous, 1.9)
-                    self.assertEqual(rows[-1][1]["packet_timing"]["frame_end"], frames)
-                finally:
-                    reader.close()
-                    room.close_turn()
-
 
 if __name__ == "__main__":
     unittest.main()

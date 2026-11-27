@@ -19,20 +19,13 @@ progress,meter{display:block;width:100%;height:13px;accent-color:var(--accent);m
 .mix-slider input[type=range]{accent-color:var(--accent);background:transparent;border:0;padding:0}
 @media(max-width:440px){.track{flex-wrap:wrap}.track .actions button{padding:6px 9px}.cover{width:38px;height:38px}}
 body{transition:background-color .8s ease;background-color:#181825}
-body[data-score=green]{background-color:#18352b}body[data-score=olive]{background-color:#303822}
-body[data-score=orange]{background-color:#47321f}body[data-score=red]{background-color:#45252d}
-#view-mic{background:#2c2b40;transition:background-color .8s ease}
-body[data-score=green] #view-mic{background-color:#234336}
-body[data-score=olive] #view-mic{background-color:#3b442b}
-body[data-score=orange] #view-mic{background-color:#4e3524}
-body[data-score=red] #view-mic{background-color:#4e2c37}
+
 @media(prefers-reduced-motion:reduce){*,*::before{animation-duration:1ms!important;transition:none!important}}
 .brand{display:flex;align-items:center;gap:10px}.brand img{width:40px;height:40px;border-radius:11px}
 .quiet{background:transparent;color:var(--muted);border-color:transparent}
 #pick,#open-room{width:100%;min-height:56px}.chosen{border-color:var(--accent);color:var(--accent)}
 .spinner{display:inline-block;width:1em;height:1em;border:.15em solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:-.12em}
 @keyframes spin{to{transform:rotate(360deg)}}
-#live-score{color:var(--accent);font-size:1.4rem;font-weight:700}
 #return-volume label{display:flex;justify-content:space-between}
 #commands{margin-bottom:12px}
 </style>
@@ -71,11 +64,11 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
 <section id="waiting" class="card hero" hidden>
   <h2 id="waiting-title"></h2><p id="waiting-song"></p><p id="waiting-detail" class="muted"></p>
   <div class="actions"><button id="edit-song">Changer de chanson</button><button id="add-song" class="quiet">Ajouter un morceau</button>
-  <button id="retry-song" hidden>Relancer la préparation</button></div>
+  <button id="retry-song" hidden>Vérifier le fichier</button></div>
   <details id="selected-songs" hidden><summary>Mes chansons</summary><div id="selection"></div></details>
 </section>
   <section id="view-mic" class="card hero" hidden>
-    <h2 id="turn-title"></h2><p id="turn-song"></p><p id="live-score"></p><p id="micro-status" class="muted">Le micro apparaît quand c’est ton tour.</p>
+    <h2 id="turn-title"></h2><p id="turn-song"></p><p id="micro-status" class="muted">Le micro apparaît quand c’est ton tour.</p>
     <label id="voice-consent-label" hidden><input id="voice-consent" type="checkbox">J’accepte la collecte audio BlackBox pendant l’essai et le tour<span id="witness-consent">, y compris le microphone témoin de la pièce</span></label>
     <button id="micro" class="primary mic-button" disabled>Activer le micro</button>
     <p id="return-output" class="muted"></p>
@@ -90,9 +83,6 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
     <div id="return-volume" hidden>
       <label for="live-music">Musique <output id="live-music-value"></output></label>
       <input type="range" id="live-music" min="0" max="100" value="100">
-      <label for="live-original">Chanteur original <output id="live-original-value"></output></label>
-      <input type="range" id="live-original" min="0" max="100" value="0">
-      <small id="live-guide-note" hidden>La notation signale les passages où l’attribution des paroles est incertaine.</small>
       <label for="voice">Ma voix <output id="voice-applied"></output></label>
       <input type="range" id="voice" min="0" max="100" step="1" value="60">
       <div class="actions"><button id="return-cut" class="danger">Couper le retour</button></div>
@@ -104,9 +94,9 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
           <option value="wrong-words">Paroles volontairement incorrectes</option><option value="duet">Chant avec l’artiste</option>
           <option value="music-volume">Changement du volume musical</option><option value="mic-volume">Changement du volume micro</option>
           <option value="rap">Rap rapide</option><option value="reggae">Reggae</option><option value="full-song">Chanson complète</option>
-          <option value="recognition">Turbo ne m’a pas reconnu</option><option value="return">Je n’entends pas mon retour</option>
+          <option value="return">Je n’entends pas mon retour</option>
           <option value="echo">Écho important</option><option value="display">Retard des paroles</option>
-          <option value="score">Problème de score</option><option value="dropout">Coupure audio</option>
+          <option value="dropout">Coupure audio</option>
         </select></label>
         <label>Commentaire facultatif <input id="mark-note" maxlength="240"></label>
         <button id="mark-live" class="quiet">Marquer ce moment</button>
@@ -115,7 +105,7 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
   </section>
 
 <section id="results" class="card" hidden>
-  <h2 id="result-title">Mon résultat</h2><div id="scores"></div><div id="ranking"></div>
+  <h2 id="result-title">Mes passages</h2><ul id="turn-history"></ul>
 </section>
   <section id="view-admin" class="card" hidden>
     <h2>Organisation</h2>
@@ -127,7 +117,6 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
       <details><summary>Réglages audio</summary><label for="music-volume">Volume général de la musique</label>
         <input type="range" id="music-volume" min="0" max="100" step="5" value="100">
         <form id="defaults-form" class="stack"><label>Musique par défaut <input name="music" type="number" min="0" max="100" required></label>
-        <label>Chanteur original par défaut <input name="original" type="number" min="0" max="100" required></label>
         <label>Retour vocal par défaut <input name="voice" type="number" min="0" max="100" placeholder="Profil de sortie" required></label>
         <button>Appliquer aux nouveaux joueurs</button></form><div id="sound-settings" hidden><label for="audio-profile">Profil de retour</label>
         <select id="audio-profile"><option value="device">Réglage de la sortie</option><option value="stable">Stable</option><option value="balanced">Équilibré</option><option value="low-latency">Faible latence</option></select>
@@ -139,8 +128,7 @@ body[data-score=red] #view-mic{background-color:#4e2c37}
       </details>
       <details open><summary>BlackBox</summary><p id="bb-status" class="muted"></p>
         <details><summary>Données collectées et prévol</summary><pre id="bb-preflight"></pre><fieldset id="bb-tracks"><legend>Pistes audio</legend></fieldset><p id="bb-disk"></p></details>
-        <label id="bb-voice-choice"><input type="checkbox" id="bb-voice">Deep Analysis · enregistrer les pistes sélectionnées pendant les tours, avec l’accord de chaque participant (prévoir 6 Go par heure de jeu)</label>
-        <label id="bb-mode-choice">Mode audio <select id="bb-mode"><option value="deep_analysis">Deep Analysis</option><option value="calibration">Calibration</option><option value="benchmark">Benchmark</option></select></label>
+        <label id="bb-voice-choice"><input type="checkbox" id="bb-voice">Enregistrer les pistes sélectionnées pendant les essais et les tours, avec l’accord de chaque participant (prévoir 6 Go par heure de jeu)</label>
         <button id="bb-control">Activer BlackBox</button></details>
     </div>
   </section>

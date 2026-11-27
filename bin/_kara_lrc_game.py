@@ -1,7 +1,6 @@
 """Read the library LRC as a display and, independently, scoring input."""
 from hashlib import sha256
 
-from _kara_words import LyricVocabulary, word_boundaries
 from _paroles_lrc import MAX_LRC_BYTES, playback_lrc
 
 
@@ -19,6 +18,8 @@ def read_source(song):
 
 
 def score_source(source, duration):
+    from _kara_words import LyricVocabulary, word_boundaries
+
     if source is None:
         return None
     _, digest, rows = source
