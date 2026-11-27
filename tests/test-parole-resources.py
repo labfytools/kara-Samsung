@@ -30,7 +30,7 @@ class ResourceTests(unittest.TestCase):
             runner = Maintenance(root, None, state=root / "state")
             self.addCleanup(runner.close)
             runner.night_running = True
-            for closed, expected in ((True, "12"), (False, "2")):
+            for closed, expected in ((True, "12"), (False, "12")):
                 runner.night.desktop = Desktop(True, True, closed, closed, False)
                 with patch("_parole_maintenance.run") as invoke:
                     runner.output([sys.executable, "-V"])
@@ -58,19 +58,19 @@ class ResourceTests(unittest.TestCase):
         for text in ("some avg10=2.08", "some avg10=nan\nfull avg10=0", "some avg10=0\nfull avg10=101"):
             with self.assertRaises(ValueError):
                 memory_psi(text)
-        self.assertEqual(memory_limits(closed=True, running=True), (None, None))
-        self.assertEqual(memory_limits(closed=True, running=False), (None, None))
-        self.assertEqual(memory_limits(closed=True, running=True, light=True), (None, None))
-        self.assertEqual(memory_limits(closed=False, running=True), (1., 1.))
+        self.assertEqual(memory_limits(nocturnal=True, running=True), (None, None))
+        self.assertEqual(memory_limits(nocturnal=True, running=False), (None, None))
+        self.assertEqual(memory_limits(nocturnal=True, running=True, light=True), (None, None))
+        self.assertEqual(memory_limits(nocturnal=False, running=True), (1., 1.))
 
     def test_closed_memory_reserves_twenty_percent(self):
         for running in (False, True):
-            self.assertEqual(memory_reserve(DEFAULTS, total_kib=15596740, closed=True, running=running), 3047)
-            self.assertEqual(memory_reserve(DEFAULTS, total_kib=16777216, closed=True, running=running), 3277)
+            self.assertEqual(memory_reserve(DEFAULTS, total_kib=15596740, nocturnal=True, running=running), 3047)
+            self.assertEqual(memory_reserve(DEFAULTS, total_kib=16777216, nocturnal=True, running=running), 3277)
         self.assertEqual(memory_reserve(DEFAULTS), DEFAULTS["memory_mib"])
         self.assertEqual(memory_reserve(DEFAULTS, running=True), DEFAULTS["running_memory_mib"])
         with self.assertRaises(ValueError):
-            memory_reserve(DEFAULTS, closed=True, total_kib=0)
+            memory_reserve(DEFAULTS, nocturnal=True, total_kib=0)
 
     def test_closed_running_memory_policy_and_cooldown(self):
         resources = Resources(Path("/fixture"))
@@ -110,12 +110,18 @@ class ResourceTests(unittest.TestCase):
             resources.disk_load.return_value = 100
             clock.return_value = 104.
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True))
-            self.assertEqual(resources.reason, "Mode capot fermé · calcul prioritaire")
+            self.assertEqual(resources.reason, "Mode nocturne · calcul prioritaire")
             readings[str(busy)] = "0"
             resources.disk_load.return_value = 0
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True, light=True))
             self.assertTrue(resources.check(DEFAULTS, running=True, nocturnal=True, lid=True))
+            self.assertTrue(resources.check(DEFAULTS, running=True, nocturnal=True, lid=False))
+            resources.session_idle.return_value = False
+            clock.return_value = 105.
+            resources.sample = 0.
             self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True, lid=False))
+            self.assertEqual(resources.reason, "Session active")
+            resources.session_idle.return_value = True
             # A full swap does not prevent starting or continuing with more
             # than 20% physical RAM available, even below the old 4-GiB floor.
             readings["/proc/meminfo"] = "MemTotal: 16777216 kB\nMemAvailable: 3460301 kB\nSwapTotal: 6291456 kB\nSwapFree: 0 kB"
@@ -168,14 +174,15 @@ class ResourceTests(unittest.TestCase):
                     "/proc/meminfo": "MemAvailable: 5570560 kB",
                     "/proc/pressure/memory": "some avg10=1.12 avg60=0.10 avg300=0.10 total=4\nfull avg10=0.10 avg60=0.10 avg300=0.10 total=4"}
         with (patch.object(Path, "read_text", lambda path: readings[str(path)]),
-              patch.object(Path, "glob", return_value=[])):
-            self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True))
+              patch.object(Path, "glob", return_value=[]),
+              patch.object(Path, "iterdir", return_value=[])):
+            self.assertFalse(resources.check(dict(DEFAULTS, battery=True), running=True))
             self.assertIn("PSI · 5440 Mio", resources.memory_detail)
             self.assertIn("1.12 %", resources.memory_detail)
             resources.sample = 0
             readings.update({"/proc/meminfo": "MemAvailable: 1310720 kB",
                              "/proc/pressure/memory": "some avg10=0.29 avg60=0.10 avg300=0.10 total=4\nfull avg10=0.10 avg60=0.10 avg300=0.10 total=4"})
-            self.assertFalse(resources.check(DEFAULTS, running=True, nocturnal=True))
+            self.assertFalse(resources.check(dict(DEFAULTS, battery=True), running=True))
             self.assertIn("réserve · 1280 Mio", resources.memory_detail)
             resources.check(DEFAULTS, busy=True, nocturnal=True)
             self.assertIsNone(resources.memory_detail)

@@ -822,9 +822,9 @@ class Maintenance:
         if self.state_root is not None:
             env["XDG_STATE_HOME"] = str(self.state_root)
         if self.night_running and import_owner is None:
-            # User-selected intensive policy while the secured lid is closed.
-            # Preserve the quieter policy when the screen can be used.
-            env["KARA_DEMUCS_THREADS"] = "12" if self.night.desktop and self.night.desktop.lid else "2"
+            # The nocturnal governor has checked the locked session, power
+            # and activity. Use the same compute budget with either lid state.
+            env["KARA_DEMUCS_THREADS"] = "12"
         # All input paths are program arguments; no shell evaluates titles or paths.
         retain = tuple(fd for fd in (self.owner, import_owner) if fd is not None)
         return run(command, stop=self.stopped if stop is None else stop, timeout=timeout, event=observer, env=env, maximum=maximum,

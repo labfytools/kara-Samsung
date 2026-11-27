@@ -69,7 +69,7 @@ def multimedia_active():
 
 
 # PSI is a stall-time indicator, not a fraction of RAM in use. For
-# unattended work with the lid closed, record stalls without treating
+# unattended nocturnal work, record stalls without treating
 # PSI alone as memory exhaustion. The absolute reserve remains mandatory.
 MEMORY_RETRY_SECONDS = 30.
 
@@ -91,13 +91,13 @@ def memory_psi(text):
     return values["some"], values["full"]
 
 
-def memory_limits(*, closed=False, running=False, light=False):
-    return (None, None) if closed else (1., 1.)
+def memory_limits(*, nocturnal=False, running=False, light=False):
+    return (None, None) if nocturnal else (1., 1.)
 
 
-def memory_reserve(settings, *, total_kib=None, closed=False, running=False):
+def memory_reserve(settings, *, total_kib=None, nocturnal=False, running=False):
     floor = min(settings["memory_mib"], settings["running_memory_mib"])
-    if closed:
+    if nocturnal:
         if total_kib is None or total_kib <= 0:
             raise ValueError("MemTotal indisponible")
         # Reserve at least 20% of the system's physical memory, rounded up
@@ -260,8 +260,8 @@ class Resources:
             available = int(next(line.split()[1] for line in meminfo
                                  if line.startswith("MemAvailable:"))) / 1024
             total_kib = (int(next(line.split()[1] for line in meminfo if line.startswith("MemTotal:")))
-                         if closed else None)
-            if available < 0 or (closed and available * 1024 > total_kib):
+                         if nocturnal else None)
+            if available < 0 or (nocturnal and available * 1024 > total_kib):
                 raise ValueError("Mémoire disponible invalide")
             pressure, full_pressure = memory_psi(Path("/proc/pressure/memory").read_text())
             gpus = [int(p.read_text()) for p in Path("/sys/class/drm").glob("card[0-9]*/device/gpu_busy_percent")]
@@ -280,14 +280,14 @@ class Resources:
             # During the task its own CPU/GPU/disk load is expected. User
             # activity, power, pressure, temperature and remaining space
             # still revoke admission and trigger process-group cleanup.
-            minimum = memory_reserve(settings, total_kib=total_kib, closed=closed, running=running)
-            some_limit, full_limit = memory_limits(closed=closed, running=running, light=light)
+            minimum = memory_reserve(settings, total_kib=total_kib, nocturnal=nocturnal, running=running)
+            some_limit, full_limit = memory_limits(nocturnal=nocturnal, running=running, light=light)
             pressure_ok = some_limit is None or (pressure < some_limit and full_pressure < full_limit)
             self.memory_observation = {"available_mib": available, "minimum_mib": minimum,
                                        "some_avg10": pressure, "full_avg10": full_pressure,
                                        "psi_advisory": some_limit is None}
             memory_ok = available >= minimum and pressure_ok
-            if closed and running and not light and not memory_ok:
+            if nocturnal and running and not light and not memory_ok:
                 self.memory_retry_at = now + MEMORY_RETRY_SECONDS
             for ok, reason in (
                 (idle, "Session active"), (power, "Alimentation secteur requise"),
@@ -302,7 +302,7 @@ class Resources:
                         # memory. Record both observations from this decision.
                         cause = ("réserve et PSI" if available < minimum and not pressure_ok
                                  else "réserve" if available < minimum else "PSI")
-                        thresholds = ("informatif, capot fermé" if some_limit is None else
+                        thresholds = ("informatif, mode nocturne" if some_limit is None else
                                       f"seuils some {some_limit:g} %, full {full_limit:g} %")
                         self.memory_detail = (f"{cause} · {available:.0f} Mio disponibles (minimum {minimum})"
                                               f" · PSI mémoire some avg10 {pressure:.2f} %,"
@@ -314,15 +314,15 @@ class Resources:
             self.can_continue = True
             # Network maintenance needs the same safety measurements and
             # launch memory floor, but does not need a free compute slot.
-            self.can_start_light = available >= memory_reserve(settings, total_kib=total_kib, closed=closed)
-            if closed and not running and now < self.memory_retry_at:
+            self.can_start_light = available >= memory_reserve(settings, total_kib=total_kib, nocturnal=nocturnal)
+            if nocturnal and not running and now < self.memory_retry_at:
                 self.reason = "Pause mémoire après interruption · reprise différée"
                 return light and self.can_start_light
-            # A secured closed lid on AC is dedicated to batch work. Load
-            # percentages are observations, not resource exhaustion. Keep
-            # thermal, memory, storage and foreground checks above.
-            if closed:
-                self.reason = "Mode capot fermé · calcul prioritaire"
+            # Night.check has already verified AC and the locked session.
+            # With the lid open, the idle check above remains mandatory.
+            # Load percentages do not prevent unattended nocturnal work.
+            if nocturnal:
+                self.reason = "Mode nocturne · calcul prioritaire"
                 self.can_start = self.can_start_light
                 return running or self.can_start
             for ok, reason in (

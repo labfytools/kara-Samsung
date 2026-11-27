@@ -37,3 +37,7 @@ Le mode intensif nocturne capot fermé transmet explicitement douze threads à D
 ### RAM à 80 %, swap sans seuil bloquant
 
 Capot fermé, la réserve de RAM devient dynamique : 20 % du `MemTotal` Linux, arrondis au Mio supérieur, avec conservation de la réserve minimale antérieure en cours de calcul si celle-ci est plus élevée. Ce seuil s’applique au démarrage et à la poursuite des tâches nocturnes. Avec 15 596 740 Kio de RAM détectée, la réserve est de 3 047 Mio. La mesure `MemAvailable` inclut la mémoire récupérable ; ce contrôle périodique n’est pas un quota strict de processus. Un swap entièrement occupé ne bloque pas à lui seul une tâche. Aucun changement de zram, du swap, des protections OOM ou des paramètres noyau. Le test simulant un swap à 100 % et les tests du seuil RAM passent ; l’endurance réelle n’a pas été qualifiée.
+
+### Même politique intensive dans les deux états du capot
+
+À compter du 27 novembre, les douze threads Demucs, les seuils de charge CPU/GPU/disque non bloquants, le PSI informatif et la réserve dynamique de 20 % de RAM s’appliquent à toute préparation nocturne admise. Capot ouvert, le verrouillage, l’inactivité Sway et le retour de l’utilisateur restent déterminants. Les limites thermiques distinctes, les protections secteur et disque ainsi que le mode ordinaire hors préparation nocturne restent inchangés. Tests simulés : mêmes règles sous charge capot ouvert et fermé, refus lorsque la session ouverte est active.
