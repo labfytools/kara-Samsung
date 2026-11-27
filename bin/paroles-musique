@@ -170,7 +170,9 @@ class RequestGate:
         if host == "lrclib.net":
             from _parole_sources import request_slot
 
-            slot = request_slot(host, self.remaining(8))
+            # Two searches may queue behind the serialized remote
+            # cadence. Leave room for that wait within the form budget.
+            slot = request_slot(host, self.remaining(20))
         else:
             slot = (resource_slot(RATE_DIRECTORY / "lyrics" / sha256(self.provider[1].encode()).hexdigest(),
                                   1, timeout=self.remaining(3)) if self.provider else nullcontext())
