@@ -70,7 +70,12 @@ def request_slot(host, timeout):
 
 def provider_limits(config):
     limits = config.get("rate", {})
-    daily, seconds = limits.get("daily", DEFAULT_REQUESTS), limits.get("seconds", 0)
+    # LRCLIB documents per-minute, not daily, allowances. Give its anonymous
+    # client a bounded local budget and a conservative 30-request/min pace.
+    # Explicit user settings and the transport's Retry-After still win.
+    lrclib = config.get("host") == "lrclib.net"
+    daily = limits.get("daily", 2000 if lrclib else DEFAULT_REQUESTS)
+    seconds = limits.get("seconds", 2 if lrclib else 0)
     if type(daily) is not int or not 0 <= daily <= 2000 or type(seconds) is not int or not 0 <= seconds <= 300:
         raise ValueError("Limites de recherche fournisseur invalides")
     return daily, seconds
@@ -100,8 +105,8 @@ def provider_policy(index, identity, *, validation=False):
     return daily, configured
 
 
-def ready_categories(index, now):
-    """Advisory admission only. Transport reserves the actual quota atomically."""
+def ready_sources(index, now):
+    """Advisory snapshot; the transport still reserves each request atomically."""
     with index.db(wait=.15) as db:
         rows = db.execute("""SELECT s.id,s.category,s.config,coalesce(u.used,0) AS used
                              FROM sources s LEFT JOIN daily_usage u
@@ -109,13 +114,21 @@ def ready_categories(index, now):
                              WHERE s.state='active' AND NOT EXISTS
                                (SELECT 1 FROM import_provider_limits l WHERE l.source=s.id AND l.until>?)""",
                           (date.fromtimestamp(now).isoformat(), now)).fetchall()
+    return {row["id"]: row for row in rows
+            if row["used"] < provider_limits(json.loads(row["config"]))[0]}
+
+
+def ready_categories(index, now):
     ready = set()
-    for row in rows:
-        daily, _ = provider_limits(json.loads(row["config"]))
-        if row["used"] < daily:
+    for identity, row in ready_sources(index, now).items():
+        if identity == "LyricDown":
+            # This adapter needs an existing text. It cannot keep the
+            # unrestricted LRC queue or unknown songs falsely eligible.
+            ready.add("lrc_text")
+        else:
             ready.update(row["category"].split(","))
-            if row["id"] == "MusicBrainz":
-                ready.add("musicbrainz")
+        if identity == "MusicBrainz":
+            ready.add("musicbrainz")
     return ready
 
 
@@ -162,6 +175,12 @@ def download_interval(index, identity, interval):
 
 def wait_provider(index, identity, host, interval, *, max_wait=5, validation=False, paced=False):
     daily, configured = provider_policy(index, identity, validation=validation)
+    now = time()
+    with index.db(wait=.15) as db:
+        if not index.can_reserve(db, "provider:" + identity, date.fromtimestamp(now).isoformat(), now, daily, 0):
+            raise ProviderUnavailable("Limite quotidienne du fournisseur atteinte")
+        if db.execute("SELECT 1 FROM import_provider_limits WHERE source=? AND until>?", (identity, now)).fetchone():
+            raise ProviderUnavailable("Fournisseur temporairement suspendu")
     if not paced:
         try:
             # Catalogue and audio share the host gate. Scheduled audio

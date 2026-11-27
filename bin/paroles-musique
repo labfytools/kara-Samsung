@@ -701,10 +701,11 @@ class LyricsSources:
         signature = (title, artist, album, duration, album_artist)
         if registry:
             from _parole_import_metrics import LOOKUP, SUCCEEDED, observe, snapshot
-            from _parole_sources import LyricsEndpoint, ProviderUnavailable, record
+            from _parole_sources import LyricsEndpoint, ProviderUnavailable, record, ready_sources
             with registry.db() as db:
                 providers = {r["id"]: r for r in db.execute("SELECT * FROM sources WHERE state='active'")}
             measured = snapshot(registry)
+            available = ready_sources(registry, time.time())
         else:
             providers = None
         clients = [
@@ -752,8 +753,8 @@ class LyricsSources:
                     if result == "":
                         instrumental = name
                     continue
-                if "limited_until" in measured.get(name, {}):
-                    failed = ServiceUnavailable("Fournisseur temporairement suspendu", "limited")
+                if name not in available or "limited_until" in measured.get(name, {}):
+                    failed = ServiceUnavailable("Fournisseur en pause ou quota atteint", "limited")
                     continue
             started = time.monotonic()
             client.failure = None
@@ -809,8 +810,8 @@ class LyricsSources:
                     if result is not None:
                         return result, row["id"]
                     continue
-                if "limited_until" in measured.get(row["id"], {}):
-                    failed = ServiceUnavailable("Fournisseur temporairement suspendu", "limited")
+                if row["id"] not in available or "limited_until" in measured.get(row["id"], {}):
+                    failed = ServiceUnavailable("Fournisseur en pause ou quota atteint", "limited")
                     continue
                 started = time.monotonic()
                 try:

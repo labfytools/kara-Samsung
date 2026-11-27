@@ -562,7 +562,7 @@ class SourceTests(Fixture):
         owner.output = Mock(wraps=owner.output)
         with self.index.db() as db:
             db.execute("""INSERT INTO daily_usage(bucket,day,used)
-                          SELECT 'provider:'||id,date('now','localtime'),200 FROM sources""")
+                          SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 2000 ELSE 200 END FROM sources""")
         settings = owner.current_settings = self.index.settings()
         self.index.enqueue("lrc", second["id"], "fixture")
         kinds = owner.network_kinds(settings, time())
@@ -641,7 +641,7 @@ class SourceTests(Fixture):
                 if not available:
                     with self.index.db() as db:
                         db.execute("""INSERT INTO daily_usage(bucket,day,used)
-                                      SELECT 'provider:'||id,date('now','localtime'),200 FROM sources""")
+                                      SELECT 'provider:'||id,date('now','localtime'),CASE WHEN id='LRCLIB' THEN 2000 ELSE 200 END FROM sources""")
                 settings = owner.current_settings = self.index.settings()
                 kinds = owner.network_kinds(settings, time())
                 self.assertEqual("lrc" in kinds, available)
@@ -738,6 +738,26 @@ class SourceTests(Fixture):
         self.assertEqual(query["release_id"], RELEASE)
         self.assertEqual(query["missing_tracks"], [[1, 2, "Outro"]])
 
+    def test_lyrics_quota_skips_network_but_keeps_local_text_provider_distinct(self):
+        from _parole_sources import configure_limits, provider_limits, ready_categories
+        seed(self.index)
+        self.assertEqual(provider_limits({"host": "lrclib.net"}), (2000, 2))
+        self.assertEqual(provider_limits({"host": "musicbrainz.org"}), (200, 0))
+        with self.index.db() as db:
+            db.execute("UPDATE sources SET state='disabled' WHERE id NOT IN ('LRCLIB','LyricDown')")
+        configure_limits(self.index, "LRCLIB", 1, 2)
+        self.assertTrue(self.index.reserve_daily("provider:LRCLIB", 1))
+        ready = ready_categories(self.index, time())
+        self.assertNotIn("lyrics", ready)
+        self.assertNotIn("lrc", ready)
+        self.assertIn("lrc_text", ready)
+        engine = lyrics_engine()
+        clients = engine.LyricsSources()
+        with patch.object(clients.lrc, "find", side_effect=AssertionError("quota épuisé")):
+            with self.assertRaises(engine.ServiceUnavailable):
+                clients.find("Chanson", "Groupe", "Album", 30, "Groupe", synced=False,
+                             registry=self.index, strict=True)
+
     def test_provider_quotas_and_intervals_are_independent(self):
         from _parole_sources import ProviderUnavailable, configure_limits, wait_provider
 
@@ -747,8 +767,10 @@ class SourceTests(Fixture):
         with patch("_parole_sources.wait_service") as host:
             wait_provider(self.index, "LRCLIB", "lrclib.net", .75)
             host.assert_called_with("lrclib.net", 6, max_wait=5)
+            host.reset_mock()
             with self.assertRaises(ProviderUnavailable):
                 wait_provider(self.index, "LRCLIB", "lrclib.net", .75)
+            host.assert_not_called()
             wait_provider(self.index, "MusicBrainz", "musicbrainz.org", 1.2)
             host.assert_called_with("musicbrainz.org", 1.2, max_wait=5)
             controls(self.index, "MusicBrainz", "disabled")

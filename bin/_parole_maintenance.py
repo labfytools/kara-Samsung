@@ -778,7 +778,18 @@ class Maintenance:
             msg = {"temporary": "Publication ou moteur temporairement indisponible",
                    "network": "Erreur réseau", "unavailable": "Fournisseur indisponible",
                    "limited": "Limitation du fournisseur"}[outcome]
-            self.journal.emit(kind.upper(), msg, "WARNING")
+            if outcome != "limited":
+                self.journal.emit(kind.upper(), msg, "WARNING")
+            else:
+                # Every task still records its own deferred outcome and
+                # counters, but the same provider episode should not flood
+                # the console once for every song.
+                notices = getattr(self, "provider_notices", {})
+                now = monotonic()
+                if now >= notices.get(kind, -60.) + 60.:
+                    self.journal.emit(kind.upper(), msg + " · recherches différées selon les quotas", "WARNING")
+                    notices[kind] = now
+                self.provider_notices = notices
             return "temporary", msg, min(DAY, 120 * 2**min(task["attempts"], 9))
         elif outcome == "ambiguous":
             self.queue_codex(kind, identity, "correspondances classiques ambiguës")
@@ -1073,7 +1084,8 @@ class Maintenance:
         # Retain a verified provider response across Demucs/Turbo cancellation.
         # Audio/sidecar edits and changed enabled sources invalidate that reply.
         local_text = sidecar(path, ".txt")[1] or json.loads(song["info"]).get("plain", "")
-        available = ready_categories(self.index, time()) & {"lyrics", "lrc"}
+        available = ready_categories(self.index, time()) & {"lyrics", "lrc", "lrc_text"}
+        timed_ready = "lrc" in available or ("lrc_text" in available and bool(local_text.strip()))
         with self.index.db() as db:
             sources = [tuple(row) for row in db.execute(
                 "SELECT id,config FROM sources WHERE state='active' ORDER BY id")]
@@ -1084,7 +1096,7 @@ class Maintenance:
         if receipt and time() - receipt["checked"] < REFERENCE_REUSE_SECONDS:
             saved = json.loads(receipt["value"])
             lrc_deferred = saved.pop("lrc_deferred", False)
-            if saved.pop("revision", None) == revision and not (lrc_deferred and "lrc" in available):
+            if saved.pop("revision", None) == revision and not (lrc_deferred and timed_ready):
                 return saved
 
         def lookup(kind, *, local_only=False):
@@ -1100,7 +1112,7 @@ class Maintenance:
 
         result = {"state": "not_found"}
         if settings["lrc"]:
-            if "lrc" in available:
+            if timed_ready:
                 self.journal.emit("LRC", f"Dernière recherche de minutage · {song['title']}")
                 result = lookup("prepare_lrc")
             elif song["lrc"] == "intégré" or song["audio"]:
@@ -1128,7 +1140,7 @@ class Maintenance:
                 and result.get("source") != LOCAL_SOURCE):
             # A plain fallback is reusable while timed providers wait. Once
             # they reopen, give timing another chance before generating it.
-            deferred = result.get("mode") == "plain" and settings["lrc"] and "lrc" not in available
+            deferred = result.get("mode") == "plain" and settings["lrc"] and not timed_ready
             self.index.review("prepare_reference", song["id"], result["state"],
                               dict(result, revision=revision, lrc_deferred=deferred))
         return result
@@ -1744,6 +1756,11 @@ class Maintenance:
         reference_provider_ready = "lrc" in kinds or (settings["generate"] and "lyrics" in kinds)
         local_preparation = None if reference_provider_ready else (settings["lrc"], settings["generate"])
         prepare_due = self.index.preparation_due(now, local_preparation=local_preparation)
+        if (not prepare_due and not transcription_due and local_preparation is not None
+                and settings["night_transcribe"]):
+            transcription_due = self.index.queue_offline_transcription(now)
+            if transcription_due:
+                self.journal.emit("TRANSCRIPTION", "Fournisseurs en attente · brouillon local planifié")
         # Offer the other class the next turn. A bounded network batch
         # alternates with one song, so neither class can starve the other.
         order = (True, False) if self.night_network_next else (False, True)

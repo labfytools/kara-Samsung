@@ -11,6 +11,7 @@
 - Utiliser douze threads Demucs en mode nocturne capot fermé.
 - Réserver 20 % de la RAM disponible au système capot fermé, sans seuil d’occupation du swap.
 - Appliquer le mode intensif aux préparations nocturnes capot ouvert comme fermé.
+- Adapter le budget LRCLIB à sa documentation, écarter les fournisseurs épuisés avant les requêtes et planifier des brouillons locaux en repli.
 
 - Afficher en parallèle les débits et la vérification USB ainsi que l’indexation Android, avec un bilan des temps par phase dans la console.
 - Publier les pistes vérifiées pendant les transferts suivants et livrer leur reçu à l’index V2 dès le tri.

@@ -435,6 +435,24 @@ class Index:
                         return started
         return None
 
+    def queue_offline_transcription(self, now):
+        # When remote references cannot be searched, propose one draft at a
+        # time. Do not mark lyrics absent or consume the original search task.
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT s.id,s.token,s.side,s.plays
+                                FROM tasks p JOIN songs s ON s.id=p.subject
+                                WHERE p.kind='prepare' AND p.state IN ('queued','suspended','temporary')
+                                AND p.due<=? AND s.lyrics='absent' AND s.lrc='absent'
+                                AND s.duration BETWEEN 1 AND 3600
+                                AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.kind='transcription' AND t.subject=s.id)
+                                AND NOT EXISTS (SELECT 1 FROM exclusions e WHERE e.kind='artist' AND e.subject=s.owner)
+                                ORDER BY p.priority,p.due,p.subject LIMIT 1""", (now,)).fetchone()
+            if row is None:
+                return False
+            return self.enqueue("transcription", row["id"], encoded_key(row["token"], row["side"], "v1"),
+                                priority=20 if row["plays"] else 35, now=now, db=db)
+
     def preparation_due(self, now, *, local_preparation=None):
         return self.work_due(("prepare",), now, local_preparation=local_preparation)
 

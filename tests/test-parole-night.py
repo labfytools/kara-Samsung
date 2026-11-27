@@ -478,6 +478,8 @@ class NightTests(unittest.TestCase):
 
     def test_offline_preparation_spends_its_turn_on_local_text(self):
         index = self.owner.index
+        index.configure(night_transcribe=False)
+        self.settings = self.owner.current_settings = index.settings()
         missing, local = (index.root / name for name in ("inconnue.opus", "texte.opus"))
         for path in (missing, local):
             path.write_bytes(b"fixture")
@@ -505,6 +507,28 @@ class NightTests(unittest.TestCase):
         with patch("_parole_maintenance.ready_categories", return_value={"lrc"}):
             self.assertTrue(self.owner.tick_night(self.settings, time()))
             self.assertEqual(prepare.call_args.args[0]["subject"], unknown)
+
+    def test_offline_transcription_keeps_original_search_and_preparation_tasks(self):
+        index = self.owner.index
+        path = index.root / "inconnue.opus"
+        path.write_bytes(b"fixture")
+        inventory(index, None, lambda *_: ("", "absent", {}), lambda: False, lambda *_: None,
+                  paths=[path], reader=lambda p: ({"title": p.stem, "artist": "Artiste", "duration_seconds": 5}, {}))
+        with index.db() as db:
+            song = db.execute("SELECT id FROM songs").fetchone()[0]
+        at = time()
+        index.enqueue("prepare", song, "fixture", now=at)
+        index.enqueue("lyrics", song, "fixture", now=at)
+        self.owner.transcribe_task = Mock(return_value=("review", "brouillon à vérifier", 0))
+        with patch("_parole_maintenance.ready_categories", return_value=set()):
+            self.assertTrue(self.owner.tick_night(self.settings, at))
+            self.owner.transcribe_task.assert_called_once()
+            self.assertFalse(self.owner.tick_night(self.settings, time()))
+        with index.db() as db:
+            states = dict(db.execute("SELECT kind,state FROM tasks"))
+        self.assertEqual(states["prepare"], "queued")
+        self.assertEqual(states["lyrics"], "queued")
+        self.assertEqual(states["transcription"], "review")
 
     def test_missing_references_enqueue_a_resumable_review_without_publication(self):
         path = self.owner.index.root / "song.opus"
