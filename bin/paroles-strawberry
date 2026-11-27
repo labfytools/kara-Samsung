@@ -25,7 +25,8 @@ from _kara_acoustic_capture import AcousticCapture
 from _kara_blackbox import BlackBox, digest
 from _kara_blackbox_lyrics import record as record_lyrics, snapshot as lyrics_snapshot
 from _kara_chronos import ENGINES as CHRONOS_ENGINES, cache_path as chronos_path
-from _kara_chronos import display_index as chronos_index, displayable, playback_experiment
+from _kara_chronos import display_index as chronos_index
+from _kara_chronos import displayable, playback_experiment, playback_lines
 from _kara_preparation_error import error_details
 from _parole_transcribe import NAME as DRAFT_FILE
 from _kara_remote_party import RemoteParty
@@ -2415,7 +2416,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.refresh_game()
         self.active = -1
         self.highlight = -1
-        experimental = self.chronos_reference["lines"] if self.chronos_reference else None
+        experimental = playback_lines(self.chronos_reference) if self.chronos_reference else None
         self.chronos_times, self.chronos_indices = chronos_index(experimental or ())
         self.view_lyrics = [line["text"] for line in experimental] if experimental else self.lyrics
         for index, text in enumerate(self.view_lyrics):
@@ -2437,11 +2438,14 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 return "Minutage historique · CHRONOS indisponible"
             return ""
         count = len(self.chronos_indices)
-        if self.chronos_reference["engine"] == "LRC":
-            return f"Minutage LRC · {count}/{len(self.view_lyrics)} lignes"
         if self.chronos_reference.get("source", {}).get("kind") == "generated-transcription":
             engine = self.chronos_reference["engine"]
             return f"Paroles générées · expérimentales · {count}/{len(self.view_lyrics)} lignes repérées ({engine})"
+        if self.chronos_reference["engine"] == "LRC":
+            return f"Minutage LRC · {count}/{len(self.view_lyrics)} lignes"
+        if "display_lines" in self.chronos_reference:
+            observed = sum(line["status"] == "experimental" for line in playback_lines(self.chronos_reference))
+            return f"Minutage CHRONOS et LRC · {observed}/{count} débuts de ligne CHRONOS"
         return (f"Minutage CHRONOS expérimental · {count}/{len(self.view_lyrics)} lignes repérées"
                 if count else "CHRONOS · aucun début de ligne corroboré")
 
@@ -2468,7 +2472,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         # song selection cannot change the display evidence for this turn.
         reference = self.active_reference
         experiment = self.chronos_reference
-        displayed = ([[line["start"], line["text"]] for line in experiment["lines"]] if experiment
+        displayed = ([[line["start"], line["text"]] for line in playback_lines(experiment)] if experiment
                      else list(zip(self.times, self.lyrics)))
         plain = self.tag_text
 
@@ -2507,11 +2511,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                  and experiment["audio_sha256"] == files["original"]["sha256"] else {})
                     if generated.get("original") and not reference:
                         original_text = generated["original"]
-                        source = generated.get("provider") or generated["kind"]
+                        kind = generated["kind"]
+                        source = kind if kind == "generated-transcription" else generated.get("provider") or kind
                     document = lyrics_snapshot(files, source, original_text, displayed, reference)
                     if generated.get("transcription"):
                         document["transcription"] = generated["transcription"]
-                    document["chronos"] = experiment if experiment and experiment["engine"] in CHRONOS_ENGINES else None
+                    document["chronos"] = ({key: value for key, value in experiment.items() if key != "display_lines"}
+                                           if experiment and experiment["engine"] in CHRONOS_ENGINES else None)
                     from _parole_lyrics_lookup import playback_candidates
 
                     if candidates := playback_candidates(original, LIBRARY):
@@ -2593,7 +2599,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             # are diagnostic and a refused word cannot advance the highlight.
             from re import finditer
             prefix = 0
-            line = self.chronos_reference["lines"][active]
+            line = playback_lines(self.chronos_reference)[active]
             for match, word in zip(finditer(r"\S+", text), line["words"]):
                 if word["start"] is None or word["start"] > position:
                     break

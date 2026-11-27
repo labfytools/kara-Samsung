@@ -48,6 +48,27 @@ class ChronosTests(unittest.TestCase):
         self.assertEqual(reference_lines({"original": text, "timed": True}), ["Two", "One"])
         self.assertEqual(reference_lines({"original": "\ufeffOne\n\nTwo", "timed": False}), ["One", "Two"])
 
+    def test_partial_chronos_uses_lrc_without_altering_the_acoustic_evidence(self):
+        from _kara_chronos import display_receipt, playback_lines
+
+        # The late proposal for line three belongs outside that line's
+        # source interval. The earlier line still keeps its observed onset.
+        raw = [
+            {"start": 1.2, "text": "One", "status": "experimental"},
+            {"start": None, "text": "Two", "status": "absent"},
+            {"start": 6.9, "text": "Three", "status": "experimental"},
+            {"start": None, "text": "Four", "status": "absent"},
+        ]
+        source = {"timed": True, "original": "[00:01]One\n[00:03]Two\n[00:05]Three\n[00:07]Four"}
+        receipt = {"engine": "huang", "status": "experimental", "source": source, "duration": 8., "lines": raw}
+        view = display_receipt(receipt)
+        self.assertIs(view["lines"], raw)
+        self.assertEqual(display_index(playback_lines(view)), ([1.2, 3., 5., 7.], [0, 1, 2, 3]))
+        self.assertEqual([line["status"] for line in playback_lines(view)],
+                         ["experimental", "source-timing", "source-timing", "source-timing"])
+        changed = dict(receipt, source={**source, "original": "[00:01]Other edition"})
+        self.assertIs(display_receipt(changed), changed)
+
     def test_project_uses_measured_clock_and_seek_breaks_continuity(self):
         turn = "4" * 16
         def clock(t, pos):
@@ -206,7 +227,7 @@ class ChronosTests(unittest.TestCase):
             self.assertIsNone(subject.align_job)
 
     def test_timed_source_survives_engine_and_score_failures_without_duplicate_work(self):
-        from _kara_chronos import playback_experiment
+        from _kara_chronos import playback_experiment, playback_lines
         from _kara_prepare import PreparedCache, Preparer, prepare_chronos_track
 
         with TemporaryDirectory() as directory:
@@ -239,14 +260,14 @@ class ChronosTests(unittest.TestCase):
                 playback = playback_experiment(song, preparer.cache, "huang")
                 self.assertEqual(playback["engine"], "LRC")
                 self.assertEqual(playback["source"]["provider"], "LRCLIB")
-                self.assertEqual(display_index(playback["lines"]), ([1., 3.], [0, 1]))
-                self.assertEqual([line["text"] for line in playback["lines"]], ["Hello night", "Again"])
+                self.assertEqual(display_index(playback_lines(playback)), ([1., 3.], [0, 1]))
+                self.assertEqual([line["text"] for line in playback_lines(playback)], ["Hello night", "Again"])
                 song.with_suffix(".lrc").write_text("[00:02]An edition from a human")
                 self.assertIsNone(playback_experiment(song, preparer.cache, "huang"))
             self.assertFalse(preparer.cache.folder(song).exists())
 
     def test_generated_draft_uses_private_reference_and_stays_outside_score(self):
-        from _kara_chronos import playback_experiment, source_for
+        from _kara_chronos import cache_path, playback_experiment, source_for
         from _kara_prepare import PreparedCache, file_token
         from _parole_transcribe import NAME
 
@@ -270,11 +291,18 @@ class ChronosTests(unittest.TestCase):
                 self.assertIsNone(playback_experiment(song, cache, ""))
                 source = source_for(song, cache, include_draft=True)
                 result = {**alignment(), "source": source, "engine": "huang", "version": 1,
-                          "audio_sha256": digest(song), "status": "experimental", "implementation": implementation()}
+                          "audio_sha256": digest(song), "status": "experimental", "implementation": implementation(),
+                          "duration": 5.}
                 with patch("_kara_chronos.calculate", return_value=result) as calculate:
                     prepare(song, cache, "huang", supplied=source, allow_demucs=False)
                     self.assertFalse(calculate.call_args.kwargs["allow_demucs"])
                     self.assertEqual(playback_experiment(song, cache, "wav2vec2")["engine"], "huang")
+                failed = {**result, "status": "abstained",
+                          "lines": rows_for(["Hello night"], [None, None], 5.)}
+                path = cache_path(song, "huang")
+                saved = json.loads(path.read_text())
+                path.write_text(json.dumps(saved | failed))
+                self.assertEqual(playback_experiment(song, cache, "huang")["engine"], "Turbo")
                 draft["timed"] = "[00:02.00]Hello night"
                 manifest.write_text(json.dumps(draft))
                 self.assertIsNone(cached(song, "huang", cache=cache))

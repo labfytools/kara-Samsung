@@ -2,6 +2,7 @@
 
 ## En développement
 
+- Compléter les débuts de ligne CHRONOS manquants avec ceux du LRC lorsque le texte correspond.
 - Consigner les erreurs et protections de la préparation CHRONOS, Turbo et Demucs dans BlackBox, avec leurs étapes et codes de sortie disponibles.
 - Préparer le minutage CHRONOS d’une partie pendant la lecture, réutiliser le LRC et proposer le chant sans note lorsque seule la synchronisation est disponible.
 - Générer les paroles manquantes d’un artiste dans la file Parole, proposer une relecture ciblée et permettre le chant expérimental sans note sur le mix original. Conserver la provenance dans CHRONOS et BlackBox.

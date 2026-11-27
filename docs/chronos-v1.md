@@ -16,9 +16,13 @@ résultats acoustiques conservent aussi l’empreinte du PCM. Huang peut
 s’appuyer sur son contraste phonétique lorsqu’une demande de partie
 dispose d’un LRC exploitable. Les repères du LRC sont réservés à
 l’affichage. Les mots et lignes sans repère acoustique corroboré gardent
-un temps absent dans le résultat CHRONOS. Quand CHRONOS ne fournit aucun
-début de ligne exploitable, Kara utilise les débuts du LRC ou du brouillon
-timé et indique cette provenance dans le lecteur.
+un temps absent dans le résultat CHRONOS. Lorsque le calage CHRONOS est
+partiel et que les deux versions ont le même texte dans le même ordre,
+l’affichage complète les débuts de ligne avec le LRC. Chaque début
+CHRONOS retenu reste entre les milieux qui le séparent des lignes source
+voisines. BlackBox conserve les résultats acoustiques et le défilement
+effectif séparément. Quand CHRONOS ne fournit aucun début de ligne
+exploitable, Kara utilise les débuts du LRC ou du brouillon minuté.
 
 Une préparation avec un LRC exploitable réutilise une référence de
 notation Turbo valide si elle existe. **Relancer l’analyse Turbo** ou
@@ -150,3 +154,20 @@ Les captures de vérification utilisent des événements de joueur
 synthétiques. Une partie consentie avec un joueur reste nécessaire pour
 qualifier la capture microphone en conditions réelles, la justesse
 volontairement fausse et les écarts physiques de lecture ou d’affichage.
+
+## Qualification de la préparation Wejdene
+
+Sur la capture `session-20261127T172801-88224449cb28`, LRCLIB avait fourni
+37 lignes Enhanced LRC. Turbo a échoué à 145,96 s après le raffinement
+vocal. Le journal de cette version ne contient pas le diagnostic du
+moteur. CHRONOS a ensuite été refusé parce qu’un flux jouait pendant
+cette préparation hors partie.
+
+La vérification locale a réutilisé le fichier audio réel et le LRC de
+la capture, avec un flux PulseAudio silencieux actif. La demande hors
+partie a conservé le refus de lecture et les 37 repères LRC. La demande
+de partie a pris 9,7 s via le chemin GTK. Le défilement a retenu
+11 débuts corroborés par Huang et 26 repères du LRC. Le contrôle du tour
+a vérifié l’ouverture du mix original et l’absence de notation avec
+un adaptateur de lecture de test. Il ne mesure pas le rendu physique
+sur écran ou au microphone.

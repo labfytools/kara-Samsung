@@ -98,16 +98,37 @@ def timed_lines(source, duration):
              "reason": "lrc-line-onset"} for stamp, text in rows]
 
 
+def playback_lines(experiment):
+    return experiment.get("display_lines", experiment["lines"])
+
+
 def displayable(experiment):
-    return bool(experiment and display_index(experiment["lines"])[0])
+    return bool(experiment and display_index(playback_lines(experiment))[0])
 
 
 def display_receipt(result):
-    if result and result["status"] in ("abstained", "source-timing"):
-        lines = timed_lines(result["source"], result["duration"])
-        if lines:
-            return dict(result, engine="LRC", status="source-timing", lines=lines)
-    return result
+    lines = result["lines"]
+    if result["status"] == "experimental" and all(line["start"] is not None for line in lines):
+        return result
+    timed = timed_lines(result["source"], result["duration"])
+    if not timed:
+        return result
+    if result["status"] in ("abstained", "source-timing"):
+        return dict(result, engine="LRC", status="source-timing", display_lines=timed)
+    if [line["text"] for line in timed] != [line["text"] for line in lines]:
+        return result
+
+    # Keep each line in its own interval around the supplied onset. This
+    # leaves the display ordered even when adjacent acoustic marks disagree
+    # with the source clock. The raw result remains available to BlackBox.
+    display = []
+    for i, (line, fallback) in enumerate(zip(lines, timed, strict=True)):
+        start = line["start"]
+        onset = fallback["start"]
+        left = (timed[i - 1]["start"] + onset) / 2 if i else 0
+        right = (onset + timed[i + 1]["start"]) / 2 if i + 1 < len(timed) else result["duration"]
+        display.append(line if start is not None and left <= start < right else fallback)
+    return dict(result, display_lines=display)
 
 
 def cache_path(song, engine):
@@ -160,13 +181,17 @@ def playback_experiment(song, cache, engine, *, before=None):
         return None
     experiment = cached(song, engine, cache=cache)
     if experiment:
-        return display_receipt(experiment)
+        experiment = display_receipt(experiment)
+        if experiment["source"]["kind"] != "generated-transcription" or displayable(experiment):
+            return experiment
     if before[1] or before[2]:
         return None
-    if engine != "huang":
+    if engine != "huang" and not experiment:
         candidate = cached(song, "huang", cache=cache)
-        if candidate and candidate.get("source", {}).get("kind") == "generated-transcription":
-            return display_receipt(candidate)
+        if candidate and candidate["source"]["kind"] == "generated-transcription":
+            experiment = display_receipt(candidate)
+            if displayable(experiment):
+                return experiment
     from _parole_transcribe import draft_display
 
     return draft_display(cache, song, before)
