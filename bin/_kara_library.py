@@ -3,17 +3,17 @@
 Ne lit jamais de fichier directement : Strawberry reste l'unique lecteur audio.
 Lecture, file d'attente et navigation disponibles sans activer le jeu.
 """
+from dataclasses import dataclass
 from pathlib import Path
 from heapq import merge
 import sqlite3
 import time
+from unicodedata import normalize
 from urllib.parse import urlsplit, unquote
 
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk, Pango, Gdk
-
-from _kara_party import Song, search_key
 
 PLAYER = 'org.mpris.MediaPlayer2.strawberry'
 OBJECT = '/org/mpris/MediaPlayer2'
@@ -22,6 +22,19 @@ TRACKLIST = 'org.mpris.MediaPlayer2.TrackList'
 PROPERTIES = 'org.freedesktop.DBus.Properties'
 NO_TRACK = '/org/mpris/MediaPlayer2/TrackList/NoTrack'
 PAGE_SIZE = 60
+
+
+def search_key(text):
+    return "".join(c for c in normalize("NFKD", text.casefold()) if not (0x300 <= ord(c) <= 0x36f))
+
+
+@dataclass(frozen=True)
+class Song:
+    path: Path
+    title: str
+    artist: str
+    album: str
+    duration: float | None = None
 
 
 def all_songs(database, library):

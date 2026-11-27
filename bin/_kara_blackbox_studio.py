@@ -118,10 +118,9 @@ class BlackBoxStudio(Gtk.Window):
         return GLib.SOURCE_CONTINUE
 
     def mark(self, *_):
-        context = self.owner.turn_context()
         position = self.owner.base_position + (monotonic() - self.owner.updated) * self.owner.rate
         self.owner.blackbox.mark(self.markers[self.marker.get_selected()], self.note.get_text(),
-                                 **context, position=position)
+                                 position=position)
         self.note.set_text("")
 
     def session_page(self):

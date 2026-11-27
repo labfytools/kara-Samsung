@@ -76,17 +76,16 @@
     }
     var panel = element("screen");
     var connect = element("connect");
-    var endpoint = "https://kara.labfytools.com:8443/tv/etat";
+    var endpoint = window.KARA_DISPLAY_ENDPOINT || "https://kara.labfytools.com:8443/tv/etat";
     var key = window.KARA_DISPLAY_KEY;
     var timer, request, retryDelay = 750;
     var lastRendered;
 
     function diagnostic(event, details) {
-        if (!key) return;
         try {
             var xhr = new XMLHttpRequest();
             xhr.open("GET", endpoint.replace(/\/etat$/, "/diagnostic") + "?event=" + event + (details || ""), true);
-            xhr.setRequestHeader("Authorization", "Bearer " + key);
+            if (key) xhr.setRequestHeader("Authorization", "Bearer " + key);
             xhr.timeout = 1400;
             xhr.send();
         } catch (error) {}

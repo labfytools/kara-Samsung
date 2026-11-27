@@ -1,13 +1,11 @@
 #!/usr/bin/python3 -B
-"""Gestion de la bibliothèque Parole et contrôleur de session Kara."""
+"""Gestion de la bibliothèque Parole et affichage Kara pour Strawberry."""
 
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
-import json
-from math import ceil, isfinite
+from math import ceil
 import os
 from pathlib import Path
-from secrets import token_hex
 import signal
 import sqlite3
 import subprocess
@@ -20,19 +18,12 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 
-from _kara_acoustic_capture import AcousticCapture
 from _kara_blackbox import BlackBox, digest
 from _kara_blackbox_lyrics import record as record_lyrics, snapshot as lyrics_snapshot
-from _kara_lrc_game import read_source
-from _kara_remote_party import RemoteParty
-from _kara_room_audio import RoomAudio
-from _kara_mobile_imports import MobileImports
-from _kara_mobile_room import RoomError
-from _kara_monitor_profiles import ROOM_MUSIC_BUDGET
+from _kara_lrc import read_source
 from _kara_files import lrc_token
 from _kara_timing import LyricTiming
-from _kara_party import Party, PlayersWindow, Singer, Song, catalogue, search_key
-from _kara_library import MusicLibraryWindow
+from _kara_library import MusicLibraryWindow, Song, search_key
 from _kara_import import AlbumImport
 from _kara_paths import BIN, music_library
 from _labfy_sync import MusicSync
@@ -158,45 +149,25 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.blackbox_disk_task = None
         self.bb_line = None
         self.tv_line_revision = 0
-        self.bb_turn = None
-        self.bb_audio_playing = False
-        self.remote_party = RemoteParty(self)
-        self.room_audio = RoomAudio(self.blackbox)
-        self.acoustic = AcousticCapture(self.blackbox)
         self.next_capture_clock = 0.
-        self.mobile_imports = MobileImports(self)
+        self.track_revision = 0
+        self.bb_reference = None
         self.seek_signal = self.bus.signal_subscribe(PLAYER, INTERFACE, "Seeked", OBJECT, None,
                                                       Gio.DBusSignalFlags.NONE, self.player_seeked)
         state_dir = Path(GLib.get_user_state_dir()) / "kara"
-        self.party = Party(state_dir / "players.json")
-        self.players_window = None
         self.music_window = None
         self.playback_state = 'Stopped'
-        self.player_track_id = None
         self.media_updated = 0.0
         self.timing = LyricTiming(state_dir / "lyric-timing.json")
-        self.failed_alignments = {}
-        self.party_selection = ()
-        self.party_available = set()
-        self.party_ready = False
         self.syncing_offset = False
-        self.music_volume = None
-        self.player_seen = 0.
-        self.turn_music_restore = None
-        self.turn_phase = ""
-        self.countdown_end = 0.
         self.receiver = None
-        self.bb_room = token_hex(16)
-        self.mobile_players = {}  # Identifiant de session -> Singer éphémère
-        self.mobile_leaving = set()  # Déconnexions pendant un tour actif
         self.next_tv_update = 0.0
 
         # The existing controller still owns the Kara core and GTK callbacks.
         # The V3 view is attached on demand, including with the service owner.
         self.album_import = AlbumImport()
-        self.album_import.can_launch = lambda: self.party.active is None
+        self.album_import.can_launch = lambda: not self.maintenance or not self.maintenance.night_context()
         self.album_import.on_update = self.report_import_update
-        self.mobile_imports.bind_queue(self.album_import.queue)
         self.import_refresh_timer = None
         self.import_refresh_active = False
         self.import_refresh_tasks = {}
@@ -205,7 +176,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_toggle = Gtk.ToggleButton(label="Importer un album")
         self.import_toggle.connect("toggled", self.album_import.toggle)
         self.music_sync = MusicSync(self, LIBRARY, BIN)
-        self.blackbox_button = Gtk.Button(label="BlackBox", tooltip_text="Enregistrer les diagnostics de la partie")
+        self.blackbox_button = Gtk.Button(label="BlackBox", tooltip_text="Enregistrer les diagnostics de lecture")
         self.blackbox_button.connect("clicked", self.show_blackbox_studio)
 
         # Existing V2 UI state feeds TV and local tools. The lyric widgets
@@ -222,7 +193,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         previous_track_button = Gtk.Button(icon_name='media-skip-backward-symbolic',
                                            tooltip_text='Morceau précédent dans Strawberry')
         previous_track_button.connect('clicked', lambda *_: self.player_command('Previous'))
-        self.media_previous = previous_track_button
         transport.append(previous_track_button)
         self.media_play = Gtk.Button(label='▶ Lecture', css_classes=["play-main"],
                                      tooltip_text='Lecture ou pause dans Strawberry')
@@ -231,7 +201,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         next_track_button = Gtk.Button(icon_name='media-skip-forward-symbolic',
                                        tooltip_text='Morceau suivant dans Strawberry')
         next_track_button.connect('clicked',lambda *_: self.player_command('Next'))
-        self.media_next = next_track_button
         transport.append(next_track_button)
         transport.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
         browse = Gtk.Button(label='Bibliothèque',
@@ -245,50 +214,27 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
         karaoke_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                                css_classes=["karaoke-options"])
-        self.kara_expander = Gtk.Expander(label="Karaoké · Joueurs et télévision")
-        self.kara_expander.set_expanded(False)
-        controls = Gtk.Box(spacing=8, css_classes=["game-controls"])
-        players = Gtk.Button(label="Joueurs", tooltip_text="Inscrire les joueurs et choisir leurs chansons")
-        players.connect("clicked", self.show_players)
-        controls.append(players)
-        self.tv_toggle = Gtk.ToggleButton(label="Salle / TV", tooltip_text="Activer la salle mobile et l'écran TV sur le réseau local")
+        controls = Gtk.Box(spacing=8)
+        self.tv_toggle = Gtk.ToggleButton(label="Télévision", tooltip_text="Activer l’affichage des paroles sur le réseau local")
         self.tv_toggle.connect("toggled", self.toggle_tv)
         controls.append(self.tv_toggle)
         self.build_timing_controls()
-        self.kara_expander.set_child(controls)
-        karaoke_box.append(self.kara_expander)
+        karaoke_box.append(controls)
         root.append(karaoke_box)
 
-        self.tv_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                              spacing=7, visible=False, css_classes=["tv-address"])
+        self.tv_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7, visible=False)
         self.tv_address = Gtk.Label(xalign=0, hexpand=True, wrap=True, selectable=True, css_classes=["lyrics-info"])
         self.tv_row.append(self.tv_address)
         self.tv_actions = Gtk.Box(spacing=8)
-        self.tv_copy = Gtk.Button(label="Copier lien joueurs")
+        self.tv_copy = Gtk.Button(label="Copier le lien TV")
         self.tv_copy.connect("clicked", self.copy_tv_url)
         self.tv_actions.append(self.tv_copy)
-        admin = Gtk.Button(label="Code organisateur")
-        admin.connect("clicked", self.show_admin_code)
-        self.tv_actions.append(admin)
-        self.tv_qr_button = Gtk.MenuButton(label="QR code", tooltip_text="Afficher le QR code des joueurs sur cet ordinateur")
-        self.tv_qr_popover = Gtk.Popover()
-        self.tv_qr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9,
-                                margin_start=14, margin_end=14, margin_top=14, margin_bottom=14)
-        self.tv_qr_box.append(Gtk.Label(label="Scanne ce code pour rejoindre la salle", xalign=0))
-        self.tv_qr_image = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN)
-        self.tv_qr_image.set_size_request(235, 235)
-        self.tv_qr_box.append(self.tv_qr_image)
-        self.tv_qr_link = Gtk.Label(wrap=True, selectable=True, max_width_chars=45)
-        self.tv_qr_box.append(self.tv_qr_link)
-        self.tv_qr_popover.set_child(self.tv_qr_box)
-        self.tv_qr_button.set_popover(self.tv_qr_popover)
-        self.tv_actions.append(self.tv_qr_button)
         self.tv_refresh_button = Gtk.Button(label="↻ Actualiser TV",
-            tooltip_text="Recharger l'affichage TV, sans interrompre Strawberry ni déconnecter les joueurs")
+            tooltip_text="Recharger l'affichage TV, sans interrompre Strawberry")
         self.tv_refresh_button.connect("clicked", self.refresh_tv_display)
         self.tv_actions.append(self.tv_refresh_button)
         self.tv_close_button = Gtk.Button(label="Fermer TV",
-            tooltip_text="Fermer seulement l'écran karaoké de la TV, pas Paroles ni la salle des joueurs")
+            tooltip_text="Fermer l’affichage TV sans interrompre Strawberry")
         self.tv_close_button.connect("clicked", self.close_tv_display)
         self.tv_actions.append(self.tv_close_button)
         self.tv_row.append(self.tv_actions)
@@ -327,7 +273,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.clear_player()
         self.request_player()
         self.timers = [GLib.timeout_add(200, self.request_player), GLib.timeout_add(32, self.animate),
-                       GLib.timeout_add(350, self.update_party_services)]
+                       GLib.timeout_add(350, self.update_services)]
         self.connect("close-request", self.close_window)
         self.tag_reader.submit(self.blackbox.recover)
         if https_configured():
@@ -343,7 +289,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 *self.maintenance.import_activity,
                 self.maintenance.import_enrichment_count())
             self.album_import.refresh_providers()
-            self.maintenance.set_priority(self.maintenance_busy(), kara=self.kara_busy())
+            self.maintenance.set_priority(self.maintenance_busy())
             self.maintenance.start()
         elif not background:
             self.maintenance.show()
@@ -375,55 +321,19 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.import_window.present()
 
     def maintenance_busy(self):
-        # The maintenance owner already yields heavy preparation to pending
-        # imports. Import activity itself must not block their enrichment.
-        return self.kara_busy() or self.playback_state == "Playing"
-
-    def kara_busy(self):
-        return bool(self.party.active is not None or self.remote_party.locked)
-
-    def turn_context(self):
-        player = self.party.active
-        return {"turn": self.bb_turn, "player": player.name, "song": player.song.title} if player else {}
-
+        return self.playback_state == "Playing"
 
     def search_missing(self, _button, option, title):
         self.open_import()
         self.album_import.start_maintenance(option, title)
 
-    def show_players(self, _button):
-        self.ensure_players_window()
-        self.players_window.present()
-
-    def ensure_players_window(self):
-        if self.players_window is None:
-            self.players_window = PlayersWindow(self, COLLECTION, LIBRARY.resolve())
-
-    def show_admin_code(self, _button):
-        if self.receiver is None:
-            Gtk.AlertDialog(message="Ouvre d’abord la salle Kara.").show(self)
-            return
-        code = self.receiver.room.issue_admin_code()
-        dialog = Gtk.AlertDialog(message=f"Code organisateur · {code}",
-                                 detail="À saisir dans Admin sur ton téléphone. Valable cinq minutes.")
-        dialog.show(self)
-
-    def start_blackbox(self, consent, voice=False, tracks=None, mode=None):
-        if voice and tracks is None:
-            tracks = ["wifi", "return", "monitor"]
-        if tracks is not None and (not isinstance(tracks, (tuple, list))
-                                   or any(track not in ("wifi", "return", "monitor", "witness") for track in tracks)):
-            raise ValueError("Piste BlackBox indisponible pour une nouvelle collecte Kara.")
-        self.blackbox.start(consent=consent, voice=voice, tracks=tracks, configuration={
+    def start_blackbox(self):
+        self.blackbox.start(consent=True, voice=False, configuration={
             "capture": "diagnostics", "lyric_offset_s": self.timing_offset,
-        }, identity={"room": self.bb_room, "party": self.remote_party.identity}, mode=mode)
-        self.bb_line = None
-        self.blackbox.emit("party", "recording-start", mode=self.blackbox.status(storage=True)["mode"])
-        if self.party.active and self.turn_phase == "playing":
-            self.log_playback_reference(self.party.active.song.path)
+        }, mode="diagnostic_light")
+        self.bb_line = self.bb_reference = None
 
     def stop_blackbox(self, reason="manual", *, wait=False):
-        self.acoustic.update()
         self.blackbox.stop(reason, wait=wait)
 
     def show_blackbox_studio(self, _button):
@@ -439,25 +349,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if status["active"]:
             self.stop_blackbox()
         elif not status["finalizing"]:
-            detail = "Confirme l’accord des participants et des responsables des mineurs. "
-            detail += "Le mode diagnostics enregistre les événements de lecture et de retour microphone. "
-            detail += ("La collecte audio enregistre le microphone du joueur et la sortie PipeWire pendant les tours. "
-                       "Le micro témoin peut être sélectionné explicitement depuis Admin sur mobile. "
-                       "Obtiens l’accord explicite de chaque participant. Prévois 6 Go par heure de jeu.")
-            detail += "\n\n" + "\n".join(
-                f"{label} · {state}" for label, state in self.blackbox_preflight().items())
-            if status["latest"]:
-                detail += f"\n\nDernière session : {status['latest']['session']}"
+            detail = "Enregistre les événements de lecture Strawberry et d’affichage TV.\n\n"
+            detail += "\n".join(f"{label} · {state}" for label, state in self.blackbox_preflight().items())
             dialog = Gtk.AlertDialog(message="Activer BlackBox ?", detail=detail,
-                                     buttons=["Annuler", "Diagnostic léger", "Collecte audio"],
-                                     cancel_button=0, default_button=0)
+                                     buttons=["Annuler", "Enregistrer"], cancel_button=0, default_button=0)
 
             def confirmed(source, result):
                 try:
-                    choice = source.choose_finish(result)
-                    modes = ("diagnostic_light", "deep_analysis")
-                    if 1 <= choice <= len(modes):
-                        self.start_blackbox(True, voice=choice > 1, mode=modes[choice - 1])
+                    if source.choose_finish(result) == 1:
+                        self.start_blackbox()
                 except (OSError, ValueError, GLib.Error) as error:
                     Gtk.AlertDialog(message="BlackBox indisponible", detail=str(error)).show(parent)
 
@@ -466,24 +366,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def blackbox_preflight(self):
         from _kara_blackbox import MIN_FREE
 
-        status = self.blackbox.status(storage=True)
-        free = status["free_bytes"]
-        mobile = self.room_audio.status()["available"]
-        received = self.room_audio.receiving(recent=True)
-        sink = self.room_audio.selected_sink()
-        references = bool(self.lyric_source)
+        free = self.blackbox.status(storage=True)["free_bytes"]
         tv = self.receiver and time.monotonic() - self.receiver.tv_seen < 4
         return {
             "Espace disque": ("À vérifier" if free is None else "Prêt" if free >= MIN_FREE + 65536 else "Bloquant"),
-            "Serveur micro": "Prêt" if mobile else "Indisponible",
-            "Microphone du tour": ("Prêt" if received and self.room_audio.consented() else
-                                   "Accord à donner" if received else "À connecter"),
-            "Paroles minutées": "LRC disponible" if references else "LRC absent",
-            "Sortie PipeWire": "Route choisie" if sink else "À vérifier au tour",
-            "Tizen": "Connecté" if tv else "Facultatif · non connecté",
+            "Paroles minutées": "LRC disponible" if self.lyric_source else "LRC absent",
+            "Télévision": "Connectée" if tv else "Déconnectée",
         }
 
-    def update_party_services(self):
+    def update_services(self):
         state = self.blackbox.status()
         now = time.monotonic()
         if (not state["active"] and now >= self.blackbox_disk_check
@@ -500,49 +391,20 @@ class LyricsWindow(Gtk.ApplicationWindow):
             else:
                 self.blackbox_button.remove_css_class("destructive-action")
             self.blackbox_button.set_tooltip_text(state["error"] or (state["latest"] or {}).get("session")
-                                                   or "Enregistrer les diagnostics de la partie")
+                                                   or "Enregistrer les diagnostics de lecture")
         self.album_import.launch_next()
         if self.maintenance:
-            self.maintenance.set_priority(self.maintenance_busy(), kara=self.kara_busy())
+            self.maintenance.set_priority(self.maintenance_busy())
         return GLib.SOURCE_CONTINUE
 
-    def set_remote_music_volume(self, percent):
-        if type(percent) is not int or not 0 <= percent <= 100:
-            raise ValueError("Volume musical invalide.")
-        if self.turn_music_restore is not None:
-            self.turn_music_restore = percent / 100
-            if self.party.active is not None:
-                self.apply_player_mix(self.party.active)
-        else:
-            self.write_music_volume(percent / 100)
-        self.blackbox.emit("audio", "music-volume", **self.turn_context(), percent=percent)
-
-    def write_music_volume(self, level, callback=None, *, stage=False):
-        if not stage:
-            self.music_volume = level
-        self.bus.call(PLAYER, OBJECT, "org.freedesktop.DBus.Properties", "Set",
-                      GLib.Variant("(ssv)", (INTERFACE, "Volume", GLib.Variant("d", level))),
-                      None, Gio.DBusCallFlags.NO_AUTO_START, 4000, None, callback)
-
-    def apply_player_mix(self, player, *, callback=None):
-        if self.turn_music_restore is None or self.turn_phase not in ("opening", "playing"):
-            return
-        # The original music shares the sink with the protected microphone.
-        # Their gains have separate controls and a bounded sum of peaks.
-        ceiling = round(100 * min(1., self.turn_music_restore))
-        music = player.music_volume if player.music_volume is not None else 100
-        gain = ROOM_MUSIC_BUDGET * min(music, ceiling) / 100
-        self.write_music_volume(gain, callback, stage=True)
-        self.blackbox.emit("audio", "original-mix", **self.turn_context(), music_requested=music,
-                           music_applied=min(music, ceiling), music_gain=gain)
-
-    def refresh_after_import(self, task, jobs):
-        self.import_refresh_tasks[task.identity] = (task, jobs)
+    def refresh_after_import(self, task):
+        self.import_refresh_tasks[task.identity] = task
         if self.import_refresh_timer is None and not self.import_refresh_active:
             self.import_refresh_timer = GLib.timeout_add(250, self.reload_after_import)
 
     def report_import_update(self, job, kind, payload):
-        self.mobile_imports.update(job, kind, payload)
+        if kind in ("settled", "recovered"):
+            self.refresh_after_import(job)
         if kind in {"queue", "suspended"} and getattr(self, "maintenance", None):
             self.maintenance.journal.emit("DOWNLOAD", payload["message"])
             self.maintenance.wake.set()
@@ -587,13 +449,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         pending, self.import_refresh_tasks = self.import_refresh_tasks, {}
         published, self.import_published_paths = self.import_published_paths, set()
         removed, self.import_removed_paths = self.import_removed_paths, set()
-        generations = [(task.identity, task.refresh_generation) for task, _ in pending.values()]
-        receiver = self.receiver
-        jobs = [job for _, linked in pending.values() for job in linked]
-        paths = {Path(path) for task, _ in pending.values()
+        generations = [(task.identity, task.refresh_generation) for task in pending.values()]
+        paths = {Path(path) for task in pending.values()
                  for outcome in task.outcomes.values() for path in outcome.get("tracks", [])}
-        paths.update(Path(path) for job in jobs for outcome in job["results"].values()
-                     for path in outcome.get("tracks", []))
         paths.update(published)
 
         def reload():
@@ -622,10 +480,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
                         continue
                 rows.append((song, search_key(f"{song.title} {song.artist} {song.album}")))
             visible_lrc = {song.path for song, _ in rows if song.path.with_suffix('.lrc').is_file()}
-            if receiver is not None and self.receiver is receiver:
-                if removed:
-                    receiver.room.remove_catalogue_paths(removed)
-                receiver.room.update_catalogue(rows, incremental=True)
             return rows, visible_lrc
 
         def done(future):
@@ -634,22 +488,20 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 return GLib.SOURCE_REMOVE
             try:
                 rows, visible_lrc = future.result()
-                linked = receiver if self.receiver is receiver else None
                 visible = {song.path for song, _ in rows}
-                for task, _ in pending.values():
+                for task in pending.values():
                     missing = [url for url, outcome in task.outcomes.items()
                                if outcome.get("audio_complete") and
                                not {Path(path) for path in outcome.get("tracks", [])} <= visible]
                     if missing:
                         self.album_import.queue.integration_failed(task.identity, task.refresh_generation, missing)
                         task.outcomes = self.album_import.queue.outcomes(task.identity)
-                self.mobile_imports.integrated(jobs, linked, visible)
                 self.album_import.acknowledge_refresh(generations)
                 if pending and getattr(self, "maintenance", None):
                     self.maintenance.journal.emit("DOWNLOAD", f"{len(paths)} pistes signalées après import")
                 if self.music_window:
                     self.music_window.publish_rows(rows, visible_lrc, removed)
-            except (OSError, sqlite3.Error, RoomError, ValueError) as error:
+            except (OSError, sqlite3.Error, ValueError) as error:
                 self.album_import.release_refresh(generations)
                 self.blackbox.emit("imports", "error", stage="library-refresh", error=str(error))
             if self.import_refresh_tasks or self.import_published_paths or self.import_removed_paths:
@@ -683,53 +535,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.base_position = max(0., position / 1_000_000)
         self.updated = time.monotonic()
         self.next_tv_update = 0.
-        self.blackbox.emit("lyrics", "seek", turn=self.bb_turn, position=self.base_position)
-
-    def party_choice(self):
-        return tuple((player, player.song) for player in self.party.players)
-
-    def open_party(self, _button):
-        if self.receiver is None:
-            self.players_window.message.set_text("Active Salle / TV pour ouvrir le salon.")
-            return
-        try:
-            self.remote_party.open()
-        except RoomError as error:
-            self.players_window.message.set_text(str(error))
-        else:
-            self.players_window.refresh()
-
-    def validate_party(self, _button):
-        self.begin_preparation([p.song for p in self.party.players if p.song], for_party=True)
-
-    def can_skip_failed(self):
-        return (not self.party_ready and bool(self.failed_alignments) and bool(self.party_available)
-                and self.party_choice() == self.party_selection)
-
-    def skip_failed(self, _button):
-        if self.can_skip_failed():
-            self.party.excluded = set(self.failed_alignments)
-            self.party_ready = True
-
-    def begin_preparation(self, songs, *, for_party):
-        # The legacy organiser action checks the selected files only.
-        if self.closed or self.party.active is not None or not for_party:
-            return False
-        paths = {song.path for song in songs}
-        available = {path for path in paths if local_track(path.as_uri()) == path}
-        self.party_selection = self.party_choice()
-        self.party_available = available
-        self.failed_alignments = dict.fromkeys(paths - available, "Fichier audio local introuvable.")
-        self.party.excluded.clear()
-        self.party_ready = bool(available) and not self.failed_alignments
-        if self.receiver is not None:
-            self.receiver.room.set_prepared(available, failures=self.failed_alignments)
-        if self.players_window is not None:
-            detail = ("Sélection prête." if self.party_ready else "Un fichier audio est indisponible.")
-            self.players_window.message.set_text(detail)
-            self.players_window.refresh()
-        self.remote_party.prepared()
-        return True
+        self.blackbox.emit("lyrics", "seek", position=self.base_position)
 
     def build_timing_controls(self):
         self.timing_menu = Gtk.MenuButton(label="Minutage", tooltip_text="Ajuster le défilement PC et TV")
@@ -754,6 +560,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         reset = Gtk.Button(label="Remettre le décalage à zéro")
         reset.connect("clicked", lambda *_: self.timing_spin.set_value(0))
         content.append(reset)
+        self.timing_fetch = Gtk.Button(label="Chercher le LRC dans les sources")
+        self.timing_fetch.connect("clicked", self.fetch)
+        content.append(self.timing_fetch)
         self.timing_message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
         content.append(self.timing_message)
         return self.timing_menu
@@ -787,285 +596,31 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         self.apply_timing()
 
-    def song_available(self, song):
-        return local_track(song.path.as_uri()) == song.path
-
-    def start_turn(self, player, *, independent=False):
-        if self.party.active is not None or player.song is None or not (independent or self.party_ready):
-            return
-        if os.environ.get("KARA_SILENT") == "1":
-            self.players_window.message.set_text("La lecture et le microphone sont désactivés pour cette séance.")
-            return
-        if player.song.path in self.party.excluded or not self.song_available(player.song):
-            self.players_window.message.set_text("Le fichier du morceau est indisponible.")
-            return
-        self.bb_turn = self.remote_party.turn_id or token_hex(8)
-        if player.mobile_id:
-            try:
-                self.room_audio.open_turn(player.mobile_id, player.name, self.bb_turn, player.song.title)
-            except RoomError as error:
-                self.bb_turn = None
-                self.players_window.message.set_text(str(error))
-                self.blackbox.emit("audio", "error", operation="turn-route", player=player.name)
-                return
-        self.party.active = player
-        self.turn_opened = False
-        self.turn_phase = "awaiting-mic" if player.mobile_id else "opening"
-        self.blackbox.emit("party", "turn-start", **self.turn_context(),
-                           identity={"room": self.bb_room, "party": self.remote_party.identity})
-        self.players_window.message.set_text("Essai microphone sur le téléphone." if player.mobile_id else "")
-        self.players_window.refresh()
-        if player.mobile_id:
-            self.room_audio.record_test(True)
-            if self.playback_state == "Playing":
-                self.player_command("Pause")
-        else:
-            self.begin_playback(player)
-
-    def countdown(self):
-        return max(0, ceil(self.countdown_end - time.monotonic())) if self.turn_phase == "countdown" else 0
-
-    def request_turn_start(self):
-        if self.turn_phase in ("countdown", "opening", "playing"):
-            return
-        if (self.turn_phase != "awaiting-mic" or not self.room_audio.receiving(recent=True)
-                or not self.room_audio.test_passed()):
-            raise RoomError("Confirme que tu entends ton retour avant de démarrer.", 409)
-        if self.music_volume is None or time.monotonic() - self.player_seen > 2:
-            raise RoomError("Le lecteur musical est indisponible.", 503)
-        if self.remote_party.opened_early and time.monotonic() - self.receiver.secure_tv_seen >= 4:
-            raise RoomError("La télévision Kara est déconnectée.", 409)
-        player = self.party.active
-        if not self.song_available(player.song):
-            raise RoomError("Le fichier audio est indisponible.", 409)
-        self.turn_phase = "countdown"
-        self.countdown_end = time.monotonic() + 3.
-        self.blackbox.emit("party", "countdown", turn=self.bb_turn, player=player.name, seconds=3)
-
-    def begin_playback(self, player):
-        self.turn_phase = "opening"
-        self.turn_deadline = time.monotonic() + 12.0
-        if self.music_volume is None:
-            self.finish_turn(error="Le volume de Strawberry est indisponible.")
-            return
-        self.room_audio.record_test(False)
-        self.turn_music_restore = self.music_volume
-
-        def opened(bus, result):
-            if player is not self.party.active or self.turn_phase != "opening":
-                return
-            try:
-                bus.call_finish(result)
-            except GLib.Error:
-                self.finish_turn(error="Impossible d’ouvrir le morceau dans Strawberry.")
-            else:
-                self.turn_opened = True
-
-        def music_set(bus, result):
-            if player is not self.party.active or self.turn_phase != "opening":
-                return
-            try:
-                bus.call_finish(result)
-            except GLib.Error:
-                self.finish_turn(error="Impossible de régler le volume musical dans Strawberry.")
-                return
-            self.player_command("OpenUri", GLib.Variant("(s)", (player.song.path.as_uri(),)), opened)
-
-        self.apply_player_mix(player, callback=music_set)
-
-    def observe_turn(self, playback):
-        player = self.party.active
-        if player is None:
-            return
-        song = player.song.path
-        if self.turn_phase == "opening" and self.turn_opened:
-            if self.track == song and playback == "Playing":
-                self.turn_phase = "playing"
-                self.log_playback_reference(song)
-        elif self.turn_phase == "playing":
-            if self.track != song:
-                # Strawberry may start its next queued song on natural EOF.
-                # Pause it until the next player explicitly starts their turn.
-                if playback == "Playing":
-                    self.player_command("Pause")
-                self.finish_turn()
-            elif playback == "Stopped":
-                self.finish_turn()
-
-    def advance_turn(self, now):
-        player = self.party.active
-        if player is None:
-            return
-        if self.turn_phase == "opening" and now >= self.turn_deadline:
-            self.finish_turn(error="Strawberry n’a pas démarré la chanson sélectionnée.")
-        elif self.turn_phase == "countdown":
-            if (not self.room_audio.receiving(recent=True) or not self.room_audio.test_passed()
-                    or self.remote_party.opened_early and now - self.receiver.secure_tv_seen >= 4
-                    or now - self.player_seen > 2 or not self.song_available(player.song)):
-                self.turn_phase = "awaiting-mic"
-            elif now >= self.countdown_end:
-                self.begin_playback(player)
-
-    def finish_turn(self, *, pause=False, error=""):
-        player = self.party.active
-        if player is None:
-            return
-        self.acoustic.update()
-        self.room_audio.record_playing(False)
-        self.bb_audio_playing = False
-        if pause and self.track == player.song.path and self.playback_state == "Playing":
-            self.player_command("Pause")
-        played = self.turn_phase == "playing"
-        if played:
-            player.done = True
-        detail = error or ("Tour terminé." if played else "Tour annulé.")
-        self.blackbox.emit("party", "turn-end", **self.turn_context(), played=played, detail=detail)
-        self.remote_party.turn_completed(player, detail, played=played)
-        self.bb_turn = None
-        self.room_audio.close_turn()
-        self.party.active = None
-        if self.turn_music_restore is not None:
-            self.write_music_volume(self.turn_music_restore)
-            self.turn_music_restore = None
-        if player.mobile_id in self.mobile_leaving:
-            self.mobile_leaving.discard(player.mobile_id)
-            self.room_audio.forget_player(player.mobile_id)
-            self.party.players = [p for p in self.party.players if p is not player]
-            self.mobile_players.pop(player.mobile_id, None)
-            self.party_ready = False
-        self.turn_phase = ""
-        if self.players_window is not None:
-            self.players_window.message.set_text(detail)
-            self.players_window.refresh()
-
-    def mobile_event(self, action, member):
-        """Mise à jour du jeu UNIQUEMENT depuis la boucle GTK principale."""
-        if self.closed or self.receiver is None:
-            return GLib.SOURCE_REMOVE
-        if action in ('join', 'reconnect'):
-            self.receiver.resume_tv_display()
-            if action == 'reconnect':
-                # A heartbeat can reopen the TV without changing the party plan.
-                return GLib.SOURCE_REMOVE
-        token = member.get('token')
-        player = self.mobile_players.get(token)
-        if action == 'join':
-            if player is None:
-                player = Singer(member['name'], mobile_id=token)
-                defaults = self.remote_party.defaults
-                player.music_volume = defaults["music"]
-                if defaults["voice"] is not None:
-                    self.room_audio.default_player_volume(token, defaults["voice"])
-                self.mobile_players[token] = player
-                self.party.players.append(player)
-                self.party_ready = False
-        elif action == 'choose':
-            if player is not None and player is not self.party.active:
-                song = self.receiver.room.song_for(member.get('song'))
-                if song is not None:
-                    player.song = song
-                    player.done = False
-                    self.party_ready = False
-        elif action == 'clear':
-            if player is not None and player is not self.party.active:
-                player.song = None
-                player.done = False
-                self.party_ready = False
-        elif action == 'leave':
-            self.remote_party.eligible.discard(token)
-            if player is self.party.active:
-                self.mobile_leaving.add(token)
-            elif player is not None:
-                self.room_audio.forget_player(token)
-                self.party.players = [p for p in self.party.players if p is not player]
-                self.mobile_players.pop(token, None)
-                self.party_ready = False
-        if self.players_window is not None:
-            self.players_window.refresh()
-        if player is not None and action in ("choose", "clear"):
-            self.remote_party.revised_selection(player)
-        self.remote_party.changed_selection()
-        self.next_tv_update = 0.0
-        return GLib.SOURCE_REMOVE
-
-    def remove_mobile(self, player):
-        if self.party.active is player:
-            if self.players_window is not None:
-                self.players_window.message.set_text('Termine le tour avant de retirer le joueur.')
-            return
-        if self.receiver is not None:
-            self.receiver.room.kick(player.mobile_id)
-        else:
-            self.party.players = [p for p in self.party.players if p is not player]
-            self.mobile_players.pop(player.mobile_id, None)
-            self.party_ready = False
-            if self.players_window is not None:
-                self.players_window.refresh()
-
-    def mobile_catalogue_loaded(self, future, receiver):
-        if self.closed or self.receiver is not receiver:
-            return GLib.SOURCE_REMOVE
-        try:
-            receiver.room.update_catalogue(future.result())
-        except (OSError, ValueError, sqlite3.Error) as error:
-            self.tv_address.set_text(f'Bibliothèque inaccessible : {error}')
-        return GLib.SOURCE_REMOVE
-
     def toggle_tv(self, button):
         if not button.get_active():
             if self.receiver is not None:
                 self.receiver.close()
                 self.receiver = None
-                # Les identités liées aux téléphones sont valables pour cette
-                # salle uniquement. Les joueurs créés sur PC sont préservés.
-                active = self.party.active
-                self.party.players = [p for p in self.party.players
-                                      if p.mobile_id is None or p is active]
-                self.mobile_players = ({active.mobile_id: active}
-                                       if active is not None and active.mobile_id else {})
-                if active is not None and active.mobile_id:
-                    self.mobile_leaving.add(active.mobile_id)
-                self.party_ready = False
-                if self.players_window is not None:
-                    self.players_window.refresh()
             self.tv_row.set_visible(False)
             return
         try:
-            self.receiver = start_receiver(
-                on_mobile=self.mobile_event,
-                reserved_names=(p.name for p in self.party.players if p.mobile_id is None),
-                diagnostics=self.blackbox, commands=self.remote_party.dispatch,
-                imports=self.mobile_imports, audio=self.room_audio)
+            self.receiver = start_receiver(diagnostics=self.blackbox)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.tv_address.set_text(str(error))
             self.tv_copy.set_visible(False)
         else:
-            self.bb_room = token_hex(16)
-            self.tv_address.set_text(
-                f"TV : {self.receiver.url} · Joueurs : {self.receiver.join_url}")
-            if self.receiver.qr:
-                try:
-                    qr_texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(self.receiver.qr))
-                    self.tv_qr_image.set_paintable(qr_texture)
-                except GLib.Error:
-                    self.tv_qr_image.set_paintable(None)
-            else:
-                self.tv_qr_image.set_paintable(None)
-            self.tv_qr_link.set_text(self.receiver.join_url)
-            self.next_tv_update = 0.0
+            self.tv_address.set_text(self.receiver.url)
+            self.next_tv_update = 0.
             self.tv_copy.set_visible(True)
-            receiver = self.receiver
-            self.tag_reader.submit(catalogue, COLLECTION, LIBRARY.resolve()).add_done_callback(
-                lambda future: GLib.idle_add(self.mobile_catalogue_loaded, future, receiver))
         self.tv_row.set_visible(True)
 
     def copy_tv_url(self, _button):
         if self.receiver is not None:
-            self.get_display().get_clipboard().set(self.receiver.join_url)
+            self.get_display().get_clipboard().set(self.receiver.url)
 
     def refresh_tv_display(self, _button):
         if self.receiver is None:
-            self.tv_address.set_text("Active d’abord Salle / TV pour actualiser l’écran.")
+            self.tv_address.set_text("Active d’abord Télévision pour actualiser l’écran.")
             return
         self.receiver.request_tv_reload()
         self.tv_refresh_button.set_label("Demande envoyée ✓")
@@ -1078,7 +633,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def close_tv_display(self, _button):
         if self.receiver is None:
-            self.tv_address.set_text("Active d’abord Salle / TV pour fermer l’écran.")
+            self.tv_address.set_text("Active d’abord Télévision pour fermer l’écran.")
             return
         self.receiver.request_tv_close()
         self.tv_close_button.set_label("Fermeture demandée ✓")
@@ -1093,23 +648,15 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if self.receiver is None or now < self.next_tv_update:
             return
         self.next_tv_update = now + 0.12
-        self.receiver.room.set_mode(
-            locked=self.party.active is not None or self.remote_party.locked,
-            game_mode=self.remote_party.phase == "running",
-            current=(self.party.active.name if self.party.active is not None else self.title.get_label()),
-            editable=self.remote_party.editable_players())
-        connected = self.receiver.room.public_roster()
-        self.remote_party.publish()
         active = self.view_anchor(position)
         lines = [self.view_lyrics[i] if 0 <= i < len(self.view_lyrics) else "" for i in range(active - 1, active + 3)]
         fraction = self.display_progress(position, active, utf16=True) if active >= 0 else 0.0
         count = round(fraction * len(lines[1].encode("utf-16-le")) / 2)
-        display_mode = "game" if self.remote_party.phase == "running" else "music"
         engine = "lrc-original"
         if (self.track, active, self.playback_state, engine) != self.bb_line:
             self.bb_line = self.track, active, self.playback_state, engine
             self.tv_line_revision += 1
-            self.blackbox.emit("lyrics", "tv-line", turn=self.bb_turn, position=position,
+            self.blackbox.emit("lyrics", "tv-line", position=position,
                                revision=self.tv_line_revision, line=active, lines=lines, playback=self.playback_state,
                                timing_engine=engine)
         if self.title.get_label():
@@ -1119,27 +666,16 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.receiver.update({
             "title": self.title.get_label(), "artist": self.artist.get_label(),
             "lines": lines, "progress": fraction, "highlight_chars": count, "notice": notice,
-            "display_mode": display_mode, "playback_state": self.playback_state,
+            "display_mode": "music", "playback_state": self.playback_state,
             "plain_lyrics": self.tag_text[:5000] if not self.times else "",
-            "status": self.remote_party.notice,
-            "players": self.party.board(), "connected": connected,
-            "recording": self.blackbox.status()["active"],
-            "party_phase": self.remote_party.phase, "turn": self.bb_turn, "turn_phase": self.turn_phase,
-            "position": position, "line": active,
-            "countdown": self.countdown(),
-            "current_player": self.party.active.name if self.party.active else "",
-            "current_song": self.party.active.song.title if self.party.active else "",
-            "next_turns": [{"player": player.name, "song": song.title}
-                           for player, song in list(self.remote_party.queue)[:5]],
-            "recent_result": self.remote_party.latest_result(),
+            "recording": self.blackbox.active(),
+            "position": position, "line": active, "track_revision": self.track_revision,
             "line_revision": self.tv_line_revision,
-        }, cover=self.tv_cover if display_mode == "music" else ("", ""))
+        }, cover=self.tv_cover)
 
     def close_window(self, _window, *, wait=True):
         if self.closed:
             return False
-        if self.party.active is not None:
-            self.finish_turn(pause=True)
         self.tv_toggle.set_active(False)
         # Managed workers own their leases and write their own result. Closing
         # the window stops scheduling and leaves any admitted import recoverable.
@@ -1157,13 +693,12 @@ class LyricsWindow(Gtk.ApplicationWindow):
         return False
 
     def clear_player(self):
-        self.player_track_id = None
         self.title.set_label("")
         self.artist.set_label("")
         self.playback_state = 'Stopped'
         self.media_play.set_label('▶ Lecture')
         self.media_clock.set_text('0:00 / 0:00')
-        self.rate = 0.0
+        self.base_position = self.duration = self.rate = 0.0
         self.set_track(None)
         self.refresh_tv_cover(None)
         self.show_empty("Lance un morceau local dans Strawberry.")
@@ -1172,6 +707,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if track == self.track:
             return
         self.track = track
+        self.track_revision += 1
+        self.next_tv_update = 0.
         self.lyric_source = None
         self.file_token = None
         self.tag_token = None
@@ -1195,16 +732,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
         try:
             properties, = bus.call_finish(result).unpack()
         except GLib.Error:
-            if self.party.active:
-                self.finish_turn(error="Strawberry est indisponible.")
             self.clear_player()
             return
         now = time.monotonic()
-        self.player_seen = now
         metadata = properties.get("Metadata", {})
-        volume = properties.get("Volume")
-        if self.turn_music_restore is None and type(volume) in (int, float) and isfinite(volume) and volume >= 0:
-            self.music_volume = volume
         title = metadata.get("xesam:title", "")
         self.title.set_label(title)
         self.artist.set_label(" · ".join(metadata.get("xesam:artist", [])))
@@ -1213,21 +744,13 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.duration = metadata.get("mpris:length", 0) / 1_000_000
         playback = properties.get("PlaybackStatus", "Stopped")
         self.playback_state = playback
-        track_id = metadata.get("mpris:trackid")
-        self.player_track_id = (track_id if isinstance(track_id, str)
-                                and GLib.Variant.is_object_path(track_id) else None)
         self.media_play.set_label('⏸ Pause' if playback == 'Playing' else '▶ Lecture')
-        # Ne pas changer de chanson au milieu du tour d'un joueur.
-        navigation = self.party.active is None
-        self.media_previous.set_sensitive(navigation)
-        self.media_next.set_sensitive(navigation)
         self.rate = properties.get("Rate", 1.0) if playback == "Playing" else 0.0
         if self.music_window is not None:
             self.music_window.update_current(metadata.get('mpris:trackid'), playback)
         self.set_track(local_track(metadata.get("xesam:url")))
         self.refresh_tv_cover(metadata.get("mpris:artUrl"))
         self.load_lines()
-        self.observe_turn(playback)
 
     def refresh_tv_cover(self, url):
         key = self.track, url if isinstance(url, str) else None
@@ -1309,6 +832,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.button.set_visible(fetch)
         self.button.set_sensitive(self.fetching is None)
         self.footer.set_visible(bool(notice) or fetch)
+        self.timing_fetch.set_sensitive(fetch and self.fetching is None)
+        self.timing_fetch.set_tooltip_text(notice or None)
 
     def show_empty(self, message, *, fetch=True):
         self.message.set_text(message)
@@ -1386,8 +911,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         session = self.blackbox.status()["session"]
         if not session or not self.blackbox.active():
             return
-        context = dict(self.turn_context())
         # Snapshot the owning GTK values before sending the disk read.
+        context = {"track_revision": self.track_revision}
         source = self.lyric_source
         displayed = list(zip(self.times, self.lyrics))
         plain = self.tag_text
@@ -1397,10 +922,10 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 files = {"original": {"library_path": str(original.relative_to(LIBRARY.resolve())),
                                       "sha256": digest(original)}}
             except (OSError, ValueError):
-                self.blackbox.emit("audio", "error", **context, recording_session=session,
+                self.blackbox.emit("audio", "error", recording_session=session,
                                    operation="reference-identification")
             else:
-                self.blackbox.emit("audio", "reference", **context, recording_session=session, files=files)
+                self.blackbox.emit("audio", "reference", recording_session=session, files=files)
                 original_text = source[0] if source else plain
                 source_kind = "sidecar-lrc" if source else "embedded" if plain else "unavailable"
                 try:
@@ -1410,8 +935,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                         document["display_offset_s"] = displayed[0][0] - source[2][0][0]
                     record_lyrics(self.blackbox, session, context, document)
                 except (KeyError, TypeError, ValueError):
-                    self.blackbox.emit("lyrics", "reference-unavailable", **context,
-                                       recording_session=session, reason="snapshot-invalid")
+                    self.blackbox.emit("lyrics", "reference-unavailable", recording_session=session, reason="snapshot-invalid")
 
         self.tag_reader.submit(identify)
 
@@ -1424,25 +948,16 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 whole = max(0,int(seconds))
                 return f'{whole//60}:{whole%60:02d}'
             self.media_clock.set_text(f'{clock(position)} / {clock(self.duration)}')
-        self.advance_turn(now)
-        self.remote_party.tick(now)
-        player = self.party.active
-        context = self.turn_context()
-        playing = bool(os.environ.get("KARA_SILENT") != "1" and self.turn_phase == "playing"
-                       and player and self.track == player.song.path and self.rate > 0 and context)
-        if playing != self.bb_audio_playing:
-            self.bb_audio_playing = playing
-            self.room_audio.record_playing(playing)
-        testing = self.turn_phase in ("awaiting-mic", "countdown")
-        if player and player.mobile_id and (playing or testing) and self.room_audio.consented():
-            self.acoustic.update(context, self.room_audio.selected_sink())
-        else:
-            self.acoustic.update()
-        if playing and now >= self.next_capture_clock and self.blackbox.active():
-            self.next_capture_clock = now + 1.
-            self.blackbox.emit("audio", "music-clock", **context, position=self.base_position,
-                               strawberry_monotonic_ns=round(self.updated * 1_000_000_000),
-                               playback_rate=self.rate)
+        if self.blackbox.active():
+            identity = self.track, self.file_token, self.timing_offset
+            if self.track and identity != self.bb_reference:
+                self.bb_reference = identity
+                self.log_playback_reference(self.track)
+            if now >= self.next_capture_clock:
+                self.next_capture_clock = now + 1.
+                self.blackbox.emit("audio", "music-clock", position=self.base_position,
+                                   strawberry_monotonic_ns=round(self.updated * 1_000_000_000),
+                                   playback_rate=self.rate)
         self.update_tv(position, now)
         if not self.rows or not self.scroll.get_mapped():
             return GLib.SOURCE_CONTINUE
@@ -1453,7 +968,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.active = active
             self.highlight = -1
             self.style_lines()
-            self.blackbox.emit("lyrics", "pc-line", **context, position=position, line=active,
+            self.blackbox.emit("lyrics", "pc-line", position=position, line=active,
                                timing_engine="lrc-original")
 
         if active >= 0:
@@ -1551,7 +1066,7 @@ class App(Gtk.Application):
                     return True
 
                 # The same D-Bus application owns the controller in both
-                # modes. Closing its optional window cannot close the room.
+                # modes. Closing its optional window cannot stop the TV server.
                 window.disconnect_by_func(window.close_window)
                 window.connect("close-request", hide)
                 GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.stop_service)

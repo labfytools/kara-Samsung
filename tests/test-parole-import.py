@@ -1654,7 +1654,7 @@ window.close()
 
 
     @unittest.skipUnless(os.environ.get("PAROLE_TEST_GTK"), "set PAROLE_TEST_GTK=1 in a GTK session")
-    def test_mobile_queue_pause_low_disk_and_library_refresh(self):
+    def test_desktop_queue_pause_low_disk_and_library_refresh(self):
         script = self.temp / "gtk_shared.py"
         script.write_text('''
 import gi
@@ -1672,7 +1672,6 @@ import time
 sys.path.insert(0, sys.argv[1])
 from _kara_import import AlbumImport
 from _kara_import_result import ImportIssue
-from _kara_mobile_imports import MobileImports
 
 loader = SourceFileLoader("parole_window_fixture", str(Path(sys.argv[1]) / "paroles-strawberry"))
 spec = spec_from_loader(loader.name, loader)
@@ -1680,42 +1679,27 @@ module = module_from_spec(spec)
 loader.exec_module(module)
 window = module.LyricsWindow
 catalogues = []
-room = SimpleNamespace(update_catalogue=lambda rows, **_kwargs: catalogues.append(rows))
-control = SimpleNamespace(receiver=SimpleNamespace(room=room), closed=False, music_window=None,
+control = SimpleNamespace(closed=False, maintenance=None,
+                          music_window=SimpleNamespace(publish_rows=lambda rows, *_: catalogues.append(rows)),
                           blackbox=SimpleNamespace(emit=lambda *args, **kwargs: None),
-                          remote_party=SimpleNamespace(locked=False), import_refresh_tasks={},
-                          import_refresh_timer=None, import_refresh_active=False, import_published_paths=set(),
+                          import_refresh_tasks={}, import_refresh_timer=None,
+                          import_refresh_active=False, import_published_paths=set(),
                           import_removed_paths=set())
-for name in ("refresh_after_import", "reload_after_import"):
+for name in ("report_import_update", "refresh_after_import", "reload_after_import"):
     setattr(control, name, MethodType(getattr(window, name), control))
 
 panel = AlbumImport()
 assert panel.configure(paused=True)
-mobile = MobileImports(control)
-control.album_import, control.mobile_imports = panel, mobile
-mobile.bind_queue(panel.queue)
-panel.on_update = mobile.update
 album_id = "MPREb_FIXTURE"
 url = f"https://music.youtube.com/browse/{album_id}"
 desktop = panel.enqueue([("Édition fixture", url)])
-for number in range(40):
-    mobile.discographies["fixture"] = {"name": f"Artiste {number}", "albums": [
-        {"id": f"MPREb_{number}", "title": f"Album {number}"}]}
-    mobile.request("token", "participant", {"handle": "fixture", "all": True, "rights": True})
-mobile.discographies["fixture"] = {"name": "Artiste fixture", "albums": [{"id": album_id, "title": "Édition fixture"}]}
-request = mobile.request("token", "participant", {"handle": "fixture", "all": True, "rights": True})
-mobile.action(request["job"], "approve")
+assert panel.enqueue([("Édition fixture", url)]).identity == desktop.identity
 assert panel.queue.count() == {"queued": 1}
-assert mobile.jobs[request["job"]]["task_id"] == desktop.identity
 
-# Recreate both frontends with the same queue and the same scoped state.
+# A restart must keep a pending desktop import and its review settings.
 panel.closing = True
-panel = AlbumImport()
-mobile = MobileImports(control)
-control.album_import, control.mobile_imports = panel, mobile
-mobile.bind_queue(panel.queue)
-panel.on_update = mobile.update
-assert len(mobile.snapshot(organizer=True)) >= 40
+control.album_import = panel = AlbumImport()
+panel.on_update = control.report_import_update
 assert panel.queue.settings() == (True, 4)
 with patch("_kara_import.check_space", side_effect=ImportIssue("space", "Fixture disque plein")):
     assert panel.configure(paused=False)
@@ -1730,12 +1714,10 @@ with ThreadPoolExecutor(max_workers=1) as pool:
         while context.pending():
             context.iteration(False)
         panel.launch_next()
-        if catalogues and not control.import_refresh_active:
+        if panel.queue.job(desktop.identity)["refresh"] == 0 and catalogues and not control.import_refresh_active:
             break
         time.sleep(.02)
-    assert len(catalogues) == 1
-    assert len(catalogues[0]) == 2
-    assert mobile.jobs[request["job"]]["state"] == "done"
+    assert len({song.path for batch in catalogues for song, _ in batch}) == 2
     assert panel.queue.job(desktop.identity)["refresh"] == 0
     panel.launch_next(force=True)
     assert panel.imports_snapshot[1]["tracks"] == 0

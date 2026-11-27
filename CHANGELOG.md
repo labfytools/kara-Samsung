@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Retirer le salon du service Arch Linux. Partager l’affichage Strawberry entre le navigateur local et la Samsung. Garder la file de lecture et les imports dans Parole.
+
 - Afficher les paroles de Strawberry en plein écran sur la Samsung, avec surlignage des mots d’origine, pause, pochette et texte simple. Version Tizen 2.2.0.
 
 - Limiter les tâches nocturnes à la récupération des LRC d’origine manquants. Conserver les quotas, les recherches sans résultat et la progression entre les redémarrages.
