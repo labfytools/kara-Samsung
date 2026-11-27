@@ -20,6 +20,7 @@ function node() {
       contains: key => classes.has(key)},
     get firstChild() { return this.children[0]; },
     appendChild(child) { this.children.push(child); },
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); },
     setAttribute(key, value) { attributes.set(key, value); },
     getAttribute(key) { return attributes.get(key); },
     removeAttribute(key) { attributes.delete(key); },
@@ -65,7 +66,15 @@ step().respond(503);
 assert.equal([...timers.values()][0].delay, 1500);
 const first = { title: "Accueil", artist: "Artiste", cover_revision: "first", line: 0,
   lines: ["", "Bonjour à tous", "Suite"], highlight_chars: 7, playback_state: "Playing" };
-step().respond(200, {...first, cover_data: "data:image/jpeg;base64,cover"});
+const credits = nodes.get("attribution");
+step().respond(200, {...first, cover_data: "data:image/jpeg;base64,cover", attribution: [
+  {label: "Paroles d’Unison", url: "https://unison.betterlyrics.org/song/Ugr4KKK_SqY"},
+  {label: "Artiste <ami>", url: "https://unison.betterlyrics.org/curator/ami"},
+  {label: "Lien injecté", url: "https://lrc.red.example/s/GBUM71029604"}
+]});
+assert.equal(credits.hidden, false);
+assert.deepEqual(credits.children.map(link => link.textContent), ["Paroles d’Unison", "Artiste <ami>"]);
+assert.equal(credits.children[0].href, "https://unison.betterlyrics.org/song/Ugr4KKK_SqY");
 assert.equal(nodes.get("connect").hidden, true);
 assert.equal(nodes.get("title").textContent, "Accueil");
 assert.equal(nodes.get("artist").textContent, "Artiste");
@@ -75,6 +84,8 @@ assert.equal(nodes.get("sung").textContent, "Bonjour");
 assert.equal(nodes.get("pending").textContent, " à tous");
 assert.match(step().url, /cover=first$/);
 requests.at(-1).respond(200, {...first, playback_state: "Paused"});
+assert.equal(credits.hidden, true);
+assert.equal(credits.children.length, 0);
 assert.equal(nodes.get("status").textContent, "En pause");
 assert.equal(nodes.get("sung").textContent, "Bonjour");
 step().respond(200, {...first, line: 1, lines: ["Bonjour", "Suite 😀", "Trois"], highlight_chars: 8});

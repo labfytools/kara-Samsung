@@ -20,6 +20,7 @@ from _kara_import_result import ImportIssue
 from _parole_index import document
 from _parole_import_providers import ARCHIVE, AUDIO_HOSTS, JAMENDO, MANUAL, YOUTUBE
 from _parole_import_metrics import Transfer, limited, observe
+from _parole_lrc_credit import RED, UNISON, red_contact
 from _parole_lyrics_lookup import backoff
 
 BUILTINS = {
@@ -29,7 +30,8 @@ BUILTINS = {
     "QQ Music": ("y.qq.com", "lyrics,lrc", ""),
     "Genius": ("genius.com", "lyrics", ""),
     "LyricDown": ("lyricdown.com", "lrc", ""),
-    "Unison": ("unison.betterlyrics.org", "lyrics_candidate", "https://docs.betterlyrics.org/unison"),
+    RED: ("lrc.red", "lrc", "https://lrc.red/api"),
+    UNISON: ("unison.betterlyrics.org", "lyrics_candidate,lrc", "https://docs.betterlyrics.org/unison"),
     "YouTube Music": ("music.youtube.com", "catalogue,cover,import", ""),
     ARCHIVE: ("archive.org", "catalogue,import", "https://archive.org/developers/md-read.html"),
     JAMENDO: ("api.jamendo.com", "catalogue,import", "https://developer.jamendo.com/v3.0/authentication"),
@@ -48,7 +50,7 @@ RECENT_SOURCE_KIND = "source_latency_samples"
 LYRICS_STATS = "lyrics_source_statistics"
 LYRICS_RATE = "lyrics_source_remote_quota"
 LYRICS_BROKER_UPSTREAMS = ("LRCLIB", "NetEase")
-LYRICS_DEFAULT_ORDER = ("LRCLIB", "NetEase", "QQ Music", "Genius", "LyricDown", "lyrics.ovh", "Unison")
+LYRICS_DEFAULT_ORDER = ("LRCLIB", RED, "NetEase", "QQ Music", UNISON, "Genius", "LyricDown", "lyrics.ovh")
 
 SOURCE_OUTCOMES = frozenset(("found", "absent", "error", "ambiguous", "different_edition"))
 COVER_PROVIDERS = {host: identity for identity, (host, category, _) in BUILTINS.items()
@@ -132,6 +134,8 @@ def lyrics_rows(index, *, db=None, now=None):
                                if row["quota_checked"] and now - row["quota_checked"] < 300 else None)
         if row["state"] != "active":
             row.update(availability=row["state"], next_available=None)
+        elif row["id"] == RED and not red_contact():
+            row.update(availability="configuration", next_available=None)
         elif not daily:
             row.update(availability="paused", next_available=None)
         else:
@@ -158,8 +162,8 @@ def move_lyrics_source(index, identity, delta):
         raise ValueError("Déplacement de fournisseur invalide")
     with index.db() as db:
         db.execute("BEGIN IMMEDIATE")
-        # Discovery-only and broker routes retain their execution semantics.
-        rows = [row for row in lyrics_rows(index, db=db) if row["id"] not in ("Unison", "lyrics.ovh")]
+        # The broker route retains its execution semantics.
+        rows = [row for row in lyrics_rows(index, db=db) if row["id"] != "lyrics.ovh"]
         position = next((i for i, row in enumerate(rows) if row["id"] == identity), -1)
         neighbor = position + delta
         if position < 0 or not 0 <= neighbor < len(rows):
@@ -210,14 +214,15 @@ def ready_sources(index, now):
                                (SELECT 1 FROM import_provider_limits l WHERE l.source=s.id AND l.until>?)""",
                           (date.fromtimestamp(now).isoformat(), now)).fetchall()
     return {row["id"]: row for row in rows
-            if row["used"] < provider_limits(json.loads(row["config"]))[0]}
+            if row["used"] < provider_limits(json.loads(row["config"]))[0]
+            and (row["id"] != RED or red_contact())}
 
 
 def night_lrc_providers(index, *, now=None, db=None):
     """Providers with an approved adapter that can deliver native LRC."""
     from _parole_lrclib_local import configured_snapshot
 
-    direct = {"LRCLIB", "NetEase", "QQ Music"}
+    direct = {"LRCLIB", RED, UNISON, "NetEase", "QQ Music"}
     providers = [row for row in lyrics_rows(index, db=db, now=now)
                  if row["state"] == "active" and "lrc" in row["category"].split(",")
                  and (row["id"] in direct or row["adapter"] == "lrclib" and row["decoded"].get("validated"))]
@@ -377,12 +382,13 @@ def https_connection(host, timeout):
             connection.forget()
 
 
-def fetch(url, *, interval=1.2, accept="application/json", registry=None, provider=None, validation=False, audit=None):
+def fetch(url, *, interval=1.2, accept="application/json", registry=None, provider=None, validation=False, audit=None,
+          user_agent="Parole/3 (https://github.com/labfytools/kara-Samsung)"):
     parts = public_url(url)
     event = {"type": "request", "url": url, "sent": False} if audit else None
     try:
         with request_slot(parts.hostname, 5):
-            return fetch_response(parts, interval, accept, registry, provider, validation, event)
+            return fetch_response(parts, interval, accept, registry, provider, validation, event, user_agent)
     except ImportIssue as error:
         raise ProviderUnavailable("Créneau fournisseur indisponible") from error
     except (OSError, ValueError) as error:
@@ -394,7 +400,7 @@ def fetch(url, *, interval=1.2, accept="application/json", registry=None, provid
             audit(event)
 
 
-def fetch_response(parts, interval, accept, registry, provider, validation, event=None):
+def fetch_response(parts, interval, accept, registry, provider, validation, event, user_agent):
     service = parts.hostname if registry is not None or parts.hostname == "lrclib.net" else "parole-" + parts.hostname
     if registry is not None:
         wait_provider(registry, provider, service, interval, validation=validation,
@@ -412,7 +418,7 @@ def fetch_response(parts, interval, accept, registry, provider, validation, even
             if event is not None:
                 event["sent"] = True
             connection.request("GET", path, headers={
-                "Accept": accept, "User-Agent": "Parole/3 (https://github.com/labfytools/kara-Samsung)"})
+                "Accept": accept, "User-Agent": user_agent})
             response = connection.getresponse()
             if event is not None:
                 event.update(http=response.status, retry_after=response.getheader("Retry-After"))
@@ -555,6 +561,9 @@ def seed(index):
                        VALUES(?,?,?,'active','builtin',?,?)""",
                        ((name, name, kinds, document({"host": host, "docs": docs}), time())
                         for name, (host, kinds, docs) in BUILTINS.items()))
+        # Upgrade capability without changing an operator's state or quota.
+        db.execute("""UPDATE sources SET category=? WHERE id=? AND adapter='builtin'
+                      AND category='lyrics_candidate'""", ("lyrics_candidate,lrc", UNISON))
         db.executemany("""INSERT OR IGNORE INTO sources(id,name,category,state,adapter,config,discovered)
                        VALUES(?,?,'import','active','builtin',?,?)""",
                        ((name, name, document({"host": route.host, "docs": route.help, "transport": "local"}), time())

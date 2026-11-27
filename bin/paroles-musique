@@ -788,6 +788,7 @@ class LyricsSources:
         self.lyricdown = LyricDown()
         self.clients = (self.lrc, self.ovh, self.netease, self.qqmusic, self.genius, self.lyricdown)
         self.cache_hits = 0
+        self.catalogue_requests = 0
         self.providers = set()
         if persistent:
             for client in self.clients:
@@ -812,6 +813,7 @@ class LyricsSources:
              registry=None, strict=False, context=(), provider_only=None, isrc=None, recording=None,
              refresh=False, audit=None, original_lrc=False):
         from _parole_import_metrics import LOOKUP, snapshot
+        from _parole_lrc_credit import CREDITED, RED, UNISON, save_links
         from _parole_sources import LYRICS_BROKER_UPSTREAMS, lyrics_rows, ready_sources
 
         signature = (title, artist, album, duration, album_artist)
@@ -855,6 +857,11 @@ class LyricsSources:
         if registry:
             rows = lyrics_rows(registry)
             providers = {row["id"]: row for row in rows if row["state"] == "active"}
+            if synced and original_lrc:
+                if RED in providers and providers[RED]["availability"] != "configuration":
+                    names.insert(1, RED)
+                if code:
+                    names.append(UNISON)
             if audit:
                 for row in rows:
                     if row["id"] in names and row["state"] != "active":
@@ -988,11 +995,15 @@ class LyricsSources:
             choice = resolve_conflict(entries, synced, local_text)
         if registry and entries:
             selected = cache_value(choice[0])["sha256"]
+            attribution = None
             for item in entries:
                 if item["provider"] == choice[1] and item["sha256"] == selected:
                     item["decision"] = "selected"
+                    attribution = item["metadata"].get("attribution") or attribution
                 elif item["decision"] == "compatible":
                     item["decision"] = "alternative" if selected else "ambiguous"
+            if choice[1] in CREDITED:
+                save_links(registry, selected, choice[1], attribution)
             save_candidates(registry, recording, entries, synced=synced)
         if choice[0]:
             return choice
@@ -1010,7 +1021,9 @@ class LyricsSources:
 
     def query(self, name, clients, row, signature, local_text, synced, registry, strict, context, code, *, audit):
         from _parole_import_metrics import LOOKUP, SUCCEEDED, observe
-        from _parole_sources import LyricsEndpoint, ProviderUnavailable, record, record_lyrics
+        from _parole_lrc_catalogues import lookup
+        from _parole_lrc_credit import CREDITED
+        from _parole_sources import LyricsEndpoint, ProviderUnavailable, lyrics_rows, record, record_lyrics
 
         started = time.monotonic()
         candidates = []
@@ -1061,6 +1074,7 @@ class LyricsSources:
             def transport_event(event):
                 nonlocal contacted
                 contacted |= event["sent"]
+                self.catalogue_requests += int(event["sent"])
                 if audit:
                     audit(event)
 
@@ -1072,23 +1086,41 @@ class LyricsSources:
                     audit({"type": "candidate", **{key: value for key, value in item.items() if key != "text"}})
 
             try:
-                title, artist, album, _, album_artist = signature
-                variants = list(dict.fromkeys([(title, artist, album),
-                                                *lyric_queries(title, artist, album, album_artist, timed=synced)]))
-                endpoint = LyricsEndpoint(conf["host"], conf["path"])
-                for label, credit, edition in variants[:3]:
-                    response = endpoint.search(label, credit, edition, registry=registry, provider=name,
-                                               audit=transport_event)
-                    value = best_transcript(
-                        response, *signature, synced=synced, strict=strict, isrc=code, original_lrc=original_lrc,
-                        on_candidate=candidate, on_reject=lambda record, reason: candidate(record, None, reason),
+                title, artist, album, duration, album_artist = signature
+                variants = lyric_queries(title, artist, album, album_artist, timed=synced)
+                if name in CREDITED:
+                    label, credit, _ = next(iter(variants), (title, artist, album))
+                    result = lookup(
+                        name, signature, code, registry, transport_event,
+                        score=lambda item: recording_score(item, *signature, isrc=code,
+                                                           on_reject=lambda row, reason: candidate(row, None, reason)),
+                        validate=lambda raw: catalog_transcript(raw, duration, synced=True, original_lrc=True),
+                        search_text=f"{label} {credit}",
                     )
-                    if value is not None:
-                        break
+                    if result:
+                        item, value, attribution = result
+                        candidate(item, value, "compatible")
+                        candidates[-1]["metadata"]["attribution"] = attribution
+                else:
+                    variants = list(dict.fromkeys([(title, artist, album), *variants]))
+                    endpoint = LyricsEndpoint(conf["host"], conf["path"])
+                    for label, credit, edition in variants[:3]:
+                        response = endpoint.search(label, credit, edition, registry=registry, provider=name,
+                                                   audit=transport_event)
+                        value = best_transcript(
+                            response, *signature, synced=synced, strict=strict, isrc=code, original_lrc=original_lrc,
+                            on_candidate=candidate, on_reject=lambda record, reason: candidate(record, None, reason),
+                        )
+                        if value is not None:
+                            break
             except AmbiguousLyrics:
                 conflict = True
             except (ProviderUnavailable, ValueError) as failure:
                 error = failure
+                if name in CREDITED:
+                    current = next(row for row in lyrics_rows(registry) if row["id"] == name)
+                    if current["last_http"] == 429 or current["remaining"] == 0:
+                        error = ServiceUnavailable(str(failure), "limited")
         outcome = ("ambiguous" if conflict else "found" if value else "instrumental" if value == "" else
                    "error" if error else "different_edition" if candidates else "absent")
         if audit:

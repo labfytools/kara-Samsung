@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Rechercher les LRC d’origine auprès de lrc.red et d’Unison, en journée et la nuit. Afficher les crédits dans Parole et sur Kara TV 2.2.2.
+
 - Privilégier l’édition de la piste lors de la recherche de LRC. Réutiliser les réponses exactes de LRCLIB, afficher les résultats LRC séparément et indiquer la prochaine échéance des quotas.
 
 - Rendre l’import d’albums accessible depuis la bibliothèque, le raccourci Parole et Ctrl+I. Rouvrir la fenêtre d’import dans l’application existante.

@@ -1,6 +1,6 @@
 # Kara sur Samsung
 
-Ouvre **Kara** depuis **Applications** sur la télévision. La version 2.2.1 suit le morceau en cours dans Strawberry et affiche le LRC d’origine, ou les paroles simples. **Réessayer** relance la connexion au PC. Le réglage **Minutage** de Parole s’applique à la TV.
+Ouvre **Kara** depuis **Applications** sur la télévision. La version 2.2.2 suit le morceau en cours dans Strawberry et affiche le LRC d’origine, ou les paroles simples. Les crédits lrc.red et Unison apparaissent sous l’artiste lorsque leur LRC est affiché. **Réessayer** relance la connexion au PC. Le réglage **Minutage** de Parole s’applique à la TV.
 
 ## Construire une mise à jour
 

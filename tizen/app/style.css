@@ -28,3 +28,5 @@ h1{margin:0;font-size:4vw;line-height:1.15;overflow-wrap:break-word}
 #retry:focus{outline:3px solid #f9e2af}
 #album-art{float:right;width:13vh;height:13vh;margin-left:2vw;border-radius:.7vw;object-fit:contain}
 #plain-lyrics{max-height:38vh;overflow:auto;white-space:pre-wrap;color:#cdd6f4;font:2.25vw/1.4 Inter,Arial,sans-serif}
+#attribution{margin-top:1vh;font-size:1.45vw}
+#attribution a{color:#b4befe;margin-right:1.2em}

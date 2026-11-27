@@ -2,6 +2,7 @@
 """Qualification hors réseau des admissions et de la provenance V3."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, nullcontext
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import sys
 from tempfile import TemporaryDirectory
 from threading import Barrier
 from time import sleep, time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -19,6 +21,7 @@ sys.path.insert(0, str(ROOT / "bin"))
 
 from _kara_files import file_token
 from _parole_index import Index
+from _parole_lrc_credit import RED, UNISON, load_links
 from _parole_lyrics_lookup import CACHE_KIND, EVIDENCE_KIND, TEMPORARY_KIND, playback_candidates
 from _parole_lrclib_local import candidates
 from _parole_sources import (configure_limits, lyrics_rows, move_lyrics_source, night_lrc_providers, ready_sources,
@@ -68,9 +71,100 @@ class LyricsTests(unittest.TestCase):
         self.assertEqual(found, (original, "LRCLIB"))
         destination = self.library / "track.lrc"
         self.engine.save_lrc(destination, original, original=True)
-        self.assertEqual(destination.read_bytes(), original.encode("utf-8"))
         self.engine.save_lrc(destination, TIMED, original=True)
         self.assertEqual(destination.read_bytes(), original.encode("utf-8"))
+
+    def test_lrc_red_verifies_edition_and_preserves_bytes_and_attribution_from_cache(self):
+        self.only(RED)
+        raw = "\ufeff[00:01.00]<00:01.00>Original  \r\n[00:02.50]Suite\r\n"
+        code = "GBUM71029604"
+        record = dict(isrc=code, title=SONG[0], artist=SONG[1], album=SONG[2], duration=SONG[3])
+        album_search = {"hits": [dict(record, isrc="GBUM71029605", album="Autre édition"), record]}
+        metadata = dict(record, files={"lrc": "https://not-the-catalogue.test/file.lrc"})
+        client = self.engine.LyricsSources()
+        options = dict(synced=True, original_lrc=True, strict=True, registry=self.index)
+        with patch.dict(os.environ, KARA_LRC_RED_CONTACT=""):
+            self.assertNotIn(RED, ready_sources(self.index, time()))
+            self.assertEqual(client.find(*SONG, **options), (None, None))
+        with patch.dict(os.environ, KARA_LRC_RED_CONTACT="public@example.org"), patch(
+            "_parole_lrc_catalogues.fetch", side_effect=[album_search, metadata, raw.encode()]) as request:
+            self.assertEqual(client.find(*SONG, **options), (raw, RED))
+            self.assertEqual([call.args[0] for call in request.call_args_list], [
+                "https://lrc.red/search.json?q=Chanson+Groupe", f"https://lrc.red/s/{code}.json",
+                f"https://lrc.red/s/{code}.lrc"])
+            self.assertIn("public@example.org", request.call_args.kwargs["user_agent"])
+        digest = sha256(raw.encode()).hexdigest()
+        self.assertEqual(load_links(self.index, digest), [
+            {"url": f"https://lrc.red/s/{code}", "label": "Paroles de lrc.red"}])
+        configure_limits(self.index, RED, 0, 0)
+        with patch.dict(os.environ, KARA_LRC_RED_CONTACT="public@example.org"), patch(
+            "_parole_lrc_catalogues.fetch", side_effect=AssertionError("le cache garde le LRC attribué")):
+            self.assertEqual(self.engine.LyricsSources().find(*SONG, **options), (raw, RED))
+        destination = self.library / "track.lrc"
+        self.engine.save_lrc(destination, raw, original=True)
+        self.engine.save_lrc(destination, TIMED, original=True)
+        self.assertEqual(destination.read_bytes(), raw.encode())
+
+    def test_lrc_red_does_not_download_when_catalogue_editions_are_ambiguous(self):
+        self.only(RED)
+        record = dict(title=SONG[0], artist=SONG[1], album=SONG[2], duration=SONG[3])
+        hits = [dict(record, isrc=code) for code in ("GBUM71029604", "GBUM71029605")]
+        with patch.dict(os.environ, KARA_LRC_RED_CONTACT="public@example.org"), patch(
+            "_parole_lrc_catalogues.fetch", return_value={"hits": hits}) as request:
+            self.assertEqual(self.engine.LyricsSources().find(*SONG, synced=True, original_lrc=True,
+                             strict=True, registry=self.index), (None, None))
+        request.assert_called_once()
+
+    def test_unison_keeps_native_lrc_and_both_credits_and_rejects_ttml(self):
+        self.only(UNISON)
+        raw = "[00:01.00]Premier mot  \r\n[00:04.00]Suite"
+        code = "FR8EU2300090"
+        item = dict(lyrics=raw, isrc=code, format="lrc", song=SONG[0], artist=SONG[1], album=SONG[2],
+                    videoId="Ugr4KKK_SqY", submitter={"displayName": "Contributrice", "keyId": "public"})
+        options = dict(synced=True, original_lrc=True, strict=True, registry=self.index, isrc=code, refresh=True)
+        client = self.engine.LyricsSources()
+        with patch("_parole_lrc_catalogues.fetch", return_value={"success": True, "data": item}) as request:
+            self.assertEqual(client.find(*SONG, **options), (raw, UNISON))
+        self.assertNotIn("user_agent", request.call_args.kwargs)
+        self.assertEqual(load_links(self.index, sha256(raw.encode()).hexdigest()), [
+            {"url": "https://unison.betterlyrics.org/song/Ugr4KKK_SqY", "label": "Paroles d’Unison"},
+            {"url": "https://unison.betterlyrics.org/curator/public", "label": "Contributrice"}])
+        for changed in (dict(format="ttml"), dict(album="Remix"), dict(lyrics="[00:50.00]Trop tard"),
+                        dict(matchedBy="linked_video"), dict(submitter={"displayName": "Sans profil"})):
+            with self.subTest(changed=changed), patch("_parole_lrc_catalogues.fetch", return_value={
+                "success": True, "data": dict(item, **changed)
+            }):
+                self.assertEqual(client.find(*SONG, **options), (None, None))
+        with patch("_parole_lrc_catalogues.fetch", side_effect=AssertionError("pas d’ISRC")):
+            self.assertEqual(client.find(*SONG, **dict(options, isrc=None)), (None, None))
+
+    def test_source_registry_upgrade_preserves_existing_unison_controls(self):
+        with self.index.db() as db:
+            db.execute("UPDATE sources SET category='lyrics_candidate',state='disabled' WHERE id=?", (UNISON,))
+        configure_limits(self.index, UNISON, 19, 3)
+        seed(self.index)
+        row = next(row for row in lyrics_rows(self.index) if row["id"] == UNISON)
+        self.assertEqual((row["category"], row["state"], row["remaining"], row["interval"]),
+                         ("lyrics_candidate,lrc", "disabled", 19, 3))
+        self.assertNotIn(UNISON, {row["id"] for row in night_lrc_providers(self.index)})
+
+    def test_lrc_red_429_keeps_retry_after_and_falls_back_without_caching_a_miss(self):
+        self.only(RED, "NetEase")
+        client = self.engine.LyricsSources()
+        response = SimpleNamespace(status=429, headers={}, getheader=lambda key, default=None: "120")
+        connection = SimpleNamespace(request=lambda *args, **kwargs: None, getresponse=lambda: response)
+        with patch.dict(os.environ, KARA_LRC_RED_CONTACT="public@example.org"), patch(
+            "_parole_sources.wait_service"), patch("_parole_sources.defer_service"), patch(
+            "_parole_sources.https_connection", return_value=nullcontext(connection)), patch.object(
+            client.netease, "find", return_value=TIMED):
+            self.assertEqual(client.find(*SONG, synced=True, original_lrc=True, strict=True,
+                                         registry=self.index), (TIMED, "NetEase"))
+            row = next(row for row in lyrics_rows(self.index) if row["id"] == RED)
+        self.assertEqual((row["availability"], row["last_http"], row["used_today"]), ("limited", 429, 1))
+        self.assertGreater(row["next_available"], time() + 115)
+        with self.index.db() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM reviews WHERE kind=? AND state='absent'",
+                                        (CACHE_KIND,)).fetchone()[0], 0)
 
     def test_timed_lookup_prioritizes_clean_edition_and_refreshes_only_old_misses(self):
         from _parole_lyrics_lookup import cache_identity, cache_value, remember
@@ -175,7 +269,7 @@ class LyricsTests(unittest.TestCase):
             self.assertNotIn("LRCLIB", ready_sources(self.index, time()))
             self.assertEqual(clients[0].find(*SONG, **opts), (TIMED, "LRCLIB"))
             query.assert_called_once()
-            self.assertEqual(lyrics_rows(self.index)[0]["id"], "NetEase")
+            self.assertEqual([row["id"] for row in lyrics_rows(self.index)][:2], [RED, "LRCLIB"])
             with self.assertRaises(self.engine.ServiceUnavailable):
                 clients[0].find(*SONG, **dict(opts, isrc="FRABC1900002"))
 

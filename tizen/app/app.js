@@ -11,6 +11,27 @@
     var coverRevision = "";
     var displayedTrack;
     var displayedLine;
+    var displayedCredits = "";
+
+    function renderCredits(links) {
+        var items = Array.isArray(links) ? links.slice(0, 3) : [];
+        var signature = JSON.stringify(items);
+        if (displayedCredits === signature) return;
+        displayedCredits = signature;
+        var footer = element("attribution");
+        while (footer.firstChild) footer.removeChild(footer.firstChild);
+        items.forEach(function (item) {
+            if (!item || typeof item.label !== "string" || typeof item.url !== "string" ||
+                !/^https:\/\/(lrc\.red\/s\/[A-Z]{2}[A-Z0-9]{3}[0-9]{7}|unison\.betterlyrics\.org\/(song\/[A-Za-z0-9_-]{11}|curator\/[A-Za-z0-9_-]{1,128}))$/.test(item.url)) return;
+            var link = document.createElement("a");
+            link.href = item.url;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = item.label;
+            footer.appendChild(link);
+        });
+        footer.hidden = !footer.firstChild;
+    }
 
     function applyRemoteCommands(state) {
         if (typeof state.tv_reload === "number") {
@@ -44,6 +65,7 @@
         cover.hidden = !coverRevision;
         show("title", data.title || "Kara");
         show("artist", data.artist || "");
+        renderCredits(data.attribution);
         show("plain-lyrics", plain);
         element("plain-lyrics").hidden = !plain;
         show("previous", lines[0] || "");

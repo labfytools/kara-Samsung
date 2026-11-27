@@ -2,6 +2,7 @@
 from collections import OrderedDict
 from datetime import datetime
 from difflib import SequenceMatcher
+from hashlib import sha256
 import json
 from math import ceil
 from pathlib import Path
@@ -19,6 +20,7 @@ from _parole_index import key, document, encoded_key, sidecar
 from _parole_import_enrichment import (artist_results, queue_artist, ARTIST_OUTCOMES, LRC_OUTCOMES,
                                       artist_lrc_summary, artist_summary, track_outcome)
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
+from _parole_lrc_credit import UNISON, load_links
 from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_music_registry import set_alias
 from _parole_sources import configure_limits, controls, lyrics_rows, move_lyrics_source, night_lrc_providers, provider_limits
@@ -854,6 +856,7 @@ class ParoleView:
                 widget, "Candidats conservés pour cet enregistrement",
                 json.dumps(candidates, ensure_ascii=False, indent=2))))
         versions = {}
+        credits = box(Gtk.Orientation.HORIZONTAL)
         def replace_text(value):
             # A format change or cancellation starts a fresh undo history.
             # Ctrl+Z must never restore another format into this buffer.
@@ -865,20 +868,34 @@ class ParoleView:
 
         def reload_text(*_):
             suffix = ".lrc" if forms.get_selected() else ".txt"
-            version, value = sidecar(path, suffix)
+            version, value = sidecar(path, suffix, preserve_bom=suffix == ".lrc")
             versions[suffix] = json.loads(version) if version and version != "invalid" else None
+            credited_text = value if suffix == ".lrc" else ""
             if not value and suffix == ".txt" and version != "invalid":
                 value = metadata.get("plain", "")
                 if not value and row["lyrics"] == "LRC":
                     from _paroles_lrc import parse_lrc
-                    value = "\n".join(line for _, line in parse_lrc(sidecar(path, ".lrc")[1]) if line)
+                    credited_text = sidecar(path, ".lrc", preserve_bom=True)[1]
+                    value = "\n".join(line for _, line in parse_lrc(credited_text) if line)
+            while child := credits.get_first_child():
+                credits.remove(child)
+            message = "Fichier illisible ou trop volumineux" if version == "invalid" else ""
+            if credited_text:
+                try:
+                    links = load_links(self.index, sha256(credited_text.encode("utf-8")).hexdigest())
+                except (sqlite3.Error, ValueError):
+                    links, value = [], ""
+                    message = "Crédits des paroles momentanément indisponibles. Change de format pour réessayer."
+                for link in links:
+                    credits.append(Gtk.LinkButton.new_with_label(link["url"], link["label"]))
+            credits.set_visible(credits.get_first_child() is not None)
             view.set_editable(False)
             forms.set_sensitive(True)
-            edit.set_sensitive(version != "invalid")
+            edit.set_sensitive(not message)
             save.set_sensitive(False)
             cancel.set_sensitive(False)
             replace_text(value)
-            status.set_text("Fichier illisible ou trop volumineux" if version == "invalid" else "")
+            status.set_text(message)
 
         def start_edit(_):
             forms.set_sensitive(False)
@@ -921,6 +938,7 @@ class ParoleView:
                 links.append(Gtk.LinkButton.new_with_label(candidate["profile"], "Contribution de " + candidate["contributor"]))
                 panel.append(links)
         panel.append(scroller(view, vexpand=True))
+        panel.append(credits)
         panel.append(status)
         forms.connect("notify::selected", reload_text)
         reload_text()
@@ -1600,7 +1618,8 @@ class ParoleView:
         selection = Gtk.SingleSelection(model=store)
         states = {"ready": "Disponible", "limited": "Temporairement indisponible",
                   "paused": "Quota local en pause", "disabled": "Désactivé",
-                  "excluded": "Exclu", "pending": "À vérifier", "upstream": "Source amont indisponible"}
+                  "excluded": "Exclu", "pending": "À vérifier", "upstream": "Source amont indisponible",
+                  "configuration": "Adresse de contact à configurer"}
 
         def display(widget, row):
             value = row.data
@@ -1610,7 +1629,7 @@ class ParoleView:
             if value["next_available"]:
                 available += " jusqu’au " + datetime.fromtimestamp(value["next_available"]).strftime("%d/%m %H:%M")
             quota = value["remote_quota"]
-            extra = (" · découverte attribuée" if value["id"] == "Unison" else
+            extra = (" · LRC par ISRC" if value["id"] == UNISON else
                      " · agrégateur" if value["id"] == "lyrics.ovh" else "")
             widget.set_text(
                 f"{value['name']}{extra} · {available} · {value['used_today']} requêtes HTTP aujourd’hui\n"

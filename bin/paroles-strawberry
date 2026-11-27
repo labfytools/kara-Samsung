@@ -29,6 +29,7 @@ from _labfy_sync import MusicSync
 from _kara_tv import current_cover, https_configured, start_receiver
 from _musique_oz import AUDIO, probe
 from _parole_index import path_rows, sidecar_token
+from _parole_lrc_credit import load_links
 from _parole_maintenance import Maintenance
 from _parole_ui import ParoleView
 
@@ -97,6 +98,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.tag_reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paroles")
         self.view_lyrics = []
         self.lyric_source = None
+        self.lyric_attribution = []
         self.times = []
         self.raw_lines = []
         self.word_marks = ()
@@ -443,6 +445,16 @@ class LyricsWindow(Gtk.ApplicationWindow):
         content.append(self.timing_fetch)
         self.timing_message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
         content.append(self.timing_message)
+        self.timing_credits = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.START, visible=False)
+        content.append(self.timing_credits)
+
+    def show_lyric_attribution(self, links):
+        self.lyric_attribution = links
+        while child := self.timing_credits.get_first_child():
+            self.timing_credits.remove(child)
+        for link in links:
+            self.timing_credits.append(Gtk.LinkButton.new_with_label(link["url"], link["label"]))
+        self.timing_credits.set_visible(bool(links))
 
     def view_anchor(self, position):
         return bisect_right(self.times, position) - 1
@@ -507,6 +519,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             "lines": lines, "progress": fraction, "highlight_chars": count, "notice": notice,
             "display_mode": "music", "playback_state": self.playback_state,
             "plain_lyrics": self.tag_text[:5000] if not self.times else "",
+            "attribution": self.lyric_attribution if self.times else [],
             "recording": self.blackbox.active(),
             "position": position, "line": active, "track_revision": self.track_revision,
             "line_revision": self.tv_line_revision,
@@ -548,6 +561,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.track_revision += 1
         self.next_tv_update = 0.
         self.lyric_source = None
+        self.show_lyric_attribution([])
         self.file_token = None
         self.tag_token = None
         self.tag_text = ""
@@ -616,8 +630,21 @@ class LyricsWindow(Gtk.ApplicationWindow):
         except (OSError, ValueError):
             source_token = "invalid"
         if (self.track, source_token) != self.file_token:
+            source = read_source(self.track) if source_token not in (None, "invalid") else None
+            try:
+                if source and self.maintenance is None:
+                    return
+                links = load_links(self.maintenance.index, source[1]) if source else []
+            except (sqlite3.Error, ValueError):
+                # A new sidecar cannot inherit credits from the file it
+                # replaced. Retry the provenance read on the next poll.
+                self.lyric_source = None
+                self.show_lyric_attribution([])
+                self.set_lines([])
+                return
             self.file_token = self.track, source_token
-            self.lyric_source = read_source(self.track) if source_token not in (None, "invalid") else None
+            self.lyric_source = source
+            self.show_lyric_attribution(links)
             self.set_lines(self.lyric_source[2] if self.lyric_source else [])
         self.timing_fetch.set_sensitive(source_token is None and self.fetching is None)
         if not self.raw_lines:

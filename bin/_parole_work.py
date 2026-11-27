@@ -323,7 +323,7 @@ def import_enrichment(index, kind, subject, report):
             "tracks_seconds": [seconds for _, seconds, _ in processed],
             "tracks": {str(path): row[2] for path, row in zip(paths, processed, strict=True)},
             "workers": min(worker_count, len(paths)),
-            "requests": sum(c.gate.requests for source in clients for c in source.clients),
+            "requests": sum(source.catalogue_requests + sum(c.gate.requests for c in source.clients) for source in clients),
             "cache_hits": sum(c.cache_hits for c in clients),
             "providers": sorted({provider for c in clients for provider in c.providers})}
 
@@ -359,12 +359,19 @@ def test_lyrics_source(index, identity):
                 "detail": "La validation LRC exige un texte de référence." if connected else str(page.failure)}
     engine = lyrics_engine()
     client = engine.LyricsSources()
-    signature = ("Yellow", "Coldplay", "Parachutes", 269, "Coldplay")
+    from _parole_lrc_credit import RED
+
+    if identity == RED:
+        signature = ("Bohemian Rhapsody (Remastered 2011)", "Queen", "A Night at the Opera", 356.52, "Queen")
+        code = "GBUM71029604"
+    else:
+        signature = ("Yellow", "Coldplay", "Parachutes", 269, "Coldplay")
+        code = None
     forms = (True, False) if "lrc" in row["category"].split(",") else (False,)
     try:
         for synced in forms:
-            text, _ = client.find(*signature, synced=synced, registry=index,
-                                  strict=True, provider_only=identity, refresh=True)
+            text, _ = client.find(*signature, synced=synced, registry=index, isrc=code,
+                                  strict=True, provider_only=identity, refresh=True, original_lrc=identity == RED)
             if text:
                 return {"state": "found", "format": "mot" if synced and engine.WORD_STAMP.search(text)
                         else "ligne" if synced else "texte"}
