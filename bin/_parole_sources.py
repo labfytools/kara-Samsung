@@ -365,20 +365,28 @@ def https_connection(host, timeout):
             connection.forget()
 
 
-def fetch(url, *, interval=1.2, accept="application/json", registry=None, provider=None, validation=False):
+def fetch(url, *, interval=1.2, accept="application/json", registry=None, provider=None, validation=False, audit=None):
     parts = public_url(url)
+    event = {"type": "request", "url": url, "sent": False} if audit else None
     try:
         with request_slot(parts.hostname, 5):
-            return fetch_response(parts, interval, accept, registry, provider, validation)
+            return fetch_response(parts, interval, accept, registry, provider, validation, event)
     except ImportIssue as error:
         raise ProviderUnavailable("Créneau fournisseur indisponible") from error
+    except (OSError, ValueError) as error:
+        if event is not None:
+            event["reason"] = str(error)
+        raise
+    finally:
+        if event is not None:
+            audit(event)
 
 
-def fetch_response(parts, interval, accept, registry, provider, validation):
+def fetch_response(parts, interval, accept, registry, provider, validation, event=None):
     service = parts.hostname if registry is not None or parts.hostname == "lrclib.net" else "parole-" + parts.hostname
     if registry is not None:
         wait_provider(registry, provider, service, interval, validation=validation,
-                      lyrics=provider == "Unison")
+                      lyrics=provider == "Unison" or event is not None)
     else:
         try:
             wait_service(service, interval, max_wait=5)
@@ -389,9 +397,13 @@ def fetch_response(parts, interval, accept, registry, provider, validation):
         try:
             checkpoint()
             path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+            if event is not None:
+                event["sent"] = True
             connection.request("GET", path, headers={
                 "Accept": accept, "User-Agent": "Parole/3 (https://github.com/labfytools/kara-Samsung)"})
             response = connection.getresponse()
+            if event is not None:
+                event.update(http=response.status, retry_after=response.getheader("Retry-After"))
             if registry and provider:
                 record_quota(registry, provider, getattr(response, "headers", {}))
             if response.status == 404:

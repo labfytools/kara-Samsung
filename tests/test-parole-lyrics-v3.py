@@ -181,6 +181,68 @@ class LyricsTests(unittest.TestCase):
             path.write_bytes(b"another recording on the same path")
             self.assertEqual(playback_candidates(path, self.library), {})
 
+    def test_progressive_discovery_keeps_original_credits_and_strict_timing(self):
+        engine = self.engine
+        title, artist, album = "03 - L’Été (feat․ Invité)", "Artiste, Invité", "Original"
+        args = (title, artist, album, 100, "Artiste")
+        record = dict(trackName="L’Été (feat. Invité)", artistName="Artiste",
+                      albumName="Compilation", duration=104, plainLyrics="Texte de l’enregistrement",
+                      syncedLyrics="[00:01.00]Texte de l’enregistrement")
+        calls = []
+
+        def get(endpoint, **terms):
+            calls.append((endpoint, terms))
+            return [record] if terms.get("artist_name") == "Invité" else None
+
+        client = engine.LrcLib()
+        with patch.object(client, "get", side_effect=get):
+            self.assertEqual(client.find(*args), record["plainLyrics"])
+            self.assertIsNone(client.find(*args, synced=True))
+        self.assertEqual(calls[0][1]["track_name"], title)
+        self.assertEqual(calls[0][1]["album_name"], album)
+        self.assertIn(("search", {"track_name": "l ete", "artist_name": "artiste"}), calls)
+        self.assertIn(("search", {"track_name": "L’Été", "artist_name": "Invité"}), calls)
+        self.assertIsNone(engine.verified_lyrics(dict(record, trackName="L’Été (Live)"), *args))
+
+    def test_ambiguity_requires_corroboration_and_preserves_candidates(self):
+        self.only("LRCLIB", "NetEase", "QQ Music")
+        client = self.engine.LyricsSources()
+        recording = self.library / "song.flac"
+        recording.write_bytes(b"fixture")
+        record = dict(id=1, trackName=SONG[0], artistName=SONG[1], albumName=SONG[2], duration=30,
+                      plainLyrics="Premier texte", syncedLyrics="[00:01.00]Premier texte")
+        other = dict(record, id=2, plainLyrics="Autre texte", syncedLyrics="[00:02.00]Premier texte")
+        events = []
+        with patch.object(client.lrc, "get", side_effect=[None, [record, other]]), patch.object(
+                client.netease, "find", return_value="Premièr texte !"), patch.object(
+                client.qqmusic, "find", return_value=None) as later:
+            self.assertEqual(client.find(*SONG, synced=False, strict=True, registry=self.index,
+                                         recording=(recording, file_token(recording)), audit=events.append),
+                             ("Premier texte", "LRCLIB"))
+        later.assert_called()
+        self.assertIn(("LRCLIB", "ambiguous"), [(e.get("provider"), e.get("outcome")) for e in events])
+        with patch.object(client.lrc, "get", side_effect=[None, [record, other]]), patch.object(
+                client.netease, "find", return_value=None), patch.object(client.qqmusic, "find", return_value=None):
+            with self.assertRaises(self.engine.AmbiguousLyrics):
+                client.find(*SONG, synced=True, strict=True, registry=self.index, local_text="Premier texte",
+                            recording=(recording, file_token(recording)))
+        with self.index.db() as db:
+            row = db.execute("SELECT value FROM reviews WHERE kind=?", (EVIDENCE_KIND,)).fetchone()
+        self.assertEqual({v["metadata"]["catalogue_id"] for v in json.loads(row[0])["synced"]}, {1, 2})
+
+    def test_artist_outcomes_are_exclusive_and_provider_yield_counts_publications(self):
+        from _parole_import_enrichment import ARTIST_OUTCOMES, artist_summary
+
+        cases = (("present", "present"), ("found", "limited"), ("found", "found"), ("present", "review"),
+                 ("missing", "missing"), ("missing", "limited"), ("temporary", "missing"))
+        audit = [{"type": "request", "provider": "LRCLIB", "sent": True},
+                 {"type": "provider", "provider": "LRCLIB", "outcome": "found"},
+                 {"type": "publication", "provider": "LRCLIB", "form": "lrc"}]
+        rows = {i: {"lyrics": plain, "lrc": timed} for i, (plain, timed) in enumerate(cases)}
+        rows[2]["audit"] = audit
+        self.assertEqual(artist_summary(rows), (dict.fromkeys(ARTIST_OUTCOMES, 1),
+                         {"LRCLIB": {"requests": 1, "found": 1, "published_lrc": 1}}))
+
     def test_quota_dashboard_keeps_local_and_remote_limits_distinct(self):
         configure_limits(self.index, "NetEase", 2, 1)
         self.assertTrue(self.index.reserve_daily("provider:NetEase", 2))

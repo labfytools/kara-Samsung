@@ -11,6 +11,7 @@ from html.parser import HTMLParser
 from hashlib import sha256
 from itertools import groupby, islice
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -33,7 +34,7 @@ from _kara_import_resources import PROCESSING, RATE_DIRECTORY, defer_service, re
 from _kara_import_result import ImportIssue
 from _parole_import_metrics import ACCESS_DENIED, ACCESS_REVIEW_DELAY
 from _parole_lyrics_lookup import (KeepAlive, cache_identity, cache_value, cached, contexts, lookup_slot,
-                                   previous_identity, provider_profiles, record_profile, remember,
+                                   provider_profiles, record_profile, remember,
                                    save_candidates, temporary)
 from _parole_lyricsfile import enhanced
 from _parole_unison import isrc as normalize_isrc
@@ -46,6 +47,7 @@ LYRICS_TAGS = {"lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx"}
 REMASTER_SUFFIX = re.compile(r"\s*[\[(](?:\d{4}\s+)?remaster(?:ed)?(?:\s+(?:\d{4}|deluxe box set))?[\])]\s*$", re.I)
 MAX_RESPONSE = 2 * 1024 * 1024
 TRACK_WORKERS = 4
+MAX_LRC_SEARCHES = 8
 
 
 class ServiceUnavailable(Exception):
@@ -93,6 +95,7 @@ class RequestGate:
         self.provider = None
         self.deadline = None
         self.requests = 0
+        self.audit = None
 
     def remaining(self, limit):
         return limit if self.deadline is None else max(0., min(limit, self.deadline - time.monotonic()))
@@ -105,7 +108,8 @@ class RequestGate:
                 wait_provider(*self.provider, host, self.interval, max_wait=self.remaining(3), lyrics=True)
                 return True
             except ProviderUnavailable as error:
-                raise ServiceUnavailable(str(error), "limited") from error
+                reason = "limited" if "quotidienne" in str(error) or "suspendu" in str(error) else "unavailable"
+                raise ServiceUnavailable(str(error), reason) from error
         if host == "lrclib.net" or os.environ.get("KARA_IMPORT_PROCESSING"):
             try:
                 wait_service(host, self.interval, max_wait=30)
@@ -140,6 +144,28 @@ class RequestGate:
 
     @contextmanager
     def open(self, opener, request, timeout):
+        if self.audit is None:
+            with self.transport(opener, request, timeout) as response:
+                yield response
+            return
+        before = self.requests
+        event = {"type": "request", "url": request.full_url}
+        try:
+            with self.transport(opener, request, timeout) as response:
+                event["http"] = getattr(response, "status", 200)
+                yield response
+        except HTTPError as error:
+            event.update(http=error.code, retry_after=(error.headers or {}).get("Retry-After"))
+            raise
+        except (ServiceUnavailable, OSError) as error:
+            event["reason"] = str(error)
+            raise
+        finally:
+            event["sent"] = self.requests > before
+            self.audit(event)
+
+    @contextmanager
+    def transport(self, opener, request, timeout):
         host = urlsplit(request.full_url).hostname
         if host == "lrclib.net":
             from _parole_sources import request_slot
@@ -151,7 +177,7 @@ class RequestGate:
         try:
             with slot:
                 if not self.remaining(timeout) or not self.wait(host) or not (budget := self.remaining(timeout)):
-                    raise ServiceUnavailable("Créneau fournisseur indisponible", "limited")
+                    raise ServiceUnavailable("Budget de temps ou créneau fournisseur indisponible")
                 self.requests += 1
                 try:
                     with opener.open(request, timeout=budget) as response:
@@ -179,7 +205,7 @@ class RequestGate:
                         self.defer(host, 5, 503)
                     raise
         except ImportIssue as error:
-            raise ServiceUnavailable(str(error), "limited") from error
+            raise ServiceUnavailable(str(error)) from error
 
 
 def candidate_evidence(record, text, decision):
@@ -210,7 +236,7 @@ class LrcLib:
         if self.answers is not None and url in self.answers:
             return self.answers[url]
         response = self.fetch(url)
-        if self.answers is not None and len(self.answers) < 3:
+        if self.answers is not None and len(self.answers) < MAX_LRC_SEARCHES + 1:
             self.answers[url] = response
         return response
 
@@ -253,46 +279,71 @@ class LrcLib:
         self.edition_candidate = False
 
         def observe(record, text, status):
-            if len(self.candidates) < 4 and text:
-                self.candidates.append(candidate_evidence(record, text, status))
-
-        def rejected(record):
-            if text := transcript(record, duration, synced):
+            if self.gate.audit:
+                item = candidate_evidence(record, text, status)
+                self.gate.audit({"type": "candidate", **{k: v for k, v in item.items() if k != "text"}})
+            if text and status == "other-edition":
                 self.edition_candidate = True
-                observe(record, text, "other-edition")
+            if text and status in ("compatible", "other-edition"):
+                item = candidate_evidence(record, text, status)
+                if item not in self.candidates and len(self.candidates) < 12:
+                    self.candidates.append(item)
+                    self.candidates.sort(key=lambda row: row["decision"] != "compatible")
 
-        signature = dict(track_name=title, artist_name=artist, duration=duration)
+        code = getattr(self, "isrc", "")
+        signature = title, artist, album, duration, album_artist
+        exact = dict(track_name=title, artist_name=artist, duration=duration)
         if album:
-            signature["album_name"] = album
-        record = self.get("get", **signature)
-        result = verified_lyrics(record, title, artist, album, duration, album_artist,
-                                 synced=synced, on_edition=rejected, isrc=getattr(self, "isrc", ""))
-        if result is not None:
-            observe(record, result, "compatible")
-            if companion := transcript(record, duration, not synced):
-                identity = record.get("id")
-                self.exact_complement = cache_value(companion, {"catalogue_id": identity}
-                                                    if type(identity) is int else {})
-            return result
-
-        base_title, _ = split_feature(clean_title(title))
-        # Query variants widen discovery only. Keep edition, version,
-        # duration and credits in the original acceptance decision.
-        search_artist = album_artist or artist
-        variants = ((base_title, search_artist), (base_title, artist), (folded(base_title), search_artist))
-        queried = set()
-        for label, credit in variants:
-            query = normalized(label), normalized(credit)
-            if not all(query) or query in queried:
-                continue
-            queried.add(query)
-            records = self.get("search", track_name=label, artist_name=credit)
-            text = best_transcript(records[:20] if isinstance(records, list) else (),
-                                   title, artist, album, duration, album_artist,
-                                   synced=synced, strict=getattr(self, "strict", False),
-                                   on_edition=rejected, on_candidate=observe, isrc=getattr(self, "isrc", ""))
+            exact["album_name"] = album
+        record = self.get("get", **exact)
+        scores = []
+        def assess(record, *, exact=False):
+            score = recording_score(record, *signature, isrc=code, synced=synced,
+                                    on_reject=lambda item, reason: observe(item, transcript(item, duration, synced), reason))
+            if score is None:
+                return None
+            text = transcript(record, duration, synced)
+            observe(record, text, "compatible" if text is not None else "format-indisponible")
             if text is not None:
-                return text
+                scores.append((score, text, record))
+                # A plain match with looser evidence cannot seed the timed
+                # cache. Validate the reverse form independently.
+                if exact and recording_score(record, *signature, isrc=code, synced=True) is not None:
+                    if companion := transcript(record, duration, not synced):
+                        self.exact_complement = cache_value(companion, candidate_evidence(record, text, "")["metadata"])
+            return text
+
+        result = assess(record, exact=True)
+        if result is not None and (synced or recording_score(record, *signature, isrc=code) is not None):
+            return result
+        if result is not None:
+            self.exact_complement = None
+        for label, credit, edition in lyric_queries(title, artist, album, album_artist)[:MAX_LRC_SEARCHES]:
+            query = {"track_name": label, "artist_name": credit}
+            if edition:
+                query["album_name"] = edition
+            try:
+                records = self.get("search", **query)
+            except ServiceUnavailable as error:
+                if not scores:
+                    raise
+                self.failure = error
+                break
+            for record in records[:20] if isinstance(records, list) else ():
+                assess(record)
+            if scores:
+                # Once discovery yields competing top candidates, keep the
+                # conflict and move to an independent provider.
+                best = max(score for score, _, _ in scores)
+                contenders = [(text, record) for score, text, record in scores if score == best]
+                editions = {record.get("albumName") for _, record in contenders}
+                if synced or edition or album in editions or result is not None:
+                    return choose_transcript(contenders, synced, getattr(self, "strict", False))
+                result = scores[0][1]
+        if scores:
+            best = max(score for score, _, _ in scores)
+            return choose_transcript([(text, record) for score, text, record in scores if score == best],
+                                     synced, getattr(self, "strict", False))
         return None
 
 
@@ -329,10 +380,8 @@ class LyricsOvh:
     def find(self, title, artist, album, duration, album_artist):
         # La recherche Deezer associée fournit l’identité et la durée. L’API
         # des paroles, elle, ne répond qu’avec du texte.
-        if not album:
-            return None
-        base_title, _ = split_feature(clean_title(title))
-        query = quote(f"{album_artist or artist} {base_title}", safe="")
+        base_title, _ = split_feature(clean_title(without_track_number(title)))
+        query = quote(getattr(self, "search_terms", None) or f"{album_artist or artist} {base_title}", safe="")
         response = self.get(f"suggest/{query}")
         if not isinstance(response, dict):
             return None
@@ -345,18 +394,19 @@ class LyricsOvh:
             metadata = dict(trackName=track_title, artistName=name,
                             albumName=(track.get("album") or {}).get("title"),
                             duration=track.get("duration"))
-            score = recording_score(metadata, title, artist, album, duration, album_artist)
+            score = audit_score(self, metadata, title, artist, album, duration, album_artist, synced=False)
             if score is not None:
                 candidates.add((score, name, track_title))
         if not candidates:
             return None
         top = max(score for score, _, _ in candidates)
         keys = {(name, track) for score, name, track in candidates if score == top}
-        if len(keys) != 1:
-            return None
-        name, track = keys.pop()
-        response = self.get(f"v1/{quote(name, safe='')}/{quote(track, safe='')}")
-        return usable_text(response.get("lyrics"), 32_000) if isinstance(response, dict) else None
+        def fetch(key):
+            name, track = key
+            response = self.get(f"v1/{quote(name, safe='')}/{quote(track, safe='')}")
+            return usable_text(response.get("lyrics"), 32_000) if isinstance(response, dict) else None
+
+        return available_transcript(dict.fromkeys(sorted(keys)[:4], top), fetch, self)
 
 
 class PublicLyrics:
@@ -394,10 +444,10 @@ class PublicLyrics:
 
 class NetEase(PublicLyrics):
     def find(self, title, artist, album, duration, album_artist, *, synced):
-        if not album:
+        if synced and not album:
             return None
-        base_title, _ = split_feature(clean_title(title))
-        params = urlencode({"s": f"{album_artist or artist} {base_title}", "type": 1, "limit": 12})
+        base_title, _ = split_feature(clean_title(without_track_number(title)))
+        params = urlencode({"s": getattr(self, "search_terms", None) or f"{album_artist or artist} {base_title}", "type": 1, "limit": 12})
         response = self.get(f"https://music.163.com/api/search/get?{params}")
         if not isinstance(response, dict):
             return None
@@ -415,7 +465,7 @@ class NetEase(PublicLyrics):
                             artistName=", ".join(a["name"] for a in song.get("artists", []) if a.get("name")),
                             albumName=(song.get("album") or {}).get("name"),
                             duration=milliseconds / 1000)
-            score = recording_score(metadata, title, artist, album, duration, album_artist)
+            score = audit_score(self, metadata, title, artist, album, duration, album_artist, synced=synced)
             if score is not None:
                 candidates[song_id] = score
         def fetch(song_id):
@@ -439,15 +489,15 @@ class QQMusic(PublicLyrics):
         return self.EXPLICIT.sub("", value) if isinstance(value, str) else ""
 
     def find(self, title, artist, album, duration, album_artist, *, synced):
-        if not album:
+        if synced and not album:
             return None
-        base_title, _ = split_feature(clean_title(title))
+        base_title, _ = split_feature(clean_title(without_track_number(title)))
         service = "music.search.SearchCgiService"
         search = {
             service: {
                 "module": service,
                 "method": "DoSearchForQQMusicDesktop",
-                "param": {"search_type": 0, "query": f"{album_artist or artist} {base_title}",
+                "param": {"search_type": 0, "query": getattr(self, "search_terms", None) or f"{album_artist or artist} {base_title}",
                           "page_num": 1, "num_per_page": 8},
             },
         }
@@ -478,8 +528,8 @@ class QQMusic(PublicLyrics):
                 albumName=album_label if strict else self.remove_explicit(album_label),
                 duration=song.get("interval"),
             )
-            score = recording_score(metadata, title if strict else self.remove_explicit(title), artist,
-                                    album if strict else self.remove_explicit(album), duration, album_artist)
+            score = audit_score(self, metadata, title if strict else self.remove_explicit(title), artist,
+                                album if strict else self.remove_explicit(album), duration, album_artist, synced=synced)
             if score is not None:
                 candidates[song_id] = score
 
@@ -537,10 +587,8 @@ class GeniusLyrics(HTMLParser):
 
 class Genius(PublicLyrics):
     def find(self, title, artist, album, duration, album_artist):
-        if not album:
-            return None
-        base_title, _ = split_feature(clean_title(title))
-        params = urlencode({"q": f"{album_artist or artist} {base_title}"})
+        base_title, _ = split_feature(clean_title(without_track_number(title)))
+        params = urlencode({"q": getattr(self, "search_terms", None) or f"{album_artist or artist} {base_title}"})
         response = self.get(f"https://genius.com/api/search/song?{params}")
         if not isinstance(response, dict):
             return None
@@ -559,10 +607,9 @@ class Genius(PublicLyrics):
             if not isinstance(details, dict):
                 continue
             song = (details.get("response") or {}).get("song") or {}
-            album_name = (song.get("album") or {}).get("name")
             apple_id = str(song.get("apple_music_id") or "")
             url = urlsplit(song.get("url") or "")
-            if (title_key(album_name) != title_key(album) or not apple_id.isdecimal()
+            if (not apple_id.isdecimal()
                     or url.scheme != "https" or url.netloc != "genius.com"):
                 continue
             params = urlencode({"id": apple_id, "country": "fr"})
@@ -575,23 +622,19 @@ class Genius(PublicLyrics):
                     continue
                 metadata = dict(trackName=track.get("trackName"), artistName=track.get("artistName"),
                                 albumName=track.get("collectionName"), duration=milliseconds / 1000)
-                score = recording_score(metadata, title, artist, album, duration, album_artist)
+                score = audit_score(self, metadata, title, artist, album, duration, album_artist, synced=False)
                 if score is not None:
                     candidates[url.geturl()] = score
-        if not candidates:
-            return None
-        top = max(candidates.values())
-        urls = [url for url, score in candidates.items() if score == top]
-        if len(urls) != 1:
-            return None
-        markup = self.get(urls[0], html=True)
-        if not markup:
-            return None
-        parser = GeniusLyrics()
-        parser.feed(markup)
-        parser.close()
-        return usable_text("".join(parser.fragments), 32_000)
+        def fetch(url):
+            markup = self.get(url, html=True)
+            if not markup:
+                return None
+            parser = GeniusLyrics()
+            parser.feed(markup)
+            parser.close()
+            return usable_text("".join(parser.fragments), 32_000)
 
+        return available_transcript(candidates, fetch, self)
 
 
 class LyricDownPage(HTMLParser):
@@ -688,9 +731,9 @@ class LyricDown(PublicLyrics):
     def find(self, title, artist, album, duration, album_artist, local_text):
         if not album or not usable_text(local_text, 32_000):
             return None
-        base, _ = split_feature(clean_title(title))
+        base, _ = split_feature(clean_title(without_track_number(title)))
         prefixes = []
-        for credit in (artist, album_artist):
+        for credit in (artist, artist_parts(title, artist, album_artist)[0]):
             slug = re.sub(r"[^a-z0-9]+", "-", folded(credit)).strip("-")
             if slug:
                 prefixes.append("/lrc/" + slug + "-")
@@ -706,7 +749,7 @@ class LyricDown(PublicLyrics):
             if page is None or len(page.records) != 1:
                 continue
             record = page.records[0]
-            if title_key(record.get("name")) != title_key(title):
+            if title_key(split_feature(record.get("name") or "")[0]) != title_key(base):
                 continue
             if credits((record.get("byArtist") or {}).get("name")) not in (credits(artist), credits(album_artist)):
                 continue
@@ -718,7 +761,9 @@ class LyricDown(PublicLyrics):
             if result:
                 (exact if title_key(found_album) == title_key(album) else regional).add(result)
         selected = exact or regional
-        return selected.pop() if len(selected) == 1 else None
+        if hasattr(self, "candidates"):
+            self.candidates.extend(candidate_evidence({}, text, "compatible") for text in sorted(selected))
+        return choose_transcript([(text, {}) for text in selected], True, getattr(self, "strict", False)) if selected else None
 
 
 class LyricsSources:
@@ -753,7 +798,7 @@ class LyricsSources:
 
     def find(self, title, artist, album, duration, album_artist, *, synced, local_text="",
              registry=None, strict=False, context=(), provider_only=None, isrc=None, recording=None,
-             refresh=False):
+             refresh=False, audit=None):
         from _parole_import_metrics import LOOKUP, snapshot
         from _parole_sources import LYRICS_BROKER_UPSTREAMS, lyrics_rows, ready_sources
 
@@ -793,7 +838,12 @@ class LyricsSources:
             names.remove("LyricDown")
         providers, available, profiles, measured = {}, {}, {}, {}
         if registry:
-            providers = {row["id"]: row for row in lyrics_rows(registry) if row["state"] == "active"}
+            rows = lyrics_rows(registry)
+            providers = {row["id"]: row for row in rows if row["state"] == "active"}
+            if audit:
+                for row in rows:
+                    if row["id"] in names and row["state"] != "active":
+                        audit({"type": "provider", "provider": row["id"], "outcome": row["state"]})
             available = ready_sources(registry, time.time())
             measured = snapshot(registry)
             profiles = provider_profiles(registry, (name for name in names if name in providers), synced, context)
@@ -824,9 +874,10 @@ class LyricsSources:
             names = [name for name in names if name == provider_only]
 
         entries, instrumental, failed, ambiguous = [], None, None, False
+        quota = None
         choice = (None, None)
         for name in names:
-            if choice[0] and name != "LRCLIB":
+            if choice[0] and not ambiguous and name != "LRCLIB":
                 continue
             if registry and name not in providers:
                 continue
@@ -841,24 +892,40 @@ class LyricsSources:
             try:
                 with lookup_slot(registry, lock_key) if lock_key else nullcontext():
                     hit, result = cached(registry, identity) if identity and not refresh else (False, None)
-                    if identity and not hit and not code and not refresh:
-                        old_key = previous_identity(name, signature, synced,
-                            local_text if name == "LyricDown" else "", strict, row["config"])
-                        old_hit, old_result = cached(registry, old_key)
-                        if old_hit and old_result["text"] is not None:
-                            hit, result = True, old_result
+                    def note(event):
+                        if audit:
+                            audit({**event, "provider": name, "form": "lrc" if synced else "lyrics"})
+
                     if hit:
                         self.cache_hits += 1
-                    elif (registry and (name not in available or "limited_until" in measured.get(name, {})
-                          or name == "lyrics.ovh" and not set(LYRICS_BROKER_UPSTREAMS).issubset(
-                              ready_sources(registry, time.time())))):
-                        failed = ServiceUnavailable("Fournisseur en pause ou quota atteint", "limited")
+                        note({"type": "provider", "outcome": "cache-hit" if result["text"] is not None else "cache-miss"})
+                    elif registry and (name not in available or "limited_until" in measured.get(name, {})
+                                       or name == "lyrics.ovh" and not set(LYRICS_BROKER_UPSTREAMS).issubset(
+                                           ready_sources(registry, time.time()))):
+                        reason = row["availability"]
+                        status = row["last_http"]
+                        quota_reached = row["remaining"] == 0 or status == 429
+                        if reason == "upstream":
+                            upstreams = [providers[n] for n in LYRICS_BROKER_UPSTREAMS if n in providers]
+                            quota_reached = any(up["remaining"] == 0 or up["last_http"] == 429 for up in upstreams)
+                        error = ServiceUnavailable("Fournisseur en pause ou quota atteint",
+                                                   "limited" if quota_reached else "unavailable")
+                        if quota_reached:
+                            quota = error
+                        else:
+                            failed = error
+                        note({"type": "provider", "outcome": reason, "remaining": row["remaining"],
+                              "http": status, "retry_at": row["next_available"]})
                         continue
                     else:
                         result, error, conflict, candidates = self.query(
                             name, clients, row, signature, local_text, synced, registry, strict, context, code,
+                            audit=note if audit else None,
                         )
-                        failed = error or failed
+                        if error and getattr(error, "reason", None) == "limited":
+                            quota = error
+                        else:
+                            failed = error or failed
                         ambiguous |= conflict
                         entries.extend(dict(item, provider=name) for item in candidates)
                         if identity:
@@ -872,11 +939,15 @@ class LyricsSources:
                             elif error:
                                 temporary(registry, identity, name, str(error))
             except ImportIssue as error:
-                failed = ServiceUnavailable(str(error), "limited")
+                failed = ServiceUnavailable(str(error))
+                if audit:
+                    audit({"type": "provider", "provider": name, "outcome": "lock-timeout"})
                 continue
             value = result["text"]
             if value:
                 entries.append(dict(result, provider=name, decision="compatible"))
+                if ambiguous:
+                    continue
                 if choice[0] is None or WORD_STAMP.search(value):
                     choice = value, name
                 # Ordered execution avoids fan-out against every catalogue.
@@ -890,6 +961,8 @@ class LyricsSources:
                 break
             if value == "":
                 instrumental = name
+        if ambiguous:
+            choice = resolve_conflict(entries, synced, local_text)
         if registry and entries:
             selected = cache_value(choice[0])["sha256"]
             for item in entries:
@@ -900,17 +973,19 @@ class LyricsSources:
             save_candidates(registry, recording, entries, synced=synced)
         if choice[0]:
             return choice
-        if instrumental is not None:
-            return "", instrumental
         if strict and ambiguous:
             raise AmbiguousLyrics("Correspondance ambiguë")
+        if instrumental is not None:
+            return "", instrumental
+        if strict and quota:
+            raise quota
         if strict and failed:
             if isinstance(failed, ServiceUnavailable):
                 raise failed
             raise ServiceUnavailable("Au moins un fournisseur est indisponible")
         return None, None
 
-    def query(self, name, clients, row, signature, local_text, synced, registry, strict, context, code):
+    def query(self, name, clients, row, signature, local_text, synced, registry, strict, context, code, *, audit):
         from _parole_import_metrics import LOOKUP, SUCCEEDED, observe
         from _parole_sources import LyricsEndpoint, ProviderUnavailable, record, record_lyrics
 
@@ -924,40 +999,81 @@ class LyricsSources:
             client.isrc = code
             client.strict = strict
             client.gate.provider = (registry, name) if registry else None
+            client.gate.audit = audit
             requests = client.gate.requests
             if name == "LRCLIB":
                 client.exact_complement = None
             try:
-                value = client.find(*signature, local_text) if kwargs is None else client.find(*signature, **kwargs)
+                if kwargs is None:
+                    value = client.find(*signature, local_text)
+                elif name == "LRCLIB":
+                    value = client.find(*signature, **kwargs)
+                else:
+                    title, artist, album, _, album_artist = signature
+                    variants = lyric_queries(title, artist, album, album_artist)
+                    # Catalogue queries need a fallback without the album
+                    # and reserve one alternate for accents or artist aliases.
+                    terms = list(dict.fromkeys(" ".join(filter(None, (credit, label, edition)))
+                                               for label, credit, edition in variants))
+                    for client.search_terms in terms[:3]:
+                        value = client.find(*signature, **kwargs)
+                        if value is not None or client.failure:
+                            break
             except ServiceUnavailable as failure:
                 client.failure = failure
             except AmbiguousLyrics:
                 conflict = True
+            finally:
+                client.gate.audit = None
+                client.search_terms = None
             error = client.failure
             contacted = requests != client.gate.requests
             candidates = client.candidates
         else:
             conf = row["decoded"]
-            contacted = True
+            contacted = False
+
+            def transport_event(event):
+                nonlocal contacted
+                contacted |= event["sent"]
+                if audit:
+                    audit(event)
+
+            def candidate(record, text, decision):
+                item = candidate_evidence(record, text, decision)
+                if text and len(candidates) < 8:
+                    candidates.append(item)
+                if audit:
+                    audit({"type": "candidate", **{key: value for key, value in item.items() if key != "text"}})
+
             try:
-                title, artist, album, _, _ = signature
-                response = LyricsEndpoint(conf["host"], conf["path"]).search(
-                    title, artist, album, registry=registry, provider=name)
-                value = best_transcript(
-                    response, *signature, synced=synced, strict=strict, isrc=code,
-                    on_candidate=lambda item, text, decision: candidates.append(candidate_evidence(item, text, decision))
-                    if text and len(candidates) < 4 else None,
-                )
+                title, artist, album, _, album_artist = signature
+                variants = list(dict.fromkeys([(title, artist, album),
+                                                *lyric_queries(title, artist, album, album_artist)]))
+                endpoint = LyricsEndpoint(conf["host"], conf["path"])
+                for label, credit, edition in variants[:3]:
+                    response = endpoint.search(label, credit, edition, registry=registry, provider=name,
+                                               audit=transport_event)
+                    value = best_transcript(
+                        response, *signature, synced=synced, strict=strict, isrc=code,
+                        on_candidate=candidate, on_reject=lambda record, reason: candidate(record, None, reason),
+                    )
+                    if value is not None:
+                        break
             except AmbiguousLyrics:
                 conflict = True
             except (ProviderUnavailable, ValueError) as failure:
                 error = failure
+        outcome = ("ambiguous" if conflict else "found" if value else "instrumental" if value == "" else
+                   "error" if error else "different_edition" if candidates else "absent")
+        if audit:
+            audit({"type": "provider", "outcome": outcome, "contacted": contacted,
+                   "reason": str(error) if error else None})
         if registry and contacted:
             self.providers.add(name)
             elapsed = time.monotonic() - started
-            outcome = ("error" if error and value is None else "ambiguous" if conflict else
-                       "found" if value is not None else "different_edition" if candidates else "absent")
-            record(registry, name, outcome, elapsed, error=str(error) if error else "")
+            record(registry, name, "found" if outcome == "instrumental" else outcome,
+                   elapsed, error=str(error) if error else "")
             if value:
                 record_lyrics(registry, name, synced)
             observe(registry, name, {LOOKUP: elapsed, SUCCEEDED: int(value is not None)})
@@ -983,13 +1099,21 @@ def folded(value):
 
 
 def split_feature(value):
+    value = normalize("NFKC", value)
     match = re.fullmatch(r"(.+?)\s*[\[(](?:feat\.?|ft\.?|featuring)\s+(.+?)[\])]", value, re.I)
+    if not match:
+        match = re.fullmatch(r"(.+?)\s+(?:feat\.?|ft\.?|featuring)\s+(.+)", value, re.I)
     return (match[1], match[2]) if match else (value, "")
 
 
 def credits(value):
-    parts = re.split(r"\s*(?:,|&|\b(?:feat|ft|featuring)\.?\s+)\s*", normalized(value))
+    parts = re.split(r"\s*(?:,|;|&|\b(?:feat|ft|featuring)\.?\s+)\s*", normalized(value))
     return frozenset(folded(part) for part in parts if part)
+
+
+def without_track_number(title):
+    # A separator is required so a title such as "99 Problems" keeps its number.
+    return re.sub(r"^\s*\d{1,3}\s*(?:[.\-–—_]\s*|\s+-\s+)(?=\S)", "", title)
 
 
 def title_key(value):
@@ -997,37 +1121,136 @@ def title_key(value):
     return re.sub(r"[, (]+(?:pt|part|partie)\.?\s+(\d+)\)?$", r" part \1", key)
 
 
-def recording_score(record, title, artist, album, duration, album_artist, *, on_edition=None, isrc=""):
+def artist_parts(title, artist, album_artist):
+    _, featured = split_feature(title)
+    listed = re.split(r"\s*(?:[,;]|\s[&+]\s|\b(?:feat|ft|featuring)\.?\s+)\s*", artist)
+    main = listed[0]
+    if album_artist and credits(album_artist) and credits(album_artist) <= credits(artist):
+        main = album_artist
+    guests = dict.fromkeys([*listed[1:], *re.split(r"\s*[,;&]\s*", featured)])
+    return main, [name for name in guests if name and credits(name) - credits(main)]
+
+
+def lyric_queries(title, artist, album, album_artist):
+    numberless = without_track_number(title)
+    base, _ = split_feature(clean_title(numberless))
+    main, guests = artist_parts(title, artist, album_artist)
+    folded_title = " ".join(re.findall(r"\w+", folded(base)))
+    folded_artist = " ".join(re.findall(r"\w+", folded(main)))
+    queries = [(base, main, None), (title, artist, album), (title, artist, None),
+               (numberless, artist, None), (base, artist, None), (folded_title, folded_artist, None)]
+    queries.extend((base, guest, None) for guest in guests[:2])
+    return list(dict.fromkeys((t, a, ed) for t, a, ed in queries if t and a))
+
+
+def recording_score(record, title, artist, album, duration, album_artist, *, on_edition=None, isrc="",
+                    synced=True, on_reject=None):
     if not isinstance(record, dict):
         return None
+
+    def reject(reason):
+        if on_edition and reason == "other-edition":
+            on_edition(record)
+        if on_reject:
+            on_reject(record, reason)
+        return None
+
     actual_isrc = normalize_isrc(record.get("isrc"))
-    own_raw, their_raw = normalized(title), normalized(record.get("trackName"))
+    own_raw = without_track_number(normalized(title))
+    their_raw = without_track_number(normalized(record.get("trackName")))
     versions = (REMASTER_SUFFIX.search(own_raw), REMASTER_SUFFIX.search(their_raw))
     if bool(versions[0]) != bool(versions[1]) or (versions[0] and
             title_key(versions[0][0]) != title_key(versions[1][0])):
-        return None
+        return reject("version")
     own_title, own_feat = split_feature(clean_title(own_raw))
     their_title, their_feat = split_feature(clean_title(their_raw))
     if not own_title or title_key(their_title) != title_key(own_title):
-        return None
+        return reject("titre")
     their_album = record.get("albumName")
     length = record.get("duration")
-    if type(length) not in (int, float) or not abs(length - duration) <= 3:
-        return None
+    delta = abs(length - duration) if type(length) in (int, float) and 0 < length and isfinite(length) else float("inf")
+    if delta > (3 if synced else max(8, duration * .05)):
+        return reject("durée")
     expected = credits(artist) | credits(own_feat)
     actual = credits(record.get("artistName")) | credits(their_feat)
-    primary = credits(album_artist)
+    primary = credits(artist_parts(title, artist, album_artist)[0])
     full_credit = actual == expected
-    if not full_credit and not (album and primary and actual == primary and primary < expected):
-        return None
-    if (album and title_key(their_album) != title_key(album)) or (isrc and actual_isrc and isrc != actual_isrc):
-        # Credits, duration and version matched. The edition difference
-        # remains a reason for refusal in the absence of recording proof.
-        if on_edition is not None:
-            on_edition(record)
-        return None
-    return (full_credit, bool(isrc and actual_isrc == isrc), -abs(length - duration),
-            normalized(their_album) == normalized(album), their_title == own_title)
+    same_album = bool(album and title_key(their_album) == title_key(album))
+    same_isrc = bool(isrc and actual_isrc == isrc)
+    if not full_credit and not ((same_album or same_isrc) and primary and actual == primary and primary < expected):
+        return reject("crédits")
+    if isrc and actual_isrc and isrc != actual_isrc:
+        return reject("other-edition")
+    if synced and not (same_album or same_isrc):
+        return reject("other-edition")
+    if synced and album and not same_album:
+        return reject("other-edition")
+    if not synced and record.get("instrumental") is True and (not same_album or delta > 3):
+        return reject("other-edition")
+    return (same_isrc, full_credit, same_album, -delta, their_title == own_title)
+
+
+def words_of(text, synced):
+    if synced:
+        text = "\n".join(line for _, line in parse_lrc(text))
+    # Section headings are presentation, while repeated sung words remain
+    # in order and contribute to the identity of a candidate.
+    text = re.sub(r"^\s*\[[^\]\n]+\]\s*$", "", text, flags=re.M)
+    return tuple(re.findall(r"\w+", folded(text)))
+
+
+def choose_transcript(finalists, synced, strict):
+    matches = {text for text, _ in finalists}
+    forms = {tuple((stamp, words_of(line, False)) for stamp, line in parse_lrc(text))
+             if synced else words_of(text, False) for text in matches}
+    if len(forms) == 1:
+        return min(matches, key=lambda text: (-len(WORD_STAMP.findall(text)) if synced else 0, text))
+    if strict:
+        raise AmbiguousLyrics("Textes ou repères divergents pour la même identité")
+    return None
+
+
+def audit_score(client, record, *signature, synced):
+    def trace(item, reason):
+        if client.gate.audit:
+            client.gate.audit({"type": "candidate", **candidate_evidence(item, None, reason)})
+
+    score = recording_score(record, *signature, synced=synced, isrc=getattr(client, "isrc", ""),
+                            on_reject=trace)
+    if score is not None:
+        trace(record, "métadonnées-compatibles")
+    return score
+
+
+def resolve_conflict(entries, synced, local_text):
+    # An exact lexical match to an existing local reference can eliminate
+    # conflicting words. It cannot choose between different timings of
+    # those same words. Corroboration needs two independent catalogues.
+    groups = {}
+    for item in entries:
+        if item["decision"] != "compatible" or not item["text"]:
+            continue
+        text = item["text"]
+        words = words_of(text, synced)
+        if not words:
+            continue
+        timings = tuple((t, words_of(line, False)) for t, line in parse_lrc(text)) if synced else ()
+        groups.setdefault((words, timings), []).append(item)
+    if local_text:
+        local_words = words_of(local_text, bool(parse_lrc(local_text)))
+        matched = [group for (words, _), group in groups.items() if words == local_words]
+        if len(matched) == 1:
+            groups = {(): matched[0]}
+        elif matched:
+            return None, None
+    supported = [group for group in groups.values()
+                 if len({item["provider"] for item in group if item["provider"] != "lyrics.ovh"}) >= 2]
+    if len(supported) != 1:
+        if not local_text or len(groups) != 1 or () not in groups:
+            return None, None
+        supported = [groups[()]]
+    chosen = min(supported[0], key=lambda item: -len(WORD_STAMP.findall(item["text"])) if synced else 0)
+    return chosen["text"], chosen["provider"]
 
 
 def usable_text(text, limit):
@@ -1066,41 +1289,41 @@ def catalog_transcript(raw, duration, *, synced):
 
 def available_transcript(candidates, fetch, client):
     ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
-    for _, group in groupby(ranked, key=lambda item: item[1]):
+    for _, group in groupby(ranked[:8], key=lambda item: item[1]):
         found = [(identifier, lyrics) for identifier, _ in group if (lyrics := fetch(identifier))]
-        matches = {lyrics for _, lyrics in found}
-        if matches:
+        if found:
             if hasattr(client, "candidates"):
                 client.candidates.extend(candidate_evidence({"id": identifier}, lyrics, "compatible")
-                                         for identifier, lyrics in found[:4])
-            if len(matches) == 1:
-                return matches.pop()
-            if getattr(client, "strict", False):
-                raise AmbiguousLyrics("Plusieurs textes pour la même édition")
-            return None
+                                         for identifier, lyrics in found)
+            return choose_transcript([(lyrics, {}) for _, lyrics in found],
+                                     bool(parse_lrc(found[0][1])), getattr(client, "strict", False))
+        if getattr(client, "failure", None):
+            break
     return None
 
 
 def verified_lyrics(record, title, artist, album, duration, album_artist, *, synced=False,
                     on_edition=None, isrc=""):
     if recording_score(record, title, artist, album, duration, album_artist,
-                       on_edition=on_edition, isrc=isrc) is None:
+                       on_edition=on_edition, isrc=isrc, synced=synced) is None:
         return None
     return transcript(record, duration, synced)
 
 
 def best_transcript(records, title, artist, album, duration, album_artist, *, synced, strict=False,
-                    on_edition=None, on_candidate=None, isrc=""):
+                    on_edition=None, on_candidate=None, isrc="", on_reject=None):
     if not isinstance(records, list):
         return None
     candidates = []
     for record in records:
         score = recording_score(record, title, artist, album, duration, album_artist,
-                                on_edition=on_edition, isrc=isrc)
+                                on_edition=on_edition, isrc=isrc, synced=synced, on_reject=on_reject)
         if score is not None:
             text = transcript(record, duration, synced)
             if text is not None:
                 candidates.append((score, text, record))
+            elif on_candidate:
+                on_candidate(record, None, "format-indisponible")
     if not candidates:
         return None
     top = max(score for score, _, _ in candidates)
@@ -1108,14 +1331,7 @@ def best_transcript(records, title, artist, album, duration, album_artist, *, sy
     if on_candidate is not None:
         for text, record in finalists:
             on_candidate(record, text, "compatible")
-    # Timing precision only breaks ties when the recorded words agree.
-    forms = {tuple(parse_lrc(text)) if synced else text for text, _ in finalists}
-    matches = {text for text, _ in finalists}
-    if len(forms) == 1 and synced:
-        return min(matches, key=lambda text: (-len(WORD_STAMP.findall(text)), text))
-    if strict and len(matches) > 1:
-        raise AmbiguousLyrics("Textes divergents pour la même identité")
-    return matches.pop() if len(matches) == 1 else None
+    return choose_transcript(finalists, synced, strict)
 
 
 def duration_seconds(path):
@@ -1281,7 +1497,7 @@ def process_track(path, client, preview, synced=False, publication_root=None, re
 
 
 def process_import_track(path, client, index, settings, excluded, locks, activity, strawberry, *,
-                         notify=None, diagnostic=lambda _: None):
+                         notify=None, diagnostic=lambda _: None, audit=None):
     from _parole_index import SIDECAR, document, reference_proof, sidecar as read_sidecar
     from _parole_local_reference import SOURCE, local_reference
 
@@ -1296,10 +1512,15 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
         tags, _ = probe(path, include_duration=True)
     duration = tags.pop("duration_seconds", 0.)
     title, artist, album, owner = (tags.get(key) for key in ("title", "artist", "album", "albumartist"))
+    if audit:
+        audit({"type": "metadata", "values": {key: (tags.get(key) or "")[:400]
+               for key in ("title", "artist", "album", "albumartist", "isrc", "track")},
+               "duration": duration if isfinite(duration) else None})
     if (owner or artist) in excluded:
         return "excluded", "excluded"
     if not title or not artist or not 1 <= duration <= 3600:
-        return "review", "review"
+        diagnostic("métadonnées ou durée invalides")
+        return "invalid", "invalid"
     duration = round(duration)
     local_text = next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
     local_text = local_text or read_sidecar(path, ".txt")[1]
@@ -1327,10 +1548,10 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
             try:
                 value, provider = client.find(*signature, synced=synced, local_text=local_text,
                                               registry=index, strict=True, context=context, provider_only=provider_only,
-                                              isrc=tags.get("isrc"), recording=(path, version))
+                                              isrc=tags.get("isrc"), recording=(path, version), audit=audit)
             except ServiceUnavailable as error:
                 diagnostic(error.reason)
-                return "temporary", None, None, None
+                return ("limited" if error.reason == "limited" else "temporary"), None, None, None
             except AmbiguousLyrics:
                 diagnostic("correspondance ambiguë")
                 return "review", None, None, None
@@ -1350,6 +1571,8 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
                                         external=suffix == ".lrc" and provider not in ("Strawberry", SOURCE))
             if saved and notify:
                 notify(path, SIDECAR, proof)
+            if saved and audit:
+                audit({"type": "publication", "provider": provider, "form": "lrc" if suffix == ".lrc" else "lyrics"})
         except (OSError, ValueError) as error:
             diagnostic(str(error))
             return "temporary"
@@ -1397,7 +1620,7 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
                 timed = publish(".lrc", lrc, timed_provider, None)
                 if timed in ("found", "present"):
                     return timed, timed
-            elif assisted == "temporary" and timed == "missing":
+            elif assisted in ("limited", "temporary") and timed == "missing":
                 timed = assisted
         plain = publish(".txt", text, provider, donor)
     return plain, timed

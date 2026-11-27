@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Rechercher progressivement les paroles depuis les tags, comparer les réponses ambiguës et afficher le résultat exclusif de chaque titre avec le rendement des fournisseurs.
+
 - Mutualiser les quotas, les recherches concurrentes et le cache par fournisseur de paroles. Ajouter le tableau de bord, les repères au mot LRCLIB et le lecteur facultatif d’une sauvegarde SQLite.
 
 - Autoriser les recherches de paroles d’artiste et d’import pendant la lecture Strawberry. Donner la priorité à la recherche manuelle et permettre l’annulation d’une réponse HTTP en attente.

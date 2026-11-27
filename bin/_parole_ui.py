@@ -18,7 +18,7 @@ from _kara_paths import BIN, STATE
 from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, rebind_preparations, undo as undo_group
 from _parole_audition import DraftAudition, vocal_file
 from _parole_index import key, document, encoded_key, sidecar
-from _parole_import_enrichment import artist_results, queue_artist
+from _parole_import_enrichment import artist_results, queue_artist, ARTIST_OUTCOMES, artist_summary, track_outcome
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
 from _parole_offer import AUTOMATIC, STRATEGIES
 from _parole_music_registry import set_alias
@@ -1120,10 +1120,21 @@ class ParoleView:
             state["done"] = True
             status.set_text(message)
             cancel.set_sensitive(False)
+            details.set_sensitive(bool(state["results"]))
             current.set_text("")
 
+        def show_audit(widget):
+            results = state["results"]
+            outcomes, sources = artist_summary(results)
+            report = {"morceaux": len(results), "bilan": {label: outcomes.get(key, 0)
+                      for key, label in ARTIST_OUTCOMES.items()}, "fournisseurs": sources,
+                      "détails": {str(Path(path).relative_to(self.index.root)): {
+                          "état": ARTIST_OUTCOMES[track_outcome(row)], **row} for path, row in results.items()}}
+            show_details(widget, "Bilan détaillé de la recherche", json.dumps(report, ensure_ascii=False, indent=2))
+
         cancel = button("Annuler la recherche", stop)
-        for widget in (status, progress, counters, current, errors, cancel):
+        details = button("Bilan détaillé", show_audit, sensitive=False)
+        for widget in (status, progress, counters, current, errors, details, cancel):
             content.append(widget)
         window.set_child(content)
 
@@ -1139,22 +1150,21 @@ class ParoleView:
             state["results"].update(results)
             values = state["results"]
             total, completed = len(state["paths"]), len(values)
-            found = sum(row["lyrics"] == "found" for row in values.values())
-            timed = sum(row["lrc"] == "found" for row in values.values())
-            absent = sum(row["lyrics"] in ("missing", "review", "temporary", "unknown") for row in values.values())
-            topics = [(Path(path).stem, row["errors"]) for path, row in values.items() if row["errors"]]
-            counters.set_text(f"{total} morceaux à analyser · {found} paroles trouvées · {timed} LRC trouvés\n"
-                              f"{absent} morceaux traités sans paroles confirmées · {len(topics)} avec erreur")
-            if topics:
-                translations = {"limited": "quota ou délai fournisseur", "network": "réseau",
-                                "unavailable": "fournisseur indisponible"}
-                errors.set_text("\n".join(f"{name} · {', '.join(translations.get(p, p) for p in reasons)}"
-                                         for name, reasons in topics[-3:]))
+            counts, sources = artist_summary(values)
+            lines = [" · ".join(f"{counts.get(key, 0)} {ARTIST_OUTCOMES[key].lower()}"
+                                for key in group) for group in (("present", "lyrics", "lrc"),
+                                                               ("review", "missing", "limited", "error"))]
+            counters.set_text("\n".join(lines))
+            if sources:
+                errors.set_text("\n".join(f"{name} · {data.get('requests', 0)} requêtes · "
+                                          f"{data.get('found', 0)} correspondances · "
+                                          f"{data.get('published_lyrics', 0) + data.get('published_lrc', 0)} publications"
+                                          for name, data in sources.items()))
             progress.set_fraction(completed / total if total else 1.)
             progress.set_text(f"{completed}/{total} morceaux analysés")
             current.set_text("Recherche en cours · " + ", ".join(Path(path).stem for path in running[:4])
                              if running else "")
-            if completed == total:
+            if completed == total and not running:
                 finish("Recherche terminée.")
             else:
                 status.set_text("Recherche en cours" if running else "En attente d’un créneau de recherche Parole")
@@ -1163,9 +1173,14 @@ class ParoleView:
         def inspect():
             paths = state["paths"]
             live = self.maintenance.artist_lyrics_live(set(paths.values()))
-            results = artist_results(self.index, paths, started)
-            results.update({path: result for path, result in live.items() if path in paths and result is not None})
-            return results, [path for path, result in live.items() if path in paths and result is None]
+            durable = artist_results(self.index, paths, started)
+            results = dict(durable)
+            results.update({path: result for path, result in live.items()
+                            if path in paths and path not in results and result is not None})
+            # A live result can precede the committed full audit. Wait for
+            # the receipt before declaring the window complete.
+            running = [path for path in live if path in paths and path not in durable]
+            return results, running
 
         def poll():
             if state["done"] or self.control.closed:

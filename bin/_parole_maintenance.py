@@ -1018,6 +1018,7 @@ class Maintenance:
             code, data = self.output([sys.executable, "-B", str(BIN / "_parole_work.py"), kind, subject],
                                      timeout=180 + 105 * ((len(paths) + 1) // 2) if kind == IMPORT_LYRICS else 180,
                                      observer=update if kind == IMPORT_LYRICS else None,
+                                     maximum=2 * 1024**2 if kind == IMPORT_LYRICS else 262_144,
                                      extra_env={"KARA_ENRICHMENT_EVENTS": "1"}, stop=stop, import_owner=owner)
         finally:
             if kind == IMPORT_LYRICS:

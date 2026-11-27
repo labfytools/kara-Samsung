@@ -159,13 +159,8 @@ def cache_identity(provider, signature, synced, local_text, strict, configuratio
     settings = json.loads(configuration)
     # Admission/order changes do not alter previously verified content.
     config = {name: settings.get(name) for name in ("host", "path")}
-    return encoded_key("lyrics-v3", provider, signature, synced,
+    return encoded_key("lyrics-v4", provider, signature, synced,
                        encoded_key(local_text) if synced else "", strict, config)
-
-
-def previous_identity(provider, signature, synced, local_text, strict, configuration):
-    version = ("lrclib-2", *signature) if provider == "LRCLIB" else signature
-    return encoded_key(provider, version, synced, encoded_key(local_text) if synced else "", strict, configuration)
 
 
 @contextmanager
@@ -240,7 +235,9 @@ def save_candidates(index, recording, entries, *, synced):
             # Merge evidence from narrowed diagnostics with the earlier run.
             previous = value.get(form, [])
             entries = list({(item["provider"], item["sha256"], item["decision"]): item
-                            for item in [*entries, *previous]}.values())[:MAX_CANDIDATES]
+                            for item in [*previous, *entries]}.values())
+            order = {"selected": 0, "ambiguous": 1, "compatible": 2, "alternative": 3}
+            entries = sorted(entries, key=lambda item: order.get(item["decision"], 4))[:MAX_CANDIDATES]
             value[form] = entries
             db.execute("INSERT OR REPLACE INTO reviews VALUES(?,?,?,?,?)",
                        (EVIDENCE_KIND, subject, "observed", time(), document(value)))

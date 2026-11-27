@@ -30,6 +30,14 @@ Les recherches simultanées réutilisent le résultat sous un verrou interproces
 
 Un résultat conserve sa source, l’identifiant de catalogue disponible et l’empreinte du texte. Lorsqu’un fournisseur renvoie plusieurs candidats crédibles, Parole conserve un ensemble borné de textes et de décisions pour la version exacte du fichier. Les diagnostics CHRONOS et BlackBox exposent les décisions, identifiants et empreintes sans dupliquer les textes alternatifs dans les captures. Les bandes de référence et les règles de notation gardent leur contrat de qualification.
 
+## Recherche par artiste V4
+
+**Rechercher les paroles** ouvre un bilan par artiste. Le texte et le LRC gardent chacun leur résultat technique. Le bilan attribue une seule issue par titre, dans l’ordre suivant. Nouveau LRC, nouveau texte, correspondance à vérifier, paroles présentes, report pour quota, erreur technique, aucun résultat. Le détail consultable affiche les métadonnées audio, les requêtes tentées et envoyées, les statuts HTTP, les décisions sur les candidats, les refus d’admission et les publications. Le rendement compte séparément les requêtes, les correspondances et les fichiers publiés, avec les réutilisations de cache dans le détail. Les reçus restent dans l’index privé. Un catalogue volumineux peut atteindre la limite indiquée des décisions détaillées.
+
+L’identité de recherche part des tags. Des variantes bornées enlèvent le numéro de piste, isolent les crédits principaux et invités et simplifient accents et ponctuation. Une variante ne change pas les métadonnées d’origine. Le texte simple tolère une autre publication et un écart de durée allant jusqu’au plus grand de huit secondes et 5 %. Le LRC exige une preuve d’édition, un écart d’au plus trois secondes et des repères compatibles avec la durée. Un ISRC contradictoire bloque les deux formats. Les décisions V3 ne remplissent pas le nouveau cache.
+
+Quand les candidats divergent, les autres fournisseurs admissibles sont consultés. Un texte local peut départager deux textes, et deux catalogues directs peuvent corroborer la même variante. Lorsque deux LRC ont les mêmes mots et des repères différents, le texte seul laisse la décision ouverte. Les alternatives sont conservées avec leur identité et leur empreinte pour la vérification.
+
 ## LRCLIB hors ligne
 
 L’index officiel annonce `lrclib-db-dump-20261119T035719Z.sqlite3.gz` à **64 325 951 597 octets**, soit **59,9 Gio compressés**. L’en-tête HTTP confirme cette taille. Le volume de la bibliothèque avait **182 Gio libres** lors de l’audit. La taille décompressée et le rapport de compression restent à vérifier. L’ETag est multipart et ne constitue pas une somme SHA-256. La licence MIT du serveur ne fixe pas les droits attachés à chaque contribution de la base. Le téléchargement complet est soumis à autorisation préalable. [Catalogue officiel](https://lrclib.net/db-dumps) · [Schéma et licence du serveur](https://github.com/tranxuanthang/lrclib)

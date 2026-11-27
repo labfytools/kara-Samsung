@@ -1,4 +1,5 @@
 """Raccord durable entre une publication audio et la maintenance Parole."""
+from collections import Counter, defaultdict
 import json
 from pathlib import Path
 from time import time
@@ -125,6 +126,49 @@ def artist_results(index, paths, started):
         if row["state"] in ("done", "review", "excluded") and row["updated"] >= started:
             answers[path] = {"lyrics": "unknown", "lrc": "unknown", "errors": [row["detail"] or row["state"]]}
     return answers
+
+
+# A new LRC includes usable lyrics. A saved text can coexist with a timed
+# candidate needing review, which remains visible in the per-form details.
+ARTIST_OUTCOMES = {
+    "present": "Paroles déjà présentes",
+    "lyrics": "Nouvelles paroles récupérées",
+    "lrc": "Nouveau LRC récupéré",
+    "review": "Correspondance à vérifier",
+    "missing": "Aucun résultat",
+    "limited": "Recherche reportée pour quota",
+    "error": "Erreur technique",
+}
+
+
+def track_outcome(row):
+    plain, timed = row["lyrics"], row["lrc"]
+    forms = {plain, timed}
+    for matched, category in (
+        (timed == "found", "lrc"), (plain == "found", "lyrics"),
+        ("review" in forms, "review"), ("present" in forms, "present"),
+        ("limited" in forms, "limited"), (bool(forms & {"unknown", "temporary", "invalid", "excluded"}), "error"),
+    ):
+        if matched:
+            return category
+    return "missing"
+
+
+def artist_summary(results):
+    outcomes = Counter(track_outcome(row) for row in results.values())
+    sources = defaultdict(Counter)
+    for row in results.values():
+        for event in row.get("audit", ()):
+            if name := event.get("provider"):
+                if event["type"] == "request" and event["sent"]:
+                    sources[name]["requests"] += 1
+                    if event.get("http") == 429:
+                        sources[name]["http_429"] += 1
+                elif event["type"] == "provider":
+                    sources[name][event["outcome"]] += 1
+                elif event["type"] == "publication":
+                    sources[name]["published_" + event["form"]] += 1
+    return dict(outcomes), {name: dict(stats) for name, stats in sorted(sources.items())}
 
 
 def paths_for(index, kind, subject):

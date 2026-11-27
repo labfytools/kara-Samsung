@@ -275,16 +275,33 @@ def import_enrichment(index, kind, subject, report):
 
     def work(path):
         began = monotonic()
-        errors = []
+        errors, audit_items = [], []
+
+        def audit(event):
+            # Record sent requests before candidate samples. At most 100
+            # candidate decisions per track keep the existing receipt bounded.
+            candidates = event["type"] == "candidate"
+            if len(audit_items) < 100 or not candidates:
+                if "url" in event:
+                    event["url"] = event["url"][:1200]
+                audit_items.append(event)
+            elif not any(item["type"] == "truncated" for item in audit_items):
+                audit_items.append({"type": "truncated", "reason": "limite des décisions détaillées"})
+
         report({"event": "track-start", "path": str(path)})
         try:
             result = engine.process_import_track(path, storage.source, index, settings, excluded, locks, activity,
-                                                 strawberry.get(str(path)), notify=notify, diagnostic=errors.append)
+                                                 strawberry.get(str(path)), notify=notify, diagnostic=errors.append,
+                                                 audit=audit if manual else None)
         except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
             result = "temporary", "temporary"
             errors.append(type(error).__name__)
         detail = {"lyrics": result[0], "lrc": result[1], "errors": sorted(set(errors))}
+        # Stream lightweight progress. The final SQLite receipt owns the
+        # detailed audit so the process pipe carries each trace only once.
         report({"event": "track-result", "path": str(path), "result": detail})
+        if manual:
+            detail = {**detail, "audit": audit_items}
         return result, monotonic() - began, detail
 
     started = monotonic()
@@ -297,8 +314,8 @@ def import_enrichment(index, kind, subject, report):
     prune(index)
     plain = Counter(result[0] for result, _, _ in processed)
     timed = Counter(result[1] for result, _, _ in processed)
-    missing = {"missing", "review"}
-    state = ("temporary" if plain["temporary"] or timed["temporary"] else
+    missing = {"missing", "review", "invalid"}
+    state = ("temporary" if any(plain[key] or timed[key] for key in ("temporary", "limited")) else
              "not_found" if missing & (plain.keys() | timed.keys()) else "complete")
     return {"state": state, "lyrics": dict(plain), "lrc": dict(timed), "seconds": monotonic() - started,
             "tracks_seconds": [seconds for _, seconds, _ in processed],

@@ -759,10 +759,10 @@ class SourceTests(Fixture):
         client = engine.LrcLib()
         record = dict(trackName="Titre", artistName="Artiste", albumName="Anthologie",
                       duration=12, syncedLyrics="[00:01.000]Paroles entendues")
-        client.get = Mock(side_effect=(None, [record]))
+        client.get = Mock(side_effect=lambda endpoint, **_: None if endpoint == "get" else [record])
         self.assertIsNone(client.find("Titre", "Artiste", "Album", 12, "Artiste", synced=True))
         self.assertTrue(client.edition_candidate)
-        client.get = Mock(side_effect=(None, [dict(record, duration=22)]))
+        client.get = Mock(side_effect=lambda endpoint, **_: None if endpoint == "get" else [dict(record, duration=22)])
         self.assertIsNone(client.find("Titre", "Artiste", "Album", 12, "Artiste", synced=True))
         self.assertFalse(client.edition_candidate)
 
