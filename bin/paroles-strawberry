@@ -3,7 +3,6 @@
 
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
-from math import ceil
 import os
 from pathlib import Path
 import signal
@@ -41,9 +40,6 @@ INTERFACE = "org.mpris.MediaPlayer2.Player"
 LIBRARY = music_library()
 COLLECTION = Path(GLib.get_user_data_dir()) / "strawberry/strawberry/strawberry.db"
 LYRICS_TAGS = ("lyrics", "unsyncedlyrics", "lyricseng", "lyricsxxx")
-FADE_HEIGHT = 56
-LYRIC_FOCUS = 0.33
-LYRIC_FADES = ("fade-near", "fade-far", "fade-distant")
 CSS = (BIN / "parole.css").read_bytes()
 IMPORT_ACCENT = b"""
 @define-color import_lavender #B4BEFE;
@@ -77,34 +73,6 @@ def embedded_lyrics(track):
     return next((tags[key] for key in LYRICS_TAGS if tags.get(key)), "")
 
 
-def faded_scroll(scroll, *, top_share=0.18, bottom_share=0.30, height_limit=FADE_HEIGHT):
-    overlay = Gtk.Overlay()
-    overlay.set_child(scroll)
-    top = Gtk.Box(valign=Gtk.Align.START, can_target=False, css_classes=["lyrics-fade-top"])
-    bottom = Gtk.Box(valign=Gtk.Align.END, can_target=False, css_classes=["lyrics-fade-bottom"])
-    overlay.add_overlay(top)
-    overlay.add_overlay(bottom)
-
-    def update_fades(adjustment):
-        page = adjustment.get_page_size()
-        position = adjustment.get_value()
-        above = position - adjustment.get_lower() if page else 0
-        below = adjustment.get_upper() - page - position if page else 0
-        for fade, share, distance in ((top, top_share, above), (bottom, bottom_share, below)):
-            height = max(1, round(page * share))
-            if height_limit is not None:
-                height = min(height, height_limit)
-            if fade.get_size_request()[1] != height:
-                fade.set_size_request(-1, height)
-            fade.set_opacity(max(0.0, min(1.0, distance / height)))
-
-    adjustment = scroll.get_vadjustment()
-    adjustment.connect("changed", update_fades)
-    adjustment.connect("value-changed", update_fades)
-    update_fades(adjustment)
-    return overlay
-
-
 class LyricsWindow(Gtk.ApplicationWindow):
     def __init__(self, application):
         super().__init__(application=application, title="Parole",
@@ -116,7 +84,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.polling = False
         self.updated = time.monotonic()
         self.base_position = 0.0
-        self.duration = 0.0
         self.rate = 0.0
         self.track = None
         self.file_token = None
@@ -128,16 +95,12 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.tv_cover = "", ""
         self.seek_revision = 0
         self.tag_reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paroles")
-        self.rows = []
-        self.lyrics = []
         self.view_lyrics = []
         self.lyric_source = None
         self.times = []
         self.raw_lines = []
         self.word_marks = ()
         self.timing_offset = 0.0
-        self.active = -1
-        self.highlight = -1
         self.fetching = None
         self.fetch_message = ""
         self.closed = False
@@ -157,7 +120,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         state_dir = Path(GLib.get_user_state_dir()) / "kara"
         self.music_window = None
         self.playback_state = 'Stopped'
-        self.media_updated = 0.0
         self.timing = LyricTiming(state_dir / "lyric-timing.json")
         self.syncing_offset = False
         self.receiver = None
@@ -179,97 +141,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.blackbox_button = Gtk.Button(label="BlackBox", tooltip_text="Enregistrer les diagnostics de lecture")
         self.blackbox_button.connect("clicked", self.show_blackbox_studio)
 
-        # Existing V2 UI state feeds TV and local tools. The lyric widgets
-        # are kept detached so no desktop viewport animates during playback.
-        self.legacy_controls = root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        track = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["track"])
-        self.title = Gtk.Label(xalign=0.0, wrap=True, css_classes=["track-title"])
-        self.artist = Gtk.Label(xalign=0.0, wrap=True, css_classes=["artist"])
-        track.append(self.title)
-        track.append(self.artist)
-        root.append(track)
-
-        transport = Gtk.Box(spacing=9, css_classes=["transport-strip"])
-        previous_track_button = Gtk.Button(icon_name='media-skip-backward-symbolic',
-                                           tooltip_text='Morceau précédent dans Strawberry')
-        previous_track_button.connect('clicked', lambda *_: self.player_command('Previous'))
-        transport.append(previous_track_button)
-        self.media_play = Gtk.Button(label='▶ Lecture', css_classes=["play-main"],
-                                     tooltip_text='Lecture ou pause dans Strawberry')
-        self.media_play.connect('clicked',lambda *_: self.player_command('PlayPause'))
-        transport.append(self.media_play)
-        next_track_button = Gtk.Button(icon_name='media-skip-forward-symbolic',
-                                       tooltip_text='Morceau suivant dans Strawberry')
-        next_track_button.connect('clicked',lambda *_: self.player_command('Next'))
-        transport.append(next_track_button)
-        transport.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        browse = Gtk.Button(label='Bibliothèque',
-                             tooltip_text='Parcourir et gérer la liste de lecture sans changer de workspace')
-        browse.connect('clicked', self.show_library)
-        transport.append(browse)
-        self.media_clock = Gtk.Label(label='0:00 / 0:00', xalign=1, hexpand=True,
-                                     css_classes=['media-clock'])
-        transport.append(self.media_clock)
-        root.append(transport)
-
-        karaoke_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                               css_classes=["karaoke-options"])
-        controls = Gtk.Box(spacing=8)
-        self.tv_toggle = Gtk.ToggleButton(label="Télévision", tooltip_text="Activer l’affichage des paroles sur le réseau local")
-        self.tv_toggle.connect("toggled", self.toggle_tv)
-        controls.append(self.tv_toggle)
+        self.title = self.artist = self.tv_error = ""
         self.build_timing_controls()
-        karaoke_box.append(controls)
-        root.append(karaoke_box)
-
-        self.tv_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7, visible=False)
-        self.tv_address = Gtk.Label(xalign=0, hexpand=True, wrap=True, selectable=True, css_classes=["lyrics-info"])
-        self.tv_row.append(self.tv_address)
-        self.tv_actions = Gtk.Box(spacing=8)
-        self.tv_copy = Gtk.Button(label="Copier le lien TV")
-        self.tv_copy.connect("clicked", self.copy_tv_url)
-        self.tv_actions.append(self.tv_copy)
-        self.tv_refresh_button = Gtk.Button(label="↻ Actualiser TV",
-            tooltip_text="Recharger l'affichage TV, sans interrompre Strawberry")
-        self.tv_refresh_button.connect("clicked", self.refresh_tv_display)
-        self.tv_actions.append(self.tv_refresh_button)
-        self.tv_close_button = Gtk.Button(label="Fermer TV",
-            tooltip_text="Fermer l’affichage TV sans interrompre Strawberry")
-        self.tv_close_button.connect("clicked", self.close_tv_display)
-        self.tv_actions.append(self.tv_close_button)
-        self.tv_row.append(self.tv_actions)
-        root.append(self.tv_row)
-
-        self.stack = Gtk.Stack(vexpand=True)
-        root.append(self.stack)
-        empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
-                        halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, css_classes=["empty"])
-        self.message = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=42)
-        empty.append(self.message)
-        self.stack.add_named(empty, "empty")
-
-        self.plain_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        self.plain_label = Gtk.Label(xalign=0.5, justify=Gtk.Justification.CENTER, wrap=True, selectable=True,
-                                    css_classes=["plain-lyrics"],
-                                    margin_start=34, margin_end=34, margin_top=24, margin_bottom=24)
-        self.plain_scroll.set_child(self.plain_label)
-        self.stack.add_named(faded_scroll(self.plain_scroll), "plain")
-
-        self.footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["lyrics-footer"])
-        self.notice = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, css_classes=["lyrics-info"])
-        self.footer.append(self.notice)
-        self.button = Gtk.Button(label="Chercher le minutage", halign=Gtk.Align.CENTER, css_classes=["fetch"])
-        self.button.connect("clicked", self.fetch)
-        self.footer.append(self.button)
-        root.append(self.footer)
-
-        self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=22, margin_end=22)
-        self.scroll.set_child(self.box)
-        self.scroll.get_vadjustment().connect("changed", self.pad_lyrics)
-        self.stack.add_named(
-            faded_scroll(self.scroll, top_share=0.25, bottom_share=0.50, height_limit=None), "lyrics"
-        )
         self.clear_player()
         self.request_player()
         self.timers = [GLib.timeout_add(200, self.request_player), GLib.timeout_add(32, self.animate),
@@ -277,7 +150,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.connect("close-request", self.close_window)
         self.tag_reader.submit(self.blackbox.recover)
         if https_configured():
-            self.tv_toggle.set_active(True)
+            self.connect_display()
 
     def start_maintenance(self, *, background=False):
         if not self.maintenance:
@@ -289,7 +162,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 *self.maintenance.import_activity,
                 self.maintenance.import_enrichment_count())
             self.album_import.refresh_providers()
-            self.maintenance.set_priority(self.maintenance_busy())
+            self.maintenance.set_priority(self.maintenance_busy(), kara=False)
             self.maintenance.start()
         elif not background:
             self.maintenance.show()
@@ -394,7 +267,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                                    or "Enregistrer les diagnostics de lecture")
         self.album_import.launch_next()
         if self.maintenance:
-            self.maintenance.set_priority(self.maintenance_busy())
+            self.maintenance.set_priority(self.maintenance_busy(), kara=False)
         return GLib.SOURCE_CONTINUE
 
     def refresh_after_import(self, task):
@@ -565,7 +438,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         content.append(self.timing_fetch)
         self.timing_message = Gtk.Label(xalign=0, wrap=True, css_classes=["lyrics-info"])
         content.append(self.timing_message)
-        return self.timing_menu
 
     def view_anchor(self, position):
         return bisect_right(self.times, position) - 1
@@ -576,7 +448,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.timing_offset = self.timing.offset(self.track)
         self.times = [stamp + self.timing_offset for stamp, _, _ in self.raw_lines]
         self.word_marks = tuple(marks for _, _, marks in self.raw_lines)
-        self.highlight = -1
         self.next_tv_update = 0
         self.timing_spin.set_sensitive(bool(self.track and self.raw_lines))
         self.syncing_offset = True
@@ -596,53 +467,16 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         self.apply_timing()
 
-    def toggle_tv(self, button):
-        if not button.get_active():
-            if self.receiver is not None:
-                self.receiver.close()
-                self.receiver = None
-            self.tv_row.set_visible(False)
-            return
-        try:
-            self.receiver = start_receiver(diagnostics=self.blackbox)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            self.tv_address.set_text(str(error))
-            self.tv_copy.set_visible(False)
-        else:
-            self.tv_address.set_text(self.receiver.url)
+    def connect_display(self):
+        if self.receiver is None:
+            try:
+                self.receiver = start_receiver(diagnostics=self.blackbox)
+            except (OSError, ValueError) as error:
+                self.tv_error = str(error)
+                return
             self.next_tv_update = 0.
-            self.tv_copy.set_visible(True)
-        self.tv_row.set_visible(True)
-
-    def copy_tv_url(self, _button):
-        if self.receiver is not None:
-            self.get_display().get_clipboard().set(self.receiver.url)
-
-    def refresh_tv_display(self, _button):
-        if self.receiver is None:
-            self.tv_address.set_text("Active d’abord Télévision pour actualiser l’écran.")
-            return
-        self.receiver.request_tv_reload()
-        self.tv_refresh_button.set_label("Demande envoyée ✓")
-        GLib.timeout_add(1800, self.reset_tv_refresh_button)
-
-    def reset_tv_refresh_button(self):
-        if not self.closed:
-            self.tv_refresh_button.set_label("↻ Actualiser TV")
-        return GLib.SOURCE_REMOVE
-
-    def close_tv_display(self, _button):
-        if self.receiver is None:
-            self.tv_address.set_text("Active d’abord Télévision pour fermer l’écran.")
-            return
-        self.receiver.request_tv_close()
-        self.tv_close_button.set_label("Fermeture demandée ✓")
-        GLib.timeout_add(1800, self.reset_tv_close_button)
-
-    def reset_tv_close_button(self):
-        if not self.closed:
-            self.tv_close_button.set_label("Fermer TV")
-        return GLib.SOURCE_REMOVE
+            self.tv_error = ""
+        self.receiver.resume_tv_display()
 
     def update_tv(self, position, now):
         if self.receiver is None or now < self.next_tv_update:
@@ -650,7 +484,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.next_tv_update = now + 0.12
         active = self.view_anchor(position)
         lines = [self.view_lyrics[i] if 0 <= i < len(self.view_lyrics) else "" for i in range(active - 1, active + 3)]
-        fraction = self.display_progress(position, active, utf16=True) if active >= 0 else 0.0
+        fraction = self.display_progress(position, active) if active >= 0 else 0.0
         count = round(fraction * len(lines[1].encode("utf-16-le")) / 2)
         engine = "lrc-original"
         if (self.track, active, self.playback_state, engine) != self.bb_line:
@@ -659,12 +493,12 @@ class LyricsWindow(Gtk.ApplicationWindow):
             self.blackbox.emit("lyrics", "tv-line", position=position,
                                revision=self.tv_line_revision, line=active, lines=lines, playback=self.playback_state,
                                timing_engine=engine)
-        if self.title.get_label():
+        if self.title:
             notice = "Paroles minutées indisponibles" if not self.times else " "
         else:
             notice = "En attente de Strawberry…"
         self.receiver.update({
-            "title": self.title.get_label(), "artist": self.artist.get_label(),
+            "title": self.title, "artist": self.artist,
             "lines": lines, "progress": fraction, "highlight_chars": count, "notice": notice,
             "display_mode": "music", "playback_state": self.playback_state,
             "plain_lyrics": self.tag_text[:5000] if not self.times else "",
@@ -676,7 +510,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def close_window(self, _window, *, wait=True):
         if self.closed:
             return False
-        self.tv_toggle.set_active(False)
+        if self.receiver is not None:
+            self.receiver.close()
+            self.receiver = None
         # Managed workers own their leases and write their own result. Closing
         # the window stops scheduling and leaves any admitted import recoverable.
         if self.maintenance:
@@ -693,15 +529,12 @@ class LyricsWindow(Gtk.ApplicationWindow):
         return False
 
     def clear_player(self):
-        self.title.set_label("")
-        self.artist.set_label("")
-        self.playback_state = 'Stopped'
-        self.media_play.set_label('▶ Lecture')
-        self.media_clock.set_text('0:00 / 0:00')
-        self.base_position = self.duration = self.rate = 0.0
+        self.title = self.artist = ""
+        self.playback_state = "Stopped"
+        self.base_position = self.rate = 0.
         self.set_track(None)
         self.refresh_tv_cover(None)
-        self.show_empty("Lance un morceau local dans Strawberry.")
+        self.timing_fetch.set_sensitive(False)
 
     def set_track(self, track):
         if track == self.track:
@@ -736,15 +569,12 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return
         now = time.monotonic()
         metadata = properties.get("Metadata", {})
-        title = metadata.get("xesam:title", "")
-        self.title.set_label(title)
-        self.artist.set_label(" · ".join(metadata.get("xesam:artist", [])))
+        self.title = metadata.get("xesam:title", "")
+        self.artist = " · ".join(metadata.get("xesam:artist", []))
         self.base_position = properties.get("Position", 0) / 1_000_000
         self.updated = (self.poll_started + now) / 2
-        self.duration = metadata.get("mpris:length", 0) / 1_000_000
         playback = properties.get("PlaybackStatus", "Stopped")
         self.playback_state = playback
-        self.media_play.set_label('⏸ Pause' if playback == 'Playing' else '▶ Lecture')
         self.rate = properties.get("Rate", 1.0) if playback == "Playing" else 0.0
         if self.music_window is not None:
             self.music_window.update_current(metadata.get('mpris:trackid'), playback)
@@ -773,24 +603,23 @@ class LyricsWindow(Gtk.ApplicationWindow):
 
     def load_lines(self):
         if self.track is None:
-            self.show_empty("Lance un morceau de ~/Music dans Strawberry.", fetch=False)
+            self.timing_fetch.set_sensitive(False)
             return
         path = self.track.with_suffix(".lrc")
         try:
             source_token = lrc_token(path)
         except (OSError, ValueError):
-            source_token = None
+            source_token = "invalid"
         if (self.track, source_token) != self.file_token:
             self.file_token = self.track, source_token
-            self.lyric_source = read_source(self.track) if source_token is not None else None
-            if self.lyric_source:
-                self.set_lines(self.lyric_source[2])
-            else:
-                self.set_lines([])
-        if not self.rows:
-            notice = ("Recherche des paroles minutées…" if self.fetching == self.track else
-                      self.fetch_message or "Les paroles minutées de ce morceau sont indisponibles.")
-            self.show_fallback(notice, fetch=source_token is None)
+            self.lyric_source = read_source(self.track) if source_token not in (None, "invalid") else None
+            self.set_lines(self.lyric_source[2] if self.lyric_source else [])
+        self.timing_fetch.set_sensitive(source_token is None and self.fetching is None)
+        if not self.raw_lines:
+            self.load_embedded()
+            message = ("Recherche du LRC…" if self.fetching == self.track else
+                       self.fetch_message or "LRC indisponible.")
+            self.timing_message.set_text(message)
 
     def load_embedded(self):
         try:
@@ -811,34 +640,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if self.tag_job is None:
             self.tag_job = token, self.tag_reader.submit(embedded_lyrics, self.track)
         return None
-
-    def show_fallback(self, message, *, fetch=True):
-        text = self.load_embedded()
-        if not text:
-            self.show_empty("Lecture des paroles intégrées…" if text is None else message, fetch=fetch)
-            return
-        if self.plain_label.get_text() != text or self.stack.get_visible_child_name() != "plain":
-            self.plain_label.set_text(text)
-            self.plain_scroll.get_vadjustment().set_value(0)
-        status = "Paroles non synchronisées"
-        if self.fetching == self.track or self.fetch_message or not fetch:
-            status += f" · {message}"
-        self.set_footer(status, fetch)
-        self.stack.set_visible_child_name("plain")
-
-    def set_footer(self, notice, fetch):
-        self.notice.set_text(notice)
-        self.notice.set_visible(bool(notice))
-        self.button.set_visible(fetch)
-        self.button.set_sensitive(self.fetching is None)
-        self.footer.set_visible(bool(notice) or fetch)
-        self.timing_fetch.set_sensitive(fetch and self.fetching is None)
-        self.timing_fetch.set_tooltip_text(notice or None)
-
-    def show_empty(self, message, *, fetch=True):
-        self.message.set_text(message)
-        self.set_footer("", fetch and self.track is not None)
-        self.stack.set_visible_child_name("empty")
 
     def fetch(self, _button):
         track = self.track
@@ -875,37 +676,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.load_lines()
 
     def set_lines(self, lines):
-        for label in self.rows:
-            self.box.remove(label)
-        self.rows = []
         self.raw_lines = lines
+        self.view_lyrics = [text for _, text, _ in lines]
         self.apply_timing()
-        self.lyrics = [text for _, text, _ in lines]
-        self.active = -1
-        self.highlight = -1
-        self.view_lyrics = self.lyrics
-        for text in self.view_lyrics:
-            label = Gtk.Label(label=text, xalign=0.5, justify=Gtk.Justification.CENTER, wrap=True,
-                              css_classes=["lyric"])
-            self.box.append(label)
-            self.rows.append(label)
-        self.scroll.get_vadjustment().set_value(0)
-        if self.rows:
-            self.style_lines()
-            self.set_footer("", False)
-            self.stack.set_visible_child_name("lyrics")
-
-    def style_lines(self):
-        anchor = max(0, self.active)
-        for index, row in enumerate(self.rows):
-            classes = ["lyric"]
-            if index == self.active:
-                classes.append("active")
-            else:
-                distance = abs(index - anchor) + (1 if index < anchor else 0)
-                if distance >= 2:
-                    classes.append(LYRIC_FADES[min(distance - 2, len(LYRIC_FADES) - 1)])
-            row.set_css_classes(classes)
 
     def log_playback_reference(self, original):
         session = self.blackbox.status()["session"]
@@ -914,7 +687,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
         # Snapshot the owning GTK values before sending the disk read.
         context = {"track_revision": self.track_revision}
         source = self.lyric_source
-        displayed = list(zip(self.times, self.lyrics))
+        displayed = list(zip(self.times, self.view_lyrics))
         plain = self.tag_text
 
         def identify():
@@ -942,12 +715,6 @@ class LyricsWindow(Gtk.ApplicationWindow):
     def animate(self):
         now = time.monotonic()
         position = self.base_position + (now - self.updated) * self.rate
-        if now >= self.media_updated:
-            self.media_updated = now + .35
-            def clock(seconds):
-                whole = max(0,int(seconds))
-                return f'{whole//60}:{whole%60:02d}'
-            self.media_clock.set_text(f'{clock(position)} / {clock(self.duration)}')
         if self.blackbox.active():
             identity = self.track, self.file_token, self.timing_offset
             if self.track and identity != self.bb_reference:
@@ -959,27 +726,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
                                    strawberry_monotonic_ns=round(self.updated * 1_000_000_000),
                                    playback_rate=self.rate)
         self.update_tv(position, now)
-        if not self.rows or not self.scroll.get_mapped():
-            return GLib.SOURCE_CONTINUE
-        active = self.view_anchor(position)
-        if active != self.active:
-            if self.active >= 0:
-                self.rows[self.active].set_text(self.view_lyrics[self.active])
-            self.active = active
-            self.highlight = -1
-            self.style_lines()
-            self.blackbox.emit("lyrics", "pc-line", position=position, line=active,
-                               timing_engine="lrc-original")
-
-        if active >= 0:
-            self.progress_line(position, active)
-            self.center_line(self.rows[active])
-        else:
-            adjustment = self.scroll.get_vadjustment()
-            adjustment.set_value(adjustment.get_value() * 0.8)
         return GLib.SOURCE_CONTINUE
 
-    def display_progress(self, position, active, *, utf16=False):
+    def display_progress(self, position, active):
         text = self.view_lyrics[active]
         if not text:
             return 0.0
@@ -990,44 +739,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
             return 1.
         source_position = position - self.timing_offset
         shown = max((end for stamp, _, end in marks if stamp <= source_position), default=0)
-        if utf16:
-            prefix = int(shown)
-            units = len(text[:prefix].encode("utf-16-le")) / 2
-            units += (shown - prefix) * (len(text[prefix:prefix + 1].encode("utf-16-le")) / 2)
-            return units / (len(text.encode("utf-16-le")) / 2)
-        return shown / len(text)
-
-    def progress_line(self, position, active):
-        text = self.view_lyrics[active]
-        count = int(self.display_progress(position, active) * len(text) + 1e-8)
-        if count != self.highlight:
-            done = GLib.markup_escape_text(text[:count])
-            pending = GLib.markup_escape_text(text[count:])
-            self.rows[active].set_markup(
-                f'<span background="#b4befe" foreground="#181825">{done}</span>{pending}'
-            )
-            self.highlight = count
-
-    def pad_lyrics(self, adjustment):
-        # La première et la dernière ligne peuvent aussi atteindre le point de lecture.
-        page = round(adjustment.get_page_size())
-        if page:
-            top = round(page * LYRIC_FOCUS)
-            if self.box.get_margin_top() != top or self.box.get_margin_bottom() != page - top:
-                self.box.set_margin_top(top)
-                self.box.set_margin_bottom(page - top)
-
-    def center_line(self, row):
-        adjustment = self.scroll.get_vadjustment()
-        found, bounds = row.compute_bounds(self.box)
-        if not found or not adjustment.get_page_size():
-            return
-        middle = bounds.get_y() + bounds.get_height() / 2
-        desired = middle + self.box.get_margin_top() - adjustment.get_page_size() * LYRIC_FOCUS
-        maximum = max(0.0, adjustment.get_upper() - adjustment.get_page_size())
-        desired = min(maximum, max(0.0, desired))
-        old = adjustment.get_value()
-        adjustment.set_value(desired if abs(desired - old) < 1 else old + (desired - old) * 0.2)
+        return len(text[:shown].encode("utf-16-le")) / len(text.encode("utf-16-le"))
 
 
 class App(Gtk.Application):

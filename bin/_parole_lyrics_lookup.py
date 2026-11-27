@@ -256,7 +256,7 @@ def playback_candidates(path, root):
 
 
 def recording_candidates(location, path, *, include_text=False):
-    from _kara_prepare import file_token
+    from _kara_files import file_token
 
     if not location.is_file():
         return {}

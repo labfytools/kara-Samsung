@@ -1,4 +1,4 @@
-# Validation de la préparation nocturne capot fermé
+# Validation de la recherche nocturne des LRC capot fermé
 
 ## Incident du 26 novembre 2026 sur ArchASP
 
@@ -41,22 +41,8 @@ journalctl --user -u parole-capot-essai.service -f
 
 Le relevé `samples.jsonl` contient les deux horloges, les températures CPU/GPU, le secteur, les états bruts ACPI et logind, le verrou, les écrans, la raison courante et les tâches terminées. Un écart entre la progression de `CLOCK_BOOTTIME` et celle de l’horloge monotone montre un passage par la veille, à confirmer dans `suspend.log`. Le `bilan.json` est produit à la fin. Le journal de maintenance du dossier d’essai précise les phases Demucs/Turbo. La commande `systemctl --user stop parole-capot-essai.service` met fin à l’essai.
 
-### Relevé du 26 novembre sur ArchASP
-
-De 10 h 31 min 57 s à 10 h 43 min 30 s, le capot est resté physiquement fermé sur secteur. Le verrou était actif et les écrans éteints. Les 43 sondes HTTPS via Proton VPN ont répondu 200. Le journal logind et la comparaison des deux horloges concordent sur l’absence de veille. L’écran est revenu sur le verrou à la réouverture.
-
-Pendant cette première fermeture, la température CPU a d’abord empêché le calcul. TLP indiquait Performance malgré la demande du profil Économie. Le profil Économie choisi explicitement a rendu le calcul thermiquement admissible. Le gouverneur a ensuite continué à respecter la lecture active de Strawberry via Bluetooth. Après la réouverture, la lecture a été mise en pause avec l’accord de l’utilisateur pour mesurer la préparation.
-
-La deuxième fermeture sur secteur a permis de terminer une préparation Kara. Les premières tentatives ont été suspendues lorsque la pression mémoire a dépassé 1 %. La reprise a vérifié et réutilisé les pistes Demucs d’un essai précédent après contrôle du PCM et du modèle. Turbo Vulkan a ensuite terminé le minutage et Kara a publié le titre prêt dans le cache d’essai. Les températures maximales échantillonnées pendant les tâches étaient de 65,4 °C CPU et 61 °C GPU. Une vérification MusicBrainz a pu démarrer entre deux tentatives de calcul et a rendu un échec temporaire. Elle reste à reprendre. Le bilan de la fermeture compte une préparation terminée.
-
-Le premier débranchement a libéré l’inhibiteur à 10 h 54 min 37 s. Logind a alors rendu la veille ordinaire au capot fermé. L’écran est resté éteint à la réouverture parce que la décision de rallumage dépendait du descripteur d’inhibition déjà libéré. Le correctif conserve la responsabilité des écrans jusqu’à la réouverture confirmée, même sur batterie. Au nouvel essai, le retrait de l’inhibiteur a précédé l’entrée dans `s2idle` à 11 h 06 min 02 s. Après réouverture et réveil sur batterie, l’écran s’est rallumé sur le verrou à 11 h 06 min 52 s. L’inhibiteur est resté absent tant que le secteur était débranché.
-
-QuickShell a quitté à la première reprise sur une erreur de popup Wayland. Qt avait été mis à jour de 6.12.0 à 6.12.1 et le garde de son lanceur refusait le redémarrage de l’ancien binaire. L’installation locale a été sauvegardée, reconstruite avec le script existant pour Qt 6.12.1 et relancée. Le nouvel essai de veille sur batterie a conservé la barre. La boîte Bluetooth restée à l’écran appartenait à Blueman et a été fermée individuellement. Le profil TLP initial Performance a été rétabli après le premier essai.
-
-À 11 h 07 min 45 s, sur secteur et capot ouvert avec l’inhibiteur réarmé, la commande **Veille** de QuickShell a bien déclenché une suspension via logind. Le noyau est revenu à 11 h 08 min 08 s. La session est restée verrouillée jusqu’au déverrouillage et QuickShell a conservé son processus. Ce dernier contrôle a été effectué hors traitement intensif.
-
 ## Activation et retour arrière
 
-La politique système utilise les réglages logind, Sway, swayidle, QuickShell, NetworkManager et Proton existants. Après le test, sauvegarder l’index SQLite par son API de sauvegarde en ligne et relever les valeurs initiales de `night_lid`, `night_lid_qualified` et `night_minutes`. Activer les deux options de capot dans **Parole → Paramètres → Préparation nocturne**, puis redémarrer `kara.service` quand aucune partie et aucun import ne risquent d’être interrompus. Vérifier que le nouveau propriétaire publie l’événement d’armement capot ouvert. Le premier essai de production sur une nuit entière doit confirmer le bilan et l’absence d’événement de suspension non sollicité.
+La politique système utilise les réglages logind, Sway, swayidle, QuickShell, NetworkManager et Proton existants. Après le test, sauvegarder l’index SQLite par son API de sauvegarde en ligne et relever les valeurs initiales de `night_lid`, `night_lid_qualified` et `night_minutes`. Activer les deux options de capot dans **Parole → Paramètres → LRC nocturnes**, puis redémarrer `kara.service` quand aucune partie et aucun import ne risquent d’être interrompus. Vérifier que le nouveau propriétaire publie l’événement d’armement capot ouvert. Le premier essai de production sur une nuit entière doit confirmer le bilan et l’absence d’événement de suspension non sollicité.
 
-Pour revenir au comportement précédent, décocher **Préparer lorsque le capot est fermé**. Parole libère le descripteur et logind applique sa politique habituelle. Restaurer les seules valeurs nocturnes sauvegardées si nécessaire. Une restauration de la base entière écraserait les tâches et bilans plus récents. Les relevés restent dans le dossier privé de l’essai.
+Pour revenir au comportement précédent, décocher **Rechercher les LRC lorsque le capot est fermé**. Parole libère le descripteur et logind applique sa politique habituelle. Restaurer les seules valeurs nocturnes sauvegardées si nécessaire. Une restauration de la base entière écraserait les tâches et bilans plus récents. Les relevés restent dans le dossier privé de l’essai.

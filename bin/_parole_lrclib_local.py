@@ -1,8 +1,39 @@
 """Optional, read-only catalogue adapter for an unpacked LRCLIB snapshot."""
 from contextlib import closing
+from functools import lru_cache
+import os
 from pathlib import Path
 import sqlite3
 from time import monotonic
+
+
+@lru_cache(maxsize=4)
+def readable(path, _identity):
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=.15)) as db:
+            db.execute("PRAGMA trusted_schema=OFF")
+            db.execute("""SELECT t.name_lower,t.artist_name_lower,t.album_name_lower,t.duration,
+                                 t.last_lyrics_id,l.synced_lyrics,l.has_word_sync,l.lyricsfile
+                          FROM tracks t, lyrics l LIMIT 0""")
+        return True
+    except (OSError, sqlite3.Error, ValueError):
+        return False
+
+
+def configured_snapshot():
+    location = os.environ.get("PAROLE_LRCLIB_SQLITE")
+    if not location:
+        return None
+    try:
+        path = Path(location).expanduser().resolve(strict=True)
+        info = path.stat()
+        if not path.is_file() or path.with_name(path.name + "-wal").exists():
+            return None
+        # Configuration can be atomically replaced while the scheduler runs.
+        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        return path if readable(path, identity) else None
+    except (OSError, ValueError):
+        return None
 
 
 def candidates(snapshot, title, artist, album, duration, owner):

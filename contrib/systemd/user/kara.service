@@ -1,5 +1,5 @@
 [Unit]
-Description=Serveur de soirée Kara pour Sway
+Description=Parole et affichage Strawberry pour Samsung
 PartOf=graphical-session.target
 After=graphical-session-pre.target pipewire.service pipewire-pulse.service app-org.strawberrymusicplayer.strawberry@autostart.service
 Wants=pipewire.service pipewire-pulse.service app-org.strawberrymusicplayer.strawberry@autostart.service

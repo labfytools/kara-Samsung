@@ -21,7 +21,7 @@ from _kara_import_resources import ImportPause, ImportSuspended, checkpoint, lea
 from _musique_oz import (INBOX, UNKNOWN_ALBUM, UNKNOWN_ARTIST, album_groups, audio_file, audio_files,
                          canonical_album_artist, component, index_file, manual_album_artist, mutation_report,
                          probe, share_file, shared_mutation, SHARED_LIBRARY, source_video, title_pair)
-from _parole_artist_tags import WRITABLE as TAG_WRITABLE, has_preparation, remux, save_original, verify_audio
+from _parole_artist_tags import WRITABLE as TAG_WRITABLE, remux, save_original, verify_audio
 from _parole_index import document, revision
 
 
@@ -166,8 +166,6 @@ def album_artists(items, root):
 
 def write_tags(source, target, tags, updates, recover=False, *, admission, approved=False, backup=False):
     token = revision(source.lstat())
-    if backup and has_preparation(source):
-        raise ValueError("une préparation liée à ce fichier doit être préservée")
     with TemporaryDirectory(dir=target.parent, prefix=".tri-") as temp:
         draft = Path(temp) / source.name
         new_tags = remux(source, draft, tags, updates)
@@ -182,8 +180,6 @@ def write_tags(source, target, tags, updates, recover=False, *, admission, appro
         with admission(new_tags):
             if revision(source.lstat()) != token:
                 raise ValueError("fichier modifié pendant la vérification")
-            if backup and has_preparation(source):
-                raise ValueError("une préparation a été publiée pendant la vérification")
             if source == target:
                 os.replace(draft, target)
                 sync_dir(target.parent)

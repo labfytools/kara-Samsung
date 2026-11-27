@@ -23,7 +23,7 @@ def main():
             draft.write(f"""[Desktop Entry]
 Type=Application
 Name=Parole
-Comment=Gérer et préparer la bibliothèque musicale pour Kara
+Comment=Gérer la bibliothèque musicale et ses paroles
 Exec=/usr/bin/python3 -B {quoted}
 Icon=multimedia-player
 Terminal=false

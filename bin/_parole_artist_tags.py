@@ -93,14 +93,6 @@ def save_original(source, draft, token, pcm, *, state=STATE):
     return receipt
 
 
-def has_preparation(path):
-    from _kara_prepare import PreparedCache
-    from _kara_stems import stem_directory
-
-    return ((PreparedCache().folder(path) / "prepared.json").exists()
-            or (stem_directory(path) / "meta.json").exists())
-
-
 def repair(index, path, *, apply=False, state=STATE, expected=None):
     if not path.is_relative_to(index.root) or path.resolve() != path or not audio_file(path):
         return "hors bibliothèque"
@@ -116,10 +108,6 @@ def repair(index, path, *, apply=False, state=STATE, expected=None):
         return "sans correction autorisée"
     if path.suffix.lower() not in WRITABLE:
         return "format à examiner"
-    # A bound cache remains playable until a receipt-specific rebind is
-    # available. A metadata repair never invalidates a published preparation.
-    if has_preparation(path):
-        return "préparation à réassocier"
     if not apply:
         return "correction autorisée"
     with shared_mutation(index.root):
@@ -135,7 +123,7 @@ def repair(index, path, *, apply=False, state=STATE, expected=None):
             share_file(draft, path)
             with draft.open("rb") as output:
                 os.fsync(output.fileno())
-            if revision(path.lstat()) != token or has_preparation(path):
+            if revision(path.lstat()) != token:
                 raise ValueError("La piste a changé avant la publication.")
             os.replace(draft, path)
             sync_directory(path.parent)

@@ -17,11 +17,11 @@ from urllib.error import HTTPError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 
-from _kara_prepare import file_token
+from _kara_files import file_token
 from _parole_index import Index
 from _parole_lyrics_lookup import CACHE_KIND, EVIDENCE_KIND, TEMPORARY_KIND, playback_candidates
 from _parole_lrclib_local import candidates
-from _parole_sources import (configure_limits, lyrics_rows, move_lyrics_source, ready_sources,
+from _parole_sources import (configure_limits, lyrics_rows, move_lyrics_source, night_lrc_providers, ready_sources,
                              record_quota, seed)
 from _parole_work import lyrics_engine
 
@@ -298,10 +298,16 @@ class LyricsTests(unittest.TestCase):
             """)
             db.execute("INSERT INTO lyrics VALUES (810,0,1,'Premier mot',?,?)", (TIMED, WORD))
         before = database.read_bytes()
+        self.only()
         self.assertEqual([row["id"] for row in candidates(database, *SONG)], [800])
         self.assertEqual(candidates(database, "Chanson", "Groupe", "Edition live", 30, "Groupe"), [])
         with patch.dict(os.environ, {"PAROLE_LRCLIB_SQLITE": str(database)}):
             value, source = self.engine.LyricsSources().find(*SONG, synced=True, registry=self.index)
+            original, original_source = self.engine.LyricsSources().find(
+                *SONG, synced=True, registry=self.index, original_lrc=True)
+            self.assertEqual(night_lrc_providers(self.index),
+                             [dict(id="LRCLIB local", availability="ready", next_available=None)])
+        self.assertEqual((original, original_source), (TIMED, "LRCLIB local"))
         self.assertEqual(source, "LRCLIB local")
         self.assertIn("<00:01.804>", value)
         self.assertEqual(database.read_bytes(), before)

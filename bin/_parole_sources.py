@@ -215,11 +215,15 @@ def ready_sources(index, now):
 
 def night_lrc_providers(index, *, now=None, db=None):
     """Providers with an approved adapter that can deliver native LRC."""
-    direct = {"LRCLIB", "NetEase", "QQ Music"}
-    return [row for row in lyrics_rows(index, db=db, now=now)
-            if row["state"] == "active" and "lrc" in row["category"].split(",")
-            and (row["id"] in direct or row["adapter"] == "lrclib" and row["decoded"].get("validated"))]
+    from _parole_lrclib_local import configured_snapshot
 
+    direct = {"LRCLIB", "NetEase", "QQ Music"}
+    providers = [row for row in lyrics_rows(index, db=db, now=now)
+                 if row["state"] == "active" and "lrc" in row["category"].split(",")
+                 and (row["id"] in direct or row["adapter"] == "lrclib" and row["decoded"].get("validated"))]
+    if configured_snapshot():
+        providers.insert(0, dict(id="LRCLIB local", availability="ready", next_available=None))
+    return providers
 
 def ready_categories(index, now):
     ready = set()

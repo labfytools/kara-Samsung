@@ -22,7 +22,6 @@ Le dialogue garde la progression USB et ses débits à l’écran pendant que Me
 | Console | `maintenance.jsonl` dans le même dossier | Rotation à 512 Kio, quatre archives, 600 événements dans la console. Le bouton Historique charge les 4 000 derniers événements au maximum. |
 | Corrections locales | À côté de l’audio, avec l’ancienne version dans `corrections/<id>` | Le dialogue vérifie les versions avant d’écrire. Restaurer une version se fait dans ce dialogue en recopiant son texte. |
 | Imports | File commune dans `$XDG_STATE_HOME/kara/import-queue` | Les reçus de maintenance restent liés au lot existant. Les lots intégrés passent dans l’historique. Les imports partiels et les échecs restent relançables. |
-| Préparation | `$XDG_STATE_HOME/kara/prepared` et `$XDG_CACHE_HOME/paroles-strawberry/stems` | Kara lit les mêmes générations que Parole. Les brouillons marqués de traitements interrompus peuvent être nettoyés dans Stockage. |
 | Associations manuelles | Index Parole et manifestes d’origine dans `$XDG_STATE_HOME/kara/music-tidy-backups` | Les manifestes terminés rétablissent les associations exactes par album. Les crédits de piste et les sauvegardes restent intacts. |
 
 Avec les valeurs XDG par défaut, l’état se trouve sous `~/.local/state` et le cache sous `~/.cache`. Conserver l’index avec son WAL lors d’une copie à chaud ou utiliser l’API de sauvegarde SQLite. Pour intervenir sur les fichiers hors ligne, attendre la fin de la maintenance, des imports actifs et des parties.
@@ -39,48 +38,25 @@ L’index SQLite `songs_display` suit l’ordre des lignes de la liste. Sur une 
 
 ## Ordre de travail et limites
 
-Le propriétaire GTK existant garde les priorités des joueurs, de l’organisateur et de l’import. La maintenance revendique une tâche SQLite à la fois et répartit les tours de recherche entre paroles, LRC, albums, discographies, pochettes et sources. Les opérations réseau conservent leur échéance et une temporisation progressive. Les tentatives de recherche sur des fournisseurs et les préparations anticipées ont chacune leur compteur journalier. La file d’importation conserve sa concurrence configurable de 1 à 8 lots, 4 par défaut, et ses réservations partagées.
+Le propriétaire GTK coordonne les imports, la lecture Strawberry et les recherches de Parole. La maintenance revendique une tâche SQLite à la fois et répartit les tours de recherche entre paroles, LRC, albums, discographies, pochettes et sources. Les opérations réseau conservent leur échéance et une temporisation progressive. Les fournisseurs ont des quotas et une temporisation persistants. La file d’importation conserve sa concurrence configurable de 1 à 8 lots, 4 par défaut, et ses réservations partagées.
 
 | Réglage initial | Valeur |
 | --- | --- |
 | Inventaire | Au lancement, puis toutes les 15 min |
 | Vérifications éditoriales | Tous les 30 jours après une vérification |
 | Opérations réseau classiques | Quotas et intervalles par fournisseur. Jusqu’à 145 s par recherche par défaut. |
-| Préparations anticipées | 3 admissions par jour hors mode nocturne, une à la fois |
 | Inactivité Sway | 300 s, sur secteur par défaut |
 | Admission lourde | CPU <25 %, GPU ≤15 %, activité disque <25 %, température <78 °C, mémoire disponible ≥4 Gio |
 | Surveillance en cours | Événement de reprise Sway, alimentation, activité multimédia, partie ou import prioritaire, pression mémoire, réserve mémoire de 1,5 Gio, température et stockage |
 | Stockage | 50 Gio de cache et au moins 20 Gio libres sur chaque partition utile, avec marge temporaire par morceau |
 
-### Préparation nocturne
+### LRC nocturnes
 
-La section **Paramètres → Préparation nocturne** active un traitement à la fois dans la file existante, sans limite quotidienne pour les préparations Kara. En mode service, le propriétaire de Kara démarre la maintenance même sans fenêtre. Le mode exige une source secteur système confirmée par le noyau. Les périphériques USB alimentés par le portable et le pourcentage de batterie ne servent pas de preuve. Capot ouvert, l’inactivité minimale vaut 420 s par défaut. Le maintien éveillé est configurable de 5 à 720 minutes, avec 480 minutes par défaut et conservation d’une valeur déjà enregistrée. La durée est décomptée dès la première admission ou fermeture du capot et survit au redémarrage du service sur le même démarrage système.
+**Paramètres → LRC nocturnes** active la recherche des LRC d’origine manquants dans la file existante. Le [service utilisateur](../contrib/systemd/user/kara.service) la supervise sans fenêtre. Avec la session verrouillée, Parole récupère un fichier à la fois. Les tâches d’album, de métadonnées et de paroles simples sont reprises dans leur parcours de jour.
 
-Sur ArchASP, `swayidle.service` lance le verrou QuickShell à 300 s et coupe les écrans à 360 s. Sa demande `IdleHint` à 420 s peut être rejetée par logind sous le gestionnaire système utilisateur. Parole observe l’inactivité via le compositeur, confirme le verrou et lit l’état des écrans par IPC Sway. Quand les options capot fermé et refroidissement vérifié sont activées, Parole demande `handle-lid-switch:block` capot ouvert sur secteur, même si la session est encore active et la file vide. Le journal annonce quand on peut fermer le capot. À la fermeture, Parole fait confirmer le verrouillage avant de couper les écrans, puis applique les seuils capot fermé sans attendre le délai d’inactivité.
+LRCLIB, NetEase, QQ Music et les adaptateurs compatibles explicitement validés peuvent fournir des LRC. La recherche vérifie la correspondance du morceau puis enregistre le texte minuté d’origine en UTF-8, uniquement si le fichier est absent. Les résultats négatifs ont une expiration. Quand une source atteint son quota, les autres restent utilisables. Les échéances SQLite et les délais renvoyés par les fournisseurs permettent de reprendre sans recommencer la file.
 
-Le descripteur `idle:block` protège contre l’action automatique d’inactivité lors des préparations et tout au long de la fermeture protégée. Le seul inhibiteur `sleep` est en mode `delay` pendant les traitements. Une veille manuelle reste possible et logind lui laisse son délai normal, de cinq secondes sur ArchASP. Débranchement, expiration, désactivation ou arrêt rendent la main à logind après l’arrêt du moteur. À la réouverture confirmée, Parole réactive les écrans et laisse le verrou en place. Une ouverture signalée pendant la veille est écartée. Après réveil ou pendant le fonctionnement normal, une ouverture doit rester stable au moins deux secondes et une mesure ACPI contradictoire empêche la confirmation.
-
-Sur secteur avec une session sécurisée et inactive, le service alterne un lot réseau et une préparation Kara, même sans fenêtre Parole. La fermeture protégée suffit à établir l’inactivité. Les recherches de paroles, LRC et pochettes alternent avec les vérifications de métadonnées, d’albums et de discographies. Le réglage **Maximum de recherches indépendantes en parallèle** accepte 1 à 20 et vaut 4 par défaut. Le service démarre avec deux créneaux et ajuste leur nombre d’après les résultats des lots et le plafond choisi. Il évite d’exécuter deux tâches portant sur le même morceau ou la même édition. Une source limitée ne bloque pas les autres. Quand tous les fournisseurs d’une catégorie sont indisponibles ou ont atteint leur quota, ses tâches attendent dans la file. Chaque moteur a une durée maximale et une erreur reporte la tâche concernée. Les tâches réseau peuvent avancer quand aucun créneau de calcul n’est libre si les seuils de température, de mémoire et de stockage sont respectés.
-
-Quand aucun fournisseur ne peut servir une référence de préparation, le service donne les créneaux lourds aux pistes possédant un LRC, un texte local utilisable, une correspondance PCM à vérifier, une préparation partielle ou une référence déjà obtenue. Les réglages de génération et de LRC déterminent les parcours utilisables. Les pistes qui doivent encore attendre un fournisseur conservent leur priorité et leur échéance. Elles redeviennent éligibles à sa réouverture. Le travail de transcription déjà en file conserve son tour et applique les mêmes protections.
-
-Les seuils initiaux capot ouvert sont de 78 °C CPU et 75 °C GPU. Le seuil capot fermé ne dépasse jamais 70 °C et requiert une qualification thermique préalable sur le Vivobook. Demucs limite ses fils de calcul à deux. Parole demande un profil Économie temporaire uniquement si le gestionnaire de profils sait le libérer à la déconnexion. TLP 1.11.0 a conservé une demande après disparition du client sur ArchASP. Avec TLP, Parole respecte donc le profil choisi dans QuickShell et applique les mêmes seuils. Au retour d’activité, à la reprise de Kara, au débranchement, à la réouverture du capot ou si une mesure requise devient indisponible, le traitement est interrompu. Les résultats validés restent réutilisables.
-
-Le fichier d’unité livré est [kara.service](../contrib/systemd/user/kara.service). Son activation dans le gestionnaire utilisateur démarre Kara à la connexion graphique sans ouvrir Parole. Sur ArchASP, le service a été activé avec le mode nocturne capot ouvert et écran éteint, après autorisation. Les seuils initiaux ont été conservés. Les réglages système de logind et de swayidle n’ont pas été modifiés.
-
-Le démarrage de l’unité attend l’acquisition de `fr.labfy.ParolesStrawberry` sur le bus de la session. Le lancement graphique qui suit rejoint alors le propriétaire du service. Après modification du fichier d’unité, charger sa nouvelle définition dans le gestionnaire utilisateur avant le redémarrage.
-
-Le bilan de la dernière période d’inactivité est conservé dans l’index. Il affiche les chansons prêtes et restantes, les LRC corrigés ou générés, les échecs, les interruptions, les reports, le temps cumulé des tentatives clôturées et la variation du cache alloué. La cadence est calculée sur ces tentatives, y compris le temps passé sur les échecs. Le bilan de la dernière fermeture protégée ajoute la date, les tâches réglées par catégorie et le motif de fin. Une recherche terminée sans correspondance compte comme vérification réalisée. Les tâches différées et interrompues sont comptées à part. Un arrêt inattendu marque la tentative Kara en cours comme interrompue et conserve les totaux clôturés. La reprise retire les brouillons marqués et retrouve les caches valides publiés avant l’arrêt.
-
-Les interruptions terminent le groupe de processus et les moteurs libèrent leurs ressources. Les fichiers déjà publiés sont réutilisables. Une préparation interrompue pendant Demucs peut reprendre avec des pistes séparées si leur génération a été validée. Une partie et les sélections mobiles conservent leur chemin prioritaire. La suspension globale ne modifie pas la file d’importation ni une partie Kara.
-
-Le [protocole capot fermé](parole-capot-ferme.md) décrit le diagnostic, les mesures physiques et le retour à la politique habituelle.
-
-Une recherche de paroles préserve les textes locaux et les corrections. Les écritures de tags utilisent le moteur existant et sa vérification des flux audio et image, avec copie des flux. Le LRC externe vérifié a la priorité. Après une recherche classique récente sans résultat et, si configuré, une attente bornée de Codex, Turbo peut utiliser le texte Strawberry ou sa correction locale. L’alignement n’ajoute aucun repère à une ligne sans appui acoustique. Une génération publie un LRC seulement si tous les débuts de ligne sont observés et si les seuils Kara sont atteints. Les mots incertains restent sans repère de notation. La couverture et l’erreur temporelle face à une référence annotée sont deux mesures distinctes.
-
-Pendant la préparation nocturne, si aucun fournisseur de minutage ne peut travailler, Parole examine le LRC intégré ou la preuve PCM indexée puis utilise le texte local lorsqu’il est disponible. Une interruption peut reprendre ce texte. La réouverture d’un fournisseur de minutage rend sa recherche de nouveau éligible. En l’absence de référence locale, une indisponibilité reste un report de recherche.
-
-Dans les détails du brouillon, **Passages à vérifier** propose le mix et, si la version courante possède déjà une séparation valide, la voix. Le lecteur d’aperçu joue jusqu’à douze secondes du passage sans déplacer Strawberry. Une seule écoute peut être active. Elle s’arrête au changement de passage, à la fermeture du panneau ou à la reprise de Strawberry ou de Kara. Les paroles et le LRC se corrigent et s’enregistrent séparément.
+Le tableau indique le nombre de morceaux, les LRC présents, les LRC manquants, les acquisitions de la nuit, l’état des fournisseurs et la prochaine échéance. Le [mode capot fermé](parole-capot-ferme.md) garde les contrôles de secteur, de verrouillage, de température, de mémoire et de stockage.
 
 L’album est comparé aux positions disque et piste et aux titres de l’édition MusicBrainz. Une correspondance par titre seule est insuffisante. La discographie utilise un MusicBrainz ID inscrit dans le fichier ou corroboré par des éditions locales distinctes. Les ambiguïtés, doublons et positions absentes sont consultables. Pour un morceau dont les métadonnées sont incomplètes, la maintenance peut joindre une identification MusicBrainz aux détails après recoupement du crédit, de l’édition et de la durée. Les suggestions restent séparées des tags et crédits originaux. Lorsque la récupération classique d’une piste manquante est indisponible, la recherche approfondie reçoit les positions et titres réellement manquants pour l’édition. L’import automatique requiert une édition vérifiée et un lien YouTube Music expressément autorisé dans son dialogue. Les pistes déjà reconnues par la file sont réutilisées. Les exclusions persistent. Les champs de droits ou les liens proposés par Codex ne valent pas autorisation.
 
@@ -94,7 +70,6 @@ Les sources enregistrées sont consultables, désactivables et mesurées pendant
 
 Dans **Paramètres → Sources**, les limites du fournisseur sélectionné règlent son quota de requêtes HTTP de maintenance et son intervalle minimal. Le quota initial est de 200 requêtes par jour et le réglage de l’intervalle peut renforcer le minimum du client ou du fournisseur. Un quota de zéro suspend les nouvelles requêtes. Les recherches classiques et celles précédant Turbo partagent ces limites par fournisseur. Les anciens réglages globaux de quota et d’intervalle des recherches classiques ne sont plus utilisés. LRCLIB traite les requêtes une par une, avec une pause après réponse et une temporisation qui respecte `Retry-After`. En cas d’erreurs répétées, le délai augmente pour le fournisseur concerné. [Documentation LRCLIB](https://lrclib.net/docs) · [Politique MusicBrainz](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting)
 
-Le bilan affiche les résultats de l’heure et des 24 heures révolues. Il distingue publications réseau et locales, brouillons Turbo, formats de brouillon validés, LRC générés et recalés, titres prêts et reports effectivement attribués à la mémoire ou à une limitation fournisseur. Une tâche vérifiée sans résultat ne compte pas comme une publication. Le nombre de brouillons à vérifier décrit les tâches connues dont un format manque encore dans la bibliothèque. Les fermetures protégées enregistrent également les résultats de leurs propres tâches. Les compteurs ajoutés démarrent au déploiement, avec conservation de l’historique des publications externes.
 
 Le statut Local, Externe ou Généré du LRC apparaît dans le tableau. Les détails indiquent la provenance, la couverture si mesurée et les éventuels échecs. La console prend ses messages dans les événements des opérations, et ne recopie pas les détails des processus Codex.
 
@@ -150,40 +125,8 @@ Pour les tests graphiques, utiliser `PAROLE_TEST_GTK=1` sur un bureau ou un comp
 | --- | --- |
 | GTK dans Sway headless, bibliothèque temporaire | 1,357 s à la première image, 202 Mio RSS et 1,20 % d’un cœur au repos |
 | Inventaire réel, 80 fichiers | 0,283 s au premier passage, 0,212 s à chaud, 0 modification au second passage |
-| Demucs CPU, échantillon de 22,754 s | 19,575 s, lecture du cache en 0,302 s |
-| Turbo Vulkan sur le même échantillon | 22,297 s pour le processus complet, 2,392 s d’analyse reportée, 93,83 % de mots couverts, 1,657 s pour la relecture du cache |
-| Turbo Vulkan avec le même texte sans minutage | 14,30 s, 93,83 % de mots et 80 % de débuts de ligne couverts. Publication refusée. L’original est resté identique. |
-| Pic de charge GPU pendant Turbo | 97 % observés sur le périphérique, charge agrégée |
-| Taille de préparation de l’échantillon | Environ 2,57 Mo pour les deux FLAC et le manifeste |
 | Cache existant mesuré en lecture seule | Environ 307 Mio sur la machine à la date du relevé |
 | Fournisseurs publics | MusicBrainz et LRCLIB ont répondu à une requête publique de qualification |
 | Codex CLI 0.172.0 | Après montage du compagnon, recherche native avec résultats et réponse conforme au schéma Parole. Documentation publique LRCLIB vérifiée en 15,8 s dans Bubblewrap. |
 
 La qualification ne fixe pas la précision de 500 ms. Elle demande un corpus dont les débuts de ligne et de mot sont annotés indépendamment. Les temps observés sur un morceau court ne donnent pas la moyenne de la bibliothèque. La TV physique, la découverte effective d’un nouveau fournisseur par Codex et une campagne d’importation automatique sur la collection réelle restent à qualifier.
-
-### Essais nocturnes sur ArchASP
-
-Le [banc de performances](parole-performances.md) décrit la campagne élargie, la mesure par étape et le témoin temporel indépendant.
-
-Le bilan nocturne distingue les préparations complètes et les références temporelles validées, y compris celles qui attendent leurs pistes. Chaque moyenne est accompagnée du nombre de mesures. Demucs inclut la séparation et sa publication. La transcription Turbo reprend la mesure de la première passe du moteur, décodage PCM compris. Les reprises comptent la durée de consolidation lorsqu’un décodage local a eu lieu. La moyenne de cache par préparation porte sur les deux pistes, le manifeste et son LRC alloués à une préparation complète. La taille de la session reste mesurée séparément. Les octets mutualisés par liens physiques sont observés lors de l’inventaire disque. Les sessions antérieures conservent uniquement les mesures qu’elles avaient enregistrées.
-
-Deux morceaux complets ont été traités sur des copies privées, capot ouvert, avec Demucs CPU à deux fils et Turbo Vulkan. Les mesures utilisent temporairement le profil Économie de TLP. Le profil Performance a fait dépasser 85 °C au CPU pendant l’essai initial. En Économie, les essais terminés ont mesuré au plus 74,9 °C au CPU et 61 °C au GPU. Le décodeur strict a confirmé `Vulkan0`. Lorsque le pilote a été masqué pour le seul processus de test, il a quitté avec le code 4 avant d’annoncer sa disponibilité.
-
-| Morceau entier | Demucs | Turbo avec LRC | Couverture mots / lignes | Repères corrigés | Cache alloué |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Rap rapide, 6 min 04 | 386,2 s | 764,3 s | 84,9 % / 82,4 % | 120 | 69,6 Mio |
-| Chant, 4 min 36 | 282,5 s | 191,4 s | 95,2 % / 92,9 % | 32 | 51,3 Mio |
-
-Les deux corrections sont validées dans Kara. Aucun repère corrigé ne dépend d’une interpolation seule. Les originaux audio et LRC ont été vérifiés après l’essai. Sur les deux passages validés, la cadence observée est de 4,43 chansons par heure de calcul et le cache total est de 120,8 Mio, soit environ 268 Mio par heure de calcul. Le calcul additionne les mesures Demucs et Turbo des deux parcours validés et exclut les essais supplémentaires et interruptions.
-
-Les deux morceaux ont ensuite été traités à partir de leurs seules paroles. Les durées Turbo étaient de 698,5 s et 192,1 s. La génération a refusé les deux publications, faute d’appui acoustique sur tous les débuts de ligne. Les fixtures vérifient également le cas publiable. Les couvertures mesurent les repères établis par le moteur et ne mesurent pas l’erreur face à une annotation indépendante.
-
-Un essai Turbo s’est arrêté lorsque l’état secteur est devenu indéterminé. La reprise a retrouvé la séparation du morceau de rap rapide en 0,5 s. Sur un troisième morceau, la perte effective du secteur a arrêté Demucs après 280 s, avant publication. Un débranchement physique pendant une transcription Vulkan a aussi arrêté le groupe Turbo avant publication, 32,1 s après le début de la transcription. La réserve a été vérifiée sur les volumes de la bibliothèque et sur une partition de test offrant 7,24 Gio libres, rejetée sans remplissage artificiel.
-
-Un service utilisateur transitoire a démarré la maintenance sans fenêtre sur une bibliothèque isolée. Une terminaison forcée a confirmé la libération des descripteurs logind. Avec les inhibiteurs de test `idle:block` et `sleep:delay` en place, la veille manuelle a été acceptée. Le signal `PreparingForSleep` a entraîné leur libération, et le noyau a confirmé l’entrée et la sortie de `s2idle` après 12,74 s.
-
-Sur le bureau réel, l’option **Maintenir éveillé** de QuickShell bloquait le verrouillage et l’extinction automatiques. Après sa désactivation par l’utilisateur, le signal d’inactivité, le verrouillage QuickShell et l’extinction Sway ont été observés sur secteur, capot ouvert. Le service installé a ensuite démarré sans fenêtre et terminé l’inventaire initial sans erreur.
-
-Un premier essai sur secteur a duré 24,3 s capot fermé sans calcul lourd. Un [parcours physique ultérieur](parole-performances.md#relevé-archasp-du-25-novembre-2026) a validé un titre complet en 318,4 s, avec des maxima de 62,6 °C au CPU et 56 °C au GPU. La préparation capot fermé reste désactivée sur le service installé. Une période nocturne entière sous charge reste à observer. La préemption par une partie Kara a été vérifiée sur fixtures avec un vrai sous-processus supervisé.
-
-Les contrôles des budgets, le diagnostic par fournisseur et le miroir SQLite sont détaillés dans [Sources de paroles V3](parole-sources-v3.md).

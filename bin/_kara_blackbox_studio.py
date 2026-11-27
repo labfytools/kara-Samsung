@@ -45,7 +45,6 @@ class BlackBoxStudio(Gtk.Window):
         self.paths = []
         self.turns = []
         self.preview = None
-        self.recalculated = None
         self.serial = 0
         self.catalogue_serial = 0
         self.timer = 0
@@ -236,9 +235,7 @@ class BlackBoxStudio(Gtk.Window):
                 for row in rows]))
             self.event_selected()
 
-        recalculated = (self.recalculated["alignment"] if self.recalculated
-                        and self.recalculated["cycle"] == f"{path.name}/{turn}" else None)
-        self.submit(lambda: tiles(path, turn, origin, start, width, recalculated), show, self.timeline_state.set_text)
+        self.submit(lambda: tiles(path, turn, origin, start, width), show, self.timeline_state.set_text)
 
     def event_selected(self, *_):
         index = self.event_picker.get_selected()

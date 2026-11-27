@@ -128,7 +128,7 @@ def main():
         owner.close()
         owner.thread.join(timeout=15)
         with (workspace / "bilan.json").open("x", encoding="utf-8") as stream:
-            json.dump({"capot": owner.index.closed_progress(), "préparation": owner.index.night_progress()[3]},
+            json.dump({"capot": owner.index.closed_progress(), "LRC": owner.index.night_lrc_status()},
                       stream, ensure_ascii=False, indent=2)
         journal = read_command("journalctl", "-b", "-u", "systemd-logind", "-u", "systemd-suspend",
                                "--since", started.strftime("%Y-%m-%d %H:%M:%S"), "--no-pager",

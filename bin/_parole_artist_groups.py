@@ -242,27 +242,6 @@ def recover(index, queue=None, *, state=STATE):
     return len(rows)
 
 
-def rebind_preparations(index, plan, *, undo=False):
-    from _kara_prepare import PreparedCache
-    from _kara_stems import rebind
-    from _musique_oz import audio_files
-
-    cache = PreparedCache()
-    result = {"references": 0, "stems": 0}
-    for row in plan["moves"]:
-        source, target = endpoints(index.root, row, undo)
-        for track in audio_files(target):
-            previous = source / track.relative_to(target)
-            if (cache.folder(previous) / "prepared.json").is_file():
-                try:
-                    with cache.locked(track) as directory:
-                        result["references"] += bool(cache.cached(track, previous=previous, rebind=directory))
-                except (OSError, ValueError):
-                    pass
-            result["stems"] += rebind(track, previous)
-    return result
-
-
 def main():
     import argparse
     from _kara_import_queue import ImportQueue
@@ -288,13 +267,12 @@ def main():
             if row is None:
                 raise ValueError("Reçu inconnu.")
             undo(index, args.annuler, queue)
-            result = {"undo": args.annuler,
-                      "preparation": rebind_preparations(index, json.loads(row["value"]), undo=True)}
+            result = {"undo": args.annuler}
         else:
             plan = preview(index.root, args.cible, args.artistes)
             if args.appliquer:
                 identity = apply(index, plan, queue)
-                result = {"receipt": identity, "preparation": rebind_preparations(index, plan)}
+                result = {"receipt": identity}
             else:
                 result = plan
         print(json.dumps(result, ensure_ascii=False, indent=2))

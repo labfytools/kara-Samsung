@@ -1,6 +1,5 @@
 """Politique d'admission lourde de Parole dans la session Sway."""
 import os
-import stat
 from pathlib import Path
 import selectors
 from shutil import disk_usage
@@ -9,35 +8,9 @@ import subprocess
 import sys
 from time import monotonic
 
-from _kara_prepare import CACHE_ROOT
-from _kara_stems import ROOT as STEM_ROOT
 
 GIB = 1024**3
 MIB = 1024**2
-
-
-def contents(root):
-    total, shared, sizes, seen = 0, 0, {}, set()
-    for parent, _, names in os.walk(root):
-        for name in names:
-            p = Path(parent) / name
-            try:
-                info = p.lstat()
-                identity = info.st_dev, info.st_ino
-                if stat.S_ISREG(info.st_mode):
-                    size = info.st_blocks * 512
-                    if identity in seen:
-                        # Count each additional name for an already allocated
-                        # inode without charging its blocks to the disk cap.
-                        shared += size
-                        continue
-                    seen.add(identity)
-                    total += size
-                    category = name if name.endswith(".flac") else p.suffix
-                    sizes[category] = sizes.get(category, 0) + size
-            except FileNotFoundError:
-                continue
-    return total, sizes, shared
 
 
 def nearest(path):
@@ -182,14 +155,9 @@ class Resources:
     def collect_storage(self, now, force=False):
         if not force and now < self.last_usage + 30:
             return
-        prepared, reference, shared_references = contents(CACHE_ROOT)
-        stems, audio, shared_stems = contents(STEM_ROOT)
-        paths = {name: nearest(path) for name, path in (
-            ("bibliothèque", self.root), ("références", CACHE_ROOT), ("pistes IA", STEM_ROOT))}
-        self.storage = {"bytes": prepared + stems, "reference": reference, "stems": audio,
-                        "shared_bytes": shared_references + shared_stems,
-                        "free": {name: disk_usage(path).free for name, path in paths.items()},
-                        "devices": {name: block_device(path) for name, path in paths.items()}}
+        path = nearest(self.root)
+        self.storage = {"free": {"bibliothèque": disk_usage(path).free},
+                        "devices": {"bibliothèque": block_device(path)}}
         self.last_usage = now
 
     def disk_load(self, now):
@@ -206,14 +174,10 @@ class Resources:
         return max((value - previous.get(key, value)) / (10 * (now - self.sample))
                    for key, value in current.items())
 
-    def allowed_storage(self, settings, duration=0):
-        if not self.storage:
-            return False
-        # Reserve for concurrent FLAC drafts and the reference on the mounted
-        # filesystems, including a conservative transient upper bound.
-        working = int(max(duration, 1) * 3 * MIB) if duration else 0
-        return (self.storage["bytes"] + working < settings["cache_gib"] * GIB
-                and min(self.storage["free"].values()) > settings["reserve_gib"] * GIB + working)
+    def allowed_storage(self, settings):
+        # Lyric sidecars are written beside the songs. The library mount
+        # owns the free-space reserve, even after a service restart.
+        return bool(self.storage and self.storage["free"]["bibliothèque"] > settings["reserve_gib"] * GIB)
 
     def check(self, settings, *, busy=False, running=False, nocturnal=False, lid=False, light=False):
         now = monotonic()
@@ -232,9 +196,7 @@ class Resources:
             self.collect_storage(now)
             if running:
                 # Free space is sampled on the actual mounts during writing.
-                self.storage = {**self.storage, "free": {
-                    name: disk_usage(nearest(path)).free for name, path in (
-                        ("bibliothèque", self.root), ("références", CACHE_ROOT), ("pistes IA", STEM_ROOT))}}
+                self.storage["free"] = {"bibliothèque": disk_usage(nearest(self.root)).free}
             # The owner has already confirmed the closed lid, compositor
             # lock and DPMS. Re-sample under the stricter thermal limits at
             # that transition without waiting for a Wayland idle timeout.
@@ -293,7 +255,7 @@ class Resources:
                 (idle, "Session active"), (power, "Alimentation secteur requise"),
                 (memory_ok, "Mémoire ou pression mémoire"),
                 (temperatures, "Température CPU/GPU indisponible ou trop élevée"),
-                (self.allowed_storage(settings), "Réserve disque ou plafond du cache"),
+                (self.allowed_storage(settings), "Réserve disque de la bibliothèque"),
             ):
                 if not ok:
                     self.reason = reason
@@ -322,7 +284,7 @@ class Resources:
             # With the lid open, the idle check above remains mandatory.
             # Load percentages do not prevent unattended nocturnal work.
             if nocturnal:
-                self.reason = "Mode nocturne · calcul prioritaire"
+                self.reason = "Mode nocturne · récupération des LRC"
                 self.can_start = self.can_start_light
                 return running or self.can_start
             for ok, reason in (

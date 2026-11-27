@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
-        id="https://labfytools.com/karaoke-tv" version="2.2.0" viewmodes="maximized">
+        id="https://labfytools.com/karaoke-tv" version="2.2.1" viewmodes="maximized">
   <tizen:application id="LabfyKara0.Karaoke" package="LabfyKara0" required_version="3.0"/>
   <tizen:profile name="tv-samsung"/>
   <name>Kara</name>

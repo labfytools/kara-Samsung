@@ -14,7 +14,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from _kara_import import show_details
 from _kara_paths import BIN, STATE
-from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, rebind_preparations, undo as undo_group
+from _parole_artist_groups import apply as group_artists, last_group, preview as preview_group, undo as undo_group
 from _parole_index import key, document, encoded_key, sidecar
 from _parole_import_enrichment import artist_results, queue_artist, ARTIST_OUTCOMES, artist_summary, track_outcome
 from _parole_import_metrics import LOOKUP, STARTUP, SUCCEEDED, THROUGHPUT, TOTAL, snapshot as import_metrics
@@ -28,7 +28,7 @@ PAGE = 80
 STATES = {"absent": "Absent", "prêt": "Prêt", "partiel": "Partiel", "externe": "Externe",
           "généré": "Généré", "local": "Local", "intégré": "Intégré", "à vérifier": "À vérifier",
           "obsolète": "Obsolète", "instrumental": "Instrumental", "inconnu": "Inconnu"}
-CATEGORY_COLORS = {"DOWNLOAD": "download", "TURBO": "compute", "DEMUCS": "compute", "CODEX": "compute",
+CATEGORY_COLORS = {"DOWNLOAD": "download", "CODEX": "compute",
                    "SOURCE": "source", "SCAN": "source", "INDEX": "source", "SYNC": "source", "IDLE": "source", "SUCCESS": "success",
                    "WARNING": "warning", "ERROR": "error"}
 
@@ -276,7 +276,7 @@ CARDS = (
     ("lyrics", "Avec paroles", "lyrics"), ("lrc", "Avec LRC", "lrc"),
     ("incomplete", "Albums incomplets", "incomplete"), ("missing", "Albums manquants", "missing"),
     ("codex", "Recherches Codex", "codex"), ("sources", "Sources actives", "sources"),
-    ("bytes", "Audio en bibliothèque", "storage"), ("cache", "Cache Kara", "storage"),
+    ("bytes", "Audio en bibliothèque", "storage"),
 )
 FILTERS = (("all", "Toutes les chansons"), ("lyrics", "Avec paroles"), ("no_lyrics", "Sans paroles"),
            ("lrc", "Avec LRC"), ("no_lrc", "Sans LRC"), ("bad_lrc", "LRC à vérifier"),
@@ -431,12 +431,9 @@ class ParoleView:
 
     def connect_tv(self, _):
         self.tv_requested = monotonic()
-        if self.control.receiver is None:
-            if self.control.tv_toggle.get_active():
-                self.control.tv_toggle.set_active(False)
-            self.control.tv_toggle.set_active(True)
-        if self.control.receiver:
-            self.control.receiver.resume_tv_display()
+        self.control.connect_display()
+        if self.control.tv_error:
+            Gtk.AlertDialog(message="Affichage Kara indisponible", detail=self.control.tv_error).show(self.control)
         self.update_tv()
 
     def update_tv(self):
@@ -722,14 +719,13 @@ class ParoleView:
 
     def display_stats(self, stats):
         self.maintenance.metrics["index_aux"] = {"errors": stats["errors"]}
-        stats["cache"] = self.maintenance.resources.storage.get("bytes")
         for name, value in self.cards.items():
             data = stats[name]
             if data is None:
                 formatted = "—"
             elif name in ("lyrics", "lrc"):
                 formatted = f"{100*data/stats['total']:.1f} %" if stats["total"] else "—"
-            elif name in ("bytes", "cache"):
+            elif name == "bytes":
                 formatted = display_size(data)
             else:
                 formatted = f"{data:,}".replace(",", " ")
@@ -920,8 +916,6 @@ class ParoleView:
                 links.append(Gtk.LinkButton.new_with_label(candidate["url"], "Candidat de paroles sur Unison"))
                 links.append(Gtk.LinkButton.new_with_label(candidate["profile"], "Contribution de " + candidate["contributor"]))
                 panel.append(links)
-        editbar.append(button("Rechercher avec Codex",
-                              lambda *_: self.manual_codex("lrc" if forms.get_selected() else "lyrics", identity, status)))
         panel.append(scroller(view, vexpand=True))
         panel.append(status)
         forms.connect("notify::selected", reload_text)
@@ -1308,7 +1302,6 @@ class ParoleView:
             ("night_cpu_temperature", "Limite CPU (°C)", 45, 95),
             ("night_gpu_temperature", "Limite GPU (°C)", 45, 95),
             ("night_closed_temperature", "Limite capot fermé (°C)", 45, 95),
-            ("cache_gib", "Plafond du cache Kara (Gio)", 1, 1000),
             ("night_minutes", "Maintien éveillé (minutes, 0 = illimité sur secteur)", 0, 720),
         ):
             number(night, *spec)
@@ -1354,7 +1347,6 @@ class ParoleView:
         self.lyrics_source_controls(lyrics_sources)
         stack.add_titled(scroller(lyrics_sources), "lyrics_sources", "Sources de paroles")
         storage = new()
-        number(storage, "cache_gib", "Plafond du cache Kara (Gio)", 1, 1000)
         number(storage, "reserve_gib", "Réserve libre par partition (Gio)", 20, 150)
         self.storage_controls(storage)
         stack.add_titled(scroller(storage), "storage", "Stockage")
@@ -1451,7 +1443,7 @@ class ParoleView:
 
         def finish(future, plan, reverse):
             try:
-                identity, preparation = future.result()
+                identity = future.result()
             except (OSError, sqlite3.Error, ValueError) as error:
                 status.set_text(str(error))
                 return GLib.SOURCE_REMOVE
@@ -1462,7 +1454,7 @@ class ParoleView:
             for row in plan["moves"]:
                 self.maintenance.journal.emit("ALBUM", f"{row['source']} → {row['destination']}")
             self.control.artist_group_changed(plan, reverse=reverse)
-            status.set_text(f"{message} · {preparation['references']} références et {preparation['stems']} séparations réassociées.")
+            status.set_text(f"{message} · {amount} éditions.")
             accept.set_sensitive(False)
             restore.set_sensitive(False)
             return GLib.SOURCE_REMOVE
@@ -1478,7 +1470,7 @@ class ParoleView:
                 queue = self.maintenance.import_queue
                 previous = (undo_group(self.index, identity, queue, state=state) if identity else
                             group_artists(self.index, plan, queue, state=state))
-                return previous, rebind_preparations(self.index, plan, undo=bool(identity))
+                return previous
             future = self.control.tag_reader.submit(change)
             future.add_done_callback(lambda result: GLib.idle_add(finish, result, plan, bool(identity)))
 
@@ -1859,15 +1851,8 @@ class ParoleView:
             if not storage:
                 label.set_text("Mesure en attente")
                 return
-            lines = [f"Cache Kara · {display_size(storage['bytes'])}"]
-            for category in ("stems", "reference"):
-                lines.extend(f"{name} · {display_size(size)}" for name, size in sorted(storage[category].items()) if size)
-            lines.extend(f"Libre · {name} · {display_size(size)}" for name, size in storage["free"].items())
-            with self.index.db() as db:
-                count, ready = db.execute("SELECT total,ready FROM library_stats").fetchone()
-            if ready:
-                lines.append("Les pistes audio sont conservées seulement pour les sélections utiles.")
-            label.set_text("\n".join(lines))
+            label.set_text("\n".join(f"Libre · {name} · {display_size(size)}"
+                                     for name, size in storage["free"].items()))
 
         def cleanup(_):
             self.index.enqueue("cleanup", "workspace", "stage-v1", 12, force=True)

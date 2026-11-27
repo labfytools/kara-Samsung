@@ -49,3 +49,11 @@ Le lecteur optionnel accepte une base SQLite décompressée et immuable pointée
 - `python -B tests/test-parole-lyrics-v3.py` vérifie les 429 simultanés, la bascule vers une troisième source, le cache positif et négatif, le partage texte/LRC, les doublons concurrents, la quarantaine du courtier, la distinction des éditions et la lecture seule du miroir.
 - `PAROLE_TEST_GTK=1 python -B tests/test-parole-v3.py -v GtkTests` vérifie la visibilité du tableau de bord et le contrôle d’un fournisseur à quota nul, via le sous-processus de production.
 - Pendant la lecture réelle de Strawberry, les fixtures d’import, de mise en pause et d’annulation réseau ont tourné durant 6,042 s. Les 20 échantillons MPRIS indiquaient le même morceau en lecture, avec une avance de 6,034 s. Les compteurs d’erreurs du nœud Strawberry et de la sortie PipeWire sont restés à zéro variation.
+
+### Récupération de LRC d’origine la nuit
+
+Le mode nocturne utilise LRCLIB, NetEase, QQ Music et les adaptateurs compatibles déjà validés qui livrent un LRC. Un résultat trouvé est publié à côté du morceau avec sa provenance et ses octets UTF-8 d’origine. Les délais `Retry-After` et les quotas journaliers sont partagés avec les recherches de jour. Une correspondance incertaine laisse le morceau en attente.
+
+Une [sauvegarde SQLite officielle de LRCLIB](https://lrclib.net/db-dumps) peut constituer une première recherche locale. Définir `PAROLE_LRCLIB_SQLITE` dans l’environnement du service vers un fichier décompressé autonome. La copie est ouverte en lecture seule et contrôlée d’après les métadonnées de la piste. Parole reprend la recherche réseau si elle ne trouve aucun LRC exploitable. Prévoir l’espace libre indiqué par LRCLIB avant de télécharger la sauvegarde.
+
+L’API officielle [Musixmatch](https://www.postman.com/musixmatch-dev/musixmatch-apis/request/j136ay9/track-subtitle-get) expose des sous-titres au format LRC. [LrcShare](https://api.lrcshare.com/docs/) documente également un accès au format LRC avec une clé. Leur admission dans la recherche automatique demande de vérifier leurs conditions d’accès, les quotas et la correspondance audio. Les imports de fichiers LRC fournis avec un album suivent le parcours local existant.

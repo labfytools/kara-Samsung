@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Archiver le retour micro logiciel, la notation, les moteurs acoustiques et leurs tests. Réserver BlackBox au diagnostic d’affichage et à la lecture des captures.
+
 - Retirer le salon du service Arch Linux. Partager l’affichage Strawberry entre le navigateur local et la Samsung. Garder la file de lecture et les imports dans Parole.
 
 - Afficher les paroles de Strawberry en plein écran sur la Samsung, avec surlignage des mots d’origine, pause, pochette et texte simple. Version Tizen 2.2.0.

@@ -51,7 +51,7 @@ def candidate(root, row, reviews, synced):
         text = info.get("plain", "")
         if info.get("lyrics_provider") and text.strip() and len(text.encode()) <= MAX_LRC_BYTES:
             return LocalReference(path, row["token"], "", "", text)
-    token, text = sidecar(path, ".lrc")
+    token, text = sidecar(path, ".lrc", preserve_bom=synced)
     if not token or not text or not trusted_sidecar(row, info, ".lrc", token, reviews):
         return None
     rows = parse_lrc(text)

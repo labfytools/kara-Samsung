@@ -16,7 +16,7 @@ def read_json(path):
         return json.load(source)
 
 
-def tiles(folder, turn, origin, start, seconds, recalculated=None):
+def tiles(folder, turn, origin, start, seconds):
     """Summarize publication time; raw source clocks remain in event detail."""
     elapsed = round(start * SECOND)
     begin = origin + elapsed
@@ -73,7 +73,7 @@ def tiles(folder, turn, origin, start, seconds, recalculated=None):
         hi[track][idx] = high if hi[track][idx] is None else max(hi[track][idx], high)
     from _kara_blackbox_lyric_clock import project
 
-    markers, references = project(folder, turn, begin, end, BINS, recalculated)
+    markers, references = project(folder, turn, begin, end, BINS)
     peaks = {**references, **{name: list(zip(lo[name], hi[name])) for name in TRACKS if name in lo}}
     return {"peaks": peaks, "markers": markers + score_marks,
             "events": sorted(listed + [row for row in markers if row["event"] != "phone"][:MAX_EVENTS],

@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -B
-"""Lance la télé Tizen dans son conteneur Ubuntu et libère la dictée à la sortie."""
+"""Lance la télé Tizen dans son conteneur Ubuntu."""
 from fcntl import LOCK_EX, LOCK_NB, flock
 import os
 from pathlib import Path
@@ -7,7 +7,6 @@ import signal
 import subprocess
 import sys
 
-from _kara_voice_session import interrupted, without_dictation
 from _kara_paths import kara_data
 
 
@@ -66,14 +65,17 @@ def main():
             except BlockingIOError:
                 notify("La télé virtuelle est déjà ouverte.")
                 return 0
-            with without_dictation(notify=lambda kind, msg: notify(msg) if kind == "error" else None):
-                code = run_tv(display)
+            code = run_tv(display)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         notify(f"Lancement impossible · {error}")
         return 1
     if code:
         notify(f"L’émulateur s’est arrêté. Journal dans {WORKSPACE / 'emulateur.log'}.")
     return code
+
+
+def interrupted(_signal, _frame):
+    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":

@@ -21,7 +21,6 @@ from _musique_oz import AUDIO, INBOX, UNKNOWN_ARTIST, album_groups, manual_album
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 from _parole_taglib import helper as taglib_helper, read as taglib_read
 
-REFERENCE_REUSE_SECONDS = 86_400
 MEDIA, SIDECAR, PREPARATION, REMOVE, ARTWORK = (1 << i for i in range(5))
 LEXICON = "lexicon"
 EVENT_BATCH = 64
@@ -33,7 +32,7 @@ COVER_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
 
 DEFAULTS = {
     "startup": True, "paused": False, "lyrics": True, "lrc": True, "generate": True,
-    "albums": True, "discography": True, "cover": True, "metadata": True, "autoprepare": False, "import_tracks": False, "import_albums": False,
+    "albums": True, "discography": True, "cover": True, "metadata": True, "import_tracks": False, "import_albums": False,
     "codex": False, "codex_auto": False, "codex_daily": 2, "codex_timeout": 120,
     "codex_model": "", "codex_effort": "low",
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
@@ -41,7 +40,7 @@ DEFAULTS = {
     "import_strategy": "speed", "import_preferred": "",
     "import_lyrics_workers": 4,
     "gpu": 15, "disk_busy": 25, "network_timeout": 145, "network_workers": 4, "heavy_daily": 3,
-    "reserve_gib": 20, "cache_gib": 50, "scan_minutes": 15, "review_days": 30,
+    "reserve_gib": 20, "scan_minutes": 15, "review_days": 30,
     "night_enabled": False, "night_screen_off": True, "night_lid": False, "night_lid_qualified": False,
     "night_transcribe": True,
     "night_idle": 420, "night_cpu_temperature": 78, "night_gpu_temperature": 75,
@@ -81,25 +80,6 @@ LOCAL_REFERENCE_SCOPE = """
       AND
 """
 
-# With no eligible reference provider, keep the existing queue order among
-# tasks that can try local evidence. Neither cheap catalogue hints nor a
-# recent receipt establish validity. The preparation worker still checks it.
-LOCAL_PREPARATION_SCOPE = """
-    FROM tasks AS candidate JOIN songs AS target ON target.id=candidate.subject
-    WHERE candidate.kind='prepare' AND (
-        target.lrc IN ('local','externe','généré') OR target.kara='partiel'
-        OR (? AND target.lrc='intégré')
-        OR (? AND target.lyrics NOT IN ('absent','instrumental'))
-        OR ((? OR ?) AND length(target.audio)=64 AND EXISTS (
-            SELECT 1 FROM songs AS donor WHERE donor.audio=target.audio AND donor.id<>target.id
-              AND (donor.lrc IN ('local','externe','généré')
-                   OR (? AND donor.lyrics NOT IN ('absent','instrumental')))
-        ))
-        OR EXISTS (SELECT 1 FROM reviews AS saved WHERE saved.kind='prepare_reference'
-                   AND saved.subject=target.id AND saved.state='found' AND saved.checked>?)
-    ) AND
-"""
-
 # A present sidecar is left for manual review even when its timestamps are
 # invalid. Only the absent file token is eligible for a provider publication.
 NIGHT_LRC_MISSING = "coalesce(CASE WHEN json_valid(s.side) THEN json_extract(s.side,'$[0]') END,'')=''"
@@ -110,12 +90,9 @@ NIGHT_LRC_TRACK = f""" AND candidate.kind='lrc' AND EXISTS(
     AND NOT EXISTS(SELECT 1 FROM exclusions e WHERE e.kind='artist' AND e.subject=s.owner))"""
 
 
-def task_scope(local_reference, local_preparation, now):
+def task_scope(local_reference):
     if local_reference:
         return LOCAL_REFERENCE_SCOPE, (LOCAL_REFERENCE_MISS, LOCAL_REFERENCE_MISS)
-    if local_preparation is not None:
-        timed, plain = local_preparation
-        return LOCAL_PREPARATION_SCOPE, (timed, plain, timed, plain, plain, now - REFERENCE_REUSE_SECONDS)
     return "FROM tasks AS candidate WHERE", ()
 
 
@@ -189,9 +166,7 @@ class Index:
                     payload TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(kind, subject)
                 );
                 CREATE INDEX IF NOT EXISTS tasks_ready ON tasks(state, due, priority);
-                CREATE INDEX IF NOT EXISTS tasks_draft ON tasks(subject)
-                    WHERE kind='transcription' AND state='review' AND detail='brouillon à vérifier';
-                CREATE INDEX IF NOT EXISTS tasks_analysis ON tasks(kind,state) WHERE kind IN ('prepare','transcription');
+
                 CREATE TABLE IF NOT EXISTS reviews (
                     kind TEXT NOT NULL, subject TEXT NOT NULL, state TEXT NOT NULL,
                     checked REAL NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind, subject)
@@ -444,63 +419,11 @@ class Index:
                         return started
         return None
 
-    def queue_transcription(self, song, *, manual=False, now=None, db=None):
-        if song["lyrics"] != "absent" or song["lrc"] != "absent" or not 1 <= song["duration"] <= 3600:
-            return False
-        if db is None:
-            with self.db() as db:
-                db.execute("BEGIN IMMEDIATE")
-                return self.queue_transcription(song, manual=manual, now=now, db=db)
-        from _parole_transcribe import VERSION
-
-        now = time() if now is None else now
-        identity = song["id"]
-        version = encoded_key(song["token"], song["side"], "transcription", VERSION)
-        inserted = self.enqueue("transcription", identity, version,
-                                priority=12 if manual else 20 if song["plays"] else 35,
-                                payload={"manual": True} if manual else {}, now=now, db=db)
-        if manual and not inserted:
-            # Promote an existing claim without superseding its generation
-            # or overwriting a finished draft for this exact audio.
-            return db.execute("""UPDATE tasks SET payload=?,priority=min(priority,12),due=min(due,?)
-                                 WHERE kind='transcription' AND subject=? AND revision=?
-                                 AND state IN ('queued','suspended','temporary','running')
-                                 AND json_extract(payload,'$.manual') IS NULL""",
-                              (document({"manual": True}), now, identity, version)).rowcount > 0
-        return inserted
-
-    def queue_artist_transcriptions(self, owner):
-        with self.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            songs = db.execute("""SELECT * FROM songs WHERE owner=? AND lyrics='absent' AND lrc='absent'
-                                  ORDER BY plays DESC,album,disc,track,id""", (owner,)).fetchall()
-            return len(songs), sum(self.queue_transcription(song, manual=True, db=db) for song in songs)
-
-    def queue_offline_transcription(self, now):
-        # When remote references cannot be searched, propose one draft at a
-        # time. Do not mark lyrics absent or consume the original search task.
-        with self.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("""SELECT s.id,s.token,s.side,s.plays,s.lyrics,s.lrc,s.duration
-                                FROM tasks p JOIN songs s ON s.id=p.subject
-                                WHERE p.kind='prepare' AND p.state IN ('queued','suspended','temporary')
-                                AND p.due<=? AND s.lyrics='absent' AND s.lrc='absent'
-                                AND s.duration BETWEEN 1 AND 3600
-                                AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.kind='transcription' AND t.subject=s.id)
-                                AND NOT EXISTS (SELECT 1 FROM exclusions e WHERE e.kind='artist' AND e.subject=s.owner)
-                                ORDER BY p.priority,p.due,p.subject LIMIT 1""", (now,)).fetchone()
-            if row is None:
-                return False
-            return self.queue_transcription(row, now=now, db=db)
-
-    def preparation_due(self, now, *, local_preparation=None):
-        return self.work_due(("prepare",), now, local_preparation=local_preparation)
-
-    def work_due(self, kinds, now, *, local_reference=False, local_preparation=None, manual_only=False):
+    def work_due(self, kinds, now, *, local_reference=False, manual_only=False):
         if not kinds:
             return False
         placeholders = ",".join("?" for _ in kinds)
-        scope, arguments = task_scope(local_reference, local_preparation, now)
+        scope, arguments = task_scope(local_reference)
         with self.db(wait=.15) as db:
             return db.execute(f"""SELECT 1 {scope} candidate.kind IN ({placeholders}) AND candidate.due<=?
                                   AND candidate.state IN ('queued','suspended','temporary')
@@ -563,34 +486,7 @@ class Index:
                 return sum(report["completed"].values())
         return None
 
-    @staticmethod
-    def read_night_report(db):
-        row = db.execute("SELECT value FROM settings WHERE key='night_report'").fetchone()
-        return json.loads(row[0]) if row else None
-
-    @staticmethod
-    def write_night_report(db, report):
-        db.execute("INSERT OR REPLACE INTO settings VALUES('night_report',?)", (document(report),))
-
-    def night_progress(self):
-        with self.db(wait=.15) as db:
-            ready = db.execute("SELECT ready FROM library_stats WHERE id=1").fetchone()[0]
-            references = db.execute("""
-                SELECT count(*) FROM songs
-                WHERE kara='prêt' OR (kara='partiel' AND json_extract(info, '$.report.reference_validated')=1)
-            """).fetchone()[0]
-            remaining = db.execute("""
-                SELECT count(*) FROM tasks JOIN songs ON songs.id=tasks.subject
-                WHERE tasks.kind='prepare' AND tasks.state IN ('queued','running','suspended','temporary')
-                AND songs.kara!='prêt' AND songs.lyrics!='instrumental'
-                AND coalesce(json_extract(songs.info, '$.report.reference_validated'),0)!=1
-                AND NOT EXISTS(SELECT 1 FROM exclusions WHERE kind='artist' AND subject=songs.owner)
-            """).fetchone()[0]
-            return ready, references, remaining, self.read_night_report(db)
-
     def configure(self, **changes):
-        if "night_enabled" in changes:
-            changes.setdefault("autoprepare", False)
         with self.db() as db:
             db.executemany("INSERT OR REPLACE INTO settings VALUES(?,?)",
                            ((name, document(value)) for name, value in changes.items() if name in DEFAULTS))
@@ -613,15 +509,14 @@ class Index:
         # Only the application holding the maintenance lease may recover claims.
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            report = self.read_night_report(db)
-            interrupted = bool(report and report["pending"] is not None)
-            if interrupted:
-                report["interrupted"] += 1
-                report["pending"] = None
-                self.write_night_report(db, report)
             closed = self.read_closed_report(db)
+            interrupted = False
             if closed and closed["ended"] is None:
+                # The closed window only admits LRC searches. Desktop import
+                # claims can also be recovered without owning this report.
+                interrupted = db.execute("SELECT 1 FROM tasks WHERE kind='lrc' AND state='running' LIMIT 1").fetchone() is not None
                 closed.update(ended=time(), reason="redémarrage de la maintenance")
+                closed["interrupted"] += int(interrupted)
                 self.write_closed_report(db, closed)
             db.execute("UPDATE tasks SET state='suspended' WHERE state='running'")
             return interrupted
@@ -657,13 +552,13 @@ class Index:
             self.reserve(db, bucket, day, now, gap)
             return True
 
-    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0, night=None,
-              avoid=(), local_reference=False, local_preparation=None, manual_only=False, night_lrc=False):
+    def claim(self, kinds, now, *, bucket=None, limit=0, high=False, codex_auto=True, gap=0,
+              avoid=(), local_reference=False, manual_only=False, night_lrc=False):
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
         excluded = ",".join("?" for _ in avoid)
-        scope, arguments = task_scope(local_reference, local_preparation, now)
+        scope, arguments = task_scope(local_reference)
         # The import lane and classical network lane share the claim
         # transaction. A pending batch owns its tracks until this pass ends.
         lyrics_guard = """
@@ -703,20 +598,9 @@ class Index:
             """, (now, *arguments, *kinds, *avoid, now, high, manual_only, codex_auto, now)).fetchone()
             if bucket and task is not None:
                 self.reserve(db, bucket, day, now, gap)
-            if night is not None and task is not None:
-                since, storage = night
-                window = [Path("/proc/sys/kernel/random/boot_id").read_text().strip(), since]
-                report = self.read_night_report(db)
-                # Reserve one durable receipt with the queue claim. A crash
-                # leaves the last completed totals and one interrupted item.
-                if not report or report["window"] != window:
-                    report = dict(window=window, started=now, seconds=0., ready=0, corrected=0, generated=0,
-                                  failed=0, deferred=0, interrupted=0, cache_baseline=storage, cache_bytes=storage)
-                report["pending"] = [task["subject"], task["revision"]]
-                self.write_night_report(db, report)
             return task
 
-    def finish(self, task, state, detail="", delay=0, *, night=None, closed=None, refund_attempt=False,
+    def finish(self, task, state, detail="", delay=0, *, closed=None, refund_attempt=False,
                network_found=False, activity=()):
         now = time()
         with self.db() as db:
@@ -735,27 +619,6 @@ class Index:
                 db.execute("DELETE FROM reviews WHERE kind='network_yield' AND checked<?", (minute - 48 * 3600,))
             if changed and activity:
                 self.record_activity(db, now, activity)
-            if night is not None:
-                report = self.read_night_report(db)
-                if report and report["pending"] == [task["subject"], task["revision"]]:
-                    report["pending"] = None
-                    report["seconds"] += night["seconds"]
-                    if night["cache_bytes"] is not None:
-                        report["cache_bytes"] = night["cache_bytes"]
-                    if changed:
-                        report[night["outcome"]] += 1
-                        report["corrected"] += night["corrected"]
-                        report["generated"] += night["generated"]
-                        # Store sums and observation counts in the same
-                        # transaction as the claim outcome. Missing stages
-                        # from old reports or interruptions add no samples.
-                        for name, value in night.get("measurements", {}).items():
-                            aggregate = report.setdefault("measurements", {}).setdefault(name, [0, 0])
-                            aggregate[0] += value
-                            aggregate[1] += 1
-                    else:
-                        report["interrupted"] += 1
-                    self.write_night_report(db, report)
             if changed and closed is not None:
                 since, outcome = closed
                 report = self.read_closed_report(db)
@@ -953,7 +816,7 @@ def integer(value):
         return 0
 
 
-def sidecar(path, suffix, limit=MAX_LRC_BYTES):
+def sidecar(path, suffix, limit=MAX_LRC_BYTES, *, preserve_bom=False):
     candidate = path.with_suffix(suffix)
     try:
         info = candidate.lstat()
@@ -969,7 +832,7 @@ def sidecar(path, suffix, limit=MAX_LRC_BYTES):
             version = os.fstat(stream.fileno())
             if revision(before) != revision(version):
                 return "invalid", ""
-            return revision(version), raw.decode("utf-8-sig")
+            return revision(version), raw.decode("utf-8" if preserve_bom else "utf-8-sig")
     except FileNotFoundError:
         return "", ""
     except (OSError, UnicodeError, ValueError):

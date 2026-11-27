@@ -13,30 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from _parole_index import DEFAULTS
 from _parole_maintenance import Journal, Maintenance
-from _parole_resources import GIB, Resources, contents, thermal_admission, memory_psi, memory_limits, memory_reserve
+from _parole_resources import GIB, Resources, thermal_admission, memory_psi, memory_limits, memory_reserve
 
 
 class ResourceTests(unittest.TestCase):
-    def test_demucs_thread_policy(self):
-        from _kara_stems import demucs_threads
-        from _parole_night import Desktop
-        self.assertEqual(demucs_threads({}), "6")
-        for value in ("2", "6", "12"):
-            self.assertEqual(demucs_threads({"KARA_DEMUCS_THREADS": value}), value)
-        for value in ("0", "1000", "invalid"):
-            self.assertEqual(demucs_threads({"KARA_DEMUCS_THREADS": value}), "6")
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runner = Maintenance(root, None, state=root / "state")
-            self.addCleanup(runner.close)
-            runner.night_running = True
-            for closed, expected in ((True, "12"), (False, "12")):
-                runner.night.desktop = Desktop(True, True, closed, closed, False)
-                with patch("_parole_maintenance.run") as invoke:
-                    runner.output([sys.executable, "-V"])
-                self.assertEqual(invoke.call_args.kwargs["env"]["KARA_DEMUCS_THREADS"], expected)
-                self.assertEqual(demucs_threads(invoke.call_args.kwargs["env"]), expected)
-
     def test_configurable_closed_lid_thermal_ceiling(self):
         self.assertFalse(thermal_admission(DEFAULTS, [70], [60], nocturnal=True, closed=True))
         self.assertTrue(thermal_admission(DEFAULTS, [69], [60], nocturnal=True, closed=True))
@@ -78,7 +58,7 @@ class ResourceTests(unittest.TestCase):
         resources.disk_load = Mock(return_value=0)
         resources.allowed_storage = Mock(return_value=True)
         resources.session_idle = Mock(return_value=True)
-        resources.storage = {"bytes": 0, "free": {"test": 100 * GIB}}
+        resources.storage = {"bytes": 0, "free": {"bibliothèque": 100 * GIB}}
         cpu = Path("/sys/class/hwmon/hwmon-test-cpu")
         gpu = Path("/sys/class/hwmon/hwmon-test-gpu")
         busy = Path("/sys/class/drm/card0/device/gpu_busy_percent")
@@ -110,7 +90,7 @@ class ResourceTests(unittest.TestCase):
             resources.disk_load.return_value = 100
             clock.return_value = 104.
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True))
-            self.assertEqual(resources.reason, "Mode nocturne · calcul prioritaire")
+            self.assertEqual(resources.reason, "Mode nocturne · récupération des LRC")
             readings[str(busy)] = "0"
             resources.disk_load.return_value = 0
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True, light=True))
@@ -144,25 +124,12 @@ class ResourceTests(unittest.TestCase):
             readings["/proc/stat"] = "cpu 1003 0 3 250 0 0 0 0"
             self.assertTrue(resources.check(DEFAULTS, nocturnal=True, lid=True))
 
-    def test_stem_shared_blocks_do_not_count_twice_against_the_cap(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            stem = root / "instrumental.flac"
-            stem.write_bytes(b"x" * 8192)
-            (root / "reused").mkdir()
-            os.link(stem, root / "reused" / stem.name)
-            allocated = stem.stat().st_blocks * 512
-            self.assertGreater(allocated, 0)
-            self.assertEqual(contents(root), (allocated, {stem.name: allocated}, allocated))
-
-    def test_storage_checks_the_least_free_partition_and_working_margin(self):
+    def test_storage_checks_the_library_mount(self):
         resources = Resources(Path("/fixture"))
-        resources.storage = {"bytes": GIB, "free": {"library": 22 * GIB, "cache": 20 * GIB}}
-        self.assertFalse(resources.allowed_storage(DEFAULTS, duration=200))
-        resources.storage["free"]["cache"] = 22 * GIB
-        self.assertTrue(resources.allowed_storage(DEFAULTS, duration=200))
-        resources.storage["bytes"] = 50 * GIB - 10
-        self.assertFalse(resources.allowed_storage(DEFAULTS, duration=200))
+        resources.storage = {"free": {"bibliothèque": 20 * GIB}}
+        self.assertFalse(resources.allowed_storage(DEFAULTS))
+        resources.storage["free"]["bibliothèque"] += 1
+        self.assertTrue(resources.allowed_storage(DEFAULTS))
 
     def test_memory_observation_distinguishes_pressure_from_reserve(self):
         resources = Resources(Path("/fixture"))
@@ -187,68 +154,19 @@ class ResourceTests(unittest.TestCase):
             resources.check(DEFAULTS, busy=True, nocturnal=True)
             self.assertIsNone(resources.memory_detail)
 
-    def test_kara_selection_and_return_of_activity_release_supervised_work(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runner = Maintenance(root, None, state=root / "state")
-            self.addCleanup(runner.close)
-            runner.current_settings = runner.index.settings()
-            policy = Mock(return_value=True)
-            runner.resources.check = policy
-            for phase in ("Demucs", "Turbo"):
-                with self.subTest(phase=phase):
-                    subject = phase.lower()
-                    runner.priority_until = 0.
-                    runner.index.enqueue("prepare", subject, "fixture")
-                    entry = runner.index.claim(("prepare",), time())
-                    entered = Event()
-
-                    def prepare(_task):
-                        command = [sys.executable, "-c",
-                                   "import json,time; print(json.dumps({'started': True}), flush=True); time.sleep(25)"]
-                        runner.output(command, timeout=10,
-                                      observer=lambda event: entered.set() if event.get("started") else None)
-                        self.fail("Le traitement devait libérer ses ressources")
-
-                    runner.prepare = prepare
-                    worker = Thread(target=runner.execute, args=(entry,))
-                    worker.start()
-                    try:
-                        self.assertTrue(entered.wait(2))
-                        start = monotonic()
-                        if phase == "Demucs":
-                            # The selected song can retry once our group has
-                            # released the slot. GTK never waits synchronously.
-                            self.assertFalse(runner.yield_heavy())
-                        else:
-                            policy.return_value = False
-                        worker.join(timeout=5)
-                        self.assertFalse(worker.is_alive())
-                        self.assertLess(monotonic() - start, 5)
-                        with runner.index.db() as db:
-                            job = db.execute("SELECT state,detail FROM tasks WHERE kind='prepare' AND subject=?",
-                                             (subject,)).fetchone()
-                            self.assertEqual(tuple(job), ("suspended", "ressources libérées"))
-                        self.assertTrue(runner.yield_heavy())
-                    finally:
-                        runner.interrupt.set()
-                        worker.join(timeout=5)
-                        runner.interrupt.clear()
-                        policy.return_value = True
-
     def test_memory_diagnostic_remains_in_console_after_restart(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             runner = Maintenance(root, None, state=root / "state")
             self.addCleanup(runner.close)
             runner.resources.memory_detail = "PSI · 5440 Mio disponibles · 1.12 %"
-            runner.progress = ("DEMUCS", "Titre privé", .5)
+            runner.progress = ("LRC", "Titre privé", .5)
             runner.log_memory_stop()
             restarted = Journal(runner.index.folder)
             self.addCleanup(restarted.close)
             _, entries = restarted.snapshot()
             self.assertEqual(entries[-1][1:], ("RESSOURCES", "WARNING",
-                                               "DEMUCS suspendu · PSI · 5440 Mio disponibles · 1.12 %"))
+                                               "LRC suspendu · PSI · 5440 Mio disponibles · 1.12 %"))
 
 
 if __name__ == "__main__":

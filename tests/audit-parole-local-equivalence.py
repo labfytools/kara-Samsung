@@ -15,8 +15,8 @@ from time import monotonic
 HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1] / "bin"))
 from _kara_audio_identity import pcm_digest
-from _kara_prepare import file_token
-from _kara_turbo import digest
+from _kara_files import file_token
+from _kara_blackbox import digest
 from _parole_fingerprint import read as fingerprint, similarity
 from _parole_index import document, key
 from _parole_local_reference import candidate

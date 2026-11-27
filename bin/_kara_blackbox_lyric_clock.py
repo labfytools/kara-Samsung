@@ -11,7 +11,6 @@ import numpy as np
 from _kara_blackbox import digest, events
 from _kara_blackbox_lyrics import load
 from _kara_paths import music_library
-from _kara_stems import ROOT as STEM_ROOT
 
 SECOND = 1_000_000_000
 
@@ -89,8 +88,6 @@ def waveforms(document, intervals, begin, end, bins):
     if not 0 <= start < stop <= start + 45:
         return {}
     sources = [("musique", library, reference.get("library_path", ""), reference["sha256"])]
-    if voice := files.get("original_voice"):
-        sources.append(("voix guide", STEM_ROOT, voice["cache_generation"] + "/vocals.flac", voice["sha256"]))
     result = {}
     for name, root, relative, expected in sources:
         try:
@@ -127,41 +124,7 @@ def waveforms(document, intervals, begin, end, bins):
 
 
 
-def sampled_envelopes(track, intervals, begin, end, bins, name):
-    if not track or not intervals:
-        return {}
-    result = {}
-    times = [first for first, _, _, _ in intervals]
-    for view, item in track.get("views", {}).items():
-        if "envelope_s8" not in item:
-            continue
-        packed = item["envelope_s8"]
-        if not isinstance(packed, str) or len(packed) > 32_000:
-            continue
-        try:
-            cells = np.frombuffer(b64decode(packed, validate=True), dtype="i1").reshape(-1, 2)
-            period = item["frames_per_cell"] / item["rate"]
-        except (ValueError, KeyError, TypeError, ZeroDivisionError):
-            continue
-        if not .025 <= period <= .1:
-            continue
-        peaks = [(None, None)] * bins
-        for i in range(bins):
-            left = begin + (end - begin) * i // bins
-            j = bisect_right(times, left) - 1
-            if j < 0:
-                continue
-            first, last, low, high = intervals[j]
-            if not first <= left < last:
-                continue
-            position = low + (left - first) / (last - first) * (high - low)
-            if 0 <= position / period < len(cells):
-                mn, mx = cells[int(position / period)]
-                peaks[i] = (int(mn) / 128, int(mx) / 128)
-        result[f"{name} {view}"] = peaks
-    return result
-
-def project(folder, turn, begin, end, bins, recalculated=None):
+def project(folder, turn, begin, end, bins):
     if not turn:
         return [], {}
     try:
@@ -170,8 +133,7 @@ def project(folder, turn, begin, end, bins, recalculated=None):
         return [], {}
     intervals = [row for row in anchors(events(folder / "events.jsonl"), turn, end)
                  if row[0] < end and row[1] > begin]
-    tracks = [("historical", document.get("historical")), ("experimental", document.get("chronos")),
-              ("recalculated", recalculated)]
+    tracks = [("historical", document.get("historical"))]
     results = []
     for kind, track in tracks:
         if track:
@@ -180,6 +142,4 @@ def project(folder, turn, begin, end, bins, recalculated=None):
                 row["data"]["engine"] = track.get("engine", track.get("method", kind))
                 results.append(row)
     sound = waveforms(document, intervals, begin, end, bins)
-    for name, track in tracks[1:]:
-        sound.update(sampled_envelopes(track, intervals, begin, end, bins, name))
     return sorted(results, key=lambda row: row["monotonic_ns"]), sound

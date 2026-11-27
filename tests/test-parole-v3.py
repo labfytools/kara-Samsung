@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 
 from _kara_audio_identity import pcm_digest
-from _kara_prepare import lrc_token
+from _kara_files import lrc_token
 from _parole_catalogue import check_album, check_discography, check_recording, compare
 from _parole_codex import authenticate, daily_slot, validate
 from _parole_index import SIDECAR, Index, inventory, encoded_key, reference_proof, revision
@@ -65,7 +65,7 @@ class Fixture(unittest.TestCase):
 
 class InventoryTests(Fixture):
     def test_incremental_lexicon_updates_only_the_changed_version_and_recovers_claim(self):
-        from _kara_prepare import file_token
+        from _kara_files import file_token
         from _parole_lexicon import incremental_records, make_record, refresh_one
 
         first = self.audio("01.flac")
@@ -410,9 +410,7 @@ class QueueTests(Fixture):
         self.addCleanup(owner.close)
         cover, lyrics = Event(), Event()
         owner.import_enrichment_active = {("import_lyrics", "album"): lyrics, ("import_cover", "album"): cover}
-        owner.active = ("prepare", "song")
         owner.set_priority(True, kara=False)
-        self.assertTrue(owner.interrupt.is_set())
         self.assertTrue(cover.is_set())
         self.assertFalse(lyrics.is_set())
         owner.prioritize_artist_lyrics({"album"})
@@ -717,7 +715,7 @@ class SourceTests(Fixture):
                 self.assertTrue(self.index.work_due(("lrc",), time(), local_reference=True))
                 self.assertTrue(owner.tick_network(settings, time(), kinds))
                 self.assertEqual(owner.output.call_args.args[0][-1], "--local-reference-only")
-                self.assertEqual(path.with_suffix(".lrc").read_text(), embedded + "\n")
+                self.assertEqual(path.with_suffix(".lrc").read_bytes(), embedded.encode())
                 self.assertEqual(path.read_bytes(), before)
                 with patch("_parole_maintenance.time", return_value=time() + 2):
                     owner.index_turn()
@@ -1011,7 +1009,6 @@ class GtkTests(Fixture):
         self.assertEqual(view.songs.get_n_items(), 1)
         view.tree_selection.set_selected(0)
         self.assertTrue(view.search_lyrics.get_sensitive())
-        self.assertTrue(view.generate_lyrics.get_sensitive())
         view.search_lyrics.emit("clicked")
         search = view.artist_search
         self.addCleanup(search["window"].destroy)
@@ -1041,12 +1038,8 @@ class GtkTests(Fixture):
         view.card_action("no_lyrics")
         wait_library()
         self.assertEqual(view.songs.get_n_items(), 1)
-        view.card_action("ready")
-        wait_library()
-        self.assertEqual(view.songs.get_n_items(), 0)
         view.all()
         wait_library()
-        self.assertIsNone(window.legacy_controls.get_root())
         visible = view.songs.get_item(0)
         view.song_selection.set_selected(0)
         modifications = []
@@ -1064,15 +1057,7 @@ class GtkTests(Fixture):
         wait_library()
         self.assertEqual(modifications, [True])
         self.assertEqual(view.song_selection.get_selected_item().data["id"], visible.data["id"])
-        draft = {"duration": 5., "language": "fr", "plain": "Brouillon vocal",
-                 "timed": "[00:01.000]Brouillon vocal", "audio": {"sha256": "fixture"},
-                 "model": {}, "settings": {}, "observation": {"input": "original", "acceleration": "vulkan"},
-                 "first_pass": {"language_request": "", "words": [],
-                                "segments": [{"start": .75, "end": 1.99, "no_speech": .12,
-                                              "text": "Passage à écouter"}]}}
-        window.maintenance.index.enqueue("transcription", visible.data["id"], "fixture")
-        with patch("_parole_transcribe.read_draft", return_value=draft):
-            view.details(view.songs.get_item(0).data)
+        view.details(view.songs.get_item(0).data)
         detail = next(w for w in Gtk.Window.get_toplevels() if w.get_transient_for() is window
                       and w.get_title() == visible.data["title"])
 
@@ -1108,45 +1093,16 @@ class GtkTests(Fixture):
         editor = next(widget for widget in descendants(detail) if isinstance(widget, Gtk.TextView))
         contents = editor.get_buffer()
         formats.set_selected(1)
-        editor_buttons["Charger le brouillon Turbo"].emit("clicked")
+        editor_buttons["Corriger"].emit("clicked")
         self.assertTrue(editor.get_editable())
         self.assertFalse(formats.get_sensitive())
-        self.assertFalse(contents.get_can_undo())
-        contents.insert_at_cursor(" saisie")
-        self.assertTrue(contents.get_can_undo())
+        contents.insert_at_cursor("[00:01.000]Texte de vérification")
         contents.undo()
-        self.assertEqual(contents.get_text(*contents.get_bounds(), False), draft["timed"])
+        self.assertFalse(contents.get_can_undo())
         editor_buttons["Annuler la correction"].emit("clicked")
         self.assertTrue(formats.get_sensitive())
-        self.assertFalse(contents.get_can_undo())
         self.assertFalse(path.with_suffix(".lrc").exists())
 
-        expander = next(widget for widget in descendants(detail) if isinstance(widget, Gtk.Expander))
-        expander.set_expanded(True)
-        controls_by_label = {widget.get_label(): widget for widget in descendants(expander.get_child())
-                             if isinstance(widget, Gtk.Button)}
-        self.assertFalse(controls_by_label["Voix"].get_sensitive())
-        with patch.object(view.draft_audition, "start") as preview:
-            controls_by_label["Mix"].emit("clicked")
-            self.assertEqual(preview.call_args.args[2:6], (path, visible.data["token"], .75, 1.99))
-            self.assertEqual(preview.call_args.kwargs, {"isolated": False, "slow": False, "repeat": False})
-            options = {widget.get_label(): widget for widget in descendants(expander.get_child())
-                       if isinstance(widget, Gtk.CheckButton)}
-            options["Répéter 3 fois"].set_active(True)
-            options["Vitesse 80 %"].set_active(True)
-            controls_by_label["Mix"].emit("clicked")
-            self.assertEqual(preview.call_args.kwargs, {"isolated": False, "slow": True, "repeat": True})
-        self.assertFalse(window.permits_draft_audition())
-        self.assertIn("désactivé", window.seek_draft_review(path, .75))
-        with patch.dict(os.environ, {"KARA_SILENT": "0"}), patch.object(window, "player_command") as seek:
-            window.track, window.player_track_id, window.duration = path, "/org/mpris/Track/fixture", 5.
-            window.player_seen = app_module.time.monotonic()
-            with patch.object(window, "playback_state", "Playing"):
-                self.assertFalse(window.permits_draft_audition())
-            self.assertIsNotNone(window.seek_draft_review(path.with_suffix(".wav"), .75))
-            self.assertIsNone(window.seek_draft_review(path, .75))
-            method, values = seek.call_args.args
-            self.assertEqual((method, values.unpack()), ("SetPosition", (window.player_track_id, 750_000)))
         window.open_import()
         self.assertTrue(window.album_import.get_reveal_child())
         self.assertEqual(window.album_import.get_root(), window.import_window)
@@ -1192,12 +1148,9 @@ class GtkTests(Fixture):
             self.assertEqual(view.settings_dialog.get_child().get_end_child().get_visible_child_name(), page)
         view.refresh_night_summary()
         summary = view.night_summary.get_label()
-        self.assertIn("0 pistes avec mixage en cache", summary)
-        self.assertIn("0 références temporelles validées", summary)
-        self.assertIn("Dernières 24 h révolues · Réseau 0 textes / 0 LRC · Bibliothèque 0 textes / 0 LRC", summary)
-        self.assertIn("0 reports mémoire · 0 reports quota", summary)
-        self.assertNotIn("Moyennes", summary)
-
+        self.assertIn("1 morceaux · 0 avec LRC · 1 sans LRC", summary)
+        self.assertIn("0 LRC récupérés cette nuit", summary)
+        self.assertIn("Prochaine reprise", summary)
 
         # Exercise the real multi-selection, preview and confirmation in a
         # mounted GTK dialog. The fixture collection alone is mutated.

@@ -24,7 +24,6 @@ FIXTURES = ROOT / "tests/fixtures/parole"
 sys.path.insert(0, str(BIN))
 from _kara_audio_identity import pcm_digest
 from _kara_import_local import local_target
-from _kara_mobile_imports import MobileImports
 from _kara_import_queue import ImportQueue, digest
 from _kara_import_resources import MAX_DOWNLOADS, PROCESSING, YOUTUBE_DEFAULT_SLOTS, lease, slot_count
 from _kara_import_result import ImportIssue
@@ -70,24 +69,6 @@ class QueueTests(unittest.TestCase):
                     ready: {"status": "pending"}, failed: {"status": "failure"}}
         order = list(source_order([interrupted, partial, ready, new, failed, archive], previous))
         self.assertEqual(order, [(3, ready), (6, archive), (4, new), (1, interrupted), (2, partial), (5, failed)])
-
-    def test_mobile_discography_approval_keeps_the_selected_artist(self):
-        private = Path(self.enterContext(TemporaryDirectory()))
-        queue = ImportQueue(private / "state", private)
-        control = SimpleNamespace(blackbox=SimpleNamespace(emit=lambda *args, **kwargs: None))
-        mobile = MobileImports(control)
-        mobile.bind_queue(queue)
-        artist_id = "UC" + "a" * 22
-        mobile.discographies["catalogue"] = {"artist_id": artist_id, "name": "Bob Marley",
-                                           "albums": [{"id": "MPREtest01", "title": "Exodus"}]}
-        request = mobile.request("fixture-session", "Organisateur",
-                                 {"handle": "catalogue", "all": True, "rights": True})
-        restarted = MobileImports(control)
-        restarted.bind_queue(queue)
-        job = restarted.jobs[request["job"]]
-        restarted.enqueue(job)
-        self.assertEqual(queue.routes(job["task_id"]),
-                         {"https://music.youtube.com/browse/MPREtest01": ("Bob Marley", artist_id, "MPREtest01")})
 
     def test_spelling_keys_preserve_collaborator_boundaries(self):
         for a, b in (("Bob Marley & The Wailers", "Bob Marley and the Wailers"),
@@ -142,10 +123,9 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(historical[0]["journal"], "journal-local")
             self.assertEqual(set(relaunched.outcomes(identity)), {good, missing})
 
-    def test_history_cleanup_keeps_queue_receipts_and_updates_mobile(self):
+    def test_history_cleanup_keeps_queue_receipts(self):
         root = Path(self.enterContext(TemporaryDirectory(prefix="parole-history-")))
         queue = ImportQueue(root / "state", root)
-        mobile = MobileImports(SimpleNamespace(album_import=SimpleNamespace(imports_snapshot=([], {}))))
 
         def add(number, event=None, *, acknowledge=True, linked=False):
             url = playlist(f"HISTORY{number}")
@@ -173,14 +153,10 @@ class QueueTests(unittest.TestCase):
         partial, pending_url = add(5, "failure")
         integrating, _ = add(6, "success", acknowledge=False)
         waiting, _ = add(7)
-        mobile.bind_queue(queue)
-        self.assertEqual(len(mobile.snapshot(organizer=True, history=True)), 6)
-        self.assertEqual(len(mobile.snapshot(token="member", history=True)), 1)
         self.assertEqual(queue.totals(), (1, 2, 2, 3))
 
         self.assertEqual(queue.delete_history((linked, cancelled, waiting, partial, integrating)), 4)
         self.assertEqual(queue.history_policy(), (0, 1))
-        self.assertEqual(mobile.snapshot(token="member", history=True), [])
         self.assertEqual([row["id"] for row in queue.rows()], [waiting])
         self.assertEqual(queue.count(visible=True), {"queued": 1})
         self.assertEqual(queue.totals(), (0, 0, 0, 1))
@@ -192,9 +168,6 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(queue.delete_history(), 0)
 
         restarted = ImportQueue(root / "state", root)
-        mobile.bind_queue(restarted)
-        self.assertEqual(mobile.snapshot(organizer=True, history=True), [])
-        self.assertEqual(mobile.snapshot(token="member", history=True), [])
         self.assertEqual(restarted.history_policy(), (0, 3))
         self.assertEqual(restarted.enqueue_maintenance("automatic-receipt", "Album", url), success)
         self.assertEqual(restarted.outcomes(success)[url]["tracks"], ["piste-1"])

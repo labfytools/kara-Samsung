@@ -13,13 +13,9 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
-from _kara_prepare import PreparedCache, file_token
-from _kara_refine import VERSION as REFINEMENT_VERSION
-from _kara_turbo import ObservedWord
 from _parole_index import document, inventory, sidecar
 from _parole_maintenance import Maintenance
 from _parole_night import Desktop, Login, Night, mains_online, POWER_LOSS_GRACE, POWER_RECOVERY_STABLE
-from _parole_transcribe import proposals, review_ranges
 
 
 class PowerTests(unittest.TestCase):
@@ -59,10 +55,6 @@ class NightTests(unittest.TestCase):
         root = Path(temporary.name)
         self.owner = Maintenance(root, None, state=root / "state")
         self.addCleanup(self.owner.close)
-        self.stems = root / "stems"
-        stem_directory = patch("_parole_maintenance.STEM_ROOT", self.stems)
-        stem_directory.start()
-        self.addCleanup(stem_directory.stop)
         self.night = self.owner.night
         self.addCleanup(self.night.close)
         self.state = Desktop(True, True, True, False, False)
@@ -81,7 +73,6 @@ class NightTests(unittest.TestCase):
         self.owner.resources.session_idle = Mock(return_value=True)
         self.owner.resources.check = Mock(return_value=True)
         self.owner.resources.collect_storage = Mock()
-        self.owner.resources.storage = {"bytes": 100}
 
     def open(self):
         self.assertTrue(self.owner.night_allowed(self.settings, running=False))
@@ -329,6 +320,10 @@ class NightTests(unittest.TestCase):
 
     def test_closed_background_search_persists_completed_tasks(self):
         self.owner.foreground.clear()
+        # Queued daytime imports are intentionally held while the lid is
+        # closed. They must not suppress the only eligible nighttime work.
+        self.owner.import_queue = Mock()
+        self.owner.import_queue.count.return_value = {"queued": 1}
         index = self.owner.index
         index.configure(night_lid=True, night_lid_qualified=True, network_workers=1)
         self.settings = index.settings()
@@ -377,78 +372,6 @@ class NightTests(unittest.TestCase):
         self.assertEqual(row["state"], "temporary")
         self.assertGreater(row["due"], now + 60)
 
-    def test_report_retains_validated_work_and_counts_a_crashed_claim_once(self):
-        index = self.owner.index
-        at = time()
-        index.enqueue("prepare", "first", "fixture", now=at)
-        task = index.claim(("prepare",), at, night=(10., 20))
-        index.finish(task, "done", night=dict(seconds=30., outcome="ready", cache_bytes=42, corrected=1, generated=0))
-        index.enqueue("prepare", "measured", "fixture", now=at)
-        task = index.claim(("prepare",), at, night=(10., 42))
-        measured = dict(seconds=15., outcome="ready", cache_bytes=62, corrected=0, generated=0,
-                        measurements={"turbo": 6., "reprises": 2., "taille": 4096})
-        index.finish(task, "done", night=measured)
-        index.finish(task, "done", night=measured)
-        index.enqueue("prepare", "second", "fixture", now=at)
-        index.claim(("prepare",), at, night=(10., 62))
-        self.assertTrue(index.recover())
-        self.assertFalse(index.recover())
-        _, _, _, report = index.night_progress()
-        self.assertEqual((report["ready"], report["interrupted"], report["corrected"], report["seconds"]), (2, 1, 1, 45.))
-        self.assertEqual((report["cache_baseline"], report["cache_bytes"]), (20, 62))
-        self.assertEqual(report["measurements"], {"turbo": [6., 1], "reprises": [2., 1], "taille": [4096, 1]})
-        self.assertIsNone(report["pending"])
-
-    def test_recovery_removes_only_owned_drafts(self):
-        stage = self.stems / "processing-interrupted"
-        stage.mkdir(parents=True)
-        (stage / ".parole-stage").touch()
-        other = self.stems / "processing-other"
-        other.mkdir()
-        ready = self.stems / "valid"
-        ready.mkdir()
-        self.owner.recover_night_drafts()
-        self.assertFalse(stage.exists())
-        self.assertTrue(other.exists())
-        self.assertTrue(ready.exists())
-
-    def test_draft_filters_segments_without_corresponding_observed_words(self):
-        heard = [ObservedWord("vrai", 1., 1.1, .9), ObservedWord("chant", 1.2, 1.4, .8)]
-        parts = [dict(start=.9, end=2., text="Vrai chant", no_speech=.1),
-                 dict(start=2.1, end=3.1, text="Paroles suggérées", no_speech=.1)]
-        self.assertEqual(proposals(4., heard, parts), ("Vrai chant", "[00:01.000]Vrai chant", 1))
-        draft = {"duration": 4., "language": "fr", "audio": {"sha256": "fixture"},
-                 "model": {}, "settings": {}, "observation": {"input": "original", "acceleration": "vulkan"},
-                 "first_pass": {"language_request": "", "words": [[w.text, w.start, w.end, w.confidence, None]
-                                                                  for w in heard],
-                                "segments": [parts[0], *([parts[1]] * 25)]}}
-        self.assertEqual(review_ranges(draft), ((2.1, 3.1, "Paroles suggérées"),) * 20)
-        draft["first_pass"]["segments"] = [{"start": "invalid"}]
-        self.assertEqual(review_ranges(draft), ())
-
-    def test_distinct_second_reading_and_refrains_stay_experimental(self):
-        from _parole_codex import validate_draft
-        from _parole_transcribe import compare_windows, provenance, repeated_lines
-
-        spans = [SimpleNamespace(no_speech=.1, words=[ObservedWord("autre", 2.2, 2.3, .9)])]
-        decoder = SimpleNamespace(decode=Mock(return_value=("fr", spans)))
-        parts = [dict(start=2., end=3., text="Vrai chant", no_speech=.1)]
-        findings = compare_windows(decoder, lambda *_: b"pcm", (5., "fr", [], parts), lambda *_: None)
-        self.assertEqual(findings, [dict(start=2., end=3., first="Vrai chant", alternate="autre",
-                                         decision="divergent")])
-        self.assertTrue(decoder.decode.call_args.kwargs["beam"])
-        self.assertEqual(repeated_lines("Premier vers\nMême refrain\nPremier vers\nMême refrain"),
-                         {"repeated_lines": [[1, 3], [2, 4]], "possible_choruses": [[1, 3]]})
-        report = provenance({"plain": "Brouillon", "timed": "[00:01]Brouillon", "omitted": 1,
-                             "comparisons": findings})
-        self.assertEqual((report["status"], report["reliability"]), ("experimental", "partial"))
-        query = {"research_id": "fixture", "ranges": [{"id": 0}]}
-        suggestion = {"id": 0, "suggestion": "Un mot", "reason": "Proposition à écouter"}
-        with self.assertRaises(ValueError):
-            validate_draft({"research_id": "fixture", "suggestions": [suggestion, suggestion]}, query)
-        self.assertEqual(validate_draft({"research_id": "fixture", "suggestions": [suggestion]}, query)
-                         ["suggestions"], [suggestion])
-
     def test_real_subprocess_stops_on_power_loss_sleep_heat_space_and_kara(self):
         cases = ("secteur", "veille", "Kara", "activité", "désactivation")
         for phase in cases:
@@ -456,7 +379,6 @@ class NightTests(unittest.TestCase):
                 self.ac = True
                 self.state = replace(self.state, sleeping=False)
                 self.owner.set_priority(False, kara=False)
-                self.owner.priority_until = 0.
                 self.owner.resources.session_idle.return_value = True
                 self.owner.resources.check.return_value = True
                 self.owner.index.configure(night_enabled=True)

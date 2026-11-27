@@ -99,8 +99,6 @@ class ArtistGroups(unittest.TestCase):
         with self.index.db() as db:
             db.execute("INSERT INTO associations VALUES(?, ?, ?, ?)",
                        (self.source.parent.name, "Exodus", self.target.name, "validation-fixture"))
-        with patch("_parole_artist_tags.has_preparation", return_value=True):
-            self.assertEqual(repair(self.index, path, apply=True, state=self.state), "préparation à réassocier")
         with patch("_parole_artist_tags.verify_audio", side_effect=ValueError("preuve PCM absente")):
             with self.assertRaisesRegex(ValueError, "PCM"):
                 repair(self.index, path, apply=True, state=self.state)

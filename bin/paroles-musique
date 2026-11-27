@@ -813,14 +813,16 @@ class LyricsSources:
         signature = (title, artist, album, duration, album_artist)
         code = normalize_isrc(isrc)
         self.original_lrc = original_lrc
-        if not original_lrc and provider_only is None and (snapshot_path := os.environ.get("PAROLE_LRCLIB_SQLITE")):
-            from _parole_lrclib_local import candidates
+        from _parole_lrclib_local import candidates, configured_snapshot
+
+        if provider_only is None and (snapshot_path := configured_snapshot()):
 
             try:
                 records = candidates(snapshot_path, *signature)
-                if value := best_transcript(records, *signature, synced=synced, strict=True):
+                if value := best_transcript(records, *signature, synced=synced, strict=True, original_lrc=original_lrc):
                     if registry:
-                        matches = [row for row in records if transcript(row, duration, synced) == value]
+                        matches = [row for row in records
+                                   if transcript(row, duration, synced, original_lrc=original_lrc) == value]
                         identity = matches[0]["id"] if len(matches) == 1 else None
                         save_candidates(registry, recording, [dict(cache_value(value, {"catalogue_id": identity}),
                             provider="LRCLIB local", decision="selected")], synced=synced)
@@ -1488,7 +1490,7 @@ def retrieve_lyrics(path, client, tags, *, synced, registry=None):
     client.start_form()
     return client.find(title, artist, tags.get("album"), duration, tags.get("albumartist"),
                        synced=synced, local_text=local_text, registry=registry, strict=bool(registry),
-                       isrc=tags.get("isrc"), recording=(path, track_version(path)))
+                       isrc=tags.get("isrc"), recording=(path, track_version(path)), original_lrc=synced)
 
 
 def process_track(path, client, preview, synced=False, publication_root=None, registry=None):
@@ -1519,7 +1521,7 @@ def process_track(path, client, preview, synced=False, publication_root=None, re
         with shared_mutation(publication_root) if publication_root else nullcontext():
             if track_version(path) != version or path.resolve() != path:
                 raise ValueError("fichier modifié pendant la recherche")
-            return (f"paroles synchronisées · fichier .lrc · {source}" if save_lrc(sidecar, lyrics)
+            return (f"paroles synchronisées · fichier .lrc · {source}" if save_lrc(sidecar, lyrics, original=True)
                     else "paroles synchronisées déjà présentes")
     tags.pop("duration_seconds", None)
     save_lyrics(path, version, tags, lyrics, publication_root)
@@ -1578,7 +1580,8 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
             try:
                 value, provider = client.find(*signature, synced=synced, local_text=local_text,
                                               registry=index, strict=True, context=context, provider_only=provider_only,
-                                              isrc=tags.get("isrc"), recording=(path, version), audit=audit)
+                                              isrc=tags.get("isrc"), recording=(path, version), audit=audit,
+                                              original_lrc=synced)
             except ServiceUnavailable as error:
                 diagnostic(error.reason)
                 return ("limited" if error.reason == "limited" else "temporary"), None, None, None
@@ -1596,7 +1599,8 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
                     raise ValueError("fichier de référence modifié pendant la recherche")
                 # Publishing by exclusive hard link keeps existing sidecars,
                 # including one created by another worker during the lookup.
-                saved = save_lrc(path.with_suffix(suffix), text.strip())
+                timed = suffix == ".lrc"
+                saved = save_lrc(path.with_suffix(suffix), text if timed else text.strip(), original=timed)
                 proof = reference_proof(path, suffix, version, provider,
                                         external=suffix == ".lrc" and provider not in ("Strawberry", SOURCE))
             if saved and notify:
@@ -1616,7 +1620,7 @@ def process_import_track(path, client, index, settings, excluded, locks, activit
         timed = "present" if lrc_present else "review"
     elif not settings["lrc"]:
         timed = "missing"
-    elif embedded := catalog_transcript(local_text, duration, synced=True):
+    elif embedded := catalog_transcript(local_text, duration, synced=True, original_lrc=True):
         timed = publish(".lrc", embedded, "Strawberry", None)
     else:
         timed, lrc, provider, donor = lookup(True)

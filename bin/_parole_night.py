@@ -171,7 +171,7 @@ class Login:
     def inhibit(self, what, mode):
         value, fds = self.bus.call_with_unix_fd_list_sync(
             LOGIN, MANAGER, LOGIN + ".Manager", "Inhibit",
-            self.glib.Variant("(ssss)", (what, "Parole", "Préparation nocturne Kara", mode)),
+            self.glib.Variant("(ssss)", (what, "Parole", "Recherche nocturne de LRC", mode)),
             self.glib.VariantType("(h)"), self.gio.DBusCallFlags.NO_AUTO_START, 500, None, None)
         fd = fds.get(value.unpack()[0])
         os.set_inheritable(fd, False)
@@ -191,7 +191,7 @@ class Login:
             address, flags.AUTHENTICATION_CLIENT | flags.MESSAGE_BUS_CONNECTION)
         try:
             cookie = bus.call_sync(PROFILES, PROFILES_PATH, PROFILES, "HoldProfile",
-                                   self.glib.Variant("(sss)", ("power-saver", "Préparation nocturne Kara", "fr.labfy.ParolesStrawberry")),
+                                   self.glib.Variant("(sss)", ("power-saver", "Recherche nocturne de LRC", "fr.labfy.ParolesStrawberry")),
                                    self.glib.VariantType("(u)"), self.gio.DBusCallFlags.NO_AUTO_START, 600, None).unpack()[0]
         except self.glib.Error:
             bus.close_sync(None)
@@ -482,19 +482,19 @@ class Night:
         if busy:
             return self.report("Préparation nocturne suspendue · activité prioritaire")
         if self.reopened:
-            return self.report("Réouverture du capot · préparation suspendue")
+            return self.report("Réouverture du capot · recherche de LRC suspendue")
         state = self.desktop
         if state.lid and self.lid_fd is None:
             return self.report("Capot fermé · admission nocturne refusée")
         if not state.locked:
             return self.report("Préparation nocturne en attente du verrouillage Sway")
         if not state.lid and state.screen_off and not settings["night_screen_off"]:
-            return self.report("Écrans éteints · préparation désactivée dans cet état")
+            return self.report("Écrans éteints · recherche de LRC désactivée dans cet état")
         try:
             if self.profile is not None and self.login.get(PROFILES_PATH, PROFILES, "ActiveProfile", service=PROFILES) != "power-saver":
-                return self.report("Profil énergétique modifié · préparation suspendue")
+                return self.report("Profil énergétique modifié · recherche de LRC suspendue")
         except self.errors():
-            return self.report("Profil énergétique indisponible · préparation suspendue")
+            return self.report("Profil énergétique indisponible · recherche de LRC suspendue")
         return True
 
     def errors(self):

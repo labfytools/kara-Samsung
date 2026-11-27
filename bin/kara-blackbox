@@ -3,22 +3,18 @@
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 import json
 from math import isfinite
 import os
 from pathlib import Path
 import shutil
 import stat
-import subprocess
 import sys
-from tempfile import TemporaryDirectory
 import time
 import wave
 
 from _kara_blackbox import (ROOT, TRACK_NAME, digest, events, float_header,
                             private_file, session_folders, validate_recording, wave_layout)
-from _kara_scoring import score_reference_line, score_summary
 
 
 def read(path):
@@ -133,233 +129,13 @@ def extract_window(folder, window, output_path, *, reconstruct_gaps=False):
             "zero_filled_frames": frames - coverage, "output": str(output_path)}
 
 
-def replay_whisper(args, folder, window):
-    from _kara_paths import BIN, DATA
-    data = window["data"]
-    if bool(args.backing) != bool(args.original):
-        raise ValueError("Fournis ensemble le fichier original et l’instrumental de ce tour.")
-    turn = next((row for row in events(folder / "events.jsonl")
-                 if row["turn"] == window["turn"] and row["event"] == "turn-start"), None)
-    if args.original and turn:
-        reference_hash = (turn["data"].get("reference") or {}).get("audio_sha256")
-        if reference_hash and digest(args.original) != reference_hash:
-            raise ValueError("Le fichier musical ne correspond pas à la référence de la session.")
-    guide = None
-    if data.get("guide"):
-        if not args.backing or not args.original:
-            raise ValueError("Cette fenêtre exige les références musicales séparées du tour.")
-        evidence = next((row["data"]["files"] for row in events(folder / "events.jsonl")
-                         if row["turn"] == window["turn"] and row["event"] == "reference"), {})
-        guide = args.backing.with_name("vocals.flac")
-        if (not guide.is_file() or digest(guide) != evidence.get("original_voice", {}).get("sha256")
-                or digest(args.backing) != evidence.get("instrumental", {}).get("sha256")):
-            raise ValueError("Les pistes séparées ne correspondent pas aux références de la fenêtre.")
-    python = DATA / "hyprwhspr/venv/bin/python"
-    interpreter = python if python.is_file() else sys.executable
-    with TemporaryDirectory(prefix="kara-replay-") as draft:
-        clip = Path(draft) / "window.wav"
-        capture = extract_window(folder, window, clip, reconstruct_gaps=args.reconstruct_gaps)
-        if capture["coverage"] < .9:
-            raise ValueError("Couverture de la fenêtre insuffisante pour Whisper.")
-        arguments = [str(interpreter), "-B", str(BIN / "_kara_blackbox_replay.py"), str(clip),
-                     data["language"], str(window["position"]), str(data["track_end"]), "--device", args.device or "gpu"]
-        if args.backing:
-            arguments += ["--backing", str(args.backing), "--original", str(args.original)]
-        if guide:
-            arguments += ["--guide", str(guide)]
-        result = subprocess.run(arguments, check=True, capture_output=True, text=True, timeout=200)
-    replay = json.loads(result.stdout)
-    score = next((row for row in events(folder / "events.jsonl")
-                  if row["turn"] == window["turn"] and row["event"] == "line-decision"
-                  and row["data"]["window"] == data["window"]), None)
-    output({"window": data["window"], "coverage": capture["coverage"],
-            "zero_filled_frames": capture["zero_filled_frames"], "replayed": replay,
-            "original_observed": score["data"]["raw_observed"] if score else None,
-            "original_classification": score["data"]["source"] if score else None})
-
-
-def exact_input(folder, window, call):
-    cycle = window.get("cycle")
-    number = window["data"]["window"]
-    if not cycle:
-        raise ValueError("Le PCM du décodeur exige un cycle V3.")
-    chunks, metadata, decoder = [], None, None
-    cursor = 0
-    for row in events(folder / "events.jsonl"):
-        if row.get("cycle") != cycle:
-            continue
-        data = row["data"]
-        if row["event"] == "pcm" and data.get("track") == "turbo":
-            index = data["decode"]
-            if (index["window"], index["call"]) != (number, call):
-                continue
-            if index["first_frame"] != cursor or not 0 < index["total_frames"] <= 29 * 16000:
-                raise ValueError("Bloc manquant dans l’entrée Turbo.")
-            with open_window_track(folder, data["file"]) as source:
-                source.setpos(data["sample"])
-                raw = source.readframes(data["frames"])
-            if len(raw) != data["frames"] * 2:
-                raise ValueError("Bloc Turbo tronqué.")
-            chunks.append(raw)
-            cursor += data["frames"]
-            if cursor > index["total_frames"]:
-                raise ValueError("Plage Turbo incohérente.")
-        elif row["event"] == "line-decision" and data.get("window") == number:
-            metadata = next((item for item in (data.get("decoder") or {}).get("decodes", ())
-                             if item.get("call") == call), None)
-        elif row["event"] == "decoder-ready" and row["id"] < window["id"]:
-            decoder = data["decoder"]
-    pcm = b"".join(chunks)
-    if (not metadata or not cursor or cursor != metadata["input_frames"]
-            or sha256(pcm).hexdigest() != metadata["input_sha256"]):
-        raise ValueError("Entrée Turbo incomplète ou sans preuve d’intégrité.")
-    return pcm, metadata, decoder
-
-
-def decoder_wave(path, pcm):
-    with open(path, "xb", opener=private_file) as stream, wave.open(stream, "wb") as wav:
-        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
-        wav.writeframes(pcm)
-
-
-def turbo_clip(args, clip, metadata, decoder, *, local_cpu=False):
-    from _kara_paths import BIN, DATA
-
-    python = DATA / "hyprwhspr/venv/bin/python"
-    historic = decoder or {}
-    device = args.device or ("cpu" if local_cpu or historic.get("backend_requested") == "cpu" else "gpu")
-    command = [str(python) if python.is_file() else sys.executable, "-B",
-               str(BIN / "_kara_blackbox_replay.py"), str(clip), args.language or metadata["language_requested"],
-               str(metadata["begin"]), str(metadata["end"]), "--device", device, "--exact"]
-    if local_cpu:
-        command.extend(("--threads", "2"))
-    elif historic.get("threads") and args.device is None:
-        command.extend(("--threads", str(historic["threads"])))
-    use_beam = args.beam if args.beam is not None else bool(metadata["beam_size"])
-    if use_beam:
-        command.append("--beam")
-    result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=240)
-    decoded = json.loads(result.stdout)
-    if decoded["input_sha256"] != metadata["input_sha256"]:
-        raise ValueError("Le moteur Turbo a lu un autre PCM.")
-    return decoded
-
-
-def exact_turbo(args, folder, window):
-    pcm, metadata, decoder = exact_input(folder, window, args.call)
-    if args.action == "extract-turbo":
-        if args.output is None:
-            raise ValueError("Fournis le chemin de sortie WAV avec --output.")
-        decoder_wave(args.output, pcm)
-        output({"frames": metadata["input_frames"], "sha256": metadata["input_sha256"], "call": args.call})
-        return
-    with TemporaryDirectory(prefix="kara-turbo-replay-") as draft:
-        clip = Path(draft) / "decoder.wav"
-        decoder_wave(clip, pcm)
-        result = turbo_clip(args, clip, metadata, decoder)
-    output({"input_sha256": metadata["input_sha256"], "call": args.call, "historical": metadata,
-            "historical_decoder": decoder,
-            "replayed": result})
-
-
-def compare_recognition(args, folder, window):
-    from _kara_paths import BIN
-    from _kara_recognition_compare import paired_results
-
-    if args.recognizers != "turbo" and not (args.ctc_model and args.ctc_vocab):
-        raise ValueError("Le moteur CTC exige --ctc-model et --ctc-vocab, deux fichiers locaux.")
-    truth = truth_sha256 = None
-    if args.truth:
-        with open(args.truth, "rb", opener=private_file) as stream:
-            raw = stream.read(8193)
-        if len(raw) > 8192:
-            raise ValueError("Transcription humaine trop longue pour un appel du décodeur.")
-        truth, truth_sha256 = raw.decode("utf-8"), sha256(raw).hexdigest()
-    pcm, metadata, decoder = exact_input(folder, window, args.call)
-    results = {}
-    with TemporaryDirectory(prefix="kara-recognition-") as draft:
-        clip = Path(draft) / "shared.wav"
-        decoder_wave(clip, pcm)
-        if args.recognizers != "ctc":
-            turbo = turbo_clip(args, clip, metadata, decoder, local_cpu=True)
-            turbo["words"] = [{**word, "word": word["text"]} for span in turbo["segments"]
-                              if span["no_speech"] <= .65 for word in span["words"]]
-            results["turbo"] = turbo
-        if args.recognizers != "turbo":
-            command = [str(args.ctc_python or sys.executable), "-B", str(BIN / "_kara_ctc.py"), str(clip),
-                       str(args.ctc_model.resolve(strict=True)), str(args.ctc_vocab.resolve(strict=True))]
-            worker = subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
-            ctc = json.loads(worker.stdout)
-            # Both reports use the origin of the captured Turbo job.
-            for word in ctc["words"]:
-                word["start"] += metadata["begin"]
-                word["end"] += metadata["begin"]
-            results["ctc"] = ctc
-    language = args.language or metadata.get("language_requested")
-    if not language or language == "auto":
-        language = results.get("turbo", {}).get("language") or metadata.get("language_detected")
-    result = paired_results(metadata["input_sha256"], results, language, truth)
-    output({**result, "cycle": window["cycle"], "window": window["data"]["window"], "call": args.call,
-            "reference_transcript_sha256": truth_sha256})
-
-
-def replay_round(args, folder):
-    if not args.turn and not args.cycle:
-        raise ValueError("Sélectionne un tour ou un cycle pour rejouer son score final.")
-    decisions, historical, score_void = {}, None, False
-    for row in matching(args, folder):
-        data = row["data"]
-        if row["event"] == "line-decision" and "line" in data:
-            # Production retains the last result for an evaluated line.
-            decisions[data["line"]] = data
-        elif row["event"] == "turn-end":
-            historical = data.get("summary")
-            score_void = data.get("score_void", False)
-    if not historical or not decisions:
-        raise ValueError("Synthèse finale ou décisions du tour indisponibles.")
-    tolerances = [None, *args.tolerance]
-    variants = {}
-    for name, tolerance in zip("ABC", tolerances):
-        counts = {"verified": 0, "uncertain": 0, "correct": 0, "lexical": 0, "extras": 0}
-        for data in decisions.values():
-            limit = data["tolerance"] if tolerance is None else tolerance
-            for item in score_reference_line(data["reference"], data["observed"], limit, source=data["source"]):
-                status = item["status"]
-                if item["id"] is None:
-                    counts["extras"] += status == "extra"
-                elif item.get("expected_start") is not None:
-                    counts["uncertain"] += status == "uncertain"
-                    counts["verified"] += status != "uncertain"
-                    counts["correct"] += status == "correct"
-                    counts["lexical"] += status in ("correct", "early", "late")
-        summary = score_summary(historical["total"], historical["eligible"], **counts)
-        if score_void:
-            summary["score"] = None
-        variants[name] = {"tolerance_s": tolerance, "summary": summary}
-    output({"historical": historical, "same": variants["A"]["summary"] == historical, "variants": variants,
-            "basis": "captured_final_reference_denominators"})
-
-
-def word_details(row):
-    data = row["data"]
-    expected = {word["id"]: word for word in data["reference"]["words"]}
-    return {"cycle": row.get("cycle"), "turn": row["turn"], "event_id": row["id"],
-            "window": data.get("window"), "line": data.get("line"), "source": data["source"],
-            "tolerance_s": data["tolerance"], "words": [
-                {**item, "expected_end": (expected.get(item["id"]) or {}).get("end"),
-                 "evaluated": item["id"] is not None and item["status"] != "uncertain",
-                 "credited": item["status"] == "correct"}
-                for item in data["decisions"]]}
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("action", choices=("list", "summary", "validate", "incidents", "timeline", "turns",
-                                          "lyrics-reference", "chronos-replay", "chronos-edition", "score", "words", "inspect", "replay", "replay-round", "extract", "extract-pcm", "replay-whisper",
-                                          "extract-turbo", "replay-turbo", "compare-recognition",
-                                          "analyze", "report", "export", "space", "compare", "compare-aec", "replay-timeline",
-                                          "annotate", "simulate", "diagnose", "delete", "prune"))
+                                          "lyrics-reference", "inspect", "extract", "extract-pcm",
+                                          "analyze", "report", "export", "space", "replay-timeline",
+                                          "delete", "prune"))
     parser.add_argument("session", nargs="?", default="latest")
     for field in ("cycle", "turn", "player", "song", "component", "event"):
         parser.add_argument("--" + field)
@@ -368,59 +144,16 @@ def main():
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--after-id", type=int, default=0, help="reprendre le rejeu après cet événement")
     parser.add_argument("--speed", type=float, help="cadence du rejeu de chronologie, p. ex. 1 ou 10")
-    parser.add_argument("--tolerance", type=float, action="append", default=[],
-                        help="tolérance candidate en secondes pour compare, répétable deux fois")
     parser.add_argument("--reconstruct-gaps", action="store_true",
-                        help="appliquer explicitement le remplissage du moteur de score dans un WAV")
+                        help="appliquer explicitement le remplissage historique des discontinuités dans un WAV")
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--frames", type=int)
-    parser.add_argument("--reference", choices=("monitor", "playback"), default="monitor")
-    parser.add_argument("--aec-delay-ms", type=int, help="délai préalablement mesuré pour le comparatif hors ligne")
-    parser.add_argument("--calibration", type=Path, help="reçu local de délai et de configuration audio")
-    parser.add_argument("--simulation", help="objet JSON de perturbations hors ligne")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--label")
-    parser.add_argument("--note", default="")
-    parser.add_argument("--supersedes")
     parser.add_argument("--days", type=int)
-    parser.add_argument("--device", choices=("cpu", "gpu"))
-    parser.add_argument("--language")
-    parser.add_argument("--call", type=int, default=0)
-    parser.add_argument("--beam", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--recognizers", choices=("turbo", "ctc", "both"), default="both")
-    parser.add_argument("--ctc-model", type=Path)
-    parser.add_argument("--ctc-vocab", type=Path)
-    parser.add_argument("--ctc-python", type=Path)
-    parser.add_argument("--truth", type=Path, help="transcription humaine indépendante de l’appel sélectionné")
-    parser.add_argument("--hours", type=float, default=4, help="heures de jeu effectif pour le diagnostic")
-    parser.add_argument("--witness", action="store_true", help="inclure le témoin dans l’estimation disque uniquement")
-    parser.add_argument("--budget-bytes", type=int, help="plafond de capture envisagé lors du diagnostic")
-    parser.add_argument("--backing", type=Path)
-    parser.add_argument("--original", type=Path)
-    parser.add_argument("--chronos-engine", choices=("huang", "wav2vec2", "huang-ft"), default="huang")
-    parser.add_argument("--alternate-audio", type=Path)
     args = parser.parse_args()
     try:
-        if args.action == "diagnose":
-            from _kara_blackbox_preflight import diagnostic, DEFAULT_VOICE_BYTES
-
-            if args.budget_bytes is not None and not 1 <= args.budget_bytes < 2 ** 63:
-                raise ValueError("Plafond de diagnostic hors limites.")
-            if (args.ctc_model is None) != (args.ctc_vocab is None) or args.ctc_python and not args.ctc_model:
-                raise ValueError("Fournis le modèle et le vocabulaire CTC ensemble.")
-            report = diagnostic(args.root, args.hours, args.witness, args.budget_bytes or DEFAULT_VOICE_BYTES,
-                                args.ctc_python, args.ctc_model, args.ctc_vocab)
-            output(report)
-            return 0 if report["ready_software"] else 2
         if args.speed is not None and (not isfinite(args.speed) or not 0.1 <= args.speed <= 1000):
             raise ValueError("Cadence attendue de 0,1 à 1 000.")
-        if len(args.tolerance) > 2 or any(not isfinite(value) or not 0 <= value <= 5 for value in args.tolerance):
-            raise ValueError("Deux tolérances candidates au maximum, comprises entre 0 et 5 s.")
-        if not 0 <= args.call <= 15:
-            raise ValueError("Indice d’appel Turbo hors limites.")
-        if args.aec_delay_ms is not None and not 0 <= args.aec_delay_ms <= 500:
-            raise ValueError("Délai AEC hors limites.")
         available = [path.name for path in session_folders(args.root)]
         if args.action == "list":
             output(available)
@@ -468,19 +201,6 @@ def main():
             if not turn:
                 raise ValueError("Choisis un tour ou un cycle V3.")
             output(load(folder, turn))
-        elif args.action in ("chronos-replay", "chronos-edition"):
-            from _kara_blackbox_chronos import replay
-
-            if args.cycle and not args.cycle.startswith(folder.name + "/"):
-                raise ValueError("Cycle hors de la session sélectionnée.")
-            turn = args.cycle.split("/", 1)[1] if args.cycle else args.turn
-            if not turn or (args.action == "chronos-edition") != (args.alternate_audio is not None):
-                raise ValueError("Choisis un tour et, pour une comparaison d’éditions, un autre fichier audio.")
-            output(replay(folder, turn, args.chronos_engine, explicit=args.original,
-                          output=args.output, alternate=args.alternate_audio))
-        elif args.action == "replay-round":
-            validate_recording(folder, read(folder / "manifest.json"))
-            replay_round(args, folder)
         elif args.action in ("report", "export"):
             from _kara_blackbox_lab import analyze, redacted
 
@@ -495,72 +215,6 @@ def main():
                 # capture. The writer uses the same private mode as sessions.
                 with open(args.output, "x", opener=private_file, encoding="utf-8") as stream:
                     json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        elif args.action == "annotate":
-            from _kara_blackbox_trials import annotate
-
-            manifest = read(folder / "manifest.json")
-            validate_recording(folder, manifest)
-            cycle = manifest.get("cycles", {}).get(args.cycle)
-            if (not cycle or args.output is None or args.since is None or args.until is None
-                    or cycle["start_ns"] is None or cycle["end_ns"] is None
-                    or not cycle["start_ns"] <= args.since < args.until <= cycle["end_ns"]):
-                raise ValueError("Choisis un cycle et un intervalle connus, puis un journal de sortie distinct.")
-            output(annotate(args.root, args.output, name, args.cycle, args.since, args.until,
-                            args.label, args.note, args.supersedes))
-        elif args.action == "simulate":
-            from _kara_blackbox_trials import packet_simulation, simulation_options
-
-            manifest = read(folder / "manifest.json")
-            validate_recording(folder, manifest)
-            if args.cycle not in manifest.get("cycles", {}) or not 1 <= args.limit <= 100000:
-                raise ValueError("Choisis un cycle V3 et une limite de 1 à 100 000 paquets.")
-            config = simulation_options(json.loads(args.simulation or "{}"))
-            output({"simulated": True, "configuration": config, "seed": args.seed, "cycle": args.cycle})
-            for row in packet_simulation(folder, args.cycle, config, args.seed, args.since, args.until, args.limit):
-                output(row)
-        elif args.action == "compare-aec":
-            from _kara_blackbox_aec import compare, input_pair
-            from _kara_blackbox_lab import analyze
-
-            manifest = read(folder / "manifest.json")
-            validate_recording(folder, manifest)
-            if args.cycle is None:
-                raise ValueError("Le comparatif AEC exige la sélection explicite d’un --cycle SESSION/TOUR.")
-            if args.output and args.output.resolve().is_relative_to(args.root.resolve()):
-                raise ValueError("L’écoute comparée doit être exportée en dehors des captures originales.")
-            report = analyze(folder)
-            if args.cycle not in report["cycles"]:
-                raise ValueError("Cycle V3 absent.")
-            delay = args.aec_delay_ms
-            if args.calibration:
-                if delay is not None:
-                    raise ValueError("Choisis le reçu de calibration ou le délai saisi.")
-                with open(args.calibration, "rb", opener=private_file) as stream:
-                    raw = stream.read(4097)
-                if len(raw) > 4096:
-                    raise ValueError("Reçu de calibration trop grand.")
-                receipt = json.loads(raw)
-                if not isinstance(receipt, dict):
-                    raise ValueError("Format du reçu de calibration invalide.")
-                actual = manifest["cycles"][args.cycle].get("audio_configuration", {}).get("id")
-                if not actual or actual != receipt.get("audio_configuration_id"):
-                    raise ValueError("La configuration audio a changé depuis la calibration.")
-                delay = receipt.get("delay_ms")
-                if type(delay) is not int or not 0 <= delay <= 500:
-                    raise ValueError("Délai hors limites dans le reçu de calibration.")
-            render, mic = input_pair(folder, report, args.cycle, args.reference)
-            config = {"cycle": args.cycle, "reference": args.reference, "delay_ms": delay,
-                      "pcm_sha256": sha256(render.astype("<f4").tobytes() + mic.astype("<f4").tobytes()).hexdigest()}
-            if args.simulation:
-                from _kara_blackbox_trials import simulate_pcm, simulation_options
-
-                overlay = simulation_options(json.loads(args.simulation))
-                if overlay.keys() - {"gain", "clip_peak", "echo_gain", "echo_delay_ms", "room_tail"}:
-                    raise ValueError("Le comparatif AEC accepte uniquement les perturbations du PCM.")
-                mic = simulate_pcm(mic, render, overlay, 48000)
-                config["simulated"] = overlay
-            output({"experiment": sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
-                    "inputs": config, "comparison": compare(render, mic, delay, output=args.output)})
         elif args.action == "extract-pcm":
             if args.id is None or args.output is None:
                 raise ValueError("Indique un événement PCM (--id) et un fichier de sortie (--output).")
@@ -568,24 +222,15 @@ def main():
             if item is None:
                 raise ValueError("Événement PCM introuvable.")
             output(extract_pcm(folder, item, args.output, args.frames))
-        elif args.action in ("extract", "replay-whisper", "extract-turbo", "replay-turbo", "compare-recognition"):
+        elif args.action == "extract":
             if args.id is None:
                 raise ValueError("Fournis l’identifiant d’événement de fenêtre avec --id.")
-            if args.action == "extract" and args.output is None:
+            if args.output is None:
                 raise ValueError("Fournis le chemin de sortie WAV avec --output.")
             window = next((item for item in matching(args, folder) if item["event"] == "window"), None)
             if window is None:
                 raise ValueError("Fenêtre vocale introuvable.")
-            if args.action in ("extract-turbo", "replay-turbo", "compare-recognition"):
-                validate_recording(folder, read(folder / "manifest.json"))
-                if args.action == "compare-recognition":
-                    compare_recognition(args, folder, window)
-                else:
-                    exact_turbo(args, folder, window)
-            elif args.action == "extract":
-                output(extract_window(folder, window, args.output, reconstruct_gaps=args.reconstruct_gaps))
-            else:
-                replay_whisper(args, folder, window)
+            output(extract_window(folder, window, args.output, reconstruct_gaps=args.reconstruct_gaps))
         elif args.action == "delete":
             if not args.yes or read(folder / "manifest.json")["status"] == "recording":
                 raise ValueError("Suppression refusée. Sélectionne une session terminée et ajoute --yes.")
@@ -594,36 +239,14 @@ def main():
             from itertools import islice
             from _kara_blackbox import INCIDENTS
             kind = args.action
-            if kind in ("replay", "compare", "replay-timeline"):
+            if kind == "replay-timeline":
                 validate_recording(folder, read(folder / "manifest.json"))
-            if kind == "compare" and not args.tolerance:
-                raise ValueError("Indique une ou deux tolérances candidates avec --tolerance.")
             rows = (item for item in matching(args, folder)
                     if (kind in ("timeline", "replay-timeline") or (kind == "incidents" and item["event"] in INCIDENTS)
-                        or (kind == "turns" and item["event"] in ("turn-start", "turn-end"))
-                        or (kind in ("score", "words", "replay", "compare") and item["event"] == "line-decision")))
-            count = 0
+                        or (kind == "turns" and item["event"] in ("turn-start", "turn-end"))))
             replay_wall = replay_start = None
             for item in islice(rows, max(0, args.limit)):
-                count += 1
-                if kind == "replay":
-                    data = item["data"]
-                    decisions = score_reference_line(data["reference"], data["observed"],
-                                                     data["tolerance"], source=data["source"])
-                    output({"event_id": item["id"], "turn": item["turn"], "same": decisions == data["decisions"],
-                            "original": data["decisions"], "replayed": decisions})
-                elif kind == "compare":
-                    data = item["data"]
-                    choices = [data["tolerance"], *args.tolerance]
-                    variants = [score_reference_line(data["reference"], data["observed"], tolerance,
-                                                     source=data["source"]) for tolerance in choices]
-                    output({"event_id": item["id"], "turn": item["turn"], "cycle": item.get("cycle"),
-                            "historical": variants[0] == data["decisions"],
-                            "variants": dict(zip("ABC", ({"tolerance_s": tolerance, "result": result}
-                                                           for tolerance, result in zip(choices, variants))))})
-                elif kind == "words":
-                    output(word_details(item))
-                elif kind == "replay-timeline":
+                if kind == "replay-timeline":
                     if args.speed is not None:
                         if replay_wall is None:
                             replay_wall, replay_start = time.monotonic_ns(), item["monotonic_ns"]
@@ -634,10 +257,8 @@ def main():
                     print(json.dumps(item, ensure_ascii=False, separators=(",", ":")), flush=True)
                 else:
                     output(item)
-            if kind in ("replay", "compare") and not count:
-                raise ValueError("Aucune fenêtre de notation disponible pour le replay.")
         return 0
-    except (ValueError, KeyError, OSError, RuntimeError, wave.Error, subprocess.SubprocessError) as exc:
+    except (ValueError, KeyError, OSError, RuntimeError, wave.Error) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

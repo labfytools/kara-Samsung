@@ -81,7 +81,8 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
                 if file_token(path) != token or path.resolve() != path or not local.current():
                     return {"state": "rescan"}
                 extension = ".lrc" if synced else ".txt"
-                if not engine.save_lrc(path.with_suffix(extension), local.text.strip()):
+                if not engine.save_lrc(path.with_suffix(extension), local.text if synced else local.text.strip(),
+                                       original=synced):
                     return {"state": "present"}
                 proof = reference_proof(path, extension, token, LOCAL_SOURCE)
             index.notify([path], SIDECAR, proofs={str(path): proof})
@@ -95,7 +96,7 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
                 title, artist, tags.get("album"), duration, tags.get("albumartist"),
                 synced=synced, local_text=local_text, registry=index, strict=True,
                 context=engine.contexts(tags), isrc=tags.get("isrc"), recording=(path, token),
-                **({"original_lrc": True} if original_lrc else {}))
+                original_lrc=synced)
         except engine.AmbiguousLyrics:
             lyrics, missing = None, "ambiguous"
         except engine.ServiceUnavailable as error:
@@ -120,8 +121,7 @@ def lookup_song(index, identity, synced, *, read_only=False, local_reference_onl
         # exclusive sidecar creation for the exact recording version.
         if file_token(path) != token or path.resolve() != path:
             return {"state": "rescan"}
-        save_options = {"original": True} if original_lrc else {}
-        if not engine.save_lrc(path.with_suffix(extension), lyrics, **save_options):
+        if not engine.save_lrc(path.with_suffix(extension), lyrics, original=synced):
             return {"state": "present"}
         proof = reference_proof(path, extension, token, provider, external=synced and provider != "Strawberry")
     index.notify([path], SIDECAR, proofs={str(path): proof})
