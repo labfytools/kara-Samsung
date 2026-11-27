@@ -30,7 +30,7 @@ from _kara_mobile_room import RoomError
 from _kara_prepare import PreparedCache, file_token, lrc_token
 from _kara_reference import display_marks
 from _kara_stem_playback import StemPlayback, STRENGTHS
-from _kara_stems import cached_stems
+from _kara_stems import cached_stems, prune_stems
 from _kara_timing import LyricTiming, highlighted_characters
 from _kara_party import Party, PlayersWindow, Singer, Song, catalogue, score_color, search_key
 from _kara_preparation_ui import PreparationWindow
@@ -41,7 +41,7 @@ from _labfy_sync import MusicSync
 from _kara_tv import https_configured, start_receiver
 from _musique_oz import AUDIO, probe
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
-from _parole_index import path_rows
+from _parole_index import PREPARATION, path_rows
 from _parole_maintenance import Maintenance
 from _parole_ui import ParoleView
 
@@ -924,6 +924,28 @@ class LyricsWindow(Gtk.ApplicationWindow):
         if all(process is None for process in processes):
             self.complete_party_validation()
 
+    def release_prepared_stems(self, paths):
+        if self.validating or self.party.active is not None:
+            return set()
+        # A manual Strawberry playback may still have the current stems open.
+        released = set(paths) - {self.track}
+        if not released:
+            return set()
+        try:
+            removed, _ = prune_stems(only=released)
+        except (OSError, ValueError, RuntimeError):
+            return set()
+        for path in released:
+            self.prepared_stems.pop(path, None)
+            self.failed_alignments.pop(path, None)
+        if self.maintenance and removed:
+            try:
+                self.maintenance.index.notify(removed, PREPARATION)
+                self.maintenance.index_wake.set()
+            except (OSError, ValueError, sqlite3.Error):
+                pass
+        return released
+
     def begin_preparation(self, songs, *, for_party, force=False, force_paths=()):
         if self.closed or self.validating or self.party.active is not None:
             return False
@@ -935,6 +957,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.preparation_only = not for_party
         self.preload_cancelled = False
         self.active_plan = plan
+        if for_party:
+            self.remote_party.managed_stems.update(plan)
         self.training_only = (self.remote_party.training_paths()[1]
                               if for_party and self.remote_party.phase == "preparing" else set())
         self.align_finished.clear()
@@ -1910,6 +1934,8 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.vocal_effect.disable()
         self.game_toggle.set_active(False)
         self.tv_toggle.set_active(False)
+        if not self.validating and self.party.active is None:
+            self.release_prepared_stems(self.remote_party.managed_stems)
         # Managed workers own their leases and write their own result. Closing
         # the window stops scheduling and leaves any admitted import recoverable.
         if self.maintenance:

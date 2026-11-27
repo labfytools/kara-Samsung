@@ -35,6 +35,7 @@ class RemoteParty:
         self.unscored_turns = set()
         self.retries = set()
         self.background_path = None
+        self.managed_stems = set()
         self.defaults = {"music": 100, "original": 0, "voice": None}
         self.last_result = None
 
@@ -253,8 +254,8 @@ class RemoteParty:
             self.revision += 1
             self.notice = ""
 
-    def selected_turns(self):
-        selections = self.control.receiver.room.selections()
+    def selected_turns(self, *, confirmed_only=True):
+        selections = self.control.receiver.room.selections() if self.control.receiver is not None else {}
         choices = []
         for player in self.control.party.players:
             if not player.mobile_id:
@@ -262,8 +263,11 @@ class RemoteParty:
                     choices.append((player, [player.song]))
                 continue
             ready, _, songs = selections.get(player.mobile_id, (False, False, []))
-            if ready and songs and all(songs):
-                choices.append((player, songs))
+            if confirmed_only:
+                if ready and songs and all(songs):
+                    choices.append((player, songs))
+            elif (available := [song for song in songs if song is not None]):
+                choices.append((player, available))
         return [(player, songs[index]) for index in range(max((len(songs) for _, songs in choices), default=0))
                 for player, songs in choices if index < len(songs)]
 
@@ -330,6 +334,7 @@ class RemoteParty:
             self.background_path = song.path
             if control.begin_preparation([song], for_party=False, force=force):
                 self.retries.discard(song.path)
+                self.managed_stems.add(song.path)
             else:
                 self.background_path = None
             break
@@ -427,8 +432,15 @@ class RemoteParty:
             self.revision += 1
 
     def tick(self, now):
-        if self.phase in ("lobby", "ready") and self.control.receiver is not None:
-            self.background(self.selected_turns())
+        if self.phase in ("lobby", "ready"):
+            candidates = self.selected_turns(confirmed_only=False)
+            paths = {song.path for _, song in candidates}
+            if self.background_path is not None and self.background_path not in paths:
+                self.control.interrupt_preload()
+            discarded = self.managed_stems - paths
+            if discarded and not self.control.validating and self.control.party.active is None:
+                self.managed_stems -= self.control.release_prepared_stems(discarded)
+            self.background(candidates)
         if (self.phase != "running" or self.control.party.active is not None or self.current is not None
                 or now < self.next_at):
             return

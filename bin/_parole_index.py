@@ -33,7 +33,7 @@ COVER_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
 
 DEFAULTS = {
     "startup": True, "paused": False, "lyrics": True, "lrc": True, "generate": True,
-    "albums": True, "discography": True, "cover": True, "metadata": True, "autoprepare": True, "import_tracks": False, "import_albums": False,
+    "albums": True, "discography": True, "cover": True, "metadata": True, "autoprepare": False, "import_tracks": False, "import_albums": False,
     "codex": False, "codex_auto": False, "codex_daily": 2, "codex_timeout": 120,
     "codex_model": "", "codex_effort": "low",
     "codex_categories": ["lyrics", "lrc", "album", "discography", "track", "cover", "metadata", "identify", "import_failure"],
@@ -515,6 +515,7 @@ class Index:
                 SELECT count(*) FROM tasks JOIN songs ON songs.id=tasks.subject
                 WHERE tasks.kind='prepare' AND tasks.state IN ('queued','running','suspended','temporary')
                 AND songs.kara!='prêt' AND songs.lyrics!='instrumental'
+                AND coalesce(json_extract(songs.info, '$.report.reference_validated'),0)!=1
                 AND NOT EXISTS(SELECT 1 FROM exclusions WHERE kind='artist' AND subject=songs.owner)
             """).fetchone()[0]
             return ready, references, remaining, self.read_night_report(db)

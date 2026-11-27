@@ -202,7 +202,9 @@ class NightTests(unittest.TestCase):
         self.assertFalse(self.observe(sleeping=False))
         self.night.power_online_since -= POWER_RECOVERY_STABLE + 1
         self.night.budget = 1.
-        self.assertFalse(self.night.refresh(self.settings))
+        self.settings["night_minutes"] = 1
+        with patch("_parole_night.clock_gettime", return_value=10000.):
+            self.assertFalse(self.night.refresh(self.settings))
         self.assertIsNone(self.night.lid_fd)
 
     def test_ambiguous_opening_does_not_light_displays_or_reset_budget(self):
@@ -260,7 +262,9 @@ class NightTests(unittest.TestCase):
         fd = self.night.lid_fd
         self.assertTrue(self.observe(lid=True))
         self.night.budget = 1.
-        self.assertFalse(self.night.refresh(self.settings))
+        self.settings["night_minutes"] = 1
+        with patch("_parole_night.clock_gettime", return_value=10000.):
+            self.assertFalse(self.night.refresh(self.settings))
         with self.assertRaises(OSError):
             os.fstat(fd)
         self.assertIsNone(self.night.fd)
@@ -289,8 +293,10 @@ class NightTests(unittest.TestCase):
         self.night = self.owner.night = Night(self.owner.index, self.owner.journal)
         self.night.login = self.login
         self.addCleanup(self.night.close)
-        self.assertFalse(self.night.check(self.settings))
-        self.assertFalse(self.night.open(self.settings))
+        self.settings["night_minutes"] = 1
+        with patch("_parole_night.clock_gettime", return_value=10000.):
+            self.assertFalse(self.night.check(self.settings))
+            self.assertFalse(self.night.open(self.settings))
         self.owner.resources.resumed = True
         self.assertTrue(self.owner.night_allowed(self.settings, running=False))
         self.assertIsNone(self.owner.index.night_budget())
@@ -336,13 +342,16 @@ class NightTests(unittest.TestCase):
 
         self.owner.output = Mock(side_effect=output)
         self.owner.prepare = prepare
-        for kind, subject in (("lrc", "slow"), ("cover", "cover"), ("cover", "cover2"), ("prepare", "song")):
+        for kind, subject in (("lrc", "slow"), ("lyrics", "lyric1"), ("lyrics", "lyric2"),
+                              ("cover", "cover"), ("prepare", "song")):
             self.owner.index.enqueue(kind, subject, "fixture", now=1)
         for _ in range(4):
             self.owner.tick()
         report = self.owner.index.closed_progress()
         self.assertEqual(order, ["prepare"])
-        self.assertEqual(report["completed"], {"cover": 2, "prepare": 1})
+        self.assertEqual(report["completed"], {"lyrics": 2, "prepare": 1})
+        with self.owner.index.db() as db:
+            self.assertEqual(db.execute("SELECT state FROM tasks WHERE kind='cover'").fetchone()[0], "queued")
         self.assertEqual(report["deferred"], 1)
         self.assertIsNone(report["ended"])
         self.assertEqual(self.owner.index.night_progress()[3]["ready"], 1)
@@ -555,6 +564,40 @@ class NightTests(unittest.TestCase):
                              ("review", "brouillon à vérifier"))
         self.assertFalse(path.with_suffix(".lrc").exists())
         self.assertFalse(path.with_suffix(".txt").exists())
+
+    def test_night_prepares_reference_without_creating_or_requiring_stems(self):
+        path = self.owner.index.root / "song.opus"
+        path.write_bytes(b"fixture")
+        path.with_suffix(".lrc").write_text("[00:01.000]Paroles locales")
+        song = {"id": "fixture", "path": str(path), "token": document(file_token(path)), "title": "Chanson",
+                "side": document([sidecar(path, suffix)[0] for suffix in (".lrc", ".txt")]),
+                "lrc": "local", "lyrics": "local", "duration": 24, "plays": 5, "previous": None,
+                "info": document({"plain": ""})}
+        self.owner.index.song = Mock(return_value=song)
+        reference = {"refinement": {"version": REFINEMENT_VERSION}, "audio": {"pcm_sha256": "a"*64},
+                     "source": {"kind": "local", "provider": "library"}, "report": {"changed": 0},
+                     "lrc_sha256": "a"*64}
+        self.owner.cache.cached = Mock(side_effect=[None, None, reference])
+        self.owner.resources.allowed_storage = Mock(return_value=True)
+        self.owner.output = Mock(return_value=(0, b""))
+        self.owner.refresh_song = Mock()
+        with patch("_parole_maintenance.cached_stems") as stems:
+            self.assertEqual(self.owner.prepare({"subject": "fixture"}, nocturnal=True),
+                             ("done", "référence prête", 0))
+        stems.assert_not_called()
+        self.owner.output.assert_called_once()
+        command = self.owner.output.call_args.args[0]
+        self.assertIn("_kara_prepare.py", " ".join(command))
+        self.assertNotIn("--separate-if-needed", command)
+        self.assertNotIn("kara", self.owner.refresh_song.call_args.kwargs)
+
+    def test_night_codex_research_is_available_with_lyrics_policy(self):
+        self.owner.index.configure(codex=True, codex_auto=True, codex_categories=["lyrics", "lrc"])
+        with patch("_parole_maintenance.ready_categories", return_value={"lyrics","lrc","cover"}):
+            kinds = self.owner.network_kinds(self.owner.index.settings(), time(), nocturnal=True)
+        self.assertIn("codex", kinds)
+        self.assertIn("lrc", kinds)
+        self.assertNotIn("cover", kinds)
 
     def test_draft_filters_segments_without_corresponding_observed_words(self):
         heard = [ObservedWord("vrai", 1., 1.1, .9), ObservedWord("chant", 1.2, 1.4, .8)]

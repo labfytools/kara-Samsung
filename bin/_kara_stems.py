@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -25,6 +26,8 @@ ROOT = CACHE / "paroles-strawberry/stems"
 PYTHON = kara_data("demucs-venv/bin/python")
 CHECKPOINT = Path(os.environ.get("TORCH_HOME") or CACHE / "torch") / "hub/checkpoints/955717e8-8726e21a.th"
 FILES = ("instrumental.flac", "vocals.flac")
+MAX_STEM_CACHE = 4 * 1024**3
+MIN_DISK_FREE = 20 * 1024**3
 PARAMETERS = {"engine": "demucs", "model": MODEL, "stem": "vocals", "shifts": 0,
               "overlap": 0.1, "segment": 7, "format": "flac"}
 
@@ -66,6 +69,78 @@ def source_signature(song):
 def stem_directory(song):
     _, token = source_signature(song)
     return ROOT / token
+
+
+def prune_stems(*, keep=(), only=None, root=None):
+    """Remove only published, recognisable Demucs generations under its lease."""
+    root = ROOT if root is None else Path(root)
+    keep = {str(path) for path in keep}
+    only = None if only is None else {str(path) for path in only}
+    if not root.exists():
+        return set(), 0
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("Répertoire du cache Demucs invalide")
+    removed, count = set(), 0
+    with lease(root / "demucs.lock", wait=False) as slot:
+        if slot is None:
+            raise RuntimeError("Cache Demucs occupé")
+        for directory in root.iterdir():
+            if not re.fullmatch(r"[a-f0-9]{64}", directory.name) or directory.is_symlink() or not directory.is_dir():
+                continue
+            try:
+                files = list(directory.iterdir())
+                if {p.name for p in files} != {"meta.json", *FILES} or any(
+                        not stat.S_ISREG(p.lstat().st_mode) for p in files):
+                    continue
+                data = read_metadata(directory)
+                source = data.get("source", data)
+                song = source.get("path")
+                if (not isinstance(song, str) or not Path(song).is_absolute()
+                        or source.get("model") != MODEL or song in keep
+                        or only is not None and song not in only):
+                    continue
+                expected = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()
+                if expected != directory.name:
+                    continue
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            # Never follow a symlink, a nested folder or an unrecognised entry.
+            for file in files:
+                file.unlink()
+            directory.rmdir()
+            removed.add(Path(song))
+            count += 1
+        registry = root / "identities"
+        if registry.is_dir() and not registry.is_symlink():
+            for pointer in registry.iterdir():
+                if (not re.fullmatch(r"[a-f0-9]{64}", pointer.name)
+                        or not stat.S_ISREG(pointer.lstat().st_mode) or pointer.stat().st_size > 64):
+                    continue
+                try:
+                    target = pointer.read_text()
+                    if re.fullmatch(r"[a-f0-9]{64}", target) and not (root / target).exists():
+                        pointer.unlink()
+                except (OSError, UnicodeError):
+                    continue
+    return removed, count
+
+
+def admit_storage(root, seconds):
+    """Reserve disk for a separation and enforce an independent audio-cache ceiling."""
+    seen, used = set(), 0
+    for parent, dirs, names in os.walk(root, followlinks=False):
+        for name in names:
+            try:
+                info = (Path(parent) / name).lstat()
+            except FileNotFoundError:
+                continue
+            identity = (info.st_dev, info.st_ino)
+            if stat.S_ISREG(info.st_mode) and identity not in seen:
+                seen.add(identity)
+                used += info.st_blocks * 512
+    working = int(max(seconds, 1) * 3 * 1024**2)
+    if used + working > MAX_STEM_CACHE or shutil.disk_usage(root).free < MIN_DISK_FREE + working:
+        raise RuntimeError("Plafond du cache Demucs (4 Gio) ou réserve disque (20 Gio) : retire des morceaux de la sélection.")
 
 
 def rebind(song, previous):
@@ -173,6 +248,7 @@ def separate_locked(song):
     if not PYTHON.is_file() or not CHECKPOINT.is_file():
         raise RuntimeError("Modèle Demucs absent ou installation incomplète")
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    admit_storage(ROOT, duration(original))
     output = ROOT / token
     before = original.stat()
     audio = pcm_digest(original)

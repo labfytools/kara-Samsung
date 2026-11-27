@@ -773,7 +773,7 @@ class ParoleView:
         progress, activity, closed = snapshot or (self.index.night_progress(), self.index.activity_progress(),
                                                     self.index.closed_progress())
         ready, references, remaining, report = progress
-        lines = [f"Bibliothèque · {ready} préparations complètes · {references} références temporelles validées · "
+        lines = [f"Bibliothèque · {ready} pistes avec mixage en cache · {references} références temporelles validées · "
                  f"{remaining} restantes dans la file"]
         night = self.maintenance.night
         state = night.desktop
@@ -1279,8 +1279,8 @@ class ParoleView:
             general.append(button("Synchroniser la bibliothèque sur USB", self.control.music_sync.open_settings))
         stack.add_titled(scroller(general), "general", "Maintenance")
         resources = new()
-        toggles(resources, (("autoprepare", "Préparation anticipée hors mode nocturne"),
-                            ("battery", "Autoriser la préparation anticipée sur batterie")))
+        resources.append(Gtk.Label(label="Les pistes Demucs sont préparées à la sélection des chansons.",
+                                   xalign=0, wrap=True, css_classes=["muted"]))
         for spec in (
             ("idle", "Inactivité Sway (secondes)", 30, 3600), ("cpu", "Charge CPU avant départ (%)", 1, 95),
             ("memory_mib", "Mémoire disponible au départ (Mio)", 512, 65536, 256),
@@ -1289,7 +1289,6 @@ class ParoleView:
             ("gpu", "Charge GPU avant départ (%)", 0, 95), ("disk_busy", "Activité disque avant départ (%)", 1, 95),
             ("network_timeout", "Durée maximale par recherche classique (secondes)", 15, 300),
             ("network_workers", "Maximum de recherches indépendantes en parallèle", 1, 20),
-            ("heavy_daily", "Préparations anticipées par jour", 1, 100),
         ):
             number(resources, *spec)
         resources.append(Gtk.Label(label="Un traitement de maintenance à la fois.", xalign=0, css_classes=["muted"]))
@@ -1298,7 +1297,7 @@ class ParoleView:
         self.night_summary = Gtk.Label(xalign=0, wrap=True, selectable=True, css_classes=["muted"])
         night.append(self.night_summary)
         self.refresh_night_summary()
-        toggles(night, (("night_enabled", "Activer la préparation nocturne"),
+        toggles(night, (("night_enabled", "Activer les recherches et minutages nocturnes des paroles"),
                         ("night_transcribe", "Proposer des transcriptions quand aucune source ne répond"),
                         ("night_screen_off", "Préparer lorsque l’écran est éteint"),
                         ("night_lid", "Préparer lorsque le capot est fermé"),
@@ -1314,7 +1313,9 @@ class ParoleView:
             number(night, *spec)
         night.append(Gtk.Label(label="Secteur obligatoire. Attendez l’inhibiteur de capot actif avant de fermer.",
                                xalign=0, wrap=True, css_classes=["muted"]))
-        stack.add_titled(scroller(night), "night", "Préparation nocturne")
+        night.append(Gtk.Label(label="Paroles et LRC uniquement : aucun nouveau fichier instrumental ou vocal Demucs.",
+                               xalign=0, wrap=True, css_classes=["muted"]))
+        stack.add_titled(scroller(night), "night", "Paroles nocturnes")
         codex = new()
         toggles(codex, (("codex", "Autoriser l’authentification ChatGPT existante dans l’espace isolé"),
                         ("codex_auto", "Rechercher automatiquement en dernier recours")))
@@ -1757,8 +1758,7 @@ class ParoleView:
             with self.index.db() as db:
                 count, ready = db.execute("SELECT total,ready FROM library_stats").fetchone()
             if ready:
-                lines.append(f"Extrapolation du cache sur les {count-ready} chansons restantes · "
-                             f"{display_size((count-ready)*storage['bytes']/ready)}")
+                lines.append("Les pistes audio sont conservées seulement pour les sélections utiles.")
             label.set_text("\n".join(lines))
 
         def cleanup(_):

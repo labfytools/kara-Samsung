@@ -331,6 +331,39 @@ class RoomTests(unittest.TestCase):
             remote.command("player-start", "Alex", data)
             self.assertEqual(control.calls.count("countdown"), 1)
 
+    def test_prepare_before_confirmation_and_release_unselected_song(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            control = FakeController(path)
+            control.receiver = receiver = Receiver("127.0.0.1", b"", on_mobile=control.mobile_event)
+            self.addCleanup(receiver.close)
+            room = receiver.room
+            first = Song(path / "A", "Premier", "Artiste", "Album")
+            second = Song(path / "B", "Second", "Artiste", "Album")
+            first.path.touch(); second.path.touch()
+            room.update_catalogue([(song, search_key(song.title)) for song in (first, second)])
+            token = room.join("Alex")["token"]
+            room.choose(token, room.search(token, first.title)["results"][0]["id"], confirm=False)
+            self.idle_until(lambda: len(control.party.players) == 1)
+            remote = control.remote_party
+            self.assertEqual(remote.selected_turns(), [])
+            remote.tick(time.monotonic())
+            self.assertEqual(control.batch, [first])
+            control.interrupt_preload = lambda: control.calls.append("cancel")
+            room.choose(token, room.search(token, second.title)["results"][0]["id"], confirm=False, replace=True)
+            remote.tick(time.monotonic())
+            self.assertIn("cancel", control.calls)
+            control.validating = False
+            remote.background_path = None
+            released = []
+            def release(paths):
+                released.extend(paths)
+                return set(paths)
+            control.release_prepared_stems = release
+            remote.tick(time.monotonic())
+            self.assertEqual(released, [first.path])
+            self.assertEqual(control.batch, [second])
+
     def test_tv_display_reopens_once_after_start_or_manual_close(self):
         receiver = Receiver("127.0.0.1", b"TV")
         try:

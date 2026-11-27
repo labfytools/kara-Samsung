@@ -573,9 +573,13 @@ class Maintenance:
                 if kind == "prepare":
                     priority += 30 if song["lrc"] == "absent" else 20
                 if kind == "prepare" and settings["night_enabled"]:
-                    night_revision = encoded_key(revision, "night", settings["generate"], settings["lrc"], settings["lyrics"])
+                    if song["kara"] == "prêt" or json.loads(song["info"]).get("report", {}).get("reference_validated"):
+                        db.execute("UPDATE tasks SET state='done' WHERE kind=? AND subject=? "
+                                   "AND state IN ('queued','temporary','suspended')", (kind, subject))
+                        continue
+                    night_revision = encoded_key(revision, "night-lyrics-v1", settings["generate"], settings["lrc"], settings["lyrics"])
                     self.index.enqueue(kind, subject, night_revision, priority, db=db)
-                elif settings.get("autoprepare" if kind == "prepare" else kind):
+                elif kind != "prepare" and settings.get(kind):
                     self.index.enqueue(kind, subject, revision, priority, db=db)
 
     @staticmethod
@@ -1185,6 +1189,8 @@ class Maintenance:
             if result["state"] in ("temporary", "network", "unavailable", "limited", "rescan"):
                 return "temporary", "dernière recherche indisponible", 300
             if result["state"] != "found":
+                if result["state"] == "not_found" and self.current_settings["codex"] and self.current_settings["codex_auto"]:
+                    self.queue_codex("lrc", identity, "aucun LRC vérifié")
                 if (result["state"] == "not_found" and self.current_settings["night_transcribe"]
                         and song["lrc"] == "absent" and song["lyrics"] == "absent"):
                     self.index.enqueue("transcription", identity, encoded_key(song["token"], song["side"], "v1"),
@@ -1247,7 +1253,8 @@ class Maintenance:
                                                    and seconds >= 0)
             return receive
 
-        if not cached_stems(path):
+        # Nocturnal work is exclusively lyrical. Demucs is reserved for an explicit preparation.
+        if not nocturnal and not cached_stems(path):
             began = monotonic()
             self.journal.emit("DEMUCS", f"Séparation voix / accompagnement · {song['title']}")
             rc, _ = self.output(["nice", "-n", "12", sys.executable, "-B", str(BIN / "_kara_stems.py"), str(path)],
@@ -1278,19 +1285,21 @@ class Maintenance:
                 if rc and not self.cache.cached(path, verify=False, insufficient=True):
                     return "temporary", "analyse Turbo indisponible", 6 * HOUR
         reference = self.cache.cached(path, verify=False)
-        prepared_stems = (cached_stems(path) if reference and
-                          reference.get("refinement", {}).get("version") == REFINEMENT_VERSION else None)
-        if prepared_stems:
+        valid_reference = reference and reference.get("refinement", {}).get("version") == REFINEMENT_VERSION
+        prepared_stems = cached_stems(path) if valid_reference and not nocturnal else None
+        if valid_reference and (nocturnal or prepared_stems):
             if nocturnal:
                 folder = self.cache.folder(path)
                 try:
                     # Measure this complete generation, excluding locks,
                     # superseded drafts and unrelated changes to the cache.
-                    files = (*prepared_stems, folder / "prepared.json", folder / (reference["lrc_sha256"] + ".lrc"))
+                    files = (folder / "prepared.json", folder / (reference["lrc_sha256"] + ".lrc"))
                     self.night_measures["taille"] = sum(file.stat().st_blocks * 512 for file in files)
                 except OSError:
                     pass
-            updated = {"audio": reference["audio"].get("pcm_sha256", ""), "kara": "prêt"}
+            updated = {"audio": reference["audio"].get("pcm_sha256", "")}
+            if not nocturnal:
+                updated["kara"] = "prêt"
             origin = reference["source"]
             generated = bool(origin.get("plain_sha256") and reference_option == "--plain-reference")
             corrected = bool(reference["report"].get("changed") and analyzed)
@@ -1303,6 +1312,9 @@ class Maintenance:
                 self.journal.emit("LRC", f"Minutage corrigé dans Kara · {song['title']}")
             self.refresh_song(song, **updated)
             self.night_lrc = (corrected, generated)
+            if nocturnal:
+                self.journal.emit("LRC", f"Référence temporelle validée · {song['title']}")
+                return "done", "référence prête", 0
             self.journal.emit("KARA", f"Chanson prête · {song['title']}")
             return "done", "prêt", 0
         self.refresh_song(song)
@@ -1463,7 +1475,7 @@ class Maintenance:
             activity = ("draft",)
         if state == "suspended" and self.memory_interruption:
             activity = ("memory",)
-        if kind == "prepare" and state == "done" and detail == "prêt":
+        if kind == "prepare" and state == "done" and detail in ("prêt", "référence prête"):
             corrected, generated = self.night_lrc
             activity = tuple(label for label, observed in (("ready", True), ("corrected", corrected and not generated),
                                                            ("generated", generated)) if observed)
@@ -1671,20 +1683,13 @@ class Maintenance:
             self.block = self.resources.reason
             self.journal.emit("IDLE", self.block)
         self.authorized_imports(settings)
-        if (not imports_pending and not settings["night_enabled"] and settings["autoprepare"] and self.resources.can_start
-                and monotonic() >= self.priority_until and not self.priority):
-            task = self.index.claim(("prepare",), now, bucket="heavy", limit=settings["heavy_daily"])
-            if task is not None:
-                self.execute(task)
-                return
-
         if not self.resources.allowed_storage(settings):
             return
         self.tick_network(settings, now, self.network_kinds(settings, now))
 
     def network_kinds(self, settings, now, *, nocturnal=False):
         ready = ready_categories(self.index, now)
-        return tuple(kind for kind in (NIGHT_NETWORK if nocturnal else NETWORK)
+        return tuple(kind for kind in (("lyrics", "lrc", "codex", "source", "source_probe") if nocturnal else NETWORK)
                      if (NETWORK_FLAGS.get(kind, kind) is None or settings[NETWORK_FLAGS.get(kind, kind)])
                      and (kind not in NETWORK_CATEGORY or NETWORK_CATEGORY[kind] in ready)
                      and (kind != "codex" or now >= settings.get("codex_suspended_until", 0)))
