@@ -24,6 +24,7 @@ from _parole_import_metrics import snapshot
 from _parole_local_reference import SOURCE as LOCAL_SOURCE, local_reference
 from _parole_lyrics_lookup import prune
 from _parole_sources import ProviderUnavailable, LyricsEndpoint, validate_endpoint, record, fetch
+from _parole_word_upgrade import KIND as WORD_LRC, verify_track as verify_word_lrc
 from _paroles_lrc import MAX_LRC_BYTES, parse_lrc
 
 
@@ -399,6 +400,9 @@ def main():
         result = lookup_song(index, subject, kind == "lrc",
                              local_reference_only=sys.argv[3:] == ["--local-reference-only"],
                              original_lrc=kind == "lrc" and sys.argv[3:] == ["--original-lrc"])
+    elif kind == WORD_LRC:
+        os.environ["KARA_IMPORT_PROCESSING"] = "1"
+        result = verify_word_lrc(index, subject, lyrics_engine())
     elif kind in KINDS:
         # Library-lock progress and tool diagnostics must not contaminate the
         # machine-readable result expected by the maintenance supervisor.

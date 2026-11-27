@@ -36,17 +36,19 @@ from _parole_night import Night
 from _parole_process import Interrupted, run
 from _parole_resources import Resources
 from _parole_sources import discover, seed, controls, ready_categories, night_lrc_providers
+from _parole_word_upgrade import KIND as WORD_LRC
 from _paroles_lrc import MAX_LRC_BYTES
 
 CATEGORIES = ("SYSTEM", "SCAN", "INDEX", "LYRICS", "LRC", "ALBUM", "DISCOGRAPHIE", "DOWNLOAD", "METADATA",
               "COVER", "CODEX", "SOURCE", "TV", "SYNC", "IDLE", "CACHE",
               "SUCCESS", "WARNING", "ERROR", "RESSOURCES")
 NIGHT_NETWORK = ("lyrics", "lrc", "album", "discography", "cover", "metadata")
-NETWORK = (*NIGHT_NETWORK, "codex", "source", "source_probe")
-NETWORK_FLAGS = {"album": "albums", "source": None, "source_probe": None}
+NETWORK = (*NIGHT_NETWORK, "codex", "source", "source_probe", WORD_LRC)
+NETWORK_FLAGS = {"album": "albums", "source": None, "source_probe": None, WORD_LRC: "lrc"}
 NETWORK_CATEGORY = {"lyrics": "lyrics", "lrc": "lrc", "album": "musicbrainz", "metadata": "musicbrainz",
-                    "discography": "musicbrainz", "cover": "cover"}
-NETWORK_TURN = ("lrc", "lyrics", "album", "lrc", "discography", "lyrics", "cover", "metadata", "codex", "source", "source_probe")
+                    "discography": "musicbrainz", "cover": "cover", WORD_LRC: "lrc"}
+NETWORK_TURN = ("lrc", "lyrics", "album", "lrc", "discography", "lyrics", "cover", "metadata",
+                "codex", "source", "source_probe", WORD_LRC)
 CHECKED_RESULTS = {"complete", "incomplete", "checked", "partial", "identified", "found", "not_found",
                    "invalid", "ambiguous", "instrumental", "present"}
 HOUR = 3600
@@ -817,6 +819,13 @@ class Maintenance:
         outcome = value["state"]
         if kind in ("lyrics", "lrc"):
             return self.do_song(task, value)
+        if kind == WORD_LRC:
+            if outcome in ("limited", "unavailable", "network", "temporary"):
+                return "temporary", outcome, min(DAY, 120 * 2**min(task["attempts"], 9))
+            if outcome == "found":
+                self.journal.emit("LRC", "Version mot à mot vérifiée")
+            return ("review" if outcome in ("not_found", "ambiguous", "invalid") else
+                    "excluded" if outcome == "excluded" else "done"), outcome, 0
         if kind == "cover":
             if outcome == "not_found":
                 self.queue_codex("cover", task["subject"], "aucune pochette vérifiée")
@@ -1155,7 +1164,7 @@ class Maintenance:
         if nocturnal and kind != "lrc":
             self.index.finish(task, "suspended", "Hors file nocturne LRC", 0, refund_attempt=True)
             return
-        category = {"discography": "DISCOGRAPHIE", "source_probe": "SOURCE",
+        category = {"discography": "DISCOGRAPHIE", "source_probe": "SOURCE", WORD_LRC: "LRC",
                     "cleanup": "CACHE"}.get(kind, kind.upper())
         network_found = False
         activity = ()
@@ -1165,12 +1174,13 @@ class Maintenance:
             self.active = (kind, subject)
         self.night_running = nocturnal
         self.night_settings_at = 0.
-        song = self.index.song(subject) if kind in ("lyrics", "lrc") else None
+        song = self.index.song(subject) if kind in ("lyrics", "lrc", WORD_LRC) else None
         self.progress = (category, song["title"] if song is not None else "En cours", None)
         if local_reference_only:
             self.journal.emit(category, "Vérification d’une référence locale")
         elif kind != "codex":
             self.journal.emit(category, {"lyrics": "Recherche de paroles", "lrc": "Recherche d’un LRC",
+                                        WORD_LRC: "Recherche d’une version mot à mot",
                                         "album": "Vérification d’une édition", "discography": f"Vérification · {subject}",
                                         "source": "Vérification des conditions et des correspondances",
                                         "source_probe": "Vérification de la documentation fournisseur",
@@ -1401,7 +1411,10 @@ class Maintenance:
         self.authorized_imports(settings)
         if not self.resources.allowed_storage(settings):
             return
-        self.tick_network(settings, now, self.network_kinds(settings, now))
+        kinds = self.network_kinds(settings, now)
+        if imports_pending:
+            kinds = tuple(kind for kind in kinds if kind != WORD_LRC)
+        self.tick_network(settings, now, kinds)
 
     def network_kinds(self, settings, now):
         ready = ready_categories(self.index, now)

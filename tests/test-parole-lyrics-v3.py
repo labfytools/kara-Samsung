@@ -107,6 +107,19 @@ class LyricsTests(unittest.TestCase):
                                          registry=self.index, refresh=True)
                 self.assertEqual(result, (TIMED, "LRCLIB"))
 
+    def test_library_recheck_uses_the_reference_and_defers_an_exhausted_source(self):
+        self.only("LRCLIB", "NetEase")
+        options = dict(synced=True, original_lrc=True, strict=True, registry=self.index, word_reference=TIMED)
+        configure_limits(self.index, "NetEase", 0, 0)
+        with patch.object(self.engine.LrcLib, "find", return_value="[00:05.00]Premier mot"):
+            with self.assertRaises(self.engine.ServiceUnavailable) as caught:
+                self.engine.LyricsSources().find(*SONG, **options)
+        self.assertEqual(caught.exception.reason, "limited")
+        configure_limits(self.index, "NetEase", 200, 0)
+        native = "[00:01.000]<00:01.000>Premier <00:01.804>mot"
+        with patch.object(self.engine.NetEase, "find", return_value=native):
+            self.assertEqual(self.engine.LyricsSources().find(*SONG, **options), (native, "NetEase"))
+
     def test_lrc_red_verifies_edition_and_preserves_bytes_and_attribution_from_cache(self):
         self.only(RED)
         raw = "\ufeff[00:01.00]<00:01.00>Original  \r\n[00:02.50]Suite\r\n"

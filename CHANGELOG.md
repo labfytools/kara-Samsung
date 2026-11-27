@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Réexaminer les LRC ligne par ligne avec la file persistante et afficher les versions d’origine mot à mot compatibles avec le fichier local.
+
 - Privilégier les LRC d’origine avec des repères mot à mot exploitables et garder le premier LRC à la ligne compatible en repli.
 
 - Porter le plafond local de LRCLIB à 20 000 requêtes par jour et conserver le délai minimal de deux secondes entre requêtes.

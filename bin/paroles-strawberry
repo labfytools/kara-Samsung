@@ -19,7 +19,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk
 
 from _kara_blackbox import BlackBox, digest
 from _kara_blackbox_lyrics import record as record_lyrics, snapshot as lyrics_snapshot
-from _kara_lrc import read_source
+from _kara_lrc import read_source, source_payload
 from _kara_files import lrc_token
 from _kara_timing import LyricTiming
 from _kara_library import MusicLibraryWindow, Song, search_key
@@ -28,10 +28,11 @@ from _kara_paths import BIN, music_library
 from _labfy_sync import MusicSync
 from _kara_tv import current_cover, https_configured, start_receiver
 from _musique_oz import AUDIO, probe
-from _parole_index import path_rows, sidecar_token
+from _parole_index import document, path_rows, sidecar_token
 from _parole_lrc_credit import load_links
 from _parole_maintenance import Maintenance
 from _parole_ui import ParoleView
+from _parole_word_upgrade import variant as word_lrc_variant
 
 
 APP_ID = "fr.labfy.ParolesStrawberry"
@@ -88,6 +89,9 @@ class LyricsWindow(Gtk.ApplicationWindow):
         self.rate = 0.0
         self.track = None
         self.file_token = None
+        self.word_source = None
+        self.word_key = None
+        self.next_word_poll = 0.
         self.tag_token = None
         self.tag_job = None
         self.tag_text = ""
@@ -629,8 +633,26 @@ class LyricsWindow(Gtk.ApplicationWindow):
             source_token = lrc_token(path)
         except (OSError, ValueError):
             source_token = "invalid"
-        if (self.track, source_token) != self.file_token:
-            source = read_source(self.track) if source_token not in (None, "invalid") else None
+        key = self.track, source_token
+        now = time.monotonic()
+        if self.word_key != key:
+            self.word_key, self.word_source, self.next_word_poll = key, None, 0.
+        if self.maintenance is not None and source_token not in (None, "invalid") and now >= self.next_word_poll:
+            # The worker can validate a variant during playback. Poll for
+            # that receipt at a lower cadence than the Strawberry position.
+            self.next_word_poll = now + 3
+            try:
+                raw = word_lrc_variant(self.maintenance.index, self.track, document(source_token))
+                self.word_source = source_payload(raw.encode()) if raw else None
+            except sqlite3.Error:
+                pass
+            except (KeyError, OSError, ValueError):
+                self.word_source = None
+        playback_key = (*key, self.word_source[1] if self.word_source else None)
+        if playback_key != self.file_token:
+            source = self.word_source
+            if source is None and source_token not in (None, "invalid"):
+                source = read_source(self.track)
             try:
                 if source and self.maintenance is None:
                     return
@@ -642,7 +664,7 @@ class LyricsWindow(Gtk.ApplicationWindow):
                 self.show_lyric_attribution([])
                 self.set_lines([])
                 return
-            self.file_token = self.track, source_token
+            self.file_token = playback_key
             self.lyric_source = source
             self.show_lyric_attribution(links)
             self.set_lines(self.lyric_source[2] if self.lyric_source else [])

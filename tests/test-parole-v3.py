@@ -65,6 +65,42 @@ class Fixture(unittest.TestCase):
 
 
 class InventoryTests(Fixture):
+    def test_word_lrc_audit_is_idempotent_and_keeps_the_exact_original(self):
+        from _parole_index import sidecar_token
+        from _parole_word_upgrade import KIND, queue_library, variant, verify_track
+
+        track = self.audio()
+        self.audio("02.flac", title="Sans paroles")
+        original = track.with_suffix(".lrc")
+        original.write_bytes(b"[00:01.00]Premier mot\r\n")
+        self.scan()
+        self.assertEqual(queue_library(self.index, preview=True),
+                         {"total": 2, "missing": 1, "lines": 1, "eligible": 1})
+        self.assertIsNone(self.index.claim((KIND,), time()))
+        self.assertEqual(queue_library(self.index)["queued"], 1)
+        self.assertEqual(queue_library(self.index)["queued"], 0)
+        task = self.index.claim((KIND,), time())
+        seed(self.index)
+        with self.index.db() as db:
+            db.execute("UPDATE sources SET state='disabled' WHERE id NOT IN ('LRCLIB','NetEase')")
+        engine = lyrics_engine()
+        record = dict(trackName="Chanson", artistName="Groupe, Invité", albumName="Album",
+                      duration=5, syncedLyrics="[00:01.00]Premier mot")
+        native = "\ufeff[00:01.000]<00:01.000>Premier <00:01.804>mot\r\n"
+        with patch.object(engine.LrcLib, "get", return_value=record), patch.object(
+            engine.NetEase, "find", return_value=native
+        ):
+            result = verify_track(self.index, task["subject"], engine)
+        self.assertEqual(result, {"state": "found", "source": "NetEase"})
+        self.index.finish(task, "done", "found")
+        fresh = Index(self.root, self.base / "state")
+        self.assertEqual(variant(fresh, track, sidecar_token(original)), native)
+        self.assertEqual(original.read_bytes(), b"[00:01.00]Premier mot\r\n")
+        self.assertEqual(queue_library(fresh)["queued"], 0)
+        original.write_text("[00:01.20]Premier mot")
+        self.assertIsNone(variant(fresh, track, sidecar_token(original)))
+        self.assertEqual(queue_library(fresh)["queued"], 1)
+
     def test_incremental_lexicon_updates_only_the_changed_version_and_recovers_claim(self):
         from _kara_files import file_token
         from _parole_lexicon import incremental_records, make_record, refresh_one
@@ -1229,6 +1265,24 @@ class GtkTests(Fixture):
         self.assertIn("1 morceaux · 0 avec LRC · 1 sans LRC", summary)
         self.assertIn("0 LRC récupérés cette nuit", summary)
         self.assertIn("Prochaine reprise", summary)
+
+        from _parole_index import document, sidecar_token
+        from _parole_word_upgrade import KIND
+
+        window.set_track(path)
+        window.load_lines()
+        self.assertFalse(any(window.word_marks))
+        word_lrc = "[00:00.20]<00:00.20>Paroles <00:00.60>à <00:00.80>confirmer"
+        self.index.review(KIND, encoded_key(str(path)), "verified",
+                          {"audio": document(file_token(path)), "base": sidecar_token(path.with_suffix(".lrc")),
+                           "text": word_lrc, "source": KUGOU})
+        window.next_word_poll = 0.
+        window.load_lines()
+        self.assertEqual(len(window.word_marks[0]), 3)
+        self.assertEqual(path.with_suffix(".lrc").read_bytes(), offered_lrc.encode())
+        path.with_suffix(".lrc").write_text("[00:01.00]Paroles à confirmer")
+        window.load_lines()
+        self.assertFalse(any(window.word_marks))
 
         # Exercise the real multi-selection, preview and confirmation in a
         # mounted GTK dialog. The fixture collection alone is mutated.

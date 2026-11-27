@@ -811,7 +811,7 @@ class LyricsSources:
 
     def find(self, title, artist, album, duration, album_artist, *, synced, local_text="",
              registry=None, strict=False, context=(), provider_only=None, isrc=None, recording=None,
-             refresh=False, audit=None, original_lrc=False):
+             refresh=False, audit=None, original_lrc=False, word_reference=None):
         from _parole_import_metrics import LOOKUP, snapshot
         from _parole_lrc_credit import CREDITED, RED, UNISON, save_links
         from _parole_sources import COMMUNITY_LRC, KUGOU, LYRICS_BROKER_UPSTREAMS, lyrics_rows, ready_sources
@@ -824,6 +824,10 @@ class LyricsSources:
         entries = []
         from _parole_lrclib_local import candidates, configured_snapshot
 
+        def matches_word_reference(value):
+            return has_word_timing(value) and (
+                word_reference is None or choose_transcript([(word_reference, {}), (value, {})], True, False) == value)
+
         if provider_only is None and (snapshot_path := configured_snapshot()):
 
             try:
@@ -834,12 +838,13 @@ class LyricsSources:
                     identity = matches[0]["id"] if len(matches) == 1 else None
                     entries.append(dict(cache_value(value, {"catalogue_id": identity}),
                                         provider="LRCLIB local", decision="compatible"))
-                    if not prefer_words or has_word_timing(value):
+                    if not prefer_words or matches_word_reference(value):
                         if registry:
                             entries[0]["decision"] = "selected"
                             save_candidates(registry, recording, entries, synced=synced)
                         return value, "LRCLIB local"
-                    choice = value, "LRCLIB local"
+                    if word_reference is None:
+                        choice = value, "LRCLIB local"
             except (OSError, sqlite3.Error, ValueError):
                 # A stale, damaged or missing mirror leaves the normal
                 # network path available with its own quota and evidence.
@@ -907,7 +912,9 @@ class LyricsSources:
         instrumental, failed, ambiguous = None, None, False
         quota = None
         for name in names:
-            if prefer_words and choice[0] and not self.lrc.gate.remaining(1):
+            if prefer_words and (choice[0] or word_reference is not None) and not self.lrc.gate.remaining(1):
+                if word_reference is not None:
+                    failed = ServiceUnavailable("Délai de vérification du mot à mot atteint", "temporary")
                 break
             if not prefer_words and choice[0] and not ambiguous and name != "LRCLIB":
                 continue
@@ -969,7 +976,7 @@ class LyricsSources:
                             failed = error or failed
                         # An optional word-timing search cannot invalidate
                         # the compatible result already available as fallback.
-                        ambiguous |= conflict and (not prefer_words or not choice[0])
+                        ambiguous |= conflict and word_reference is None and (not prefer_words or not choice[0])
                         entries.extend(dict(item, provider=name) for item in candidates)
                         if identity:
                             if not error and not conflict:
@@ -994,6 +1001,11 @@ class LyricsSources:
             if value:
                 entries.append(dict(result, provider=name, decision="compatible"))
                 if ambiguous:
+                    continue
+                if word_reference is not None:
+                    if matches_word_reference(value):
+                        choice = value, name
+                        break
                     continue
                 if prefer_words:
                     if has_word_timing(value) and (not choice[0] or
@@ -1819,12 +1831,21 @@ def main():
     parser.add_argument("--bibliotheque", type=Path, default=LIBRARY)
     parser.add_argument("--suivi-activite", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--lrc-stdout", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--reverifier-mot-a-mot", action="store_true",
+                        help="recense la bibliothèque et met en file les LRC à la ligne")
     args = parser.parse_args()
     if args.tout and args.chemins:
         parser.error("--tout ou des chemins explicites sont attendus")
     root = args.bibliotheque.expanduser().resolve()
     if not root.is_dir():
         parser.error(f"bibliothèque introuvable : {root}")
+    if args.reverifier_mot_a_mot:
+        from _parole_word_upgrade import queue_library
+
+        if args.chemins or args.synchro:
+            parser.error("La vérification mot à mot porte sur la bibliothèque entière.")
+        print(json.dumps(queue_library(registered_sources(root), preview=args.apercu), ensure_ascii=False))
+        return 0
     if args.lrc_stdout:
         # Preparation retrieves a candidate without taking a mutation lock or
         # writing to the library. Turbo must still validate the exact recording.
