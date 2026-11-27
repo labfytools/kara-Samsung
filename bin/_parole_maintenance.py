@@ -1454,7 +1454,10 @@ class Maintenance:
         tasks = [first]
         maximum = max(1, min(20, settings["network_workers"], self.network_width))
         if first["kind"] in NIGHT_NETWORK and maximum > 1:
-            batch_kinds = tuple(kind for kind in kinds if kind in NIGHT_NETWORK)
+            # Reserve at most one word-check slot in a daytime batch. Its
+            # turn must survive even when classic LRC work fills every batch.
+            batch_kinds = tuple(kind for kind in kinds
+                                if kind in NIGHT_NETWORK or (kind == WORD_LRC and not nocturnal))
             subjects = [first["subject"]]
             while len(tasks) < maximum:
                 task = self.claim_network(settings, now, batch_kinds, avoid=subjects)
@@ -1462,6 +1465,8 @@ class Maintenance:
                     break
                 tasks.append(task)
                 subjects.append(task["subject"])
+                if task["kind"] == WORD_LRC:
+                    batch_kinds = tuple(kind for kind in batch_kinds if kind != WORD_LRC)
         if len(tasks) == 1:
             result = self.execute(first, nocturnal=nocturnal)
             if self.network_width == 1 and result and self.network_completed(result):

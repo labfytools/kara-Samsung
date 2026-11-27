@@ -65,6 +65,23 @@ class Fixture(unittest.TestCase):
 
 
 class InventoryTests(Fixture):
+    def test_regular_network_batch_leaves_a_slot_for_the_word_lrc_audit(self):
+        from _parole_maintenance import NETWORK_TURN
+        from _parole_word_upgrade import KIND
+
+        owner = Maintenance(self.root, None, state=self.base / "state")
+        self.addCleanup(owner.close)
+        owner.network_batch = Mock()
+        owner.network_width = 4
+        owner.network_cursor = NETWORK_TURN.index("discography") - 1
+        for position in range(4):
+            self.index.enqueue("lrc", f"regular-{position}", "fixture")
+            self.index.enqueue(KIND, f"word-{position}", "fixture")
+        settings = self.index.settings()
+        self.assertTrue(owner.tick_network(settings, time(), ("lrc", KIND)))
+        tasks = owner.network_batch.call_args.args[0]
+        self.assertEqual([task["kind"] for task in tasks], ["lrc", KIND, "lrc", "lrc"])
+
     def test_word_lrc_audit_is_idempotent_and_keeps_the_exact_original(self):
         from _parole_index import sidecar_token
         from _parole_word_upgrade import KIND, queue_library, variant, verify_track
