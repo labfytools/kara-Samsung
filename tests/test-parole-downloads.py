@@ -172,7 +172,7 @@ class AdmissionTests(unittest.TestCase):
         with TemporaryDirectory() as temp, patch.dict(sys.modules, modules), patch.dict(
                 os.environ, KARA_PAROLE_COVER="0"), patch.object(resources, "RATE_DIRECTORY", Path(temp)), patch.object(
                 resources.time, "time", return_value=10_000) as now:
-            session = catalogue.client()
+            session = catalogue.client(catalogue_only=True)
             with self.assertRaisesRegex(ImportIssue, "HTTP 429"):
                 session.request("GET", "https://music.youtube.com/")
             now.return_value += 119
@@ -202,6 +202,9 @@ class AdmissionTests(unittest.TestCase):
                 fail(video)
             with self.assertRaisesRegex(ImportIssue, resources.YOUTUBE_AVAILABILITY):
                 resources.check_youtube()
+            resources.wait_service("youtube", 0, catalogue=True)
+            with self.assertRaisesRegex(ImportIssue, resources.YOUTUBE_AVAILABILITY):
+                resources.wait_service("youtube", 0)
             resources.observe_youtube(detail="HTTP Error 429: Too Many Requests; Retry-After: 7200")
             resources.observe_youtube(extracted=True)
             now.return_value += 7199

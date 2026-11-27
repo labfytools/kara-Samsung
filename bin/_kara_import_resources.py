@@ -342,12 +342,14 @@ def read_youtube_gate(path):
         return {"until": 0, "reason": "", "recent": {}}
 
 
-def check_youtube():
+def check_youtube(*, catalogue=False):
     path = RATE_DIRECTORY / "youtube-gate.json"
     if path.exists():
         with lease(RATE_DIRECTORY / "youtube-gate.lock", shared=True):
             gate = read_youtube_gate(path)
-        if gate["until"] > time.time():
+        # Ambiguous media failures pause playback extraction. Read-only
+        # catalogue metadata still shares the provider's explicit limits.
+        if gate["until"] > time.time() and not (catalogue and gate["reason"] == YOUTUBE_AVAILABILITY):
             raise ImportIssue("provider_hold", f"{YOUTUBE_HOLD_MESSAGE} · {gate['reason']}.")
 
 
@@ -540,12 +542,12 @@ def reserve_service(service, interval):
         return True
 
 
-def wait_service(service, interval, *, max_wait=60):
+def wait_service(service, interval, *, max_wait=60, catalogue=False):
     path = RATE_DIRECTORY / service
     deadline = time.monotonic() + max_wait
     while True:
         if service == "youtube":
-            check_youtube()
+            check_youtube(catalogue=catalogue)
         with lease(path) as fd:
             now = time.time()
             delay = rate_record(fd) - now

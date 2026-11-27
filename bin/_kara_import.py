@@ -528,7 +528,10 @@ class AlbumImport(Gtk.Revealer):
             command = [str(KARA), mode, value] if mode else catalogue_command(action, value)
             self.lookup = Gio.Subprocess.new(command, PIPE)
         except (GLib.Error, ValueError) as error:
-            if not live:
+            if live:
+                self.message("Suggestions indisponibles. Appuie sur Entrée pour lancer la recherche.",
+                             failed=True, detail=str(error))
+            else:
                 category = "path" if isinstance(error, ValueError) else "dependency"
                 self.message(CATEGORIES[category], failed=True, detail=str(error))
             return
@@ -565,14 +568,18 @@ class AlbumImport(Gtk.Revealer):
             if not isinstance(payload, dict):
                 raise ValueError("Réponse du catalogue invalide.")
         except (GLib.Error, ValueError, TypeError) as error:
+            message = ("Suggestions indisponibles. Appuie sur Entrée pour lancer la recherche." if live else
+                       f"La recherche {source} a échoué.")
+            self.message(message, failed=True, detail=output or str(error))
             if not live:
-                self.message(f"La recherche {source} a échoué.", failed=True, detail=output or str(error))
                 self.search_next_catalogue(source, self.artist.get_text().strip())
             return
         if not process.get_successful() or "data" not in payload:
+            text = CATEGORIES.get(payload.get("category"), f"La recherche {source} a échoué.")
+            if live:
+                text = f"{text}. Appuie sur Entrée pour lancer la recherche."
+            self.message(text, failed=True, detail=payload.get("error") or output)
             if not live:
-                text = CATEGORIES.get(payload.get("category"), f"La recherche {source} a échoué.")
-                self.message(text, failed=True, detail=payload.get("error") or output)
                 self.search_next_catalogue(source, self.artist.get_text().strip())
             return
         callback(payload["data"])

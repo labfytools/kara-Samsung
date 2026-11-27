@@ -18,7 +18,7 @@ VIDEO = re.compile(r"[A-Za-z0-9_-]{11}")
 YOUTUBE_COVER_HOSTS = {"lh3.googleusercontent.com", "yt3.googleusercontent.com"}
 
 
-def client():
+def client(*, catalogue_only=False):
     from requests import Session
     from ytmusicapi import YTMusic
 
@@ -41,7 +41,7 @@ def client():
             if registry is not None:
                 wait_provider(registry, "YouTube Music", "youtube", .8, max_wait=12)
             else:
-                wait_service("youtube", 0.5)
+                wait_service("youtube", 0.5, max_wait=12, catalogue=catalogue_only)
             options.setdefault("timeout", (5, 12))
             try:
                 response = super().request(method, url, **options)
@@ -280,7 +280,7 @@ def main(argv):
 
     try:
         action, value, *rest = argv
-        yt = client()
+        yt = client(catalogue_only=action in ("artistes", "albums", "edition", "morceau"))
         if action == "artistes":
             data = artist_search(yt, value)
         elif action == "albums":

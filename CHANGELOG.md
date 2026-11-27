@@ -2,6 +2,8 @@
 
 ## En développement
 
+- Rétablir les suggestions d’albums pendant une suspension des téléchargements pour réponses vidéo ambiguës. Afficher le motif quand les suggestions échouent.
+
 - Suspendre l’économiseur d’écran Samsung tant que Kara TV 2.2.3 est au premier plan et le rétablir à la sortie.
 
 - Rechercher les LRC d’origine auprès de lrc.red et d’Unison, en journée et la nuit. Afficher les crédits dans Parole et sur Kara TV 2.2.2.
